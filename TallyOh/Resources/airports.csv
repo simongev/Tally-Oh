@@ -1,0 +1,102 @@
+ICAO,Name,Latitude,Longitude,Elevation
+KJFK,John F Kennedy International Airport,40.6398,-73.7789,13
+KLAX,Los Angeles International Airport,33.9425,-118.4081,125
+KORD,Chicago O'Hare International Airport,41.9786,-87.9048,672
+KATL,Hartsfield-Jackson Atlanta International Airport,33.6367,-84.4281,1026
+KDFW,Dallas Fort Worth International Airport,32.8968,-97.0380,607
+KDEN,Denver International Airport,39.8617,-104.6731,5434
+KSFO,San Francisco International Airport,37.6213,-122.3790,13
+KLAS,Las Vegas McCarran International Airport,36.0840,-115.1537,2181
+KSEA,Seattle-Tacoma International Airport,47.4502,-122.3088,433
+KMIA,Miami International Airport,25.7959,-80.2870,8
+KPHX,Phoenix Sky Harbor International Airport,33.4342,-112.0080,1135
+KIAH,George Bush Intercontinental Airport,29.9844,-95.3414,97
+KBOS,Boston Logan International Airport,42.3656,-71.0096,19
+KMSP,Minneapolis-St Paul International Airport,44.8848,-93.2223,841
+KDTW,Detroit Metropolitan Wayne County Airport,42.2124,-83.3534,645
+KPHL,Philadelphia International Airport,39.8744,-75.2424,36
+KCLT,Charlotte Douglas International Airport,35.2144,-80.9473,748
+KBWI,Baltimore/Washington International Airport,39.1774,-76.6684,146
+KMDW,Chicago Midway International Airport,41.7868,-87.7522,620
+KOAK,Oakland International Airport,37.7213,-122.2208,9
+KSAN,San Diego International Airport,32.7336,-117.1897,17
+KDAL,Dallas Love Field,32.8471,-96.8518,487
+KBUR,Bob Hope Airport,34.2007,-118.3587,778
+KONT,Ontario International Airport,34.0560,-117.6012,944
+KPDX,Portland International Airport,45.5887,-122.5975,30
+KSLC,Salt Lake City International Airport,40.7884,-111.9778,4227
+KMCI,Kansas City International Airport,39.2976,-94.7139,1026
+KSTL,Lambert-St Louis International Airport,38.7487,-90.3700,618
+KRDU,Raleigh-Durham International Airport,35.8776,-78.7875,435
+KAUS,Austin-Bergstrom International Airport,30.1945,-97.6699,542
+KBNA,Nashville International Airport,36.1245,-86.6782,599
+KMSY,Louis Armstrong New Orleans International Airport,29.9934,-90.2580,4
+KPIT,Pittsburgh International Airport,40.4915,-80.2329,1203
+KCVG,Cincinnati/Northern Kentucky International Airport,39.0488,-84.6678,896
+KMKE,Milwaukee Mitchell International Airport,42.9472,-87.8966,723
+KSAT,San Antonio International Airport,29.5337,-98.4698,809
+KSJC,San Jose International Airport,37.3626,-121.9290,62
+KSMF,Sacramento International Airport,38.6954,-121.5908,27
+Krsw,Southwest Florida International Airport,26.5362,-81.7552,30
+KMCO,Orlando International Airport,28.4294,-81.3089,96
+KTPA,Tampa International Airport,27.9755,-82.5332,26
+KIAH,Houston George Bush Intercontinental,29.9844,-95.3414,97
+KHOU,Houston William P Hobby Airport,29.6454,-95.2789,46
+KBDL,Bradley International Airport,41.9389,-72.6832,173
+KCLE,Cleveland Hopkins International Airport,41.4117,-81.8498,791
+KCOS,Colorado Springs Airport,38.8058,-104.7006,6187
+KELP,El Paso International Airport,31.8072,-106.3778,3958
+KHPN,Westchester County Airport,41.0670,-73.7076,439
+KISP,Long Island MacArthur Airport,40.7952,-73.1002,99
+KPBI,Palm Beach International Airport,26.6832,-80.0956,19
+KRIC,Richmond International Airport,37.5052,-77.3197,167
+KRNO,Reno-Tahoe International Airport,39.4991,-119.7681,4415
+KSRQ,Sarasota-Bradenton International Airport,27.3954,-82.5544,30
+KTUS,Tucson International Airport,32.1161,-110.9410,2643
+KTUL,Tulsa International Airport,36.1984,-95.8881,677
+KABQ,Albuquerque International Sunport,35.0402,-106.6090,5355
+KBOI,Boise Airport,43.5644,-116.2228,2871
+KBUF,Buffalo Niagara International Airport,42.9405,-78.7322,728
+KFAT,Fresno Yosemite International Airport,36.7762,-119.7181,336
+KGRR,Gerald R Ford International Airport,42.8808,-85.5228,794
+KHSV,Huntsville International Airport,34.6372,-86.7751,629
+KJAX,Jacksonville International Airport,30.4941,-81.6879,30
+KLIT,Bill and Hillary Clinton National Airport,34.7294,-92.2243,262
+KMEM,Memphis International Airport,35.0424,-89.9767,341
+KOKC,Will Rogers World Airport,35.3931,-97.6007,1295
+KOMG,Omega Airport,25.8978,-97.4286,25
+KPNS,Pensacola International Airport,30.4734,-87.1866,121
+KPVD,T F Green Airport,41.7240,-71.4281,55
+KSAV,Savannah/Hilton Head International Airport,32.1276,-81.2021,51
+KSDF,Louisville Muhammad Ali International,38.1744,-85.7360,501
+KSJC,Norman Y Mineta San Jose International,37.3626,-121.9290,62
+KSYR,Syracuse Hancock International Airport,43.1112,-76.1063,421
+KTYS,McGhee Tyson Airport,35.8111,-83.9940,981
+EGLL,London Heathrow Airport,51.4700,-0.4543,83
+EGKK,London Gatwick Airport,51.1481,-0.1903,202
+EHAM,Amsterdam Schiphol Airport,52.3086,4.7639,11
+EDDF,Frankfurt Airport,50.0333,8.5706,364
+LFPG,Paris Charles de Gaulle Airport,49.0097,2.5479,392
+LEMD,Madrid-Barajas Airport,40.4983,-3.5676,1998
+LIRF,Rome Fiumicino Airport,41.8003,12.2389,13
+LSZH,Zurich Airport,47.4647,8.5492,1416
+LOWW,Vienna International Airport,48.1103,16.5697,600
+EDDM,Munich Airport,48.3538,11.7861,1487
+LEBL,Barcelona-El Prat Airport,41.2971,2.0785,12
+LPPT,Lisbon Portela Airport,38.7813,-9.1359,374
+EKCH,Copenhagen Airport,55.6180,12.6560,17
+ESSA,Stockholm Arlanda Airport,59.6519,17.9186,137
+ENGM,Oslo Gardermoen Airport,60.1939,11.1004,681
+EIDW,Dublin Airport,53.4213,-6.2701,242
+EBBR,Brussels Airport,50.9014,4.4844,184
+LSGG,Geneva Airport,46.2381,6.1090,1411
+CYYZ,Toronto Pearson International Airport,43.6777,-79.6248,569
+CYVR,Vancouver International Airport,49.1947,-123.1840,14
+CYUL,Montreal-Pierre Elliott Trudeau International,45.4706,-73.7408,118
+CYYC,Calgary International Airport,51.1139,-114.0203,3557
+MMMX,Mexico City International Airport,19.4363,-99.0721,7316
+MMUN,Cancun International Airport,21.0366,-86.8771,22
+SCEL,Santiago International Airport,-33.3930,-70.7858,1555
+SBGR,Sao Paulo-Guarulhos International Airport,-23.4356,-46.4731,2459
+SAEZ,Buenos Aires Ministro Pistarini International,-34.8222,-58.5358,67
+SKBO,Bogota El Dorado International Airport,4.7016,-74.1469,8361
