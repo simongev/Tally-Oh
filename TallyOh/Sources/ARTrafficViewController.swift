@@ -289,6 +289,13 @@ class ARTrafficViewController: UIViewController {
             status += "📡 Error: \(msg)\n"
         }
 
+        // Internet status
+        if connectionLogic.isInternetAvailable {
+            status += "🌐 Internet: Online\n"
+        } else {
+            status += "🌐 Internet: Offline\n"
+        }
+
         // Location status
         if let loc = userLocation {
             status += String(format: "📍 %.4f°, %.4f°\n", loc.latitude, loc.longitude)
@@ -298,9 +305,23 @@ class ARTrafficViewController: UIViewController {
             status += "📍 Waiting for GPS...\n"
         }
 
-        // Aircraft count
-        let aircraftCount = connectionLogic.detectedAircraft.count
-        status += "🛩 Aircraft: \(aircraftCount)\n"
+        // Aircraft count with data sources
+        let totalAircraft = connectionLogic.detectedAircraft.count
+        let adsbCount = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
+        let internetCount = connectionLogic.internetAircraftCount
+
+        status += "🛩 Aircraft: \(totalAircraft) "
+        if adsbCount > 0 {
+            status += "(ADS-B: \(adsbCount)"
+            if internetCount > 0 {
+                status += ", Internet: \(internetCount)"
+            }
+            status += ")\n"
+        } else if internetCount > 0 {
+            status += "(Internet: \(internetCount))\n"
+        } else {
+            status += "\n"
+        }
 
         // Airport count
         status += "🛫 Airports loaded: \(airports.count)\n"
@@ -350,6 +371,9 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         userLocation = location.coordinate
         userAltitude = location.altitude * CalculationsLogic.metersToFeet
+
+        // Update connection logic with location for internet data fetching
+        connectionLogic.updateLocation(location.coordinate)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {

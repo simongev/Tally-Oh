@@ -9,6 +9,13 @@
 import Foundation
 import Network
 import CoreLocation
+import Combine
+
+/// Data source for aircraft information
+enum AircraftSource {
+    case adsb      // From local ADS-B receiver (Sentri)
+    case internet  // From adsb.lol API
+}
 
 /// Represents an aircraft detected by ADS-B
 struct Aircraft: Identifiable {
@@ -21,6 +28,7 @@ struct Aircraft: Identifiable {
     var groundSpeed: Double // in knots
     var verticalRate: Double // in feet per minute
     var lastUpdate: Date
+    var source: AircraftSource = .adsb // Data source (default to ADS-B)
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
@@ -35,7 +43,7 @@ enum ConnectionStatus {
     case error(String)
 }
 
-/// Handles connection and data reception from Sentri ADS-B receiver
+/// Handles connection and data reception from Sentri ADS-B receiver and internet sources
 class ConnectionLogic: ObservableObject {
 
     // MARK: - Published Properties
@@ -43,9 +51,12 @@ class ConnectionLogic: ObservableObject {
     @Published var connectionStatus: ConnectionStatus = .disconnected
     @Published var detectedAircraft: [String: Aircraft] = [:] // Key: ICAO address
     @Published var ownshipData: Aircraft?
+    @Published var isInternetAvailable: Bool = false
+    @Published var internetAircraftCount: Int = 0
 
     // MARK: - Private Properties
 
+    // ADS-B Connection
     private var connection: NWConnection?
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.tallyoh.adsb", qos: .userInitiated)
@@ -55,6 +66,16 @@ class ConnectionLogic: ObservableObject {
     private let defaultHost = "192.168.10.1" // Typical Sentri IP
     private let defaultPort: UInt16 = 4000
 
+    // Internet Data
+    private let adsbLolClient = ADSBLolClient()
+    private let networkReachability = NetworkReachability()
+    private var internetFetchTimer: Timer?
+    private let internetFetchInterval: TimeInterval = 10.0 // Fetch every 10 seconds
+
+    // User location for internet queries
+    private var currentLocation: CLLocationCoordinate2D?
+    private let internetQueryRadius: Double = 50.0 // 50 NM radius
+
     // Aircraft timeout - remove if not seen for 60 seconds
     private let aircraftTimeout: TimeInterval = 60.0
     private var cleanupTimer: Timer?
@@ -63,11 +84,14 @@ class ConnectionLogic: ObservableObject {
 
     init() {
         setupCleanupTimer()
+        setupNetworkMonitoring()
     }
 
     deinit {
         disconnect()
         cleanupTimer?.invalidate()
+        internetFetchTimer?.invalidate()
+        networkReachability.stopMonitoring()
     }
 
     // MARK: - Public Methods
@@ -125,7 +149,8 @@ class ConnectionLogic: ObservableObject {
             track: 270,
             groundSpeed: 120,
             verticalRate: 0,
-            lastUpdate: Date()
+            lastUpdate: Date(),
+            source: .adsb
         )
 
         DispatchQueue.main.async { [weak self] in
@@ -133,7 +158,117 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
+    /// Update user location for internet queries
+    func updateLocation(_ location: CLLocationCoordinate2D) {
+        currentLocation = location
+
+        // Start internet fetching if not already started and internet is available
+        if isInternetAvailable && internetFetchTimer == nil {
+            startInternetFetching()
+        }
+    }
+
     // MARK: - Private Methods
+
+    /// Setup network monitoring
+    private func setupNetworkMonitoring() {
+        networkReachability.$isConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isConnected in
+                self?.isInternetAvailable = isConnected
+
+                if isConnected {
+                    print("🌐 Internet available - starting adsb.lol data fetching")
+                    self?.startInternetFetching()
+                } else {
+                    print("🌐 Internet unavailable - stopping adsb.lol data fetching")
+                    self?.stopInternetFetching()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Start fetching data from internet
+    private func startInternetFetching() {
+        guard internetFetchTimer == nil, let location = currentLocation else {
+            return
+        }
+
+        // Fetch immediately
+        fetchInternetData()
+
+        // Setup timer for periodic fetching
+        internetFetchTimer = Timer.scheduledTimer(
+            withTimeInterval: internetFetchInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.fetchInternetData()
+        }
+    }
+
+    /// Stop fetching data from internet
+    private func stopInternetFetching() {
+        internetFetchTimer?.invalidate()
+        internetFetchTimer = nil
+
+        // Remove internet-sourced aircraft
+        DispatchQueue.main.async { [weak self] in
+            self?.detectedAircraft = self?.detectedAircraft.filter { _, aircraft in
+                aircraft.source == .adsb
+            } ?? [:]
+            self?.internetAircraftCount = 0
+        }
+    }
+
+    /// Fetch aircraft data from internet
+    private func fetchInternetData() {
+        guard let location = currentLocation else { return }
+
+        adsbLolClient.fetchAircraft(
+            latitude: location.latitude,
+            longitude: location.longitude,
+            radiusNM: internetQueryRadius
+        ) { [weak self] result in
+            switch result {
+            case .success(let aircraft):
+                self?.mergeInternetAircraft(aircraft)
+
+            case .failure(let error):
+                print("⚠️ Failed to fetch internet aircraft data: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Merge internet aircraft data with ADS-B data (ADS-B has priority)
+    private func mergeInternetAircraft(_ internetAircraft: [Aircraft]) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            var internetCount = 0
+
+            for aircraft in internetAircraft {
+                // Check if we already have this aircraft from ADS-B
+                if let existing = self.detectedAircraft[aircraft.id] {
+                    // If existing aircraft is from ADS-B, keep it (ADS-B has priority)
+                    if existing.source == .adsb {
+                        continue
+                    }
+                }
+
+                // Add or update internet aircraft
+                self.detectedAircraft[aircraft.id] = aircraft
+                internetCount += 1
+            }
+
+            self.internetAircraftCount = internetCount
+
+            if internetCount > 0 {
+                print("🌐 Added/updated \(internetCount) aircraft from adsb.lol")
+            }
+        }
+    }
+
+    private var cancellables = Set<AnyCancellable>()
 
     private func handleConnectionState(_ state: NWConnection.State) {
         switch state {
@@ -294,7 +429,8 @@ class ConnectionLogic: ObservableObject {
             track: track,
             groundSpeed: groundSpeed,
             verticalRate: verticalRate,
-            lastUpdate: Date()
+            lastUpdate: Date(),
+            source: .adsb
         )
     }
 

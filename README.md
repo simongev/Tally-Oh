@@ -6,7 +6,11 @@ An iOS augmented reality app for visualizing aircraft traffic and nearby airport
 
 - 🔴 **Real-time Aircraft Tracking**: Shows red circles around nearby aircraft in AR
 - 🔵 **Airport Visualization**: Displays blue cones for airports within 20 nautical miles
-- 📡 **Sentri ADS-B Integration**: Connects to ForeFlight Sentri devices via GDL 90 protocol
+- 📡 **Dual Data Sources**:
+  - **Primary**: Sentri (ForeFlight) ADS-B receiver via GDL 90 protocol
+  - **Secondary**: Internet-based data from adsb.lol API (automatic fallback)
+  - **Smart Priority**: ADS-B data always takes priority over internet data
+- 🌐 **Internet Connectivity**: Automatically fetches aircraft data when internet is available
 - 🧭 **Accurate Positioning**: Uses GPS and compass data for precise AR placement
 - ✈️ **Flight Information**: Shows callsigns, altitudes, and heading indicators
 
@@ -15,17 +19,21 @@ An iOS augmented reality app for visualizing aircraft traffic and nearby airport
 The app is divided into three main components as requested:
 
 ### 1. ConnectionLogic.swift
-**Responsible for ADS-B connection and data reception**
+**Responsible for ADS-B connection and data reception (dual data sources)**
 
 - Connects to Sentri (ForeFlight) ADS-B receiver via UDP
 - Implements GDL 90 protocol parsing
-- Manages aircraft data structures
+- Fetches aircraft data from adsb.lol when internet is available
+- Intelligently merges data from both sources (ADS-B priority)
+- Manages aircraft data structures with source tracking
 - Handles connection states and error recovery
+- Monitors network connectivity
 - Provides test aircraft for development
 
 **Key Classes:**
 - `ConnectionLogic`: Main connection manager (ObservableObject)
-- `Aircraft`: Data structure for aircraft information
+- `Aircraft`: Data structure for aircraft information with source tracking
+- `AircraftSource`: Enum for data source (adsb, internet)
 - `ConnectionStatus`: Enum for connection states
 
 ### 2. CalculationsLogic.swift
@@ -66,6 +74,21 @@ Main view controller that integrates all three components:
 - Manages location services
 - Coordinates updates between components
 - Provides user interface controls
+- Displays data source statistics
+
+### ADSBLolClient.swift
+Internet-based aircraft data fetching:
+- Connects to adsb.lol API
+- Fetches aircraft within specified radius (up to 100 NM)
+- Parses ADSBExchange-compatible format
+- Converts to internal Aircraft model
+
+### NetworkReachability.swift
+Network connectivity monitoring:
+- Monitors internet connectivity status
+- Detects connection type (WiFi, Cellular, Ethernet)
+- Provides real-time connectivity updates
+- Enables automatic internet data fetching
 
 ### AirportDataParser.swift
 Utility for parsing airports.csv:
@@ -166,16 +189,69 @@ Access settings via the ⚙️ button:
 ### Data Flow
 
 ```
-Sentri ADS-B → ConnectionLogic → Aircraft Data
-                                       ↓
-GPS/Compass → User Position → CalculationsLogic
-                                       ↓
-                              AR Scene Positions
-                                       ↓
-                            MainAppComponents
-                                       ↓
-                              AR Visualization
+                    ┌─────────────────┐
+                    │ Sentri ADS-B    │ (Primary - High Priority)
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ ConnectionLogic │ ◄─── Internet Monitor
+                    │  - Merges data  │
+                    │  - ADS-B priority│
+                    └────────┬────────┘
+                             ▲
+                             │
+                    ┌────────┴────────┐
+                    │ adsb.lol API    │ (Secondary - Auto Fallback)
+                    └─────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ Aircraft Data   │
+                    └────────┬────────┘
+                             │
+GPS/Compass → User Position ─┤
+                             ▼
+                    ┌─────────────────┐
+                    │ CalculationsLogic│
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ AR Scene Positions│
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │MainAppComponents│
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ AR Visualization│
+                    └─────────────────┘
 ```
+
+### Data Source Priority Logic
+
+The app uses an intelligent merging system for aircraft data:
+
+1. **ADS-B Data (Priority 1)**: Direct from Sentri receiver
+   - Low latency (~1 second)
+   - Most accurate for nearby aircraft
+   - Limited range (depends on receiver)
+
+2. **Internet Data (Priority 2)**: From adsb.lol API
+   - Activated automatically when internet is available
+   - Fetches aircraft within 50 NM radius
+   - Updates every 10 seconds
+   - Supplements ADS-B coverage
+
+3. **Merging Rules**:
+   - If aircraft exists in both sources, ADS-B data is used
+   - Internet data fills in gaps for aircraft not visible to ADS-B
+   - Each aircraft is tagged with its source
+   - Status display shows count from each source
 
 ### AR Positioning
 
