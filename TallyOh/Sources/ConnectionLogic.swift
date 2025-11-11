@@ -190,7 +190,7 @@ class ConnectionLogic: ObservableObject {
 
     /// Start fetching data from internet
     private func startInternetFetching() {
-        guard internetFetchTimer == nil, let location = currentLocation else {
+        guard internetFetchTimer == nil, currentLocation != nil else {
             return
         }
 
