@@ -51,12 +51,18 @@ class ARTrafficViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         startARSession()
+
+        // Disable screen auto-lock while app is in foreground
+        UIApplication.shared.isIdleTimerDisabled = true
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         arSceneView.session.pause()
         updateTimer?.invalidate()
+
+        // Re-enable screen auto-lock when leaving
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     deinit {

@@ -25,16 +25,22 @@ class ARComponentFactory {
     ///   - radius: Radius of the circle in meters
     ///   - position: Position in AR scene
     ///   - aircraft: Aircraft data
+    ///   - distance: Distance to aircraft in meters (for LOD scaling)
     /// - Returns: SCNNode containing the aircraft visualization
     static func createAircraftMarker(
         radius: Float,
         position: SCNVector3,
-        aircraft: Aircraft
+        aircraft: Aircraft,
+        distance: Double
     ) -> SCNNode {
 
         let containerNode = SCNNode()
         containerNode.name = "aircraft_\(aircraft.id)"
         containerNode.position = position
+
+        // Calculate LOD scale based on distance
+        // Farther objects are scaled up so they remain visible
+        let lodScale = calculateLODScale(distance: distance)
 
         // Create red circle (torus with small thickness)
         let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 2.0)
@@ -42,6 +48,7 @@ class ARComponentFactory {
         circleMaterial.diffuse.contents = UIColor.red
         circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
         circleMaterial.isDoubleSided = true
+        circleMaterial.lightingModel = .constant // Always visible regardless of lighting
         circle.materials = [circleMaterial]
 
         let circleNode = SCNNode(geometry: circle)
@@ -49,11 +56,14 @@ class ARComponentFactory {
         // Rotate to be horizontal (parallel to ground)
         circleNode.eulerAngles.x = .pi / 2
 
+        // Apply LOD scaling
+        circleNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+
         containerNode.addChildNode(circleNode)
 
         // Add pulsing animation
-        let scaleUp = SCNAction.scale(to: 1.1, duration: 1.0)
-        let scaleDown = SCNAction.scale(to: 1.0, duration: 1.0)
+        let scaleUp = SCNAction.scale(to: lodScale * 1.1, duration: 1.0)
+        let scaleDown = SCNAction.scale(to: lodScale, duration: 1.0)
         let pulse = SCNAction.sequence([scaleUp, scaleDown])
         let repeatPulse = SCNAction.repeatForever(pulse)
         circleNode.runAction(repeatPulse)
@@ -64,6 +74,7 @@ class ARComponentFactory {
             color: .red,
             position: SCNVector3(0, radius + 10, 0)
         )
+        labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
 
         // Add altitude label below the callsign
@@ -73,7 +84,7 @@ class ARComponentFactory {
             color: .white,
             position: SCNVector3(0, radius + 5, 0)
         )
-        altitudeNode.scale = SCNVector3(0.7, 0.7, 0.7)
+        altitudeNode.scale = SCNVector3(0.7 * lodScale, 0.7 * lodScale, 0.7 * lodScale)
         containerNode.addChildNode(altitudeNode)
 
         // Add velocity indicator (arrow showing direction)
@@ -82,9 +93,30 @@ class ARComponentFactory {
             length: radius * 1.5,
             color: .yellow
         )
+        arrowNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(arrowNode)
 
         return containerNode
+    }
+
+    /// Calculate LOD (Level of Detail) scale based on distance
+    /// Farther objects are scaled up to remain visible
+    static func calculateLODScale(distance: Double) -> Float {
+        // Distance-based scaling
+        // Close objects: 1x scale
+        // Far objects: much larger scale to remain visible
+
+        if distance < 500 { // < 0.27 NM - very close
+            return 1.0
+        } else if distance < 1852 { // < 1 NM
+            return Float(distance / 500.0) // 1x to 3.7x
+        } else if distance < 9260 { // < 5 NM
+            return Float(distance / 300.0) // 6x to 30x
+        } else if distance < 18520 { // < 10 NM
+            return Float(distance / 200.0) // 46x to 92x
+        } else {
+            return Float(distance / 150.0) // > 10 NM - aggressive scaling
+        }
     }
 
     /// Create a direction arrow showing aircraft heading
@@ -131,15 +163,20 @@ class ARComponentFactory {
     /// - Parameters:
     ///   - position: Position in AR scene
     ///   - airport: Airport data
+    ///   - distance: Distance to airport in meters (for LOD scaling)
     /// - Returns: SCNNode containing the airport visualization
     static func createAirportMarker(
         position: SCNVector3,
-        airport: Airport
+        airport: Airport,
+        distance: Double
     ) -> SCNNode {
 
         let containerNode = SCNNode()
         containerNode.name = "airport_\(airport.icao)"
         containerNode.position = position
+
+        // Calculate LOD scale based on distance
+        let lodScale = calculateLODScale(distance: distance)
 
         // Create blue cone pointing down
         let coneHeight: CGFloat = 50.0
@@ -151,6 +188,7 @@ class ARComponentFactory {
         coneMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
         coneMaterial.transparency = 0.8
         coneMaterial.isDoubleSided = true
+        coneMaterial.lightingModel = .constant // Always visible
         cone.materials = [coneMaterial]
 
         let coneNode = SCNNode(geometry: cone)
@@ -161,6 +199,9 @@ class ARComponentFactory {
         // Position cone above ground
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
 
+        // Apply LOD scaling
+        coneNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+
         containerNode.addChildNode(coneNode)
 
         // Add ICAO code label above the cone
@@ -169,7 +210,7 @@ class ARComponentFactory {
             color: .cyan,
             position: SCNVector3(0, Float(coneHeight) + 10, 0)
         )
-        labelNode.scale = SCNVector3(1.5, 1.5, 1.5)
+        labelNode.scale = SCNVector3(1.5 * lodScale, 1.5 * lodScale, 1.5 * lodScale)
         containerNode.addChildNode(labelNode)
 
         // Add subtle rotation animation
@@ -404,12 +445,13 @@ class ARSceneManager {
             let altDiff = ac.altitude - userAltitude
             let isNew = aircraftNodes[ac.id] == nil
             let statusIcon = isNew ? "✨ NEW" : "🔄 UPD"
+            let lodScale = ARComponentFactory.calculateLODScale(distance: distance)
             print("\(statusIcon) [\(ac.source)] \(ac.callsign):")
             print("     Target: lat=\(String(format: "%.4f", ac.latitude)), lon=\(String(format: "%.4f", ac.longitude)), alt=\(Int(ac.altitude))ft MSL")
             print("     Distance: \(String(format: "%.1f", distanceNM))NM (\(Int(distance))m), Bearing: \(Int(bearing))°")
             print("     Alt diff: \(Int(altDiff))ft (\(altDiff > 0 ? "ABOVE" : "BELOW") user)")
             print("     AR position: x=\(String(format: "%.1f", position.x))m, y=\(String(format: "%.1f", position.y))m, z=\(String(format: "%.1f", position.z))m")
-            print("     Circle radius: \(Int(radius))m")
+            print("     Circle radius: \(Int(radius))m, LOD scale: \(String(format: "%.1f", lodScale))x")
 
             // Check if position is reasonable for AR visibility
             let positionMagnitude = sqrt(position.x * position.x + position.y * position.y + position.z * position.z)
@@ -431,7 +473,8 @@ class ARSceneManager {
                 let node = ARComponentFactory.createAircraftMarker(
                     radius: radius,
                     position: position,
-                    aircraft: ac
+                    aircraft: ac,
+                    distance: distance
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 aircraftNodes[ac.id] = node
@@ -498,16 +541,19 @@ class ARSceneManager {
             if airportNodes[airport.icao] == nil {
                 let node = ARComponentFactory.createAirportMarker(
                     position: position,
-                    airport: airport
+                    airport: airport,
+                    distance: distance
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 airportNodes[airport.icao] = node
 
+                let lodScale = ARComponentFactory.calculateLODScale(distance: distance)
                 print("✨ NEW Airport \(airport.icao) (\(airport.name)):")
                 print("     Location: lat=\(String(format: "%.4f", airport.latitude)), lon=\(String(format: "%.4f", airport.longitude)), elev=\(Int(airport.elevation))ft MSL")
                 print("     Distance: \(String(format: "%.1f", distanceNM))NM (\(Int(distance))m), Bearing: \(Int(bearing))°")
                 print("     Elev diff: \(Int(altDiff))ft (\(altDiff > 0 ? "ABOVE" : "BELOW") user)")
                 print("     AR position: x=\(String(format: "%.1f", position.x))m, y=\(String(format: "%.1f", position.y))m, z=\(String(format: "%.1f", position.z))m")
+                print("     LOD scale: \(String(format: "%.1f", lodScale))x")
 
                 // Check if position is reasonable
                 let positionMagnitude = sqrt(position.x * position.x + position.y * position.y + position.z * position.z)
