@@ -16,9 +16,11 @@
 		AA0007 /* ADSBLolClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0007 /* ADSBLolClient.swift */; };
 		AA0008 /* NetworkReachability.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0008 /* NetworkReachability.swift */; };
 		AA0009 /* airports.csv in Resources */ = {isa = PBXBuildFile; fileRef = BB0009 /* airports.csv */; };
+		B56BCF712EC3936A00CCBEDA /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B56BCF702EC3936A00CCBEDA /* Images.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		B56BCF702EC3936A00CCBEDA /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Images.xcassets; sourceTree = "<group>"; };
 		BB0001 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		BB0002 /* ConnectionLogic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionLogic.swift; sourceTree = "<group>"; };
 		BB0003 /* CalculationsLogic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalculationsLogic.swift; sourceTree = "<group>"; };
@@ -46,6 +48,7 @@
 		EE0001 = {
 			isa = PBXGroup;
 			children = (
+				B56BCF702EC3936A00CCBEDA /* Images.xcassets */,
 				EE0002 /* TallyOh */,
 				EE0003 /* Products */,
 			);
@@ -150,6 +153,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B56BCF712EC3936A00CCBEDA /* Images.xcassets in Resources */,
 				AA0009 /* airports.csv in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -301,13 +305,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TallyOh/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Tally Oh";
 				INFOPLIST_KEY_NSCameraUsageDescription = "TallyOh uses the camera to provide augmented reality visualization of aircraft traffic.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TallyOh needs to connect to your Sentri (ForeFlight) ADS-B receiver on the local network to receive traffic data.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "TallyOh needs continuous location access to track your position while flying.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "TallyOh needs your location to show nearby aircraft and airports in AR.";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TallyOh needs to connect to your Sentri (ForeFlight) ADS-B receiver on the local network to receive traffic data.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arkit;
@@ -320,7 +325,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.yourcompany.tallyoh;
+				PRODUCT_BUNDLE_IDENTIFIER = com.simon.tallyoh;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -335,13 +340,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TallyOh/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Tally Oh";
 				INFOPLIST_KEY_NSCameraUsageDescription = "TallyOh uses the camera to provide augmented reality visualization of aircraft traffic.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TallyOh needs to connect to your Sentri (ForeFlight) ADS-B receiver on the local network to receive traffic data.";
 				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "TallyOh needs continuous location access to track your position while flying.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "TallyOh needs your location to show nearby aircraft and airports in AR.";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "TallyOh needs to connect to your Sentri (ForeFlight) ADS-B receiver on the local network to receive traffic data.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = arkit;
@@ -354,7 +360,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.yourcompany.tallyoh;
+				PRODUCT_BUNDLE_IDENTIFIER = com.simon.tallyoh;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -365,20 +371,20 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		GG0002 /* Build configuration list for PBXProject "TallyOh" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				HH0001 /* Debug */,
-				HH0002 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 		FF0002 /* Build configuration list for PBXNativeTarget "TallyOh" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				HH0003 /* Debug */,
 				HH0004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		GG0002 /* Build configuration list for PBXProject "TallyOh" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				HH0001 /* Debug */,
+				HH0002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
