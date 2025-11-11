@@ -42,6 +42,19 @@ struct ADSBLolAircraft: Codable {
     let squawk: String?        // Transponder code
     let emergency: String?     // Emergency status
 
+    // CodingKeys for custom decoding
+    private enum CodingKeys: String, CodingKey {
+        case hex, type, flight, r, t
+        case alt_baro, alt_geom
+        case gs, track
+        case baro_rate, geom_rate
+        case lat, lon
+        case seen_pos, seen
+        case category
+        case nav_altitude_mcp, nav_heading
+        case squawk, emergency
+    }
+
     // Custom decoding to handle API inconsistencies (e.g., "ground" or numeric strings for altitude)
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
