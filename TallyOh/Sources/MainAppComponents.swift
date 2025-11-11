@@ -275,7 +275,7 @@ class ARComponentFactory {
             (from.z + to.z) / 2
         )
 
-        let direction = SCNVector3(to.x - from.x, to.y - from.y, to.z - from.z)
+        // Orient the line to point from 'from' to 'to'
         lineNode.look(at: to, up: SCNVector3(0, 1, 0), localFront: SCNVector3(0, 1, 0))
 
         return lineNode
