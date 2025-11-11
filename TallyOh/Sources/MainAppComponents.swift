@@ -62,8 +62,8 @@ class ARComponentFactory {
         containerNode.addChildNode(circleNode)
 
         // Add pulsing animation
-        let scaleUp = SCNAction.scale(to: lodScale * 1.1, duration: 1.0)
-        let scaleDown = SCNAction.scale(to: lodScale, duration: 1.0)
+        let scaleUp = SCNAction.scale(to: CGFloat(lodScale * 1.1), duration: 1.0)
+        let scaleDown = SCNAction.scale(to: CGFloat(lodScale), duration: 1.0)
         let pulse = SCNAction.sequence([scaleUp, scaleDown])
         let repeatPulse = SCNAction.repeatForever(pulse)
         circleNode.runAction(repeatPulse)
