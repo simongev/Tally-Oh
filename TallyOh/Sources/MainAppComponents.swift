@@ -425,8 +425,6 @@ class ARSceneManager {
         var currentAircraftIDs = Set<String>()
 
         for ac in aircraft {
-            currentAircraftIDs.insert(ac.id)
-
             // Calculate distance first to check minimum distance
             let distance = CalculationsLogic.distance(
                 from: userLocation,
@@ -436,13 +434,12 @@ class ARSceneManager {
             // Skip aircraft that are too close (would block user's view)
             if distance < settings.aircraftMinDistance {
                 print("⏭️  Skipping \(ac.callsign) - too close (\(Int(distance))m < \(Int(settings.aircraftMinDistance))m minimum)")
-                // Remove the node if it exists
-                if let existingNode = aircraftNodes[ac.id] {
-                    existingNode.removeFromParentNode()
-                    aircraftNodes.removeValue(forKey: ac.id)
-                }
+                // Don't add to currentAircraftIDs so it will be removed by cleanup logic
                 continue
             }
+
+            // Track that we're displaying this aircraft
+            currentAircraftIDs.insert(ac.id)
 
             // Calculate AR position
             let position = CalculationsLogic.calculateARPosition(
@@ -534,8 +531,6 @@ class ARSceneManager {
         var currentAirportIDs = Set<String>()
 
         for airport in nearbyAirports {
-            currentAirportIDs.insert(airport.icao)
-
             // Calculate distance first to check minimum distance
             let distance = CalculationsLogic.distance(
                 from: userLocation,
@@ -545,13 +540,12 @@ class ARSceneManager {
             // Skip airports that are too close (would block user's view)
             if distance < settings.airportMinDistance {
                 print("⏭️  Skipping airport \(airport.icao) - too close (\(Int(distance))m < \(Int(settings.airportMinDistance))m minimum)")
-                // Remove the node if it exists
-                if let existingNode = airportNodes[airport.icao] {
-                    existingNode.removeFromParentNode()
-                    airportNodes.removeValue(forKey: airport.icao)
-                }
+                // Don't add to currentAirportIDs so it will be removed by cleanup logic
                 continue
             }
+
+            // Track that we're displaying this airport
+            currentAirportIDs.insert(airport.icao)
 
             // Calculate AR position
             let position = CalculationsLogic.calculateAirportARPosition(
