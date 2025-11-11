@@ -242,6 +242,8 @@ class ConnectionLogic: ObservableObject {
     private func fetchInternetData() {
         guard let location = currentLocation else { return }
 
+        print("🌐 Fetching internet aircraft data within \(Int(internetQueryRadius))NM of location...")
+
         adsbLolClient.fetchAircraft(
             latitude: location.latitude,
             longitude: location.longitude,
@@ -249,6 +251,7 @@ class ConnectionLogic: ObservableObject {
         ) { [weak self] result in
             switch result {
             case .success(let aircraft):
+                print("🌐 Received \(aircraft.count) aircraft from internet")
                 self?.mergeInternetAircraft(aircraft)
 
             case .failure(let error):

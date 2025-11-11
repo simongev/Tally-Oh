@@ -366,7 +366,16 @@ class ARSceneManager {
         userAltitude: Double,
         userHeading: Double
     ) {
-        guard settings.showAircraft else { return }
+        guard settings.showAircraft else {
+            print("⚠️ Aircraft display is disabled in settings")
+            return
+        }
+
+        if aircraft.isEmpty {
+            return // Silent when no aircraft
+        }
+
+        print("🔄 Updating \(aircraft.count) aircraft. User altitude: \(Int(userAltitude))ft MSL")
 
         var currentAircraftIDs = Set<String>()
 
@@ -387,7 +396,14 @@ class ARSceneManager {
                 from: userLocation,
                 to: ac.coordinate
             )
+            let distanceNM = distance / CalculationsLogic.nauticalMileToMeters
             let radius = CalculationsLogic.calculateAircraftCircleRadius(distance: distance)
+
+            // Debug logging for first update
+            if aircraftNodes[ac.id] == nil {
+                let altDiff = ac.altitude - userAltitude
+                print("  ↳ \(ac.callsign): dist=\(String(format: "%.1f", distanceNM))NM, alt=\(Int(ac.altitude))ft (Δ\(Int(altDiff))ft), pos=(\(String(format: "%.0f", position.x)), \(String(format: "%.0f", position.y)), \(String(format: "%.0f", position.z)))")
+            }
 
             // Update or create node
             if let existingNode = aircraftNodes[ac.id] {
@@ -423,7 +439,10 @@ class ARSceneManager {
         userAltitude: Double,
         userHeading: Double
     ) {
-        guard settings.showAirports else { return }
+        guard settings.showAirports else {
+            print("⚠️ Airport display is disabled in settings")
+            return
+        }
 
         // Filter airports in range
         let nearbyAirports = CalculationsLogic.filterAirportsInRange(
@@ -431,6 +450,10 @@ class ARSceneManager {
             userCoord: userLocation,
             maxRangeNauticalMiles: settings.airportMaxDistance
         )
+
+        if !nearbyAirports.isEmpty && airportNodes.isEmpty {
+            print("🛫 Found \(nearbyAirports.count) nearby airports (within \(Int(settings.airportMaxDistance))NM of \(airports.count) total)")
+        }
 
         var currentAirportIDs = Set<String>()
 
