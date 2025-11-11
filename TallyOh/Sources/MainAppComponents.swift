@@ -103,12 +103,14 @@ class ARComponentFactory {
     /// Farther objects are scaled up to remain visible
     static func calculateLODScale(distance: Double) -> Float {
         // Aggressive distance-based scaling for high visibility
-        // All objects are made large enough to see clearly
+        // Minimum distance enforced by settings to prevent blocking view
 
-        if distance < 500 { // < 0.27 NM - very close
-            return 2.0 // Large enough to see clearly
+        if distance < 100 { // 50-100m range (very close but not blocking)
+            return 1.0 // Smaller to avoid blocking, but still visible
+        } else if distance < 500 { // 100-500m - close
+            return Float(distance / 250.0) // 0.4x to 2.0x - gradual increase
         } else if distance < 1852 { // < 1 NM
-            return Float(distance / 250.0) // 2x to 7.4x
+            return Float(distance / 200.0) // 2.5x to 9.3x
         } else if distance < 9260 { // < 5 NM
             return Float(distance / 150.0) // 12x to 61x
         } else if distance < 18520 { // < 10 NM
@@ -360,11 +362,12 @@ class ARComponentFactory {
 struct ARVisualizationSettings {
     // Aircraft settings
     var showAircraft: Bool = true
-    var aircraftMinDistance: Double = 0.0 // nautical miles
+    var aircraftMinDistance: Double = 50.0 // Don't show aircraft closer than 50 meters
     var aircraftMaxDistance: Double = 10.0 // nautical miles
 
     // Airport settings
     var showAirports: Bool = true
+    var airportMinDistance: Double = 100.0 // Don't show airports closer than 100 meters
     var airportMaxDistance: Double = 20.0 // nautical miles
 
     // Display settings
@@ -424,6 +427,23 @@ class ARSceneManager {
         for ac in aircraft {
             currentAircraftIDs.insert(ac.id)
 
+            // Calculate distance first to check minimum distance
+            let distance = CalculationsLogic.distance(
+                from: userLocation,
+                to: ac.coordinate
+            )
+
+            // Skip aircraft that are too close (would block user's view)
+            if distance < settings.aircraftMinDistance {
+                print("⏭️  Skipping \(ac.callsign) - too close (\(Int(distance))m < \(Int(settings.aircraftMinDistance))m minimum)")
+                // Remove the node if it exists
+                if let existingNode = aircraftNodes[ac.id] {
+                    existingNode.removeFromParentNode()
+                    aircraftNodes.removeValue(forKey: ac.id)
+                }
+                continue
+            }
+
             // Calculate AR position
             let position = CalculationsLogic.calculateARPosition(
                 targetCoord: ac.coordinate,
@@ -433,11 +453,6 @@ class ARSceneManager {
                 userHeading: userHeading
             )
 
-            // Calculate circle radius
-            let distance = CalculationsLogic.distance(
-                from: userLocation,
-                to: ac.coordinate
-            )
             let distanceNM = distance / CalculationsLogic.nauticalMileToMeters
             let radius = CalculationsLogic.calculateAircraftCircleRadius(distance: distance)
             let bearing = CalculationsLogic.bearing(from: userLocation, to: ac.coordinate)
@@ -521,6 +536,23 @@ class ARSceneManager {
         for airport in nearbyAirports {
             currentAirportIDs.insert(airport.icao)
 
+            // Calculate distance first to check minimum distance
+            let distance = CalculationsLogic.distance(
+                from: userLocation,
+                to: airport.coordinate
+            )
+
+            // Skip airports that are too close (would block user's view)
+            if distance < settings.airportMinDistance {
+                print("⏭️  Skipping airport \(airport.icao) - too close (\(Int(distance))m < \(Int(settings.airportMinDistance))m minimum)")
+                // Remove the node if it exists
+                if let existingNode = airportNodes[airport.icao] {
+                    existingNode.removeFromParentNode()
+                    airportNodes.removeValue(forKey: airport.icao)
+                }
+                continue
+            }
+
             // Calculate AR position
             let position = CalculationsLogic.calculateAirportARPosition(
                 airportCoord: airport.coordinate,
@@ -530,10 +562,6 @@ class ARSceneManager {
                 userHeading: userHeading
             )
 
-            let distance = CalculationsLogic.distance(
-                from: userLocation,
-                to: airport.coordinate
-            )
             let distanceNM = distance / CalculationsLogic.nauticalMileToMeters
             let bearing = CalculationsLogic.bearing(from: userLocation, to: airport.coordinate)
             let altDiff = airport.elevation - userAltitude
