@@ -170,10 +170,15 @@ class ARTrafficViewController: UIViewController {
     private var cancellables = Set<AnyCancellable>()
 
     private func loadAirports() {
-        // Load airports from CSV
+        // Load airports from CSV and filter for large airports only
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            if let airports = AirportDataParser.loadAirportsFromCSV() {
-                self?.airports = airports
+            if let allAirports = AirportDataParser.loadAirportsFromCSV() {
+                // Filter to only show large airports
+                let largeAirports = allAirports.filter { airport in
+                    airport.type == "large_airport"
+                }
+                self?.airports = largeAirports
+                print("✓ Filtered to \(largeAirports.count) large airports (from \(allAirports.count) total)")
                 DispatchQueue.main.async {
                     self?.updateStatusLabel()
                 }

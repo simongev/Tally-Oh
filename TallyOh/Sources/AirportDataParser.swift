@@ -80,6 +80,7 @@ class AirportDataParser {
 
         // Extract fields
         let ident = components[1].trimmingCharacters(in: .whitespaces)
+        let type = components[2].trimmingCharacters(in: .whitespaces)
         let name = components[3].trimmingCharacters(in: .whitespaces)
         let latString = components[4].trimmingCharacters(in: .whitespaces)
         let lonString = components[5].trimmingCharacters(in: .whitespaces)
@@ -123,7 +124,8 @@ class AirportDataParser {
             name: name.isEmpty ? ident : name,
             latitude: latitude,
             longitude: longitude,
-            elevation: elevation
+            elevation: elevation,
+            type: type.isEmpty ? nil : type
         )
     }
 
@@ -176,7 +178,8 @@ class AirportDataParser {
             name: name,
             latitude: latitude,
             longitude: longitude,
-            elevation: elevation
+            elevation: elevation,
+            type: nil // Simple format doesn't include type
         )
     }
 

@@ -311,6 +311,7 @@ struct Airport: Identifiable {
     let latitude: Double
     let longitude: Double
     let elevation: Double // in feet MSL
+    let type: String? // Airport type: large_airport, medium_airport, small_airport, etc.
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
