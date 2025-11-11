@@ -16,6 +16,7 @@
 		AA0007 /* ADSBLolClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0007 /* ADSBLolClient.swift */; };
 		AA0008 /* NetworkReachability.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0008 /* NetworkReachability.swift */; };
 		AA0009 /* airports.csv in Resources */ = {isa = PBXBuildFile; fileRef = BB0009 /* airports.csv */; };
+		AA0010 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BB0011 /* LaunchScreen.storyboard */; };
 		B56BCF712EC3936A00CCBEDA /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B56BCF702EC3936A00CCBEDA /* Images.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -31,6 +32,7 @@
 		BB0008 /* NetworkReachability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkReachability.swift; sourceTree = "<group>"; };
 		BB0009 /* airports.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = airports.csv; sourceTree = "<group>"; };
 		BB0010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB0011 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		CC0001 /* TallyOh.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TallyOh.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -58,6 +60,7 @@
 			isa = PBXGroup;
 			children = (
 				BB0010 /* Info.plist */,
+				BB0011 /* LaunchScreen.storyboard */,
 				EE0004 /* Sources */,
 				EE0005 /* Resources */,
 			);
@@ -153,6 +156,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0010 /* LaunchScreen.storyboard in Resources */,
 				B56BCF712EC3936A00CCBEDA /* Images.xcassets in Resources */,
 				AA0009 /* airports.csv in Resources */,
 			);
