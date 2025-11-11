@@ -163,21 +163,21 @@ class CalculationsLogic {
     /// - Parameter distance: Distance to the aircraft in meters
     /// - Returns: Radius in meters for the AR circle
     static func calculateAircraftCircleRadius(distance: Double) -> Float {
-        // Larger base radius for high visibility
+        // Moderate base radius for visibility without being obtrusive
         // Combined with LOD scaling for clear visualization at all distances
 
         let baseRadius: Double
 
         if distance < 500 { // Very close (< 0.27 NM)
-            baseRadius = 15.0 // 15 meters
+            baseRadius = 8.0 // 8 meters
         } else if distance < 1852 { // < 1 NM
-            baseRadius = 25.0 // 25 meters
+            baseRadius = 12.0 // 12 meters
         } else if distance < 5556 { // < 3 NM
-            baseRadius = 40.0 // 40 meters
+            baseRadius = 18.0 // 18 meters
         } else if distance < 18520 { // < 10 NM
-            baseRadius = 60.0 // 60 meters
+            baseRadius = 25.0 // 25 meters
         } else {
-            baseRadius = 80.0 // 80 meters for distant aircraft
+            baseRadius = 35.0 // 35 meters for distant aircraft
         }
 
         return Float(baseRadius)

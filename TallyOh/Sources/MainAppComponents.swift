@@ -42,8 +42,8 @@ class ARComponentFactory {
         // Farther objects are scaled up so they remain visible
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create red circle (torus with larger thickness for visibility)
-        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 3.0)
+        // Create red circle (torus with moderate thickness)
+        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 1.5)
         let circleMaterial = SCNMaterial()
         circleMaterial.diffuse.contents = UIColor.red
         circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
@@ -74,7 +74,7 @@ class ARComponentFactory {
             color: .red,
             position: SCNVector3(0, radius + 10, 0)
         )
-        labelNode.scale = SCNVector3(lodScale * 1.5, lodScale * 1.5, lodScale * 1.5)
+        labelNode.scale = SCNVector3(lodScale * 0.8, lodScale * 0.8, lodScale * 0.8)
         containerNode.addChildNode(labelNode)
 
         // Add altitude label below the callsign
@@ -84,16 +84,16 @@ class ARComponentFactory {
             color: .white,
             position: SCNVector3(0, radius + 5, 0)
         )
-        altitudeNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
+        altitudeNode.scale = SCNVector3(0.6 * lodScale, 0.6 * lodScale, 0.6 * lodScale)
         containerNode.addChildNode(altitudeNode)
 
         // Add velocity indicator (arrow showing direction)
         let arrowNode = createDirectionArrow(
             heading: Float(aircraft.track),
-            length: radius * 2.0,
+            length: radius * 1.5,
             color: .yellow
         )
-        arrowNode.scale = SCNVector3(lodScale * 1.2, lodScale * 1.2, lodScale * 1.2)
+        arrowNode.scale = SCNVector3(lodScale * 0.7, lodScale * 0.7, lodScale * 0.7)
         containerNode.addChildNode(arrowNode)
 
         return containerNode
@@ -102,21 +102,21 @@ class ARComponentFactory {
     /// Calculate LOD (Level of Detail) scale based on distance
     /// Farther objects are scaled up to remain visible
     static func calculateLODScale(distance: Double) -> Float {
-        // Aggressive distance-based scaling for high visibility
+        // Conservative distance-based scaling for visibility without blocking
         // Minimum distance enforced by settings to prevent blocking view
 
-        if distance < 100 { // 50-100m range (very close but not blocking)
-            return 1.0 // Smaller to avoid blocking, but still visible
-        } else if distance < 500 { // 100-500m - close
-            return Float(distance / 250.0) // 0.4x to 2.0x - gradual increase
+        if distance < 500 { // 200-500m range (minimum distance applied)
+            return 0.5 // Small to not block view
+        } else if distance < 1000 { // 500m-1km
+            return Float(distance / 800.0) // 0.6x to 1.25x
         } else if distance < 1852 { // < 1 NM
-            return Float(distance / 200.0) // 2.5x to 9.3x
+            return Float(distance / 600.0) // 1.6x to 3.1x
         } else if distance < 9260 { // < 5 NM
-            return Float(distance / 150.0) // 12x to 61x
+            return Float(distance / 400.0) // 4.6x to 23x
         } else if distance < 18520 { // < 10 NM
-            return Float(distance / 100.0) // 92x to 185x
+            return Float(distance / 300.0) // 30x to 61x
         } else {
-            return Float(distance / 80.0) // > 10 NM - very aggressive scaling for visibility
+            return Float(distance / 250.0) // > 10 NM - moderate scaling
         }
     }
 
@@ -129,8 +129,8 @@ class ARComponentFactory {
 
         let arrow = SCNNode()
 
-        // Create arrow shaft - larger for visibility
-        let shaft = SCNCylinder(radius: 1.0, height: CGFloat(length))
+        // Create arrow shaft - moderate size
+        let shaft = SCNCylinder(radius: 0.5, height: CGFloat(length))
         let shaftMaterial = SCNMaterial()
         shaftMaterial.diffuse.contents = color
         shaftMaterial.lightingModel = .constant // Always visible
@@ -140,8 +140,8 @@ class ARComponentFactory {
         shaftNode.eulerAngles.x = .pi / 2
         shaftNode.position = SCNVector3(0, 0, -length / 2)
 
-        // Create arrow head (cone) - larger for visibility
-        let head = SCNCone(topRadius: 0, bottomRadius: 3.0, height: 6.0)
+        // Create arrow head (cone) - moderate size
+        let head = SCNCone(topRadius: 0, bottomRadius: 1.5, height: 3.0)
         let headMaterial = SCNMaterial()
         headMaterial.diffuse.contents = color
         headMaterial.lightingModel = .constant // Always visible
@@ -181,9 +181,9 @@ class ARComponentFactory {
         // Calculate LOD scale based on distance
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create blue cone pointing down - large for visibility
-        let coneHeight: CGFloat = 80.0
-        let coneRadius: CGFloat = 25.0
+        // Create blue cone pointing down - moderate size
+        let coneHeight: CGFloat = 40.0
+        let coneRadius: CGFloat = 12.0
 
         let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
         let coneMaterial = SCNMaterial()
@@ -207,13 +207,13 @@ class ARComponentFactory {
 
         containerNode.addChildNode(coneNode)
 
-        // Add ICAO code label above the cone - large for visibility
+        // Add ICAO code label above the cone
         let labelNode = createTextLabel(
             text: airport.icao,
             color: .cyan,
             position: SCNVector3(0, Float(coneHeight) + 10, 0)
         )
-        labelNode.scale = SCNVector3(2.0 * lodScale, 2.0 * lodScale, 2.0 * lodScale)
+        labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
 
         // Add subtle rotation animation
@@ -362,12 +362,12 @@ class ARComponentFactory {
 struct ARVisualizationSettings {
     // Aircraft settings
     var showAircraft: Bool = true
-    var aircraftMinDistance: Double = 50.0 // Don't show aircraft closer than 50 meters
+    var aircraftMinDistance: Double = 200.0 // Don't show aircraft closer than 200 meters
     var aircraftMaxDistance: Double = 10.0 // nautical miles
 
     // Airport settings
     var showAirports: Bool = true
-    var airportMinDistance: Double = 100.0 // Don't show airports closer than 100 meters
+    var airportMinDistance: Double = 300.0 // Don't show airports closer than 300 meters
     var airportMaxDistance: Double = 20.0 // nautical miles
 
     // Display settings
