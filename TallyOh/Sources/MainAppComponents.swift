@@ -42,9 +42,8 @@ class ARComponentFactory {
         // Farther objects are scaled up so they remain visible
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create red circle (torus with small thickness)
-        // Use smaller pipe radius for less obtrusive appearance
-        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 1.0)
+        // Create red circle (torus with larger thickness for visibility)
+        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 3.0)
         let circleMaterial = SCNMaterial()
         circleMaterial.diffuse.contents = UIColor.red
         circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
@@ -69,32 +68,32 @@ class ARComponentFactory {
         let repeatPulse = SCNAction.repeatForever(pulse)
         circleNode.runAction(repeatPulse)
 
-        // Add callsign label above the circle (smaller scale)
+        // Add callsign label above the circle
         let labelNode = createTextLabel(
             text: aircraft.callsign,
             color: .red,
             position: SCNVector3(0, radius + 10, 0)
         )
-        labelNode.scale = SCNVector3(lodScale * 0.8, lodScale * 0.8, lodScale * 0.8)
+        labelNode.scale = SCNVector3(lodScale * 1.5, lodScale * 1.5, lodScale * 1.5)
         containerNode.addChildNode(labelNode)
 
-        // Add altitude label below the callsign (smaller scale)
+        // Add altitude label below the callsign
         let altitudeText = String(format: "%.0f ft", aircraft.altitude)
         let altitudeNode = createTextLabel(
             text: altitudeText,
             color: .white,
             position: SCNVector3(0, radius + 5, 0)
         )
-        altitudeNode.scale = SCNVector3(0.5 * lodScale, 0.5 * lodScale, 0.5 * lodScale)
+        altitudeNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(altitudeNode)
 
-        // Add velocity indicator (arrow showing direction) - smaller scale
+        // Add velocity indicator (arrow showing direction)
         let arrowNode = createDirectionArrow(
             heading: Float(aircraft.track),
-            length: radius * 1.2,
+            length: radius * 2.0,
             color: .yellow
         )
-        arrowNode.scale = SCNVector3(lodScale * 0.6, lodScale * 0.6, lodScale * 0.6)
+        arrowNode.scale = SCNVector3(lodScale * 1.2, lodScale * 1.2, lodScale * 1.2)
         containerNode.addChildNode(arrowNode)
 
         return containerNode
@@ -103,19 +102,19 @@ class ARComponentFactory {
     /// Calculate LOD (Level of Detail) scale based on distance
     /// Farther objects are scaled up to remain visible
     static func calculateLODScale(distance: Double) -> Float {
-        // Distance-based scaling with conservative factors
-        // Objects are kept small to not block the user's view
+        // Aggressive distance-based scaling for high visibility
+        // All objects are made large enough to see clearly
 
         if distance < 500 { // < 0.27 NM - very close
-            return 0.3 // Much smaller to not block view
+            return 2.0 // Large enough to see clearly
         } else if distance < 1852 { // < 1 NM
-            return Float(distance / 2000.0) // 0.25x to 0.9x
+            return Float(distance / 250.0) // 2x to 7.4x
         } else if distance < 9260 { // < 5 NM
-            return Float(distance / 1500.0) // 1.2x to 6x
+            return Float(distance / 150.0) // 12x to 61x
         } else if distance < 18520 { // < 10 NM
-            return Float(distance / 1200.0) // 7.7x to 15x
+            return Float(distance / 100.0) // 92x to 185x
         } else {
-            return Float(distance / 1000.0) // > 10 NM - conservative scaling
+            return Float(distance / 80.0) // > 10 NM - very aggressive scaling for visibility
         }
     }
 
@@ -128,8 +127,8 @@ class ARComponentFactory {
 
         let arrow = SCNNode()
 
-        // Create arrow shaft (thinner)
-        let shaft = SCNCylinder(radius: 0.3, height: CGFloat(length))
+        // Create arrow shaft - larger for visibility
+        let shaft = SCNCylinder(radius: 1.0, height: CGFloat(length))
         let shaftMaterial = SCNMaterial()
         shaftMaterial.diffuse.contents = color
         shaftMaterial.lightingModel = .constant // Always visible
@@ -139,8 +138,8 @@ class ARComponentFactory {
         shaftNode.eulerAngles.x = .pi / 2
         shaftNode.position = SCNVector3(0, 0, -length / 2)
 
-        // Create arrow head (cone) - smaller
-        let head = SCNCone(topRadius: 0, bottomRadius: 1.5, height: 3)
+        // Create arrow head (cone) - larger for visibility
+        let head = SCNCone(topRadius: 0, bottomRadius: 3.0, height: 6.0)
         let headMaterial = SCNMaterial()
         headMaterial.diffuse.contents = color
         headMaterial.lightingModel = .constant // Always visible
@@ -180,9 +179,9 @@ class ARComponentFactory {
         // Calculate LOD scale based on distance
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create blue cone pointing down - smaller to not block view
-        let coneHeight: CGFloat = 30.0
-        let coneRadius: CGFloat = 10.0
+        // Create blue cone pointing down - large for visibility
+        let coneHeight: CGFloat = 80.0
+        let coneRadius: CGFloat = 25.0
 
         let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
         let coneMaterial = SCNMaterial()
@@ -206,13 +205,13 @@ class ARComponentFactory {
 
         containerNode.addChildNode(coneNode)
 
-        // Add ICAO code label above the cone (smaller)
+        // Add ICAO code label above the cone - large for visibility
         let labelNode = createTextLabel(
             text: airport.icao,
             color: .cyan,
             position: SCNVector3(0, Float(coneHeight) + 10, 0)
         )
-        labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
+        labelNode.scale = SCNVector3(2.0 * lodScale, 2.0 * lodScale, 2.0 * lodScale)
         containerNode.addChildNode(labelNode)
 
         // Add subtle rotation animation
