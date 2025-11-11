@@ -43,7 +43,8 @@ class ARComponentFactory {
         let lodScale = calculateLODScale(distance: distance)
 
         // Create red circle (torus with small thickness)
-        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 2.0)
+        // Use smaller pipe radius for less obtrusive appearance
+        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 1.0)
         let circleMaterial = SCNMaterial()
         circleMaterial.diffuse.contents = UIColor.red
         circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
@@ -68,32 +69,32 @@ class ARComponentFactory {
         let repeatPulse = SCNAction.repeatForever(pulse)
         circleNode.runAction(repeatPulse)
 
-        // Add callsign label above the circle
+        // Add callsign label above the circle (smaller scale)
         let labelNode = createTextLabel(
             text: aircraft.callsign,
             color: .red,
             position: SCNVector3(0, radius + 10, 0)
         )
-        labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+        labelNode.scale = SCNVector3(lodScale * 0.8, lodScale * 0.8, lodScale * 0.8)
         containerNode.addChildNode(labelNode)
 
-        // Add altitude label below the callsign
+        // Add altitude label below the callsign (smaller scale)
         let altitudeText = String(format: "%.0f ft", aircraft.altitude)
         let altitudeNode = createTextLabel(
             text: altitudeText,
             color: .white,
             position: SCNVector3(0, radius + 5, 0)
         )
-        altitudeNode.scale = SCNVector3(0.7 * lodScale, 0.7 * lodScale, 0.7 * lodScale)
+        altitudeNode.scale = SCNVector3(0.5 * lodScale, 0.5 * lodScale, 0.5 * lodScale)
         containerNode.addChildNode(altitudeNode)
 
-        // Add velocity indicator (arrow showing direction)
+        // Add velocity indicator (arrow showing direction) - smaller scale
         let arrowNode = createDirectionArrow(
             heading: Float(aircraft.track),
-            length: radius * 1.5,
+            length: radius * 1.2,
             color: .yellow
         )
-        arrowNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+        arrowNode.scale = SCNVector3(lodScale * 0.6, lodScale * 0.6, lodScale * 0.6)
         containerNode.addChildNode(arrowNode)
 
         return containerNode
@@ -102,20 +103,19 @@ class ARComponentFactory {
     /// Calculate LOD (Level of Detail) scale based on distance
     /// Farther objects are scaled up to remain visible
     static func calculateLODScale(distance: Double) -> Float {
-        // Distance-based scaling
-        // Close objects: 1x scale
-        // Far objects: much larger scale to remain visible
+        // Distance-based scaling with conservative factors
+        // Objects are kept small to not block the user's view
 
         if distance < 500 { // < 0.27 NM - very close
-            return 1.0
+            return 0.3 // Much smaller to not block view
         } else if distance < 1852 { // < 1 NM
-            return Float(distance / 500.0) // 1x to 3.7x
+            return Float(distance / 2000.0) // 0.25x to 0.9x
         } else if distance < 9260 { // < 5 NM
-            return Float(distance / 300.0) // 6x to 30x
+            return Float(distance / 1500.0) // 1.2x to 6x
         } else if distance < 18520 { // < 10 NM
-            return Float(distance / 200.0) // 46x to 92x
+            return Float(distance / 1200.0) // 7.7x to 15x
         } else {
-            return Float(distance / 150.0) // > 10 NM - aggressive scaling
+            return Float(distance / 1000.0) // > 10 NM - conservative scaling
         }
     }
 
@@ -128,20 +128,22 @@ class ARComponentFactory {
 
         let arrow = SCNNode()
 
-        // Create arrow shaft
-        let shaft = SCNCylinder(radius: 0.5, height: CGFloat(length))
+        // Create arrow shaft (thinner)
+        let shaft = SCNCylinder(radius: 0.3, height: CGFloat(length))
         let shaftMaterial = SCNMaterial()
         shaftMaterial.diffuse.contents = color
+        shaftMaterial.lightingModel = .constant // Always visible
         shaft.materials = [shaftMaterial]
 
         let shaftNode = SCNNode(geometry: shaft)
         shaftNode.eulerAngles.x = .pi / 2
         shaftNode.position = SCNVector3(0, 0, -length / 2)
 
-        // Create arrow head (cone)
-        let head = SCNCone(topRadius: 0, bottomRadius: 2, height: 4)
+        // Create arrow head (cone) - smaller
+        let head = SCNCone(topRadius: 0, bottomRadius: 1.5, height: 3)
         let headMaterial = SCNMaterial()
         headMaterial.diffuse.contents = color
+        headMaterial.lightingModel = .constant // Always visible
         head.materials = [headMaterial]
 
         let headNode = SCNNode(geometry: head)
@@ -178,9 +180,9 @@ class ARComponentFactory {
         // Calculate LOD scale based on distance
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create blue cone pointing down
-        let coneHeight: CGFloat = 50.0
-        let coneRadius: CGFloat = 15.0
+        // Create blue cone pointing down - smaller to not block view
+        let coneHeight: CGFloat = 30.0
+        let coneRadius: CGFloat = 10.0
 
         let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
         let coneMaterial = SCNMaterial()
@@ -204,13 +206,13 @@ class ARComponentFactory {
 
         containerNode.addChildNode(coneNode)
 
-        // Add ICAO code label above the cone
+        // Add ICAO code label above the cone (smaller)
         let labelNode = createTextLabel(
             text: airport.icao,
             color: .cyan,
             position: SCNVector3(0, Float(coneHeight) + 10, 0)
         )
-        labelNode.scale = SCNVector3(1.5 * lodScale, 1.5 * lodScale, 1.5 * lodScale)
+        labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
 
         // Add subtle rotation animation
