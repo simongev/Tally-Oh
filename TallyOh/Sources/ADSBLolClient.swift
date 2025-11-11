@@ -164,7 +164,7 @@ class ADSBLolClient {
             // Clean up callsign (remove trailing spaces)
             let callsign = ac.flight?.trimmingCharacters(in: .whitespaces) ?? "N/A"
 
-            let aircraft = Aircraft(
+            let plane = Aircraft(
                 id: icao.uppercased(),
                 callsign: callsign.isEmpty ? icao.uppercased() : callsign,
                 latitude: lat,
@@ -177,7 +177,7 @@ class ADSBLolClient {
                 source: .internet // Mark as internet source
             )
 
-            aircraft.append(aircraft)
+            aircraft.append(plane)
         }
 
         return aircraft
