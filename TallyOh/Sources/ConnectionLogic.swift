@@ -363,11 +363,11 @@ class ConnectionLogic: ObservableObject {
         var index = 1 // Skip message type
 
         // Status byte
-        let status = data[index]
+        _ = data[index] // Status byte (unused in basic implementation)
         index += 1
 
         // Address Type and Address (3 bytes)
-        let addressType = data[index]
+        _ = data[index] // Address type (unused in basic implementation)
         index += 1
 
         let icaoAddress = String(format: "%02X%02X%02X",

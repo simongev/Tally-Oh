@@ -144,7 +144,7 @@ class AirportDataParser {
         }
 
         // Determine format based on number of fields
-        var nameIndex = 1
+        let nameIndex = 1
         var latIndex = 2
         var lonIndex = 3
         var elevIndex = 4
