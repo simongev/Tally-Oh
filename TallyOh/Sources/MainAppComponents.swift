@@ -375,7 +375,7 @@ class ARSceneManager {
             return // Silent when no aircraft
         }
 
-        print("🔄 Updating \(aircraft.count) aircraft. User altitude: \(Int(userAltitude))ft MSL")
+        print("🔄 Updating \(aircraft.count) aircraft. User: lat=\(String(format: "%.4f", userLocation.latitude)), lon=\(String(format: "%.4f", userLocation.longitude)), alt=\(Int(userAltitude))ft MSL, hdg=\(Int(userHeading))°")
 
         var currentAircraftIDs = Set<String>()
 
@@ -398,11 +398,26 @@ class ARSceneManager {
             )
             let distanceNM = distance / CalculationsLogic.nauticalMileToMeters
             let radius = CalculationsLogic.calculateAircraftCircleRadius(distance: distance)
+            let bearing = CalculationsLogic.bearing(from: userLocation, to: ac.coordinate)
 
-            // Debug logging for first update
-            if aircraftNodes[ac.id] == nil {
-                let altDiff = ac.altitude - userAltitude
-                print("  ↳ \(ac.callsign): dist=\(String(format: "%.1f", distanceNM))NM, alt=\(Int(ac.altitude))ft (Δ\(Int(altDiff))ft), pos=(\(String(format: "%.0f", position.x)), \(String(format: "%.0f", position.y)), \(String(format: "%.0f", position.z)))")
+            // Comprehensive debug logging for ALL aircraft
+            let altDiff = ac.altitude - userAltitude
+            let isNew = aircraftNodes[ac.id] == nil
+            let statusIcon = isNew ? "✨ NEW" : "🔄 UPD"
+            print("\(statusIcon) [\(ac.source)] \(ac.callsign):")
+            print("     Target: lat=\(String(format: "%.4f", ac.latitude)), lon=\(String(format: "%.4f", ac.longitude)), alt=\(Int(ac.altitude))ft MSL")
+            print("     Distance: \(String(format: "%.1f", distanceNM))NM (\(Int(distance))m), Bearing: \(Int(bearing))°")
+            print("     Alt diff: \(Int(altDiff))ft (\(altDiff > 0 ? "ABOVE" : "BELOW") user)")
+            print("     AR position: x=\(String(format: "%.1f", position.x))m, y=\(String(format: "%.1f", position.y))m, z=\(String(format: "%.1f", position.z))m")
+            print("     Circle radius: \(Int(radius))m")
+
+            // Check if position is reasonable for AR visibility
+            let positionMagnitude = sqrt(position.x * position.x + position.y * position.y + position.z * position.z)
+            if positionMagnitude > 100000 { // > 100km
+                print("     ⚠️  WARNING: Position magnitude very large (\(Int(positionMagnitude))m) - may not be visible!")
+            }
+            if abs(position.y) > 10000 { // > 10km vertical
+                print("     ⚠️  WARNING: Large vertical separation (\(Int(position.y))m) - may not be visible!")
             }
 
             // Update or create node
@@ -420,7 +435,6 @@ class ARSceneManager {
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 aircraftNodes[ac.id] = node
-                print("✈️ Added AR node for \(ac.callsign) at position: \(position), radius: \(radius)m, distance: \(Int(distance))m")
             }
         }
 
@@ -429,7 +443,10 @@ class ARSceneManager {
         for id in removedAircraft {
             aircraftNodes[id]?.removeFromParentNode()
             aircraftNodes.removeValue(forKey: id)
+            print("🗑️  Removed AR node for aircraft \(id)")
         }
+
+        print("📊 AR Scene Status: \(aircraftNodes.count) aircraft nodes active")
     }
 
     /// Update airport visualizations
@@ -469,6 +486,14 @@ class ARSceneManager {
                 userHeading: userHeading
             )
 
+            let distance = CalculationsLogic.distance(
+                from: userLocation,
+                to: airport.coordinate
+            )
+            let distanceNM = distance / CalculationsLogic.nauticalMileToMeters
+            let bearing = CalculationsLogic.bearing(from: userLocation, to: airport.coordinate)
+            let altDiff = airport.elevation - userAltitude
+
             // Create or update node
             if airportNodes[airport.icao] == nil {
                 let node = ARComponentFactory.createAirportMarker(
@@ -478,11 +503,20 @@ class ARSceneManager {
                 sceneView?.scene.rootNode.addChildNode(node)
                 airportNodes[airport.icao] = node
 
-                let distance = CalculationsLogic.distance(
-                    from: userLocation,
-                    to: airport.coordinate
-                )
-                print("🛫 Added AR node for airport \(airport.icao) at position: \(position), distance: \(Int(distance))m")
+                print("✨ NEW Airport \(airport.icao) (\(airport.name)):")
+                print("     Location: lat=\(String(format: "%.4f", airport.latitude)), lon=\(String(format: "%.4f", airport.longitude)), elev=\(Int(airport.elevation))ft MSL")
+                print("     Distance: \(String(format: "%.1f", distanceNM))NM (\(Int(distance))m), Bearing: \(Int(bearing))°")
+                print("     Elev diff: \(Int(altDiff))ft (\(altDiff > 0 ? "ABOVE" : "BELOW") user)")
+                print("     AR position: x=\(String(format: "%.1f", position.x))m, y=\(String(format: "%.1f", position.y))m, z=\(String(format: "%.1f", position.z))m")
+
+                // Check if position is reasonable
+                let positionMagnitude = sqrt(position.x * position.x + position.y * position.y + position.z * position.z)
+                if positionMagnitude > 100000 {
+                    print("     ⚠️  WARNING: Position magnitude very large (\(Int(positionMagnitude))m) - may not be visible!")
+                }
+                if abs(position.y) > 10000 {
+                    print("     ⚠️  WARNING: Large vertical separation (\(Int(position.y))m) - may not be visible!")
+                }
             }
         }
 
@@ -491,7 +525,10 @@ class ARSceneManager {
         for icao in removedAirports {
             airportNodes[icao]?.removeFromParentNode()
             airportNodes.removeValue(forKey: icao)
+            print("🗑️  Removed AR node for airport \(icao)")
         }
+
+        print("📊 AR Scene Status: \(airportNodes.count) airport nodes active")
     }
 
     /// Clear all visualizations
