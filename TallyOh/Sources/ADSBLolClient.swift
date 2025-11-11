@@ -41,6 +41,50 @@ struct ADSBLolAircraft: Codable {
     let nav_heading: Double?   // Selected heading
     let squawk: String?        // Transponder code
     let emergency: String?     // Emergency status
+
+    // Custom decoding to handle API inconsistencies (e.g., "ground" or numeric strings for altitude)
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        // Decode simple fields
+        hex = try container.decodeIfPresent(String.self, forKey: .hex)
+        type = try container.decodeIfPresent(String.self, forKey: .type)
+        flight = try container.decodeIfPresent(String.self, forKey: .flight)
+        r = try container.decodeIfPresent(String.self, forKey: .r)
+        t = try container.decodeIfPresent(String.self, forKey: .t)
+        gs = try container.decodeIfPresent(Double.self, forKey: .gs)
+        track = try container.decodeIfPresent(Double.self, forKey: .track)
+        lat = try container.decodeIfPresent(Double.self, forKey: .lat)
+        lon = try container.decodeIfPresent(Double.self, forKey: .lon)
+        seen_pos = try container.decodeIfPresent(Double.self, forKey: .seen_pos)
+        seen = try container.decodeIfPresent(Double.self, forKey: .seen)
+        category = try container.decodeIfPresent(String.self, forKey: .category)
+        nav_heading = try container.decodeIfPresent(Double.self, forKey: .nav_heading)
+        squawk = try container.decodeIfPresent(String.self, forKey: .squawk)
+        emergency = try container.decodeIfPresent(String.self, forKey: .emergency)
+
+        // Decode integer fields that might be strings
+        alt_baro = Self.decodeFlexibleInt(from: container, forKey: .alt_baro)
+        alt_geom = Self.decodeFlexibleInt(from: container, forKey: .alt_geom)
+        baro_rate = Self.decodeFlexibleInt(from: container, forKey: .baro_rate)
+        geom_rate = Self.decodeFlexibleInt(from: container, forKey: .geom_rate)
+        nav_altitude_mcp = Self.decodeFlexibleInt(from: container, forKey: .nav_altitude_mcp)
+    }
+
+    /// Helper to decode integers that might be strings (e.g., "1500" or "ground")
+    private static func decodeFlexibleInt(from container: KeyedDecodingContainer<CodingKeys>, forKey key: CodingKeys) -> Int? {
+        // Try to decode as Int first
+        if let intValue = try? container.decodeIfPresent(Int.self, forKey: key) {
+            return intValue
+        }
+
+        // Try to decode as String and parse
+        if let stringValue = try? container.decodeIfPresent(String.self, forKey: key) {
+            return Int(stringValue)
+        }
+
+        return nil
+    }
 }
 
 /// Client for fetching aircraft data from adsb.lol
