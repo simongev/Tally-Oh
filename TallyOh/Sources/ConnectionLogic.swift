@@ -140,21 +140,39 @@ class ConnectionLogic: ObservableObject {
 
     /// Manually add test aircraft for development/testing
     func addTestAircraft() {
-        let testAircraft = Aircraft(
-            id: "TEST01",
-            callsign: "N12345",
-            latitude: 37.7749,
-            longitude: -122.4194,
-            altitude: 5500,
-            track: 270,
-            groundSpeed: 120,
-            verticalRate: 0,
-            lastUpdate: Date(),
-            source: .adsb
-        )
+        guard let userLocation = currentLocation else {
+            print("Cannot add test aircraft: User location not available yet")
+            return
+        }
+
+        // Add multiple test aircraft around the user's position
+        let testAircraftData: [(id: String, callsign: String, latOffset: Double, lonOffset: Double, altitude: Double, track: Double)] = [
+            ("TEST01", "N12345", 0.005, 0.005, 1000, 270),    // ~500m NE, 1000ft above
+            ("TEST02", "N67890", -0.005, 0.005, 1500, 180),   // ~500m SE, 1500ft above
+            ("TEST03", "UAL123", 0.01, -0.01, 2000, 90),      // ~1km NW, 2000ft above
+            ("TEST04", "DAL456", -0.01, -0.01, 500, 45),      // ~1km SW, 500ft above
+        ]
 
         DispatchQueue.main.async { [weak self] in
-            self?.detectedAircraft[testAircraft.id] = testAircraft
+            guard let self = self else { return }
+
+            for data in testAircraftData {
+                let aircraft = Aircraft(
+                    id: data.id,
+                    callsign: data.callsign,
+                    latitude: userLocation.latitude + data.latOffset,
+                    longitude: userLocation.longitude + data.lonOffset,
+                    altitude: data.altitude,
+                    track: data.track,
+                    groundSpeed: 120,
+                    verticalRate: 0,
+                    lastUpdate: Date(),
+                    source: .adsb
+                )
+                self.detectedAircraft[aircraft.id] = aircraft
+            }
+
+            print("Added \(testAircraftData.count) test aircraft near user location")
         }
     }
 

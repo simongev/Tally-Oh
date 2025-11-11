@@ -404,6 +404,7 @@ class ARSceneManager {
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 aircraftNodes[ac.id] = node
+                print("✈️ Added AR node for \(ac.callsign) at position: \(position), radius: \(radius)m, distance: \(Int(distance))m")
             }
         }
 
@@ -453,6 +454,12 @@ class ARSceneManager {
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 airportNodes[airport.icao] = node
+
+                let distance = CalculationsLogic.distance(
+                    from: userLocation,
+                    to: airport.coordinate
+                )
+                print("🛫 Added AR node for airport \(airport.icao) at position: \(position), distance: \(Int(distance))m")
             }
         }
 
