@@ -129,34 +129,12 @@ class CalculationsLogic {
         // Calculate altitude difference
         let altitudeDifference = (targetAltitude - userAltitude) * feetToMeters
 
-        // Clamp distance for AR rendering (ARKit works best with objects < 5km)
-        // Objects farther than this will be positioned at max distance but still visible
-        let maxARDistance: Double = 5000.0 // 5km maximum
-        let clampedDistance = min(horizontalDistance, maxARDistance)
-
-        // Clamp altitude difference to prevent objects being too far above/below view
-        let maxAltitudeDiff: Double = 3000.0 // 3km vertical max (~10,000 ft)
-        let clampedAltitudeDiff = max(min(altitudeDifference, maxAltitudeDiff), -maxAltitudeDiff)
-
-        // If clamped, log it
-        if horizontalDistance > maxARDistance {
-            let distanceNM = horizontalDistance / nauticalMileToMeters
-            let clampMsg = "🗜️  Clamped distance from \(String(format: "%.1f", distanceNM))NM to \(Int(maxARDistance))m"
-            print("     \(clampMsg)")
-            DebugConsole.shared.log("     \(clampMsg)")
-        }
-        if abs(altitudeDifference) > maxAltitudeDiff {
-            let altDiffFt = altitudeDifference / feetToMeters
-            let altClampMsg = "🗜️  Clamped altitude from \(Int(altDiffFt))ft to \(Int(clampedAltitudeDiff / feetToMeters))ft"
-            print("     \(altClampMsg)")
-            DebugConsole.shared.log("     \(altClampMsg)")
-        }
-
         // Convert to AR coordinates
         // In ARKit: +X is right, +Y is up, -Z is forward
-        let x = Float(clampedDistance * sin(relativeBearingRad))
-        let y = Float(clampedAltitudeDiff)
-        let z = Float(-clampedDistance * cos(relativeBearingRad))
+        // Use actual distances - far clipping plane will handle rendering limits
+        let x = Float(horizontalDistance * sin(relativeBearingRad))
+        let y = Float(altitudeDifference)
+        let z = Float(-horizontalDistance * cos(relativeBearingRad))
 
         return SCNVector3(x, y, z)
     }
