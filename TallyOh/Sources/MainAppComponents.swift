@@ -420,7 +420,9 @@ class ARSceneManager {
             return // Silent when no aircraft
         }
 
-        print("🔄 Updating \(aircraft.count) aircraft. User: lat=\(String(format: "%.4f", userLocation.latitude)), lon=\(String(format: "%.4f", userLocation.longitude)), alt=\(Int(userAltitude))ft MSL, hdg=\(Int(userHeading))°")
+        let userMsg = "🔄 Updating \(aircraft.count) aircraft. User: lat=\(String(format: "%.4f", userLocation.latitude)), lon=\(String(format: "%.4f", userLocation.longitude)), alt=\(Int(userAltitude))ft MSL, hdg=\(Int(userHeading))°"
+        print(userMsg)
+        DebugConsole.shared.log(userMsg)
 
         var currentAircraftIDs = Set<String>()
 
@@ -459,6 +461,13 @@ class ARSceneManager {
             let isNew = aircraftNodes[ac.id] == nil
             let statusIcon = isNew ? "✨ NEW" : "🔄 UPD"
             let lodScale = ARComponentFactory.calculateLODScale(distance: distance)
+
+            if isNew {
+                // Log new aircraft to debug console
+                let acMsg = "\(statusIcon) [\(ac.source)] \(ac.callsign): \(String(format: "%.1f", distanceNM))NM, \(Int(ac.altitude))ft, bearing \(Int(bearing))°"
+                DebugConsole.shared.log(acMsg)
+            }
+
             print("\(statusIcon) [\(ac.source)] \(ac.callsign):")
             print("     Target: lat=\(String(format: "%.4f", ac.latitude)), lon=\(String(format: "%.4f", ac.longitude)), alt=\(Int(ac.altitude))ft MSL")
             print("     Distance: \(String(format: "%.1f", distanceNM))NM (\(Int(distance))m), Bearing: \(Int(bearing))°")
@@ -502,7 +511,9 @@ class ARSceneManager {
             print("🗑️  Removed AR node for aircraft \(id)")
         }
 
-        print("📊 AR Scene Status: \(aircraftNodes.count) aircraft nodes active")
+        let statusMsg = "📊 AR Scene Status: \(aircraftNodes.count) aircraft nodes active"
+        print(statusMsg)
+        DebugConsole.shared.log(statusMsg)
     }
 
     /// Update airport visualizations
@@ -525,7 +536,9 @@ class ARSceneManager {
         )
 
         if !nearbyAirports.isEmpty && airportNodes.isEmpty {
-            print("🛫 Found \(nearbyAirports.count) nearby airports (within \(Int(settings.airportMaxDistance))NM of \(airports.count) total)")
+            let airportMsg = "🛫 Found \(nearbyAirports.count) nearby airports (within \(Int(settings.airportMaxDistance))NM of \(airports.count) total)"
+            print(airportMsg)
+            DebugConsole.shared.log(airportMsg)
         }
 
         var currentAirportIDs = Set<String>()

@@ -20,6 +20,8 @@ class ARTrafficViewController: UIViewController {
     private var statusLabel: UILabel!
     private var connectionButton: UIButton!
     private var settingsButton: UIButton!
+    private var debugButton: UIButton!
+    private var debugConsoleView: DebugConsoleView?
 
     // MARK: - Core Components
 
@@ -132,6 +134,23 @@ class ARTrafficViewController: UIViewController {
             settingsButton.widthAnchor.constraint(equalToConstant: 44),
             settingsButton.heightAnchor.constraint(equalToConstant: 44)
         ])
+
+        // Debug Button
+        debugButton = UIButton(type: .system)
+        debugButton.translatesAutoresizingMaskIntoConstraints = false
+        debugButton.setTitle("🐛", for: .normal)
+        debugButton.titleLabel?.font = UIFont.systemFont(ofSize: 24)
+        debugButton.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.8)
+        debugButton.layer.cornerRadius = 22
+        debugButton.addTarget(self, action: #selector(toggleDebugConsole), for: .touchUpInside)
+        view.addSubview(debugButton)
+
+        NSLayoutConstraint.activate([
+            debugButton.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -8),
+            debugButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            debugButton.widthAnchor.constraint(equalToConstant: 44),
+            debugButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
     }
 
     private func setupARScene() {
@@ -198,9 +217,13 @@ class ARTrafficViewController: UIViewController {
         if let camera = arSceneView.pointOfView?.camera {
             camera.zNear = 0.1 // 10cm minimum
             camera.zFar = 50000.0 // 50km maximum - much farther than default
-            print("📷 AR Camera configured: zNear=\(camera.zNear)m, zFar=\(camera.zFar)m")
+            let msg = "📷 AR Camera configured: zNear=\(camera.zNear)m, zFar=\(camera.zFar)m"
+            print(msg)
+            DebugConsole.shared.log(msg)
         } else {
-            print("⚠️  Could not configure AR camera clipping planes")
+            let msg = "⚠️  Could not configure AR camera clipping planes"
+            print(msg)
+            DebugConsole.shared.log(msg)
         }
     }
 
@@ -245,6 +268,43 @@ class ARTrafficViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
         present(alert, animated: true)
+    }
+
+    @objc private func toggleDebugConsole() {
+        if let debugConsole = debugConsoleView {
+            // Hide console
+            UIView.animate(withDuration: 0.3, animations: {
+                debugConsole.alpha = 0
+            }) { _ in
+                debugConsole.removeFromSuperview()
+                self.debugConsoleView = nil
+            }
+        } else {
+            // Show console
+            let console = DebugConsoleView(frame: .zero)
+            console.translatesAutoresizingMaskIntoConstraints = false
+            console.alpha = 0
+            console.onClose = { [weak self] in
+                self?.toggleDebugConsole()
+            }
+
+            view.addSubview(console)
+
+            NSLayoutConstraint.activate([
+                console.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+                console.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+                console.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 16),
+                console.bottomAnchor.constraint(equalTo: connectionButton.topAnchor, constant: -16)
+            ])
+
+            debugConsoleView = console
+
+            UIView.animate(withDuration: 0.3) {
+                console.alpha = 1
+            }
+
+            DebugConsole.shared.log("✅ Debug console opened")
+        }
     }
 
     // MARK: - Update Logic

@@ -141,11 +141,15 @@ class CalculationsLogic {
         // If clamped, log it
         if horizontalDistance > maxARDistance {
             let distanceNM = horizontalDistance / nauticalMileToMeters
-            print("     🗜️  Clamped AR distance from \(Int(horizontalDistance))m (\(String(format: "%.1f", distanceNM))NM) to \(Int(maxARDistance))m for rendering")
+            let clampMsg = "🗜️  Clamped distance from \(String(format: "%.1f", distanceNM))NM to \(Int(maxARDistance))m"
+            print("     \(clampMsg)")
+            DebugConsole.shared.log("     \(clampMsg)")
         }
         if abs(altitudeDifference) > maxAltitudeDiff {
             let altDiffFt = altitudeDifference / feetToMeters
-            print("     🗜️  Clamped altitude diff from \(Int(altDiffFt))ft to \(Int(clampedAltitudeDiff / feetToMeters))ft for rendering")
+            let altClampMsg = "🗜️  Clamped altitude from \(Int(altDiffFt))ft to \(Int(clampedAltitudeDiff / feetToMeters))ft"
+            print("     \(altClampMsg)")
+            DebugConsole.shared.log("     \(altClampMsg)")
         }
 
         // Convert to AR coordinates
