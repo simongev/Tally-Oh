@@ -102,23 +102,23 @@ class ARComponentFactory {
     /// Calculate LOD (Level of Detail) scale based on distance
     /// Farther objects are scaled up to remain visible at actual distances
     static func calculateLODScale(distance: Double) -> Float {
-        // Aggressive scaling for distant objects now that we use actual positions
-        // Objects near minimum distance stay small to not block view
+        // More conservative scaling - objects at true positions shouldn't look huge
+        // Balance between visibility and realistic appearance
 
         if distance < 500 { // 200-500m range (minimum distance applied)
             return 0.5 // Small to not block view
         } else if distance < 1000 { // 500m-1km
-            return Float(distance / 700.0) // ~0.7x to 1.4x
+            return Float(distance / 1000.0) // ~0.5x to 1x
         } else if distance < 1852 { // < 1 NM
-            return Float(distance / 500.0) // ~2x to 3.7x
+            return Float(distance / 1200.0) // ~0.8x to 1.5x
         } else if distance < 9260 { // < 5 NM
-            return Float(distance / 300.0) // ~6x to 31x
+            return Float(distance / 1500.0) // ~1.2x to 6x
         } else if distance < 18520 { // < 10 NM
-            return Float(distance / 200.0) // ~46x to 92x
+            return Float(distance / 1200.0) // ~7.7x to 15x
         } else if distance < 37040 { // < 20 NM
-            return Float(distance / 150.0) // ~123x to 246x
+            return Float(distance / 1000.0) // ~18.5x to 37x
         } else {
-            return Float(distance / 100.0) // > 20 NM - very aggressive scaling
+            return Float(distance / 800.0) // > 20 NM - moderate scaling
         }
     }
 
