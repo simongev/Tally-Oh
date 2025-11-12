@@ -69,12 +69,12 @@ class ARComponentFactory {
 
         // NO pulsing animation - removed as requested
 
-        // Add label with callsign and altitude above the circle
+        // Add label with callsign and altitude hovering above the circle
         let labelText = "\(aircraft.callsign)\n\(String(format: "%.0f", aircraft.altitude))ft"
         let labelNode = createTextLabelWithBackground(
             text: labelText,
             textColor: .white,
-            position: SCNVector3(0, smallerRadius + 15, 0)
+            position: SCNVector3(0, smallerRadius + 30, 0) // Hover higher above node
         )
         labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
@@ -198,11 +198,11 @@ class ARComponentFactory {
 
         containerNode.addChildNode(sphereNode)
 
-        // Add ICAO code label above the sphere
+        // Add ICAO code label hovering above the sphere
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
-            position: SCNVector3(0, Float(sphereRadius) + 20, 0)
+            position: SCNVector3(0, Float(sphereRadius) + 35, 0) // Hover higher above node
         )
         labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
