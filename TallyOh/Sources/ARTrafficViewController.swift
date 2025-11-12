@@ -192,6 +192,16 @@ class ARTrafficViewController: UIViewController {
         configuration.providesAudioData = false
 
         arSceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+
+        // Configure camera clipping planes for far object visibility
+        // Default far plane is ~100m which is too close for aviation
+        if let camera = arSceneView.pointOfView?.camera {
+            camera.zNear = 0.1 // 10cm minimum
+            camera.zFar = 50000.0 // 50km maximum - much farther than default
+            print("📷 AR Camera configured: zNear=\(camera.zNear)m, zFar=\(camera.zFar)m")
+        } else {
+            print("⚠️  Could not configure AR camera clipping planes")
+        }
     }
 
     // MARK: - Actions
@@ -357,6 +367,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
         // Called every frame
+        // Ensure camera clipping planes are set (in case they weren't ready at session start)
+        if let camera = arSceneView.pointOfView?.camera {
+            if camera.zFar < 10000 {
+                camera.zFar = 50000.0
+            }
+        }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
