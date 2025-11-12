@@ -56,6 +56,7 @@ class CalculationsLogic {
     }
 
     /// Calculate 3D distance including altitude difference
+    /// Uses Pythagorean theorem on the great circle distance and altitude
     static func distance3D(
         from coord1: CLLocationCoordinate2D,
         altitude1: Double, // in feet
@@ -67,6 +68,44 @@ class CalculationsLogic {
 
         return sqrt(horizontalDistance * horizontalDistance +
                    verticalDistance * verticalDistance)
+    }
+
+    /// Calculate slant range (line-of-sight distance) between two points
+    /// More accurate for long distances as it accounts for Earth curvature
+    static func slantRange(
+        from coord1: CLLocationCoordinate2D,
+        altitude1: Double, // in feet MSL
+        to coord2: CLLocationCoordinate2D,
+        altitude2: Double // in feet MSL
+    ) -> Double {
+        // Convert altitudes to meters
+        let alt1Meters = altitude1 * feetToMeters
+        let alt2Meters = altitude2 * feetToMeters
+
+        // Calculate positions from Earth's center
+        let r1 = earthRadiusMeters + alt1Meters
+        let r2 = earthRadiusMeters + alt2Meters
+
+        // Get angular distance using Haversine
+        let lat1 = coord1.latitude.toRadians()
+        let lon1 = coord1.longitude.toRadians()
+        let lat2 = coord2.latitude.toRadians()
+        let lon2 = coord2.longitude.toRadians()
+
+        let dLat = lat2 - lat1
+        let dLon = lon2 - lon1
+
+        let a = sin(dLat / 2) * sin(dLat / 2) +
+                cos(lat1) * cos(lat2) *
+                sin(dLon / 2) * sin(dLon / 2)
+
+        let angularDistance = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+        // Use law of cosines for spherical coordinates
+        // d² = r1² + r2² - 2*r1*r2*cos(angular_distance)
+        let slantRangeSq = r1 * r1 + r2 * r2 - 2 * r1 * r2 * cos(angularDistance)
+
+        return sqrt(max(0, slantRangeSq))
     }
 
     // MARK: - Bearing Calculations
@@ -95,7 +134,7 @@ class CalculationsLogic {
 
     // MARK: - AR Position Calculations
 
-    /// Convert real-world position to AR scene position
+    /// Convert real-world position to AR scene position with Earth curvature correction
     /// - Parameters:
     ///   - targetCoord: GPS coordinate of the target
     ///   - targetAltitude: Altitude of target in feet MSL
@@ -111,7 +150,7 @@ class CalculationsLogic {
         userHeading: Double
     ) -> SCNVector3 {
 
-        // Calculate horizontal distance and bearing
+        // Calculate horizontal distance and bearing using great circle formulas
         let horizontalDistance = distance(from: userCoord, to: targetCoord)
         let bearing = self.bearing(from: userCoord, to: targetCoord)
 
@@ -126,15 +165,35 @@ class CalculationsLogic {
 
         let relativeBearingRad = relativeBearing.toRadians()
 
-        // Calculate altitude difference
-        let altitudeDifference = (targetAltitude - userAltitude) * feetToMeters
+        // Calculate altitude difference with Earth curvature correction
+        // For distant objects, Earth's curvature causes them to appear lower
+        var altitudeDifference = (targetAltitude - userAltitude) * feetToMeters
 
-        // Convert to AR coordinates
+        // Earth curvature correction (drop in meters)
+        // Formula: drop = distance² / (2 * Earth radius)
+        // This accounts for the horizon drop at distance
+        let curvatureDrop = (horizontalDistance * horizontalDistance) / (2.0 * earthRadiusMeters)
+
+        // Apply curvature correction - distant objects appear lower
+        altitudeDifference -= curvatureDrop
+
+        // Optional: Atmospheric refraction correction (light bends around Earth)
+        // Standard refraction is about 1/7 of the geometric curvature
+        // This makes distant objects appear slightly higher than geometric calculation
+        let refractionCorrection = curvatureDrop * 0.14286 // 1/7 of curvature
+        altitudeDifference += refractionCorrection
+
+        // Convert to AR coordinates with high precision
         // In ARKit: +X is right, +Y is up, -Z is forward
         // Use actual distances - far clipping plane will handle rendering limits
+
+        // Calculate X and Z positions using horizontal distance and bearing
+        // These use the great circle distance projected onto the local tangent plane
         let x = Float(horizontalDistance * sin(relativeBearingRad))
-        let y = Float(altitudeDifference)
         let z = Float(-horizontalDistance * cos(relativeBearingRad))
+
+        // Y is the corrected altitude difference
+        let y = Float(altitudeDifference)
 
         return SCNVector3(x, y, z)
     }
@@ -213,7 +272,7 @@ class CalculationsLogic {
 
     // MARK: - Elevation Angle Calculation
 
-    /// Calculate elevation angle from user to target
+    /// Calculate elevation angle from user to target with Earth curvature correction
     /// Returns angle in degrees (positive = above horizon, negative = below)
     static func elevationAngle(
         targetCoord: CLLocationCoordinate2D,
@@ -222,9 +281,44 @@ class CalculationsLogic {
         userAltitude: Double
     ) -> Double {
         let horizontalDistance = distance(from: userCoord, to: targetCoord)
-        let verticalDistance = (targetAltitude - userAltitude) * feetToMeters
+        var verticalDistance = (targetAltitude - userAltitude) * feetToMeters
+
+        // Apply Earth curvature correction
+        let curvatureDrop = (horizontalDistance * horizontalDistance) / (2.0 * earthRadiusMeters)
+        verticalDistance -= curvatureDrop
+
+        // Apply atmospheric refraction
+        let refractionCorrection = curvatureDrop * 0.14286
+        verticalDistance += refractionCorrection
 
         return atan2(verticalDistance, horizontalDistance).toDegrees()
+    }
+
+    /// Calculate geometric horizon distance from altitude
+    /// Returns distance in meters to the horizon
+    static func horizonDistance(altitude: Double) -> Double {
+        // altitude in feet MSL
+        let altitudeMeters = altitude * feetToMeters
+        let r = earthRadiusMeters
+
+        // Geometric horizon distance: d = sqrt(2*r*h + h²)
+        // For h << r, this simplifies to: d ≈ sqrt(2*r*h)
+        return sqrt(2.0 * r * altitudeMeters + altitudeMeters * altitudeMeters)
+    }
+
+    /// Check if target is above the horizon from user's perspective
+    static func isAboveHorizon(
+        targetCoord: CLLocationCoordinate2D,
+        targetAltitude: Double,
+        userCoord: CLLocationCoordinate2D,
+        userAltitude: Double
+    ) -> Bool {
+        let horizontalDistance = distance(from: userCoord, to: targetCoord)
+        let userHorizon = horizonDistance(altitude: userAltitude)
+        let targetHorizon = horizonDistance(altitude: targetAltitude)
+
+        // If target is within combined horizon distance, it's visible
+        return horizontalDistance <= (userHorizon + targetHorizon)
     }
 
     // MARK: - Label Position Calculation
