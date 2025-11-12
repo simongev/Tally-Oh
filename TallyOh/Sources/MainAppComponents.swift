@@ -38,12 +38,18 @@ class ARComponentFactory {
         containerNode.name = "aircraft_\(aircraft.id)"
         containerNode.position = position
 
+        // Make container always face user
+        let billboardConstraint = SCNBillboardConstraint()
+        billboardConstraint.freeAxes = [.Y]
+        containerNode.constraints = [billboardConstraint]
+
         // Calculate LOD scale based on distance
         // Farther objects are scaled up so they remain visible
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create red circle (torus with moderate thickness)
-        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 1.5)
+        // Create red circle (torus with smaller thickness) - reduced size
+        let smallerRadius = radius * 0.7 // Make airplane target smaller
+        let circle = SCNTorus(ringRadius: CGFloat(smallerRadius), pipeRadius: 1.5)
         let circleMaterial = SCNMaterial()
         circleMaterial.diffuse.contents = UIColor.red
         circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
@@ -61,36 +67,22 @@ class ARComponentFactory {
 
         containerNode.addChildNode(circleNode)
 
-        // Add pulsing animation
-        let scaleUp = SCNAction.scale(to: CGFloat(lodScale * 1.1), duration: 1.0)
-        let scaleDown = SCNAction.scale(to: CGFloat(lodScale), duration: 1.0)
-        let pulse = SCNAction.sequence([scaleUp, scaleDown])
-        let repeatPulse = SCNAction.repeatForever(pulse)
-        circleNode.runAction(repeatPulse)
+        // NO pulsing animation - removed as requested
 
-        // Add callsign label above the circle
-        let labelNode = createTextLabel(
-            text: aircraft.callsign,
-            color: .red,
-            position: SCNVector3(0, radius + 10, 0)
+        // Add label with callsign and altitude above the circle
+        let labelText = "\(aircraft.callsign)\n\(String(format: "%.0f", aircraft.altitude))ft"
+        let labelNode = createTextLabelWithBackground(
+            text: labelText,
+            textColor: .white,
+            position: SCNVector3(0, smallerRadius + 15, 0)
         )
-        labelNode.scale = SCNVector3(lodScale * 0.8, lodScale * 0.8, lodScale * 0.8)
+        labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
-
-        // Add altitude label below the callsign
-        let altitudeText = String(format: "%.0f ft", aircraft.altitude)
-        let altitudeNode = createTextLabel(
-            text: altitudeText,
-            color: .white,
-            position: SCNVector3(0, radius + 5, 0)
-        )
-        altitudeNode.scale = SCNVector3(0.6 * lodScale, 0.6 * lodScale, 0.6 * lodScale)
-        containerNode.addChildNode(altitudeNode)
 
         // Add velocity indicator (arrow showing direction)
         let arrowNode = createDirectionArrow(
             heading: Float(aircraft.track),
-            length: radius * 1.5,
+            length: smallerRadius * 1.5,
             color: .yellow
         )
         arrowNode.scale = SCNVector3(lodScale * 0.7, lodScale * 0.7, lodScale * 0.7)
@@ -164,7 +156,7 @@ class ARComponentFactory {
 
     // MARK: - Airport Components
 
-    /// Create a blue cone marker for an airport
+    /// Create a blue sphere marker for an airport
     /// - Parameters:
     ///   - position: Position in AR scene
     ///   - airport: Airport data
@@ -180,48 +172,45 @@ class ARComponentFactory {
         containerNode.name = "airport_\(airport.icao)"
         containerNode.position = position
 
+        // Make container always face user
+        let billboardConstraint = SCNBillboardConstraint()
+        billboardConstraint.freeAxes = [.Y]
+        containerNode.constraints = [billboardConstraint]
+
         // Calculate LOD scale based on distance
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create blue cone pointing down - moderate size
-        let coneHeight: CGFloat = 40.0
-        let coneRadius: CGFloat = 12.0
+        // Create larger blue sphere with rounded appearance
+        let sphereRadius: CGFloat = 20.0 // Larger than before
 
-        let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
-        let coneMaterial = SCNMaterial()
-        coneMaterial.diffuse.contents = UIColor.systemBlue
-        coneMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
-        coneMaterial.transparency = 0.8
-        coneMaterial.isDoubleSided = true
-        coneMaterial.lightingModel = .constant // Always visible
-        cone.materials = [coneMaterial]
+        let sphere = SCNSphere(radius: sphereRadius)
+        let sphereMaterial = SCNMaterial()
+        sphereMaterial.diffuse.contents = UIColor.systemBlue
+        sphereMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
+        sphereMaterial.transparency = 0.7
+        sphereMaterial.lightingModel = .constant // Always visible
+        sphere.materials = [sphereMaterial]
 
-        let coneNode = SCNNode(geometry: cone)
-
-        // Point cone downward
-        coneNode.eulerAngles.x = .pi // 180 degrees
-
-        // Position cone above ground
-        coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
+        let sphereNode = SCNNode(geometry: sphere)
 
         // Apply LOD scaling
-        coneNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+        sphereNode.scale = SCNVector3(lodScale, lodScale, lodScale)
 
-        containerNode.addChildNode(coneNode)
+        containerNode.addChildNode(sphereNode)
 
-        // Add ICAO code label above the cone
-        let labelNode = createTextLabel(
+        // Add ICAO code label above the sphere
+        let labelNode = createTextLabelWithBackground(
             text: airport.icao,
-            color: .cyan,
-            position: SCNVector3(0, Float(coneHeight) + 10, 0)
+            textColor: .white,
+            position: SCNVector3(0, Float(sphereRadius) + 20, 0)
         )
         labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
 
-        // Add subtle rotation animation
+        // Add subtle rotation animation to sphere
         let rotate = SCNAction.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 10.0)
         let repeatRotate = SCNAction.repeatForever(rotate)
-        coneNode.runAction(repeatRotate)
+        sphereNode.runAction(repeatRotate)
 
         return containerNode
     }
@@ -263,6 +252,71 @@ class ARComponentFactory {
         textNode.constraints = [constraint]
 
         return textNode
+    }
+
+    /// Create a 3D text label with gray rounded rectangle background
+    /// - Parameters:
+    ///   - text: Text to display
+    ///   - textColor: Text color
+    ///   - position: Position relative to parent
+    /// - Returns: SCNNode containing the text with background
+    static func createTextLabelWithBackground(
+        text: String,
+        textColor: UIColor,
+        position: SCNVector3
+    ) -> SCNNode {
+
+        let containerNode = SCNNode()
+        containerNode.position = position
+
+        // Create text - larger size
+        let textGeometry = SCNText(string: text, extrusionDepth: 0.5)
+        textGeometry.font = UIFont.systemFont(ofSize: 16, weight: .bold) // Bigger text
+        textGeometry.flatness = 0.1
+        textGeometry.alignmentMode = CATextLayerAlignmentMode.center.rawValue
+
+        let textMaterial = SCNMaterial()
+        textMaterial.diffuse.contents = textColor
+        textMaterial.emission.contents = textColor.withAlphaComponent(0.8)
+        textMaterial.lightingModel = .constant
+        textGeometry.materials = [textMaterial]
+
+        let textNode = SCNNode(geometry: textGeometry)
+
+        // Center the text
+        let (minBound, maxBound) = textNode.boundingBox
+        let textWidth = maxBound.x - minBound.x
+        let textHeight = maxBound.y - minBound.y
+        textNode.pivot = SCNMatrix4MakeTranslation((minBound.x + maxBound.x) / 2, (minBound.y + maxBound.y) / 2, 0)
+
+        // Create gray rounded rectangle background
+        let padding: CGFloat = 4.0
+        let bgWidth = CGFloat(textWidth) + padding * 2
+        let bgHeight = CGFloat(textHeight) + padding * 2
+        let cornerRadius = bgHeight * 0.3 // Rounded corners
+
+        let background = SCNPlane(width: bgWidth, height: bgHeight)
+        background.cornerRadius = cornerRadius
+
+        let bgMaterial = SCNMaterial()
+        bgMaterial.diffuse.contents = UIColor.darkGray.withAlphaComponent(0.85)
+        bgMaterial.lightingModel = .constant
+        bgMaterial.isDoubleSided = true
+        background.materials = [bgMaterial]
+
+        let backgroundNode = SCNNode(geometry: background)
+        backgroundNode.position = SCNVector3(0, 0, -1) // Behind text
+
+        // Add background and text to container
+        containerNode.addChildNode(backgroundNode)
+        containerNode.addChildNode(textNode)
+
+        // Make entire container face camera (billboard effect)
+        let constraint = SCNBillboardConstraint()
+        constraint.freeAxes = [.Y]
+        containerNode.constraints = [constraint]
+
+        return containerNode
     }
 
     // MARK: - Helper Components
