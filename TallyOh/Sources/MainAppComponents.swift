@@ -383,15 +383,49 @@ class ARComponentFactory {
 
     // MARK: - Update Methods
 
-    /// Update an existing aircraft marker with new data
+    /// Update an existing aircraft marker with new data and smooth prediction
     static func updateAircraftMarker(
         node: SCNNode,
         aircraft: Aircraft,
-        newPosition: SCNVector3
+        newPosition: SCNVector3,
+        userLocation: CLLocationCoordinate2D,
+        userAltitude: Double,
+        userHeading: Double
     ) {
-        // Smoothly animate to new position
-        let moveAction = SCNAction.move(to: newPosition, duration: 1.0)
-        node.runAction(moveAction)
+        // Calculate time since last update
+        let timeSinceUpdate = Date().timeIntervalSince(aircraft.lastUpdate)
+
+        // Predict future position to smooth out updates
+        // Assume next update will come in ~3 seconds (typical ADSB update rate)
+        let predictionTime = 3.0
+
+        let (predictedCoord, predictedAlt) = CalculationsLogic.predictPosition(
+            currentCoord: aircraft.coordinate,
+            currentAltitude: aircraft.altitude,
+            track: aircraft.track,
+            groundSpeed: aircraft.groundSpeed,
+            verticalRate: aircraft.verticalRate,
+            timeSeconds: predictionTime
+        )
+
+        // Calculate AR position for predicted location
+        let predictedPosition = CalculationsLogic.calculateARPosition(
+            targetCoord: predictedCoord,
+            targetAltitude: predictedAlt,
+            userCoord: userLocation,
+            userAltitude: userAltitude,
+            userHeading: userHeading
+        )
+
+        // Use SCNTransaction for smooth, non-synchronized animation
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = predictionTime
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .linear)
+
+        // Animate to predicted position over the prediction time
+        node.position = predictedPosition
+
+        SCNTransaction.commit()
 
         // Update label if callsign changed
         if let labelNode = node.childNode(withName: "label", recursively: false) {
@@ -400,16 +434,16 @@ class ARComponentFactory {
             }
         }
 
-        // Update direction arrow
+        // Smoothly update direction arrow to match track
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 1.0
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+
         if let arrowNode = node.childNode(withName: "arrow", recursively: false) {
-            let rotateAction = SCNAction.rotateTo(
-                x: 0,
-                y: CGFloat(-aircraft.track.toRadians()),
-                z: 0,
-                duration: 0.5
-            )
-            arrowNode.runAction(rotateAction)
+            arrowNode.eulerAngles.y = -Float(aircraft.track).toRadians()
         }
+
+        SCNTransaction.commit()
     }
 }
 
@@ -545,7 +579,10 @@ class ARSceneManager {
                 ARComponentFactory.updateAircraftMarker(
                     node: existingNode,
                     aircraft: ac,
-                    newPosition: position
+                    newPosition: position,
+                    userLocation: userLocation,
+                    userAltitude: userAltitude,
+                    userHeading: userHeading
                 )
             } else {
                 let node = ARComponentFactory.createAircraftMarker(
