@@ -74,7 +74,7 @@ class ARComponentFactory {
         let labelNode = createTextLabelWithBackground(
             text: labelText,
             textColor: .white,
-            position: SCNVector3(0, smallerRadius + 50, 0) // Much higher above node
+            position: SCNVector3(0, smallerRadius + 150, 0) // Hovering 150m above node
         )
         labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
@@ -227,9 +227,10 @@ class ARComponentFactory {
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
-            position: SCNVector3(0, Float(coneHeight) + 60, 0) // Much higher above node
+            position: SCNVector3(0, Float(coneHeight) + 200, 0), // Hovering 200m above cone
+            fontSize: 32 // Larger font for airports
         )
-        labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
+        labelNode.scale = SCNVector3(1.5 * lodScale, 1.5 * lodScale, 1.5 * lodScale) // 1.5x larger
         containerNode.addChildNode(labelNode)
 
         // Add subtle rotation animation to the cone
@@ -285,19 +286,21 @@ class ARComponentFactory {
     ///   - text: Text to display
     ///   - textColor: Text color
     ///   - position: Position relative to parent
+    ///   - fontSize: Font size (default: 24)
     /// - Returns: SCNNode containing the text with background
     static func createTextLabelWithBackground(
         text: String,
         textColor: UIColor,
-        position: SCNVector3
+        position: SCNVector3,
+        fontSize: CGFloat = 24
     ) -> SCNNode {
 
         let containerNode = SCNNode()
         containerNode.position = position
 
-        // Create text - much larger size
+        // Create text with specified size
         let textGeometry = SCNText(string: text, extrusionDepth: 0.5)
-        textGeometry.font = UIFont.systemFont(ofSize: 24, weight: .bold) // Much bigger text
+        textGeometry.font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
         textGeometry.flatness = 0.1
         textGeometry.alignmentMode = CATextLayerAlignmentMode.center.rawValue
 

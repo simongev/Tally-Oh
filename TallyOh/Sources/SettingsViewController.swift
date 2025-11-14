@@ -398,8 +398,11 @@ class SliderCell: UITableViewCell {
         titleLabel.text = title
         slider.minimumValue = Float(minValue)
         slider.maximumValue = Float(maxValue)
-        slider.value = Float(currentValue)
-        updateValueLabel(currentValue)
+
+        // Round current value to nearest 5 NM
+        let roundedValue = round(currentValue / 5.0) * 5.0
+        slider.value = Float(roundedValue)
+        updateValueLabel(roundedValue)
 
         slider.removeTarget(nil, action: nil, for: .allEvents)
         slider.addTarget(self, action: #selector(sliderValueChanged), for: .valueChanged)
@@ -407,7 +410,10 @@ class SliderCell: UITableViewCell {
     }
 
     @objc private func sliderValueChanged(_ sender: UISlider) {
-        updateValueLabel(Double(sender.value))
+        // Round to nearest 5 NM increment
+        let roundedValue = round(Double(sender.value) / 5.0) * 5.0
+        sender.value = Float(roundedValue)
+        updateValueLabel(roundedValue)
     }
 
     private func updateValueLabel(_ value: Double) {
