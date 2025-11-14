@@ -35,6 +35,8 @@ class ARTrafficViewController: UIViewController {
     private var userLocation: CLLocationCoordinate2D?
     private var userAltitude: Double = 0
     private var userHeading: Double = 0
+    private var smoothedHeading: Double = 0 // Smoothed heading to prevent jittery updates
+    private let headingChangeThreshold: Double = 2.0 // Degrees - only update if change > threshold
 
     private var updateTimer: Timer?
 
@@ -291,6 +293,8 @@ class ARTrafficViewController: UIViewController {
 
     @objc private func settingsDidChange() {
         // Force immediate update of AR visualization when settings change
+        // This will cause all nodes to be recreated with new settings
+        sceneManager?.forceFullRefresh()
         updateVisualization()
         DebugConsole.shared.log("⚙️ Settings changed - AR view refreshed")
     }
@@ -452,7 +456,40 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
-        userHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        let rawHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+
+        // Initialize smoothed heading on first update
+        if smoothedHeading == 0 {
+            smoothedHeading = rawHeading
+            userHeading = rawHeading
+            return
+        }
+
+        // Calculate heading difference (accounting for 0/360 wraparound)
+        var headingDiff = rawHeading - smoothedHeading
+        if headingDiff > 180 {
+            headingDiff -= 360
+        } else if headingDiff < -180 {
+            headingDiff += 360
+        }
+
+        // Only update if change exceeds threshold to prevent jittery AR updates
+        if abs(headingDiff) > headingChangeThreshold {
+            // Apply exponential smoothing for gradual transitions
+            let alpha = 0.3 // Smoothing factor (0 = no change, 1 = instant change)
+            smoothedHeading = smoothedHeading + (headingDiff * alpha)
+
+            // Normalize to 0-360 range
+            if smoothedHeading < 0 {
+                smoothedHeading += 360
+            } else if smoothedHeading >= 360 {
+                smoothedHeading -= 360
+            }
+
+            userHeading = smoothedHeading
+
+            DebugConsole.shared.log("🧭 Heading: \(Int(userHeading))° (raw: \(Int(rawHeading))°)")
+        }
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

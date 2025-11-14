@@ -739,6 +739,22 @@ class ARSceneManager {
         print("📊 AR Scene Status: \(airportNodes.count) airport nodes active")
     }
 
+    /// Force a full refresh of all nodes (used when settings change)
+    func forceFullRefresh() {
+        // Remove all existing nodes so they'll be recreated with new settings
+        for node in aircraftNodes.values {
+            node.removeFromParentNode()
+        }
+        aircraftNodes.removeAll()
+
+        for node in airportNodes.values {
+            node.removeFromParentNode()
+        }
+        airportNodes.removeAll()
+
+        DebugConsole.shared.log("🔄 Full refresh: All nodes cleared for recreation")
+    }
+
     /// Clear all visualizations
     func clearAll() {
         for node in aircraftNodes.values {
