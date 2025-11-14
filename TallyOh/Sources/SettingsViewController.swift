@@ -12,14 +12,50 @@ class SettingsViewController: UIViewController {
     private let tableView = UITableView(frame: .zero, style: .insetGrouped)
     private let settings = AppSettings.shared
 
+    // Staging variables - changes only saved when Done is pressed
+    private var stagingShowCallsign: Bool = true
+    private var stagingShowAltitude: Bool = true
+    private var stagingShowGroundSpeed: Bool = false
+    private var stagingShowVerticalRate: Bool = false
+    private var stagingShowTrack: Bool = false
+    private var stagingShowGroundAircraft: Bool = true
+    private var stagingShowLargeAirports: Bool = true
+    private var stagingShowMediumAirports: Bool = true
+    private var stagingShowSmallAirports: Bool = true
+    private var stagingShowHeliports: Bool = false
+    private var stagingShowSeaplaneBases: Bool = false
+    private var stagingShowBalloonports: Bool = false
+    private var stagingAircraftMaxDistance: Double = 40.0
+    private var stagingAirportMaxDistance: Double = 30.0
+
     override func viewDidLoad() {
         super.viewDidLoad()
 
         title = "Settings"
         view.backgroundColor = .systemBackground
 
+        // Load current settings into staging variables
+        loadCurrentSettings()
+
         setupTableView()
         setupNavigationBar()
+    }
+
+    private func loadCurrentSettings() {
+        stagingShowCallsign = settings.showCallsign
+        stagingShowAltitude = settings.showAltitude
+        stagingShowGroundSpeed = settings.showGroundSpeed
+        stagingShowVerticalRate = settings.showVerticalRate
+        stagingShowTrack = settings.showTrack
+        stagingShowGroundAircraft = settings.showGroundAircraft
+        stagingShowLargeAirports = settings.showLargeAirports
+        stagingShowMediumAirports = settings.showMediumAirports
+        stagingShowSmallAirports = settings.showSmallAirports
+        stagingShowHeliports = settings.showHeliports
+        stagingShowSeaplaneBases = settings.showSeaplaneBases
+        stagingShowBalloonports = settings.showBalloonports
+        stagingAircraftMaxDistance = settings.aircraftMaxDistance
+        stagingAirportMaxDistance = settings.airportMaxDistance
     }
 
     private func setupNavigationBar() {
@@ -56,6 +92,25 @@ class SettingsViewController: UIViewController {
     }
 
     @objc private func doneTapped() {
+        // Commit all staging changes to AppSettings
+        settings.showCallsign = stagingShowCallsign
+        settings.showAltitude = stagingShowAltitude
+        settings.showGroundSpeed = stagingShowGroundSpeed
+        settings.showVerticalRate = stagingShowVerticalRate
+        settings.showTrack = stagingShowTrack
+        settings.showGroundAircraft = stagingShowGroundAircraft
+        settings.showLargeAirports = stagingShowLargeAirports
+        settings.showMediumAirports = stagingShowMediumAirports
+        settings.showSmallAirports = stagingShowSmallAirports
+        settings.showHeliports = stagingShowHeliports
+        settings.showSeaplaneBases = stagingShowSeaplaneBases
+        settings.showBalloonports = stagingShowBalloonports
+        settings.aircraftMaxDistance = stagingAircraftMaxDistance
+        settings.airportMaxDistance = stagingAirportMaxDistance
+
+        // Notify AR view that settings have changed
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+
         dismiss(animated: true)
     }
 
@@ -68,7 +123,11 @@ class SettingsViewController: UIViewController {
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Reset", style: .destructive) { [weak self] _ in
+            // Reset actual settings
             self?.settings.resetToDefaults()
+            // Reload staging variables from reset settings
+            self?.loadCurrentSettings()
+            // Reload table to show reset values
             self?.tableView.reloadData()
         })
 
@@ -159,11 +218,11 @@ extension SettingsViewController: UITableViewDataSource {
         let cell = tableView.dequeueReusableCell(withIdentifier: "SwitchCell", for: indexPath) as! SwitchCell
 
         let labelOptions = [
-            ("Callsign", settings.showCallsign, #selector(toggleCallsign)),
-            ("Altitude", settings.showAltitude, #selector(toggleAltitude)),
-            ("Ground Speed", settings.showGroundSpeed, #selector(toggleGroundSpeed)),
-            ("Vertical Rate", settings.showVerticalRate, #selector(toggleVerticalRate)),
-            ("Track", settings.showTrack, #selector(toggleTrack))
+            ("Callsign", stagingShowCallsign, #selector(toggleCallsign)),
+            ("Altitude", stagingShowAltitude, #selector(toggleAltitude)),
+            ("Ground Speed", stagingShowGroundSpeed, #selector(toggleGroundSpeed)),
+            ("Vertical Rate", stagingShowVerticalRate, #selector(toggleVerticalRate)),
+            ("Track", stagingShowTrack, #selector(toggleTrack))
         ]
 
         let (title, isOn, action) = labelOptions[indexPath.row]
@@ -176,7 +235,7 @@ extension SettingsViewController: UITableViewDataSource {
         let cell = tableView.dequeueReusableCell(withIdentifier: "SwitchCell", for: indexPath) as! SwitchCell
         cell.configure(
             title: "Show Aircraft on Ground",
-            isOn: settings.showGroundAircraft,
+            isOn: stagingShowGroundAircraft,
             target: self,
             action: #selector(toggleGroundAircraft)
         )
@@ -187,12 +246,12 @@ extension SettingsViewController: UITableViewDataSource {
         let cell = tableView.dequeueReusableCell(withIdentifier: "SwitchCell", for: indexPath) as! SwitchCell
 
         let types = [
-            ("Large Airports", settings.showLargeAirports, #selector(toggleLargeAirports)),
-            ("Medium Airports", settings.showMediumAirports, #selector(toggleMediumAirports)),
-            ("Small Airports", settings.showSmallAirports, #selector(toggleSmallAirports)),
-            ("Heliports", settings.showHeliports, #selector(toggleHeliports)),
-            ("Seaplane Bases", settings.showSeaplaneBases, #selector(toggleSeaplaneBases)),
-            ("Balloonports", settings.showBalloonports, #selector(toggleBalloonports))
+            ("Large Airports", stagingShowLargeAirports, #selector(toggleLargeAirports)),
+            ("Medium Airports", stagingShowMediumAirports, #selector(toggleMediumAirports)),
+            ("Small Airports", stagingShowSmallAirports, #selector(toggleSmallAirports)),
+            ("Heliports", stagingShowHeliports, #selector(toggleHeliports)),
+            ("Seaplane Bases", stagingShowSeaplaneBases, #selector(toggleSeaplaneBases)),
+            ("Balloonports", stagingShowBalloonports, #selector(toggleBalloonports))
         ]
 
         let (title, isOn, action) = types[indexPath.row]
@@ -204,7 +263,7 @@ extension SettingsViewController: UITableViewDataSource {
     private func sliderCell(for indexPath: IndexPath, isAircraft: Bool) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "SliderCell", for: indexPath) as! SliderCell
 
-        let currentValue = isAircraft ? settings.aircraftMaxDistance : settings.airportMaxDistance
+        let currentValue = isAircraft ? stagingAircraftMaxDistance : stagingAirportMaxDistance
         let title = isAircraft ? "Aircraft" : "Airports"
         let action = isAircraft ? #selector(aircraftDistanceChanged) : #selector(airportDistanceChanged)
 
@@ -236,75 +295,59 @@ extension SettingsViewController: UITableViewDelegate {
 extension SettingsViewController {
 
     @objc private func toggleCallsign(_ sender: UISwitch) {
-        settings.showCallsign = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowCallsign = sender.isOn
     }
 
     @objc private func toggleAltitude(_ sender: UISwitch) {
-        settings.showAltitude = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowAltitude = sender.isOn
     }
 
     @objc private func toggleGroundSpeed(_ sender: UISwitch) {
-        settings.showGroundSpeed = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowGroundSpeed = sender.isOn
     }
 
     @objc private func toggleVerticalRate(_ sender: UISwitch) {
-        settings.showVerticalRate = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowVerticalRate = sender.isOn
     }
 
     @objc private func toggleTrack(_ sender: UISwitch) {
-        settings.showTrack = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowTrack = sender.isOn
     }
 
     @objc private func toggleGroundAircraft(_ sender: UISwitch) {
-        settings.showGroundAircraft = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowGroundAircraft = sender.isOn
     }
 
     @objc private func toggleLargeAirports(_ sender: UISwitch) {
-        settings.showLargeAirports = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowLargeAirports = sender.isOn
     }
 
     @objc private func toggleMediumAirports(_ sender: UISwitch) {
-        settings.showMediumAirports = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowMediumAirports = sender.isOn
     }
 
     @objc private func toggleSmallAirports(_ sender: UISwitch) {
-        settings.showSmallAirports = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowSmallAirports = sender.isOn
     }
 
     @objc private func toggleHeliports(_ sender: UISwitch) {
-        settings.showHeliports = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowHeliports = sender.isOn
     }
 
     @objc private func toggleSeaplaneBases(_ sender: UISwitch) {
-        settings.showSeaplaneBases = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowSeaplaneBases = sender.isOn
     }
 
     @objc private func toggleBalloonports(_ sender: UISwitch) {
-        settings.showBalloonports = sender.isOn
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingShowBalloonports = sender.isOn
     }
 
     @objc private func aircraftDistanceChanged(_ sender: UISlider) {
-        settings.aircraftMaxDistance = Double(sender.value)
-        // Post notification for AR view to update
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingAircraftMaxDistance = Double(sender.value)
     }
 
     @objc private func airportDistanceChanged(_ sender: UISlider) {
-        settings.airportMaxDistance = Double(sender.value)
-        // Post notification for AR view to update
-        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        stagingAirportMaxDistance = Double(sender.value)
     }
 }
 

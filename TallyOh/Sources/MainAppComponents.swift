@@ -71,7 +71,7 @@ class ARComponentFactory {
 
         // Add label with customizable information based on settings
         // Make label offset proportional to distance for consistent visual separation
-        let labelOffset = Float(distance * 0.15) // 15% of distance above the node
+        let labelOffset = Float(distance * 0.045) // 4.5% of distance above the node (reduced by 70%)
         let labelText = AppSettings.shared.generateAircraftLabel(aircraft: aircraft)
         let labelNode = createTextLabelWithBackground(
             text: labelText,
@@ -94,25 +94,26 @@ class ARComponentFactory {
     }
 
     /// Calculate LOD (Level of Detail) scale based on distance
-    /// Farther objects are scaled up to remain visible at actual distances
+    /// CLOSER objects are scaled LARGER for better visibility
+    /// FARTHER objects are scaled SMALLER to prevent clutter
     static func calculateLODScale(distance: Double) -> Float {
-        // More conservative scaling - objects at true positions shouldn't look huge
-        // Balance between visibility and realistic appearance
+        // Inverted scaling: close = big, far = small
+        // This ensures nearby targets are prominent and distant ones don't clutter the view
 
-        if distance < 500 { // 200-500m range (minimum distance applied)
-            return 0.5 // Small to not block view
-        } else if distance < 1000 { // 500m-1km
-            return Float(distance / 1000.0) // ~0.5x to 1x
-        } else if distance < 1852 { // < 1 NM
-            return Float(distance / 1200.0) // ~0.8x to 1.5x
-        } else if distance < 9260 { // < 5 NM
-            return Float(distance / 1500.0) // ~1.2x to 6x
-        } else if distance < 18520 { // < 10 NM
-            return Float(distance / 1200.0) // ~7.7x to 15x
-        } else if distance < 37040 { // < 20 NM
-            return Float(distance / 1000.0) // ~18.5x to 37x
+        if distance < 500 { // Very close (< 0.27 NM)
+            return 12.0 // Very large for close-up visibility
+        } else if distance < 1000 { // 500m-1km (~0.5 NM)
+            return 10.0 // Large
+        } else if distance < 1852 { // 1km-1 NM
+            return 8.0 // Medium-large
+        } else if distance < 9260 { // 1-5 NM
+            return 6.0 // Medium
+        } else if distance < 18520 { // 5-10 NM
+            return 4.0 // Medium-small
+        } else if distance < 37040 { // 10-20 NM
+            return 2.5 // Small
         } else {
-            return Float(distance / 800.0) // > 20 NM - moderate scaling
+            return 1.5 // Very small for distant objects (> 20 NM)
         }
     }
 
@@ -209,7 +210,7 @@ class ARComponentFactory {
         containerNode.addChildNode(coneNode)
 
         // Add ICAO code label with proportional offset for consistent visual separation
-        let labelOffset = Float(distance * 0.2) // 20% of distance above the cone
+        let labelOffset = Float(distance * 0.06) // 6% of distance above the cone (reduced by 70%)
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
@@ -303,8 +304,8 @@ class ARComponentFactory {
         let textHeight = maxBound.y - minBound.y
         textNode.pivot = SCNMatrix4MakeTranslation((minBound.x + maxBound.x) / 2, (minBound.y + maxBound.y) / 2, 0)
 
-        // Create gray rounded rectangle background
-        let padding: CGFloat = 4.0
+        // Create gray rounded rectangle background with larger padding
+        let padding: CGFloat = 12.0 // Increased padding for better readability
         let bgWidth = CGFloat(textWidth) + padding * 2
         let bgHeight = CGFloat(textHeight) + padding * 2
         let cornerRadius = bgHeight * 0.3 // Rounded corners
