@@ -69,12 +69,14 @@ class ARComponentFactory {
 
         // NO pulsing animation - removed as requested
 
-        // Add label with customizable information based on settings - hovering well above
+        // Add label with customizable information based on settings
+        // Make label offset proportional to distance for consistent visual separation
+        let labelOffset = Float(distance * 0.15) // 15% of distance above the node
         let labelText = AppSettings.shared.generateAircraftLabel(aircraft: aircraft)
         let labelNode = createTextLabelWithBackground(
             text: labelText,
             textColor: .white,
-            position: SCNVector3(0, smallerRadius + 150, 0) // Hovering 150m above node
+            position: SCNVector3(0, labelOffset, 0) // Proportional offset
         )
         labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
@@ -206,28 +208,12 @@ class ARComponentFactory {
 
         containerNode.addChildNode(coneNode)
 
-        // Add rounded bottom using a hemisphere
-        let hemisphere = SCNSphere(radius: coneRadius)
-        hemisphere.segmentCount = 24 // Smooth sphere
-
-        let hemisphereMaterial = SCNMaterial()
-        hemisphereMaterial.diffuse.contents = UIColor.systemBlue
-        hemisphereMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
-        hemisphereMaterial.transparency = 0.7
-        hemisphereMaterial.lightingModel = .constant
-        hemisphere.materials = [hemisphereMaterial]
-
-        let hemisphereNode = SCNNode(geometry: hemisphere)
-        hemisphereNode.position = SCNVector3(0, 0, 0) // At bottom of cone
-        hemisphereNode.scale = SCNVector3(lodScale, lodScale * 0.3, lodScale) // Flatten to hemisphere
-
-        containerNode.addChildNode(hemisphereNode)
-
-        // Add ICAO code label hovering well above the cone
+        // Add ICAO code label with proportional offset for consistent visual separation
+        let labelOffset = Float(distance * 0.2) // 20% of distance above the cone
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
-            position: SCNVector3(0, Float(coneHeight) + 200, 0), // Hovering 200m above cone
+            position: SCNVector3(0, labelOffset, 0), // Proportional offset
             fontSize: 32 // Larger font for airports
         )
         labelNode.scale = SCNVector3(1.5 * lodScale, 1.5 * lodScale, 1.5 * lodScale) // 1.5x larger
@@ -237,7 +223,6 @@ class ARComponentFactory {
         let rotate = SCNAction.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 10.0)
         let repeatRotate = SCNAction.repeatForever(rotate)
         coneNode.runAction(repeatRotate)
-        hemisphereNode.runAction(repeatRotate)
 
         return containerNode
     }
