@@ -69,8 +69,8 @@ class ARComponentFactory {
 
         // NO pulsing animation - removed as requested
 
-        // Add label with callsign and altitude hovering above the circle
-        let labelText = "\(aircraft.callsign)\n\(String(format: "%.0f", aircraft.altitude))ft"
+        // Add label with customizable information based on settings
+        let labelText = AppSettings.shared.generateAircraftLabel(aircraft: aircraft)
         let labelNode = createTextLabelWithBackground(
             text: labelText,
             textColor: .white,
@@ -156,7 +156,7 @@ class ARComponentFactory {
 
     // MARK: - Airport Components
 
-    /// Create a blue sphere marker for an airport
+    /// Create a blue cone marker with rounded bottom for an airport
     /// - Parameters:
     ///   - position: Position in AR scene
     ///   - airport: Airport data
@@ -180,37 +180,63 @@ class ARComponentFactory {
         // Calculate LOD scale based on distance
         let lodScale = calculateLODScale(distance: distance)
 
-        // Create larger blue sphere with rounded appearance
-        let sphereRadius: CGFloat = 20.0 // Larger than before
+        // Create larger cone with rounded bottom - much bigger than before
+        let coneHeight: CGFloat = 60.0 // Bigger
+        let coneRadius: CGFloat = 25.0 // Bigger radius
 
-        let sphere = SCNSphere(radius: sphereRadius)
-        let sphereMaterial = SCNMaterial()
-        sphereMaterial.diffuse.contents = UIColor.systemBlue
-        sphereMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
-        sphereMaterial.transparency = 0.7
-        sphereMaterial.lightingModel = .constant // Always visible
-        sphere.materials = [sphereMaterial]
+        let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
+        let coneMaterial = SCNMaterial()
+        coneMaterial.diffuse.contents = UIColor.systemBlue
+        coneMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
+        coneMaterial.transparency = 0.7
+        coneMaterial.isDoubleSided = true
+        coneMaterial.lightingModel = .constant // Always visible
+        cone.materials = [coneMaterial]
 
-        let sphereNode = SCNNode(geometry: sphere)
+        let coneNode = SCNNode(geometry: cone)
+
+        // Point cone downward
+        coneNode.eulerAngles.x = .pi // 180 degrees
+
+        // Position cone above ground
+        coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
 
         // Apply LOD scaling
-        sphereNode.scale = SCNVector3(lodScale, lodScale, lodScale)
+        coneNode.scale = SCNVector3(lodScale, lodScale, lodScale)
 
-        containerNode.addChildNode(sphereNode)
+        containerNode.addChildNode(coneNode)
 
-        // Add ICAO code label hovering above the sphere
+        // Add rounded bottom using a hemisphere
+        let hemisphere = SCNSphere(radius: coneRadius)
+        hemisphere.segmentCount = 24 // Smooth sphere
+
+        let hemisphereMaterial = SCNMaterial()
+        hemisphereMaterial.diffuse.contents = UIColor.systemBlue
+        hemisphereMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
+        hemisphereMaterial.transparency = 0.7
+        hemisphereMaterial.lightingModel = .constant
+        hemisphere.materials = [hemisphereMaterial]
+
+        let hemisphereNode = SCNNode(geometry: hemisphere)
+        hemisphereNode.position = SCNVector3(0, 0, 0) // At bottom of cone
+        hemisphereNode.scale = SCNVector3(lodScale, lodScale * 0.3, lodScale) // Flatten to hemisphere
+
+        containerNode.addChildNode(hemisphereNode)
+
+        // Add ICAO code label hovering above the cone
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
-            position: SCNVector3(0, Float(sphereRadius) + 35, 0) // Hover higher above node
+            position: SCNVector3(0, Float(coneHeight) + 40, 0) // Hover higher above node
         )
         labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
 
-        // Add subtle rotation animation to sphere
+        // Add subtle rotation animation to the cone
         let rotate = SCNAction.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 10.0)
         let repeatRotate = SCNAction.repeatForever(rotate)
-        sphereNode.runAction(repeatRotate)
+        coneNode.runAction(repeatRotate)
+        hemisphereNode.runAction(repeatRotate)
 
         return containerNode
     }
@@ -453,12 +479,10 @@ struct ARVisualizationSettings {
     // Aircraft settings
     var showAircraft: Bool = true
     var aircraftMinDistance: Double = 200.0 // Don't show aircraft closer than 200 meters
-    var aircraftMaxDistance: Double = 10.0 // nautical miles
 
     // Airport settings
     var showAirports: Bool = true
     var airportMinDistance: Double = 300.0 // Don't show airports closer than 300 meters
-    var airportMaxDistance: Double = 20.0 // nautical miles
 
     // Display settings
     var showGrid: Bool = false
@@ -472,6 +496,15 @@ struct ARVisualizationSettings {
     var aircraftColor: UIColor = .red
     var airportColor: UIColor = .systemBlue
     var labelColor: UIColor = .white
+
+    // Use AppSettings for user-configurable options
+    var aircraftMaxDistance: Double {
+        return AppSettings.shared.aircraftMaxDistance.rawValue
+    }
+
+    var airportMaxDistance: Double {
+        return AppSettings.shared.airportMaxDistance.rawValue
+    }
 }
 
 // MARK: - Scene Manager
@@ -517,6 +550,12 @@ class ARSceneManager {
         var currentAircraftIDs = Set<String>()
 
         for ac in aircraft {
+            // Apply app settings filters
+            if !AppSettings.shared.shouldShowAircraft(ac) {
+                print("⏭️  Skipping \(ac.callsign) - filtered by settings (ground aircraft)")
+                continue
+            }
+
             // Calculate distance first to check minimum distance
             let distance = CalculationsLogic.distance(
                 from: userLocation,
@@ -637,6 +676,12 @@ class ARSceneManager {
         var currentAirportIDs = Set<String>()
 
         for airport in nearbyAirports {
+            // Apply app settings filters for airport type
+            if !AppSettings.shared.shouldShowAirport(airport) {
+                print("⏭️  Skipping airport \(airport.icao) - filtered by settings (type: \(airport.type ?? "unknown"))")
+                continue
+            }
+
             // Calculate distance first to check minimum distance
             let distance = CalculationsLogic.distance(
                 from: userLocation,

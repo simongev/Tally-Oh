@@ -189,15 +189,11 @@ class ARTrafficViewController: UIViewController {
     private var cancellables = Set<AnyCancellable>()
 
     private func loadAirports() {
-        // Load airports from CSV and filter for large airports only
+        // Load all airports from CSV - filtering is now done in settings
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             if let allAirports = AirportDataParser.loadAirportsFromCSV() {
-                // Filter to only show large airports
-                let largeAirports = allAirports.filter { airport in
-                    airport.type == "large_airport"
-                }
-                self?.airports = largeAirports
-                print("✓ Filtered to \(largeAirports.count) large airports (from \(allAirports.count) total)")
+                self?.airports = allAirports
+                print("✓ Loaded \(allAirports.count) airports (filtering handled by user settings)")
                 DispatchQueue.main.async {
                     self?.updateStatusLabel()
                 }
@@ -243,31 +239,9 @@ class ARTrafficViewController: UIViewController {
     }
 
     @objc private func showSettings() {
-        let alert = UIAlertController(
-            title: "Settings",
-            message: "Configure AR visualization settings",
-            preferredStyle: .actionSheet
-        )
-
-        alert.addAction(UIAlertAction(title: "Toggle Aircraft", style: .default) { [weak self] _ in
-            self?.sceneManager?.settings.showAircraft.toggle()
-        })
-
-        alert.addAction(UIAlertAction(title: "Toggle Airports", style: .default) { [weak self] _ in
-            self?.sceneManager?.settings.showAirports.toggle()
-        })
-
-        alert.addAction(UIAlertAction(title: "Add Test Aircraft", style: .default) { [weak self] _ in
-            self?.connectionLogic.addTestAircraft()
-        })
-
-        alert.addAction(UIAlertAction(title: "Clear All", style: .destructive) { [weak self] _ in
-            self?.sceneManager?.clearAll()
-        })
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-
-        present(alert, animated: true)
+        let settingsVC = SettingsViewController()
+        let navController = UINavigationController(rootViewController: settingsVC)
+        present(navController, animated: true)
     }
 
     @objc private func toggleDebugConsole() {
