@@ -24,7 +24,7 @@ class AppSettings {
         static let showVerticalRate = "showVerticalRate"
         static let showTrack = "showTrack"
 
-        // Distance filters
+        // Distance filters (now continuous)
         static let aircraftMaxDistance = "aircraftMaxDistance"
         static let airportMaxDistance = "airportMaxDistance"
 
@@ -32,6 +32,9 @@ class AppSettings {
         static let showLargeAirports = "showLargeAirports"
         static let showMediumAirports = "showMediumAirports"
         static let showSmallAirports = "showSmallAirports"
+        static let showHeliports = "showHeliports"
+        static let showSeaplaneBases = "showSeaplaneBases"
+        static let showBalloonports = "showBalloonports"
 
         // Aircraft filters
         static let showGroundAircraft = "showGroundAircraft"
@@ -64,40 +67,20 @@ class AppSettings {
         set { defaults.set(newValue, forKey: Keys.showTrack) }
     }
 
-    // MARK: - Distance Filters
+    // MARK: - Distance Filters (Continuous)
 
-    enum DistanceOption: Double, CaseIterable {
-        case ten = 10.0
-        case twenty = 20.0
-        case thirty = 30.0
-        case forty = 40.0
-        case all = 999.0 // Effectively unlimited
+    // Distance range: 10-50 NM
+    static let minDistance: Double = 10.0
+    static let maxDistance: Double = 50.0
 
-        var displayName: String {
-            switch self {
-            case .ten: return "10 NM"
-            case .twenty: return "20 NM"
-            case .thirty: return "30 NM"
-            case .forty: return "40 NM"
-            case .all: return "All"
-            }
-        }
+    var aircraftMaxDistance: Double {
+        get { defaults.object(forKey: Keys.aircraftMaxDistance) as? Double ?? 40.0 }
+        set { defaults.set(newValue, forKey: Keys.aircraftMaxDistance) }
     }
 
-    var aircraftMaxDistance: DistanceOption {
-        get {
-            let value = defaults.object(forKey: Keys.aircraftMaxDistance) as? Double ?? 40.0
-            return DistanceOption(rawValue: value) ?? .forty
-        }
-        set { defaults.set(newValue.rawValue, forKey: Keys.aircraftMaxDistance) }
-    }
-
-    var airportMaxDistance: DistanceOption {
-        get {
-            let value = defaults.object(forKey: Keys.airportMaxDistance) as? Double ?? 30.0
-            return DistanceOption(rawValue: value) ?? .thirty
-        }
-        set { defaults.set(newValue.rawValue, forKey: Keys.airportMaxDistance) }
+    var airportMaxDistance: Double {
+        get { defaults.object(forKey: Keys.airportMaxDistance) as? Double ?? 30.0 }
+        set { defaults.set(newValue, forKey: Keys.airportMaxDistance) }
     }
 
     // MARK: - Airport Type Filters
@@ -115,6 +98,21 @@ class AppSettings {
     var showSmallAirports: Bool {
         get { defaults.object(forKey: Keys.showSmallAirports) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Keys.showSmallAirports) }
+    }
+
+    var showHeliports: Bool {
+        get { defaults.object(forKey: Keys.showHeliports) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Keys.showHeliports) }
+    }
+
+    var showSeaplaneBases: Bool {
+        get { defaults.object(forKey: Keys.showSeaplaneBases) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Keys.showSeaplaneBases) }
+    }
+
+    var showBalloonports: Bool {
+        get { defaults.object(forKey: Keys.showBalloonports) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: Keys.showBalloonports) }
     }
 
     // MARK: - Aircraft Filters
@@ -160,7 +158,12 @@ class AppSettings {
 
     /// Check if an airport should be shown based on type
     func shouldShowAirport(_ airport: Airport) -> Bool {
-        guard let type = airport.type else { return true }
+        guard let type = airport.type else { return false } // Don't show airports without type
+
+        // Exclude closed airports
+        if type.contains("closed") {
+            return false
+        }
 
         if type.contains("large_airport") && showLargeAirports {
             return true
@@ -169,6 +172,15 @@ class AppSettings {
             return true
         }
         if type.contains("small_airport") && showSmallAirports {
+            return true
+        }
+        if type.contains("heliport") && showHeliports {
+            return true
+        }
+        if type.contains("seaplane_base") && showSeaplaneBases {
+            return true
+        }
+        if type.contains("balloonport") && showBalloonports {
             return true
         }
 
@@ -193,12 +205,15 @@ class AppSettings {
         showVerticalRate = false
         showTrack = false
 
-        aircraftMaxDistance = .forty
-        airportMaxDistance = .thirty
+        aircraftMaxDistance = 40.0
+        airportMaxDistance = 30.0
 
         showLargeAirports = true
         showMediumAirports = true
         showSmallAirports = true
+        showHeliports = false
+        showSeaplaneBases = false
+        showBalloonports = false
 
         showGroundAircraft = true
     }

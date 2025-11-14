@@ -177,6 +177,14 @@ class ARTrafficViewController: UIViewController {
             }
             .store(in: &cancellables)
 
+        // Observe settings changes to refresh AR visualization
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsDidChange),
+            name: .settingsDidChange,
+            object: nil
+        )
+
         // Start update timer
         updateTimer = Timer.scheduledTimer(
             withTimeInterval: 1.0,
@@ -279,6 +287,12 @@ class ARTrafficViewController: UIViewController {
 
             DebugConsole.shared.log("✅ Debug console opened")
         }
+    }
+
+    @objc private func settingsDidChange() {
+        // Force immediate update of AR visualization when settings change
+        updateVisualization()
+        DebugConsole.shared.log("⚙️ Settings changed - AR view refreshed")
     }
 
     // MARK: - Update Logic

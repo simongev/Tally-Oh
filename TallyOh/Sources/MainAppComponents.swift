@@ -69,12 +69,12 @@ class ARComponentFactory {
 
         // NO pulsing animation - removed as requested
 
-        // Add label with customizable information based on settings
+        // Add label with customizable information based on settings - hovering well above
         let labelText = AppSettings.shared.generateAircraftLabel(aircraft: aircraft)
         let labelNode = createTextLabelWithBackground(
             text: labelText,
             textColor: .white,
-            position: SCNVector3(0, smallerRadius + 30, 0) // Hover higher above node
+            position: SCNVector3(0, smallerRadius + 50, 0) // Much higher above node
         )
         labelNode.scale = SCNVector3(lodScale, lodScale, lodScale)
         containerNode.addChildNode(labelNode)
@@ -223,11 +223,11 @@ class ARComponentFactory {
 
         containerNode.addChildNode(hemisphereNode)
 
-        // Add ICAO code label hovering above the cone
+        // Add ICAO code label hovering well above the cone
         let labelNode = createTextLabelWithBackground(
             text: airport.icao,
             textColor: .white,
-            position: SCNVector3(0, Float(coneHeight) + 40, 0) // Hover higher above node
+            position: SCNVector3(0, Float(coneHeight) + 60, 0) // Much higher above node
         )
         labelNode.scale = SCNVector3(1.0 * lodScale, 1.0 * lodScale, 1.0 * lodScale)
         containerNode.addChildNode(labelNode)
@@ -295,9 +295,9 @@ class ARComponentFactory {
         let containerNode = SCNNode()
         containerNode.position = position
 
-        // Create text - larger size
+        // Create text - much larger size
         let textGeometry = SCNText(string: text, extrusionDepth: 0.5)
-        textGeometry.font = UIFont.systemFont(ofSize: 16, weight: .bold) // Bigger text
+        textGeometry.font = UIFont.systemFont(ofSize: 24, weight: .bold) // Much bigger text
         textGeometry.flatness = 0.1
         textGeometry.alignmentMode = CATextLayerAlignmentMode.center.rawValue
 
@@ -499,11 +499,11 @@ struct ARVisualizationSettings {
 
     // Use AppSettings for user-configurable options
     var aircraftMaxDistance: Double {
-        return AppSettings.shared.aircraftMaxDistance.rawValue
+        return AppSettings.shared.aircraftMaxDistance
     }
 
     var airportMaxDistance: Double {
-        return AppSettings.shared.airportMaxDistance.rawValue
+        return AppSettings.shared.airportMaxDistance
     }
 }
 

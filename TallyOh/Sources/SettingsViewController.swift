@@ -52,6 +52,7 @@ class SettingsViewController: UIViewController {
         tableView.dataSource = self
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "Cell")
         tableView.register(SwitchCell.self, forCellReuseIdentifier: "SwitchCell")
+        tableView.register(SliderCell.self, forCellReuseIdentifier: "SliderCell")
     }
 
     @objc private func doneTapped() {
@@ -119,9 +120,9 @@ extension SettingsViewController: UITableViewDataSource {
         switch section {
         case .aircraftLabels: return 5 // callsign, altitude, speed, vr, track
         case .aircraftFilters: return 1 // show ground aircraft
-        case .aircraftDistance: return AppSettings.DistanceOption.allCases.count
-        case .airportTypes: return 3 // large, medium, small
-        case .airportDistance: return AppSettings.DistanceOption.allCases.count
+        case .aircraftDistance: return 1 // single slider
+        case .airportTypes: return 6 // large, medium, small, heliport, seaplane, balloonport
+        case .airportDistance: return 1 // single slider
         }
     }
 
@@ -136,11 +137,11 @@ extension SettingsViewController: UITableViewDataSource {
         case .aircraftFilters:
             return aircraftFilterCell(for: indexPath)
         case .aircraftDistance:
-            return distanceCell(for: indexPath, isAircraft: true)
+            return sliderCell(for: indexPath, isAircraft: true)
         case .airportTypes:
             return airportTypeCell(for: indexPath)
         case .airportDistance:
-            return distanceCell(for: indexPath, isAircraft: false)
+            return sliderCell(for: indexPath, isAircraft: false)
         }
     }
 
@@ -188,7 +189,10 @@ extension SettingsViewController: UITableViewDataSource {
         let types = [
             ("Large Airports", settings.showLargeAirports, #selector(toggleLargeAirports)),
             ("Medium Airports", settings.showMediumAirports, #selector(toggleMediumAirports)),
-            ("Small Airports", settings.showSmallAirports, #selector(toggleSmallAirports))
+            ("Small Airports", settings.showSmallAirports, #selector(toggleSmallAirports)),
+            ("Heliports", settings.showHeliports, #selector(toggleHeliports)),
+            ("Seaplane Bases", settings.showSeaplaneBases, #selector(toggleSeaplaneBases)),
+            ("Balloonports", settings.showBalloonports, #selector(toggleBalloonports))
         ]
 
         let (title, isOn, action) = types[indexPath.row]
@@ -197,14 +201,21 @@ extension SettingsViewController: UITableViewDataSource {
         return cell
     }
 
-    private func distanceCell(for indexPath: IndexPath, isAircraft: Bool) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "Cell", for: indexPath)
+    private func sliderCell(for indexPath: IndexPath, isAircraft: Bool) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "SliderCell", for: indexPath) as! SliderCell
 
-        let option = AppSettings.DistanceOption.allCases[indexPath.row]
-        let currentSetting = isAircraft ? settings.aircraftMaxDistance : settings.airportMaxDistance
+        let currentValue = isAircraft ? settings.aircraftMaxDistance : settings.airportMaxDistance
+        let title = isAircraft ? "Aircraft" : "Airports"
+        let action = isAircraft ? #selector(aircraftDistanceChanged) : #selector(airportDistanceChanged)
 
-        cell.textLabel?.text = option.displayName
-        cell.accessoryType = option == currentSetting ? .checkmark : .none
+        cell.configure(
+            title: title,
+            currentValue: currentValue,
+            minValue: AppSettings.minDistance,
+            maxValue: AppSettings.maxDistance,
+            target: self,
+            action: action
+        )
 
         return cell
     }
@@ -216,23 +227,7 @@ extension SettingsViewController: UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-
-        guard let section = Section(rawValue: indexPath.section) else { return }
-
-        switch section {
-        case .aircraftDistance:
-            let option = AppSettings.DistanceOption.allCases[indexPath.row]
-            settings.aircraftMaxDistance = option
-            tableView.reloadSections(IndexSet(integer: indexPath.section), with: .none)
-
-        case .airportDistance:
-            let option = AppSettings.DistanceOption.allCases[indexPath.row]
-            settings.airportMaxDistance = option
-            tableView.reloadSections(IndexSet(integer: indexPath.section), with: .none)
-
-        default:
-            break
-        }
+        // No selection handling needed - switches and sliders handle their own input
     }
 }
 
@@ -242,38 +237,74 @@ extension SettingsViewController {
 
     @objc private func toggleCallsign(_ sender: UISwitch) {
         settings.showCallsign = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleAltitude(_ sender: UISwitch) {
         settings.showAltitude = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleGroundSpeed(_ sender: UISwitch) {
         settings.showGroundSpeed = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleVerticalRate(_ sender: UISwitch) {
         settings.showVerticalRate = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleTrack(_ sender: UISwitch) {
         settings.showTrack = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleGroundAircraft(_ sender: UISwitch) {
         settings.showGroundAircraft = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleLargeAirports(_ sender: UISwitch) {
         settings.showLargeAirports = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleMediumAirports(_ sender: UISwitch) {
         settings.showMediumAirports = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     @objc private func toggleSmallAirports(_ sender: UISwitch) {
         settings.showSmallAirports = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+    }
+
+    @objc private func toggleHeliports(_ sender: UISwitch) {
+        settings.showHeliports = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+    }
+
+    @objc private func toggleSeaplaneBases(_ sender: UISwitch) {
+        settings.showSeaplaneBases = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+    }
+
+    @objc private func toggleBalloonports(_ sender: UISwitch) {
+        settings.showBalloonports = sender.isOn
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+    }
+
+    @objc private func aircraftDistanceChanged(_ sender: UISlider) {
+        settings.aircraftMaxDistance = Double(sender.value)
+        // Post notification for AR view to update
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+    }
+
+    @objc private func airportDistanceChanged(_ sender: UISlider) {
+        settings.airportMaxDistance = Double(sender.value)
+        // Post notification for AR view to update
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 }
 
@@ -299,4 +330,93 @@ class SwitchCell: UITableViewCell {
         switchControl.removeTarget(nil, action: nil, for: .allEvents)
         switchControl.addTarget(target, action: action, for: .valueChanged)
     }
+}
+
+// MARK: - Custom Slider Cell
+
+class SliderCell: UITableViewCell {
+
+    private let slider = UISlider()
+    private let valueLabel = UILabel()
+    private let titleLabel = UILabel()
+    private let stackView = UIStackView()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+
+        // Configure title label
+        titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        titleLabel.textColor = .secondaryLabel
+
+        // Configure value label
+        valueLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        valueLabel.textColor = .label
+        valueLabel.textAlignment = .right
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        // Configure slider
+        slider.minimumValue = 10
+        slider.maximumValue = 50
+        slider.isContinuous = true
+
+        // Configure stack view
+        stackView.axis = .vertical
+        stackView.spacing = 8
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+
+        // Create top row with title and value
+        let topRow = UIStackView(arrangedSubviews: [titleLabel, valueLabel])
+        topRow.axis = .horizontal
+        topRow.spacing = 8
+
+        stackView.addArrangedSubview(topRow)
+        stackView.addArrangedSubview(slider)
+
+        contentView.addSubview(stackView)
+
+        NSLayoutConstraint.activate([
+            stackView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
+            stackView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            stackView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            stackView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -8)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(
+        title: String,
+        currentValue: Double,
+        minValue: Double,
+        maxValue: Double,
+        target: Any?,
+        action: Selector
+    ) {
+        titleLabel.text = title
+        slider.minimumValue = Float(minValue)
+        slider.maximumValue = Float(maxValue)
+        slider.value = Float(currentValue)
+        updateValueLabel(currentValue)
+
+        slider.removeTarget(nil, action: nil, for: .allEvents)
+        slider.addTarget(self, action: #selector(sliderValueChanged), for: .valueChanged)
+        slider.addTarget(target, action: action, for: .valueChanged)
+    }
+
+    @objc private func sliderValueChanged(_ sender: UISlider) {
+        updateValueLabel(Double(sender.value))
+    }
+
+    private func updateValueLabel(_ value: Double) {
+        valueLabel.text = String(format: "%.0f NM", value)
+    }
+}
+
+// MARK: - Notification Name Extension
+
+extension Notification.Name {
+    static let settingsDidChange = Notification.Name("settingsDidChange")
 }
