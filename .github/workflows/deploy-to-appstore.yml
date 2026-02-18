@@ -46,7 +46,7 @@ jobs:
           security list-keychain -d user -s $KEYCHAIN_PATH
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/f53b667d-98a6-4b80-aba7-1867200c6288.mobileprovision
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/e23e7540-6d1e-4f4a-b114-07e8ff5839fe.mobileprovision
 
       - name: Archive app
         run: |
@@ -59,7 +59,7 @@ jobs:
             DEVELOPMENT_TEAM="QVLT3KZ5QL" \
             CODE_SIGN_IDENTITY="Apple Distribution" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            "PROVISIONING_PROFILE=f53b667d-98a6-4b80-aba7-1867200c6288"
+            "PROVISIONING_PROFILE=e23e7540-6d1e-4f4a-b114-07e8ff5839fe"
 
       - name: Export IPA
         run: |
@@ -76,8 +76,8 @@ jobs:
               <string>QVLT3KZ5QL</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>com.gevsimon.Tally-Ho</key>
-                  <string>f53b667d-98a6-4b80-aba7-1867200c6288</string>
+                  <key>com.simon.tallyoh</key>
+                  <string>e23e7540-6d1e-4f4a-b114-07e8ff5839fe</string>
               </dict>
               <key>signingCertificate</key>
               <string>Apple Distribution</string>
