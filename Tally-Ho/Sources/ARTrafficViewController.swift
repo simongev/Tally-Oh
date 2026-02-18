@@ -11,6 +11,7 @@
 import UIKit
 import ARKit
 import CoreLocation
+import Combine
 
 class ARTrafficViewController: UIViewController {
 
@@ -405,6 +406,3 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     }
 }
 
-// MARK: - Combine Import
-
-import Combine
