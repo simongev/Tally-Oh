@@ -58,6 +58,7 @@ jobs:
             -scheme "Tally-Ho" \
             -archivePath $RUNNER_TEMP/app.xcarchive \
             -destination "generic/platform=iOS" \
+            -sdk iphoneos \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="QVLT3KZ5QL" \
             CODE_SIGN_IDENTITY="Apple Distribution" \
