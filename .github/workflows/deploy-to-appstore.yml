@@ -38,7 +38,7 @@ jobs:
           security list-keychain -d user -s $KEYCHAIN_PATH
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/f53b667d-98a6-4b80-aba7-1867200c6288.mobileprovision
 
       - name: Archive app
         run: |
@@ -48,7 +48,10 @@ jobs:
             -archivePath $RUNNER_TEMP/app.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}"
+            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            "PROVISIONING_PROFILE=f53b667d-98a6-4b80-aba7-1867200c6288"
 
       - name: Export IPA
         run: |
@@ -61,6 +64,13 @@ jobs:
               <string>app-store-connect</string>
               <key>teamID</key>
               <string>${{ secrets.TEAM_ID }}</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>com.gevsimon.Tally-Ho</key>
+                  <string>TallyHo_App_Store_Distribution</string>
+              </dict>
+              <key>signingCertificate</key>
+              <string>Apple Distribution</string>
               <key>uploadSymbols</key>
               <true/>
               <key>destination</key>
