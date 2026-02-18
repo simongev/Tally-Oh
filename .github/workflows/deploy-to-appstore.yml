@@ -51,6 +51,9 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/eca2bf89-ed32-42b4-b8bd-ac25e67a526b.mobileprovision
 
+      - name: Remove simulator platform
+        run: sudo rm -rf "$(xcode-select -p)/Platforms/iPhoneSimulator.platform"
+
       - name: Archive app
         run: |
           xcodebuild archive \
