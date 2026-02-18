@@ -29,7 +29,7 @@ jobs:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           PROVISION_PROFILE_BASE64: ${{ secrets.PROVISION_PROFILE_BASE64 }}
-          KEYCname: DeployD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
           echo -n "$P12_BASE64" | base64 --decode -o $CERTIFICATE_PATH
@@ -40,16 +40,16 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          securi        run: |
-          mkdir -p ~/private_keysHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
           security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/f53b667d-98a        run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/certiive app
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/f53b667d-98a6-4b80-aba7-1867200c6288.mobileprovision
+
+      - name: Archive app
         run: |
           xcodebuild archive \
             -project "Tally-Ho.xcodeproj" \
@@ -93,8 +93,8 @@ jobs:
           </plist>
           PLIST
 
-          xcodebuild -expo          <?xml version="1.0" encoding="UTF-8"?>
-         chive \
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/app.xcarchive \
             -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
             -exportPath $RUNNER_TEMP/export \
             -allowProvisioningUpdates \
@@ -108,8 +108,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcrun altool --upload-app \
-                      </dict>
-            
+            -f $RUNNER_TEMP/export/*.ipa \
             -t ios \
             --apiKey "$ASC_KEY_ID" \
             --apiIssuer "$ASC_ISSUER_ID"
