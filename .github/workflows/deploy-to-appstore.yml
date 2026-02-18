@@ -15,6 +15,14 @@ jobs:
       - name: Select Xcode version
         run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
 
+      - name: Set up App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+        run: |
+          mkdir -p ~/private_keys
+          echo -n "$ASC_API_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
       - name: Install Apple certificate and provisioning profile
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
@@ -38,7 +46,7 @@ jobs:
           security list-keychain -d user -s $KEYCHAIN_PATH
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/f53b667d-98a6-4b80-aba7-1867200c6288.mobileprovision
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/eca2bf89-ed32-42b4-b8bd-ac25e67a526b.mobileprovision
 
       - name: Archive app
         run: |
@@ -48,36 +56,36 @@ jobs:
             -archivePath $RUNNER_TEMP/app.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
+            DEVELOPMENT_TEAM="QVLT3KZ5QL" \
             CODE_SIGN_IDENTITY="Apple Distribution" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            "PROVISIONING_PROFILE=f53b667d-98a6-4b80-aba7-1867200c6288"
+            "PROVISIONING_PROFILE=eca2bf89-ed32-42b4-b8bd-ac25e67a526b"
 
       - name: Export IPA
         run: |
-          cat > $RUNNER_TEMP/ExportOptions.plist <<EOF
+          cat > $RUNNER_TEMP/ExportOptions.plist << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"\>
           <plist version="1.0">
           <dict>
               <key>method</key>
               <string>app-store-connect</string>
+              <key>signingStyle</key>
+              <string>manual</string>
               <key>teamID</key>
-              <string>${{ secrets.TEAM_ID }}</string>
+              <string>QVLT3KZ5QL</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>com.gevsimon.Tally-Ho</key>
-                  <string>TallyHo_App_Store_Distribution</string>
+                  <key>com.simon.tallyoh</key>
+                  <string>eca2bf89-ed32-42b4-b8bd-ac25e67a526b</string>
               </dict>
               <key>signingCertificate</key>
               <string>Apple Distribution</string>
               <key>uploadSymbols</key>
               <true/>
-              <key>destination</key>
-              <string>upload</string>
           </dict>
           </plist>
-          EOF
+          PLIST
 
           xcodebuild -exportArchive \
             -archivePath $RUNNER_TEMP/app.xcarchive \
@@ -88,11 +96,7 @@ jobs:
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
         run: |
-          mkdir -p ~/private_keys
-          echo -n "$ASC_API_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
-
           xcrun altool --upload-app \
             -f $RUNNER_TEMP/export/*.ipa \
             -t ios \
