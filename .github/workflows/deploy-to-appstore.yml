@@ -62,12 +62,14 @@ jobs:
           <dict>
               <key>method</key>
               <string>app-store-connect</string>
+              <key>signingStyle</key>
+              <string>manual</string>
               <key>teamID</key>
               <string>${{ secrets.TEAM_ID }}</string>
               <key>provisioningProfiles</key>
               <dict>
                   <key>com.gevsimon.Tally-Ho</key>
-                  <string>TallyHo_App_Store_Distribution</string>
+                  <string>f53b667d-98a6-4b80-aba7-1867200c6288</string>
               </dict>
               <key>signingCertificate</key>
               <string>Apple Distribution</string>
