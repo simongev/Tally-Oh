@@ -39,6 +39,12 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo -n "$BUILD_PROVISION_PROFILE_BASE64" | python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" > ~/Library/MobileDevice/Provisioning\ Profiles/eca2bf89-ed32-42b4-b8bd-ac25e67a526b.mobileprovision
 
+          # Convert P12 to legacy format for macOS 14 compatibility
+          openssl pkcs12 -in $CERTIFICATE_PATH -out /tmp/cert.pem -passin pass:$P12_PASSWORD -passout pass:temp123 -legacy 2>/dev/null || \
+          openssl pkcs12 -in $CERTIFICATE_PATH -out /tmp/cert.pem -passin pass:$P12_PASSWORD -passout pass:temp123
+          openssl pkcs12 -export -in /tmp/cert.pem -out $CERTIFICATE_PATH -passin pass:temp123 -passout pass:$P12_PASSWORD
+          rm /tmp/cert.pem
+
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
