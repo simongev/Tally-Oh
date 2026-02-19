@@ -292,10 +292,12 @@ struct ARVisualizationSettings {
     var showAircraft: Bool = true
     var aircraftMaxDistance: Double = 50.0  // nautical miles
 
-    // Aircraft label fields
-    var showAircraftLabels: Bool  = true
-    var showAircraftType:   Bool  = true   // e.g. "B738"
-    var showAircraftAltitude: Bool = true  // e.g. "35000 ft"
+    // Aircraft label fields — label auto-shown when any of these is true
+    var showAircraftType:     Bool = true   // e.g. "B738"
+    var showAircraftAltitude: Bool = true   // e.g. "35000 ft"
+
+    /// Derived: show label if any aircraft label field is enabled
+    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude }
 
     // MARK: Airports
     var showAirports: Bool = true
@@ -306,12 +308,11 @@ struct ARVisualizationSettings {
     var showMediumAirports: Bool = true
     var showSmallAirports:  Bool = true
 
-    // Airport label fields
-    var showAirportLabels:   Bool = true
+    // Airport label fields — label auto-shown when any of these is true
     var showAirportDistance: Bool = true   // e.g. "14.3 NM"
 
-    // MARK: Misc
-    var showGrid: Bool = false
+    /// Derived: show label if any airport label field is enabled
+    var showAirportLabels: Bool { showAirportDistance }
 
     /// Returns true if the given airport type should be displayed.
     func shouldShow(airportType: String) -> Bool {

@@ -2,8 +2,13 @@
 //  ConnectionLogic.swift
 //  TallyOh - AR Aviation Traffic Visualization
 //
-//  Handles connection to Sentri (ForeFlight) ADS-B receiver
-//  Receives and parses traffic data in GDL 90 format
+//  Handles ADS-B reception from ForeFlight Sentry (and compatible devices)
+//  and internet aircraft data from adsb.lol.
+//
+//  ADS-B note: Sentry BROADCASTS GDL 90 UDP packets to the local network on
+//  port 4000. We must LISTEN on that port — not connect outbound to the device.
+//  A UDP NWConnection to a remote host transitions to .ready immediately
+//  regardless of whether the device is present, giving a false "connected" status.
 //
 
 import Foundation
@@ -11,434 +16,303 @@ import Network
 import CoreLocation
 import Combine
 
-/// Data source for aircraft information
+// MARK: - Enums
+
 enum AircraftSource {
-    case adsb      // From local ADS-B receiver (Sentri)
-    case internet  // From adsb.lol API
+    case adsb
+    case internet
 }
 
-/// Represents an aircraft detected by ADS-B
+enum ConnectionStatus {
+    case searching      // listener is up, waiting for first packet
+    case receiving      // actively receiving ADS-B packets
+    case notAvailable   // listener failed to start
+    case disconnected
+}
+
+// MARK: - Aircraft
+
 struct Aircraft: Identifiable {
-    let id: String // ICAO address
+    let id: String
     var callsign: String
-    var aircraftType: String = "" // Aircraft type (e.g. "B738") — populated from internet source only
+    var aircraftType: String = ""
     var latitude: Double
     var longitude: Double
-    var altitude: Double // in feet MSL
-    var track: Double // true track in degrees
-    var groundSpeed: Double // in knots
-    var verticalRate: Double // in feet per minute
+    var altitude: Double       // feet MSL
+    var track: Double          // degrees true
+    var groundSpeed: Double    // knots
+    var verticalRate: Double   // feet per minute
     var lastUpdate: Date
-    var source: AircraftSource = .adsb // Data source (default to ADS-B)
+    var source: AircraftSource = .adsb
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 }
 
-/// Connection status for the ADS-B receiver
-enum ConnectionStatus {
-    case disconnected
-    case connecting
-    case connected
-    case error(String)
-}
+// MARK: - ConnectionLogic
 
-/// Handles connection and data reception from Sentri ADS-B receiver and internet sources
 class ConnectionLogic: ObservableObject {
 
-    // MARK: - Published Properties
+    // MARK: Published
 
     @Published var connectionStatus: ConnectionStatus = .disconnected
-    @Published var detectedAircraft: [String: Aircraft] = [:] // Key: ICAO address
-    @Published var ownshipData: Aircraft?
+    @Published var detectedAircraft: [String: Aircraft] = [:]
+    @Published var ownshipData: Aircraft?           // GPS/altitude from ADS-B ownship report
     @Published var isInternetAvailable: Bool = false
     @Published var internetAircraftCount: Int = 0
 
-    // MARK: - Private Properties
+    // MARK: Private — ADS-B listener
 
-    // ADS-B Connection
-    private var connection: NWConnection?
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "com.tallyoh.adsb", qos: .userInitiated)
+    private let adsbQueue = DispatchQueue(label: "com.tallyoh.adsb", qos: .userInitiated)
+    private let adsbPort: NWEndpoint.Port = 4000
 
-    // Sentri typically broadcasts on these ports
-    // GDL 90 protocol uses UDP port 4000 or TCP port 2000
-    private let defaultHost = "192.168.10.1" // Typical Sentri IP
-    private let defaultPort: UInt16 = 4000
+    /// Time of last received GDL90 packet — used to detect signal loss
+    private var lastPacketReceived: Date?
+    private var signalWatchdogTimer: Timer?
 
-    // Internet Data
+    // MARK: Private — Internet
+
     private let adsbLolClient = ADSBLolClient()
     private let networkReachability = NetworkReachability()
     private var internetFetchTimer: Timer?
-    private let internetFetchInterval: TimeInterval = 10.0 // Fetch every 10 seconds
-
-    // User location for internet queries
+    private let internetFetchInterval: TimeInterval = 10.0
     private var currentLocation: CLLocationCoordinate2D?
-    private let internetQueryRadius: Double = 50.0 // 50 NM radius
+    private let internetQueryRadius: Double = 50.0
 
-    // Aircraft timeout - remove if not seen for 60 seconds
+    // MARK: Private — Cleanup
+
     private let aircraftTimeout: TimeInterval = 60.0
     private var cleanupTimer: Timer?
+    private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - Initialization
+    // MARK: Init
 
     init() {
-        setupCleanupTimer()
         setupNetworkMonitoring()
+        setupCleanupTimer()
+        setupSignalWatchdog()
     }
 
     deinit {
-        disconnect()
+        stopListening()
         cleanupTimer?.invalidate()
         internetFetchTimer?.invalidate()
+        signalWatchdogTimer?.invalidate()
         networkReachability.stopMonitoring()
     }
 
-    // MARK: - Public Methods
+    // MARK: - Public
 
-    /// Connect to Sentri ADS-B receiver
-    func connect(host: String? = nil, port: UInt16? = nil) {
-        let targetHost = host ?? defaultHost
-        let targetPort = port ?? defaultPort
+    /// Start listening for ADS-B broadcasts. Called once on app launch.
+    func startListening() {
+        guard listener == nil else { return }
 
-        connectionStatus = .connecting
+        do {
+            listener = try NWListener(using: .udp, on: adsbPort)
+        } catch {
+            print("❌ Failed to create ADS-B listener: \(error)")
+            DispatchQueue.main.async { self.connectionStatus = .notAvailable }
+            return
+        }
 
-        // Create UDP connection
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(targetHost),
-            port: NWEndpoint.Port(rawValue: targetPort)!
-        )
+        listener?.newConnectionHandler = { [weak self] conn in
+            conn.start(queue: self?.adsbQueue ?? .global())
+            self?.receiveFrom(conn)
+        }
 
-        connection = NWConnection(
-            to: endpoint,
-            using: .udp
-        )
-
-        connection?.stateUpdateHandler = { [weak self] state in
+        listener?.stateUpdateHandler = { [weak self] state in
             DispatchQueue.main.async {
-                self?.handleConnectionState(state)
+                switch state {
+                case .ready:
+                    print("📡 ADS-B listener ready on port 4000")
+                    self?.connectionStatus = .searching
+                case .failed(let err):
+                    print("❌ ADS-B listener failed: \(err)")
+                    self?.connectionStatus = .notAvailable
+                default:
+                    break
+                }
             }
         }
 
-        startReceiving()
-        connection?.start(queue: queue)
+        listener?.start(queue: adsbQueue)
+        DispatchQueue.main.async { self.connectionStatus = .searching }
     }
 
-    /// Disconnect from ADS-B receiver
-    func disconnect() {
-        connection?.cancel()
-        connection = nil
+    func stopListening() {
         listener?.cancel()
         listener = nil
-
-        DispatchQueue.main.async { [weak self] in
-            self?.connectionStatus = .disconnected
-            self?.detectedAircraft.removeAll()
-            self?.ownshipData = nil
+        DispatchQueue.main.async {
+            self.connectionStatus = .disconnected
+            self.detectedAircraft.removeAll()
+            self.ownshipData = nil
         }
     }
 
-    /// Manually add test aircraft for development/testing
+    func updateLocation(_ location: CLLocationCoordinate2D) {
+        currentLocation = location
+        // Kick off internet fetching now that we have a location, if not already running
+        if isInternetAvailable {
+            ensureInternetFetchRunning()
+        }
+    }
+
     func addTestAircraft() {
-        let testAircraft = Aircraft(
+        let test = Aircraft(
             id: "TEST01",
             callsign: "N12345",
             aircraftType: "C172",
-            latitude: 37.7749,
-            longitude: -122.4194,
+            latitude: (currentLocation?.latitude ?? 37.7749) + 0.05,
+            longitude: (currentLocation?.longitude ?? -122.4194) + 0.05,
             altitude: 5500,
             track: 270,
             groundSpeed: 120,
             verticalRate: 0,
             lastUpdate: Date(),
-            source: .adsb
+            source: .internet
         )
-
-        DispatchQueue.main.async { [weak self] in
-            self?.detectedAircraft[testAircraft.id] = testAircraft
-        }
+        DispatchQueue.main.async { self.detectedAircraft[test.id] = test }
     }
 
-    /// Update user location for internet queries
-    func updateLocation(_ location: CLLocationCoordinate2D) {
-        currentLocation = location
+    // MARK: - Private — ADS-B
 
-        // Start internet fetching if not already started and internet is available
-        if isInternetAvailable && internetFetchTimer == nil {
-            startInternetFetching()
-        }
-    }
-
-    // MARK: - Private Methods
-
-    /// Setup network monitoring
-    private func setupNetworkMonitoring() {
-        networkReachability.$isConnected
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] isConnected in
-                self?.isInternetAvailable = isConnected
-
-                if isConnected {
-                    print("🌐 Internet available - starting adsb.lol data fetching")
-                    self?.startInternetFetching()
-                } else {
-                    print("🌐 Internet unavailable - stopping adsb.lol data fetching")
-                    self?.stopInternetFetching()
-                }
-            }
-            .store(in: &cancellables)
-    }
-
-    /// Start fetching data from internet
-    private func startInternetFetching() {
-        guard internetFetchTimer == nil, let location = currentLocation else {
-            return
-        }
-
-        // Fetch immediately
-        fetchInternetData()
-
-        // Setup timer for periodic fetching
-        internetFetchTimer = Timer.scheduledTimer(
-            withTimeInterval: internetFetchInterval,
-            repeats: true
-        ) { [weak self] _ in
-            self?.fetchInternetData()
-        }
-    }
-
-    /// Stop fetching data from internet
-    private func stopInternetFetching() {
-        internetFetchTimer?.invalidate()
-        internetFetchTimer = nil
-
-        // Remove internet-sourced aircraft
-        DispatchQueue.main.async { [weak self] in
-            self?.detectedAircraft = self?.detectedAircraft.filter { _, aircraft in
-                aircraft.source == .adsb
-            } ?? [:]
-            self?.internetAircraftCount = 0
-        }
-    }
-
-    /// Fetch aircraft data from internet
-    private func fetchInternetData() {
-        guard let location = currentLocation else { return }
-
-        adsbLolClient.fetchAircraft(
-            latitude: location.latitude,
-            longitude: location.longitude,
-            radiusNM: internetQueryRadius
-        ) { [weak self] result in
-            switch result {
-            case .success(let aircraft):
-                self?.mergeInternetAircraft(aircraft)
-
-            case .failure(let error):
-                print("⚠️ Failed to fetch internet aircraft data: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    /// Merge internet aircraft data with ADS-B data (ADS-B has priority)
-    private func mergeInternetAircraft(_ internetAircraft: [Aircraft]) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-
-            var internetCount = 0
-
-            for aircraft in internetAircraft {
-                // Check if we already have this aircraft from ADS-B
-                if let existing = self.detectedAircraft[aircraft.id] {
-                    // If existing aircraft is from ADS-B, keep it (ADS-B has priority)
-                    if existing.source == .adsb {
-                        continue
-                    }
-                }
-
-                // Add or update internet aircraft
-                self.detectedAircraft[aircraft.id] = aircraft
-                internetCount += 1
-            }
-
-            self.internetAircraftCount = internetCount
-
-            if internetCount > 0 {
-                print("🌐 Added/updated \(internetCount) aircraft from adsb.lol")
-            }
-        }
-    }
-
-    private var cancellables = Set<AnyCancellable>()
-
-    private func handleConnectionState(_ state: NWConnection.State) {
-        switch state {
-        case .ready:
-            connectionStatus = .connected
-            print("✓ Connected to Sentri ADS-B receiver")
-
-        case .waiting(let error):
-            connectionStatus = .error("Waiting: \(error.localizedDescription)")
-            print("⚠ Waiting for connection: \(error)")
-
-        case .failed(let error):
-            connectionStatus = .error("Failed: \(error.localizedDescription)")
-            print("✗ Connection failed: \(error)")
-
-        case .cancelled:
-            connectionStatus = .disconnected
-            print("✗ Connection cancelled")
-
-        default:
-            break
-        }
-    }
-
-    private func startReceiving() {
-        connection?.receiveMessage { [weak self] data, context, isComplete, error in
+    private func receiveFrom(_ conn: NWConnection) {
+        conn.receiveMessage { [weak self] data, _, _, error in
             if let data = data, !data.isEmpty {
                 self?.processGDL90Data(data)
-            }
-
-            if let error = error {
-                print("Receive error: \(error)")
                 DispatchQueue.main.async {
-                    self?.connectionStatus = .error(error.localizedDescription)
+                    self?.lastPacketReceived = Date()
+                    if self?.connectionStatus != .receiving {
+                        self?.connectionStatus = .receiving
+                        print("✅ ADS-B signal acquired")
+                    }
                 }
-            } else {
-                // Continue receiving
-                self?.startReceiving()
+            }
+            if error == nil {
+                self?.receiveFrom(conn)   // keep receiving
+            }
+        }
+    }
+
+    /// Watchdog: if no packet received in 10 s, drop back to .searching
+    private func setupSignalWatchdog() {
+        signalWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard self.connectionStatus == .receiving else { return }
+            if let last = self.lastPacketReceived, Date().timeIntervalSince(last) > 10.0 {
+                DispatchQueue.main.async {
+                    self.connectionStatus = .searching
+                    print("⚠️ ADS-B signal lost")
+                }
             }
         }
     }
 
     private func processGDL90Data(_ data: Data) {
-        // GDL 90 message format:
-        // 0x7E (flag byte) + Message ID + Data + FCS + 0x7E (flag byte)
-
-        guard data.count >= 5 else { return }
-
-        // Remove flag bytes
-        var messageData = data
-        if messageData.first == 0x7E {
-            messageData.removeFirst()
-        }
-        if messageData.last == 0x7E {
-            messageData.removeLast()
-        }
-
-        guard let messageType = messageData.first else { return }
-
-        switch messageType {
-        case 0x00: // Heartbeat
-            break
-
-        case 0x0A: // Ownship Report
-            if let aircraft = parseTrafficReport(messageData, isOwnship: true) {
-                DispatchQueue.main.async { [weak self] in
-                    self?.ownshipData = aircraft
-                }
+        // Scan for 0x7E frame boundaries — a UDP packet may contain multiple messages
+        var bytes = [UInt8](data)
+        var i = 0
+        while i < bytes.count {
+            guard bytes[i] == 0x7E else { i += 1; continue }
+            // Find closing flag
+            if let end = bytes[(i+1)...].firstIndex(of: 0x7E) {
+                let payload = Array(bytes[(i+1)..<end])
+                handleGDL90Message(payload)
+                i = end + 1
+            } else {
+                break
             }
-
-        case 0x14: // Traffic Report
-            if let aircraft = parseTrafficReport(messageData, isOwnship: false) {
-                DispatchQueue.main.async { [weak self] in
-                    self?.detectedAircraft[aircraft.id] = aircraft
-                }
-            }
-
-        case 0x0B: // Ownship Geometric Altitude
-            break
-
-        default:
-            break
         }
     }
 
-    private func parseTrafficReport(_ data: Data, isOwnship: Bool) -> Aircraft? {
-        // GDL 90 Traffic Report format (simplified)
-        // This is a basic implementation - full GDL 90 parsing is complex
+    private func handleGDL90Message(_ payload: [UInt8]) {
+        guard let msgType = payload.first else { return }
+        switch msgType {
+        case 0x00: break  // Heartbeat
+        case 0x0A:        // Ownship
+            if let ac = parseTrafficPayload(payload, isOwnship: true) {
+                DispatchQueue.main.async { self.ownshipData = ac }
+            }
+        case 0x14:        // Traffic
+            if let ac = parseTrafficPayload(payload, isOwnship: false) {
+                DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
+            }
+        case 0x0B: break  // Ownship geometric alt (parsed inside ownship if needed)
+        default: break
+        }
+    }
 
-        guard data.count >= 28 else { return nil }
+    private func parseTrafficPayload(_ payload: [UInt8], isOwnship: Bool) -> Aircraft? {
+        // GDL 90 traffic report: 28 bytes after framing stripped
+        guard payload.count >= 28 else { return nil }
 
-        var index = 1 // Skip message type
+        var i = 1 // skip message ID byte
 
-        // Status byte
-        let status = data[index]
-        index += 1
+        // Status (1 byte)
+        i += 1
+        // Address type (1 byte) + ICAO (3 bytes)
+        i += 1
+        guard i + 3 <= payload.count else { return nil }
+        let icao = String(format: "%02X%02X%02X", payload[i], payload[i+1], payload[i+2])
+        i += 3
 
-        // Address Type and Address (3 bytes)
-        let addressType = data[index]
-        index += 1
-
-        let icaoAddress = String(format: "%02X%02X%02X",
-                                data[index], data[index + 1], data[index + 2])
-        index += 3
-
-        // Latitude (3 bytes, two's complement)
-        let latBytes = [UInt8](data[index..<index+3])
-        let latRaw = Int32(latBytes[0]) << 16 | Int32(latBytes[1]) << 8 | Int32(latBytes[2])
-        let latitude = Double(latRaw) * (180.0 / 8388608.0)
-        index += 3
+        // Latitude (3 bytes, two's complement, semicircles)
+        guard i + 3 <= payload.count else { return nil }
+        var latRaw = Int32(payload[i]) << 16 | Int32(payload[i+1]) << 8 | Int32(payload[i+2])
+        if latRaw & 0x800000 != 0 { latRaw |= Int32(bitPattern: 0xFF000000) }
+        let latitude = Double(latRaw) * (180.0 / 8_388_608.0)
+        i += 3
 
         // Longitude (3 bytes, two's complement)
-        let lonBytes = [UInt8](data[index..<index+3])
-        let lonRaw = Int32(lonBytes[0]) << 16 | Int32(lonBytes[1]) << 8 | Int32(lonBytes[2])
-        let longitude = Double(lonRaw) * (180.0 / 8388608.0)
-        index += 3
+        guard i + 3 <= payload.count else { return nil }
+        var lonRaw = Int32(payload[i]) << 16 | Int32(payload[i+1]) << 8 | Int32(payload[i+2])
+        if lonRaw & 0x800000 != 0 { lonRaw |= Int32(bitPattern: 0xFF000000) }
+        let longitude = Double(lonRaw) * (180.0 / 8_388_608.0)
+        i += 3
 
-        // Altitude (12 bits)
-        let altRaw = (UInt16(data[index]) << 4) | (UInt16(data[index + 1]) >> 4)
-        let altitude = Double(altRaw) * 25.0 - 1000.0 // 25 ft resolution, -1000 ft offset
-        index += 2
+        // Altitude: upper 12 bits of next 2 bytes, 25 ft resolution, -1000 ft offset
+        guard i + 2 <= payload.count else { return nil }
+        let altCode = (UInt16(payload[i]) << 4) | (UInt16(payload[i+1]) >> 4)
+        let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
+        i += 2
 
-        // Misc indicator byte
-        index += 1
+        // Misc (1), NIC (1), NACp (1)
+        i += 3
 
-        // NIC (Navigation Integrity Category)
-        index += 1
+        // Horizontal velocity: upper 12 bits of next 2 bytes (knots)
+        guard i + 2 <= payload.count else { return nil }
+        let hvCode = (UInt16(payload[i]) << 4) | (UInt16(payload[i+1]) >> 4)
+        let groundSpeed = hvCode == 0xFFF ? 0.0 : Double(hvCode)
+        i += 1   // only advance 1 — vv shares the lower nibble
 
-        // NACp (Navigation Accuracy Category - Position)
-        index += 1
+        // Vertical velocity: lower nibble of byte at i, then full byte at i+1
+        guard i + 2 <= payload.count else { return nil }
+        let vvRaw = (Int16(payload[i] & 0x0F) << 8) | Int16(payload[i+1])
+        let vvSigned = vvRaw > 2047 ? vvRaw - 4096 : vvRaw
+        let verticalRate = Double(vvSigned) * 64.0
+        i += 2
 
-        // Horizontal velocity (12 bits)
-        let hvBytes = [UInt8](data[index..<index+2])
-        let hvRaw = (UInt16(hvBytes[0]) << 4) | (UInt16(hvBytes[1]) >> 4)
-        let groundSpeed = Double(hvRaw)
-        index += 1
+        // Track (1 byte, 0–255 maps to 0–360°)
+        guard i < payload.count else { return nil }
+        let track = Double(payload[i]) * (360.0 / 256.0)
+        i += 1
 
-        // Vertical velocity (12 bits, in 64 fpm increments)
-        let vvByte1 = UInt16(data[index]) & 0x0F
-        let vvByte2 = UInt16(data[index + 1])
-        let vvRaw = (vvByte1 << 8) | vvByte2
-        let verticalRate = Double(Int16(bitPattern: vvRaw)) * 64.0
-        index += 2
+        // Emitter category (1 byte)
+        i += 1
 
-        // Track/Heading
-        let trackRaw = data[index]
-        let track = Double(trackRaw) * (360.0 / 256.0)
-        index += 1
-
-        // Emitter category
-        index += 1
-
-        // Callsign: 8 ASCII characters (bytes 19–26)
-        var callsign: String
-        if isOwnship {
-            callsign = "OWNSHIP"
-        } else if index + 8 <= data.count {
-            let callsignBytes = data[index..<(index + 8)]
-            let raw = String(bytes: callsignBytes, encoding: .ascii) ?? ""
+        // Callsign: up to 8 ASCII chars
+        var callsign = icao
+        if !isOwnship, i + 8 <= payload.count {
+            let raw = String(bytes: payload[i..<(i+8)], encoding: .ascii) ?? ""
             let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
-            callsign = trimmed.isEmpty ? icaoAddress : trimmed
-        } else {
-            callsign = icaoAddress
+            if !trimmed.isEmpty { callsign = trimmed }
         }
 
         return Aircraft(
-            id: icaoAddress,
-            callsign: callsign,
+            id: isOwnship ? "OWNSHIP" : icao,
+            callsign: isOwnship ? "OWNSHIP" : callsign,
             latitude: latitude,
             longitude: longitude,
             altitude: altitude,
@@ -450,19 +324,76 @@ class ConnectionLogic: ObservableObject {
         )
     }
 
-    private func setupCleanupTimer() {
-        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
-            self?.cleanupOldAircraft()
+    // MARK: - Private — Internet
+
+    private func setupNetworkMonitoring() {
+        networkReachability.$isConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                self?.isInternetAvailable = connected
+                if connected {
+                    self?.ensureInternetFetchRunning()
+                } else {
+                    self?.stopInternetFetching()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func ensureInternetFetchRunning() {
+        guard currentLocation != nil else { return }
+        guard internetFetchTimer == nil else { return }
+        fetchInternetData()
+        internetFetchTimer = Timer.scheduledTimer(withTimeInterval: internetFetchInterval, repeats: true) { [weak self] _ in
+            self?.fetchInternetData()
         }
     }
 
-    private func cleanupOldAircraft() {
-        let now = Date()
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
+    private func stopInternetFetching() {
+        internetFetchTimer?.invalidate()
+        internetFetchTimer = nil
+        DispatchQueue.main.async {
+            self.detectedAircraft = self.detectedAircraft.filter { $0.value.source == .adsb }
+            self.internetAircraftCount = 0
+        }
+    }
 
-            self.detectedAircraft = self.detectedAircraft.filter { _, aircraft in
-                now.timeIntervalSince(aircraft.lastUpdate) < self.aircraftTimeout
+    private func fetchInternetData() {
+        guard let loc = currentLocation else { return }
+        adsbLolClient.fetchAircraft(
+            latitude: loc.latitude,
+            longitude: loc.longitude,
+            radiusNM: internetQueryRadius
+        ) { [weak self] result in
+            switch result {
+            case .success(let aircraft):
+                self?.mergeInternetAircraft(aircraft)
+            case .failure(let err):
+                print("⚠️ adsb.lol fetch failed: \(err.localizedDescription)")
+            }
+        }
+    }
+
+    private func mergeInternetAircraft(_ list: [Aircraft]) {
+        DispatchQueue.main.async {
+            var count = 0
+            for ac in list {
+                if let existing = self.detectedAircraft[ac.id], existing.source == .adsb { continue }
+                self.detectedAircraft[ac.id] = ac
+                count += 1
+            }
+            self.internetAircraftCount = count
+        }
+    }
+
+    // MARK: - Private — Cleanup
+
+    private func setupCleanupTimer() {
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let cutoff = Date().addingTimeInterval(-self.aircraftTimeout)
+            DispatchQueue.main.async {
+                self.detectedAircraft = self.detectedAircraft.filter { $0.value.lastUpdate > cutoff }
             }
         }
     }

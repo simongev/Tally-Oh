@@ -10,13 +10,13 @@ import Combine
 
 class ARTrafficViewController: UIViewController {
 
-    // MARK: - UI Components
+    // MARK: - UI
 
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
     private var settingsButton: UIButton!
 
-    // MARK: - Core Components
+    // MARK: - Core
 
     private var connectionLogic = ConnectionLogic()
     private var sceneManager: ARSceneManager?
@@ -25,8 +25,12 @@ class ARTrafficViewController: UIViewController {
     // MARK: - State
 
     private var airports: [Airport] = []
+
+    /// Always from iPhone CLLocationManager — primary positioning source.
     private var userLocation: CLLocationCoordinate2D?
+    /// Altitude from iPhone barometer/GPS (meters, converted to feet).
     private var userAltitude: Double = 0
+    /// Heading from iPhone compass.
     private var userHeading: Double = 0
 
     private var updateTimer: Timer?
@@ -36,8 +40,6 @@ class ARTrafficViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-
-        // Keep screen always on
         UIApplication.shared.isIdleTimerDisabled = true
 
         setupUI()
@@ -46,8 +48,13 @@ class ARTrafficViewController: UIViewController {
         setupObservers()
         loadAirports()
 
-        // Auto-connect to Sentri ADS-B on launch (runs in background; no user action needed)
-        connectionLogic.connect()
+        // Load persisted settings before starting
+        if let saved = ARVisualizationSettings.load() {
+            sceneManager?.settings = saved
+        }
+
+        // Begin listening for ADS-B broadcasts in background
+        connectionLogic.startListening()
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -63,7 +70,7 @@ class ARTrafficViewController: UIViewController {
 
     deinit {
         UIApplication.shared.isIdleTimerDisabled = false
-        connectionLogic.disconnect()
+        connectionLogic.stopListening()
     }
 
     // MARK: - Setup
@@ -71,12 +78,10 @@ class ARTrafficViewController: UIViewController {
     private func setupUI() {
         view.backgroundColor = .black
 
-        // AR Scene View — fills the whole screen
         arSceneView = ARSCNView(frame: view.bounds)
         arSceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(arSceneView)
 
-        // Status Label — top-left HUD
         statusLabel = UILabel()
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.65)
@@ -95,7 +100,6 @@ class ARTrafficViewController: UIViewController {
             statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
 
-        // Settings Button — bottom-right corner only
         settingsButton = UIButton(type: .system)
         settingsButton.translatesAutoresizingMaskIntoConstraints = false
         settingsButton.setTitle("⚙️", for: .normal)
@@ -128,19 +132,21 @@ class ARTrafficViewController: UIViewController {
     }
 
     private func setupObservers() {
-        // Reflect Sentri connection changes in the status label
         connectionLogic.$connectionStatus
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateStatusLabel() }
             .store(in: &cancellables)
 
-        // Reflect internet status changes
         connectionLogic.$isInternetAvailable
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateStatusLabel() }
             .store(in: &cancellables)
 
-        // 1-second update loop for AR visualization
+        connectionLogic.$detectedAircraft
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusLabel() }
+            .store(in: &cancellables)
+
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
@@ -158,10 +164,10 @@ class ARTrafficViewController: UIViewController {
     }
 
     private func startARSession() {
-        let configuration = ARWorldTrackingConfiguration()
-        configuration.worldAlignment = .gravityAndHeading
-        configuration.providesAudioData = false
-        arSceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        let config = ARWorldTrackingConfiguration()
+        config.worldAlignment = .gravityAndHeading
+        config.providesAudioData = false
+        arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
 
     // MARK: - Settings
@@ -170,7 +176,7 @@ class ARTrafficViewController: UIViewController {
         guard let settings = sceneManager?.settings else { return }
         let vc = SettingsViewController(settings: settings) { [weak self] updated in
             self?.sceneManager?.settings = updated
-            // Clear and redraw so type-filter changes take effect immediately
+            updated.save()
             self?.sceneManager?.clearAll()
         }
         let nav = UINavigationController(rootViewController: vc)
@@ -181,47 +187,44 @@ class ARTrafficViewController: UIViewController {
     // MARK: - Update Loop
 
     private func updateVisualization() {
-        guard let userLocation = userLocation else { return }
-
+        guard let loc = userLocation else { return }
         sceneManager?.updateAircraft(
             Array(connectionLogic.detectedAircraft.values),
-            userLocation: userLocation,
+            userLocation: loc,
             userAltitude: userAltitude,
             userHeading: userHeading
         )
-
         sceneManager?.updateAirports(
             airports,
-            userLocation: userLocation,
+            userLocation: loc,
             userAltitude: userAltitude,
             userHeading: userHeading
         )
-
         updateStatusLabel()
     }
 
-    // MARK: - HUD Status Label
+    // MARK: - HUD
 
     private func updateStatusLabel() {
         var lines: [String] = []
 
-        // ADS-B / Sentri status
+        // ADS-B status
         switch connectionLogic.connectionStatus {
-        case .connected:   lines.append("📡 Sentri: Connected")
-        case .connecting:  lines.append("📡 Sentri: Connecting…")
-        case .disconnected: lines.append("📡 Sentri: Searching…")
-        case .error:       lines.append("📡 Sentri: Not found")
+        case .receiving:     lines.append("📡 ADS-B: Receiving")
+        case .searching:     lines.append("📡 ADS-B: Searching…")
+        case .notAvailable:  lines.append("📡 ADS-B: Unavailable")
+        case .disconnected:  lines.append("📡 ADS-B: Off")
         }
 
         // Internet
         lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
 
-        // GPS
+        // GPS — always from iPhone
         if let loc = userLocation {
-            lines.append(String(format: "📍 %.4f°  %.4f°", loc.latitude, loc.longitude))
+            lines.append(String(format: "📍 %.4f°  %.4f°  (iPhone GPS)", loc.latitude, loc.longitude))
             lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f°", userAltitude, userHeading))
         } else {
-            lines.append("📍 Waiting for GPS…")
+            lines.append("📍 GPS: Acquiring…")
         }
 
         // Traffic
@@ -229,26 +232,23 @@ class ARTrafficViewController: UIViewController {
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
         var trafficLine = "🛩 Aircraft: \(total)"
-        if adsbCnt > 0 || netCnt > 0 {
-            var parts: [String] = []
-            if adsbCnt > 0 { parts.append("ADS-B:\(adsbCnt)") }
-            if netCnt  > 0 { parts.append("Net:\(netCnt)") }
-            trafficLine += " (\(parts.joined(separator: " ")))"
-        }
+        var parts: [String] = []
+        if adsbCnt > 0 { parts.append("ADS-B:\(adsbCnt)") }
+        if netCnt  > 0 { parts.append("Net:\(netCnt)") }
+        if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
         lines.append(trafficLine)
 
         // Airports
-        lines.append("🛫 Airports loaded: \(airports.count)")
+        lines.append("🛫 Airports: \(airports.count)")
         if let loc = userLocation {
             let nearby = CalculationsLogic.filterAirportsInRange(
                 airports: airports,
                 userCoord: loc,
-                maxRangeNauticalMiles: 50.0
+                maxRangeNauticalMiles: sceneManager?.settings.airportMaxDistance ?? 50
             )
             lines.append("🛫 Nearby: \(nearby.count)")
         }
 
-        // Pad each line with a small left margin
         statusLabel.text = lines.map { "  \($0)  " }.joined(separator: "\n")
     }
 }
@@ -256,19 +256,11 @@ class ARTrafficViewController: UIViewController {
 // MARK: - ARSCNViewDelegate
 
 extension ARTrafficViewController: ARSCNViewDelegate {
-
     func session(_ session: ARSession, didFailWithError error: Error) {
-        print("AR Session failed: \(error.localizedDescription)")
+        print("AR error: \(error.localizedDescription)")
     }
-
-    func sessionWasInterrupted(_ session: ARSession) {
-        print("AR Session interrupted")
-    }
-
-    func sessionInterruptionEnded(_ session: ARSession) {
-        print("AR Session resumed")
-        startARSession()
-    }
+    func sessionWasInterrupted(_ session: ARSession) { }
+    func sessionInterruptionEnded(_ session: ARSession) { startARSession() }
 }
 
 // MARK: - CLLocationManagerDelegate
@@ -276,10 +268,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 extension ARTrafficViewController: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let location = locations.last else { return }
-        userLocation = location.coordinate
-        userAltitude = location.altitude * CalculationsLogic.metersToFeet
-        connectionLogic.updateLocation(location.coordinate)
+        guard let loc = locations.last else { return }
+        // Always use iPhone GPS for positioning
+        userLocation = loc.coordinate
+        userAltitude = loc.altitude * CalculationsLogic.metersToFeet
+        connectionLogic.updateLocation(loc.coordinate)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
