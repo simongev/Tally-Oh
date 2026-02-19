@@ -21,6 +21,7 @@ enum AircraftSource {
 struct Aircraft: Identifiable {
     let id: String // ICAO address
     var callsign: String
+    var aircraftType: String = "" // Aircraft type (e.g. "B738") — populated from internet source only
     var latitude: Double
     var longitude: Double
     var altitude: Double // in feet MSL
@@ -143,6 +144,7 @@ class ConnectionLogic: ObservableObject {
         let testAircraft = Aircraft(
             id: "TEST01",
             callsign: "N12345",
+            aircraftType: "C172",
             latitude: 37.7749,
             longitude: -122.4194,
             altitude: 5500,
@@ -416,9 +418,23 @@ class ConnectionLogic: ObservableObject {
         // Track/Heading
         let trackRaw = data[index]
         let track = Double(trackRaw) * (360.0 / 256.0)
+        index += 1
 
-        // Extract callsign if available (simplified)
-        let callsign = isOwnship ? "OWNSHIP" : "N\(icaoAddress)"
+        // Emitter category
+        index += 1
+
+        // Callsign: 8 ASCII characters (bytes 19–26)
+        var callsign: String
+        if isOwnship {
+            callsign = "OWNSHIP"
+        } else if index + 8 <= data.count {
+            let callsignBytes = data[index..<(index + 8)]
+            let raw = String(bytes: callsignBytes, encoding: .ascii) ?? ""
+            let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
+            callsign = trimmed.isEmpty ? icaoAddress : trimmed
+        } else {
+            callsign = icaoAddress
+        }
 
         return Aircraft(
             id: icaoAddress,

@@ -62,6 +62,11 @@ class AirportDataParser {
 
     // MARK: - Private
 
+    /// Public airport types to display by default
+    static let publicAirportTypes: Set<String> = [
+        "large_airport", "medium_airport", "small_airport"
+    ]
+
     /// Parse a single CSV line into an Airport, returning nil for invalid/unusable rows
     private static func parseCSVLine(_ line: String) -> Airport? {
         let fields = parseCSVFields(line)
@@ -73,6 +78,10 @@ class AirportDataParser {
               let longitude = Double(fields[Column.longitude.rawValue]) else {
             return nil
         }
+
+        // Airport type — filter to public airports only
+        let airportType = fields[Column.type.rawValue]
+        guard publicAirportTypes.contains(airportType) else { return nil }
 
         // Use icao_code first, fall back to gps_code, then ident
         let icao = bestIdentifier(fields: fields)
@@ -88,6 +97,7 @@ class AirportDataParser {
             id: icao,
             icao: icao,
             name: name,
+            type: airportType,
             latitude: latitude,
             longitude: longitude,
             elevation: elevation

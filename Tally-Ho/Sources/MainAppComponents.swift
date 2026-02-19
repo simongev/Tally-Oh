@@ -58,23 +58,18 @@ class ARComponentFactory {
         let repeatPulse = SCNAction.repeatForever(pulse)
         circleNode.runAction(repeatPulse)
 
-        // Add callsign label above the circle
+        // Build combined label: "CALLSIGN / TYPE\nALT ft" (type only if non-empty)
+        let line1 = aircraft.aircraftType.isEmpty
+            ? aircraft.callsign
+            : "\(aircraft.callsign) / \(aircraft.aircraftType)"
+        let line2 = String(format: "%.0f ft", aircraft.altitude)
+        let labelText = "\(line1)\n\(line2)"
         let labelNode = createTextLabel(
-            text: aircraft.callsign,
-            color: .red,
+            text: labelText,
+            color: .white,
             position: SCNVector3(0, radius + 10, 0)
         )
         containerNode.addChildNode(labelNode)
-
-        // Add altitude label below the callsign
-        let altitudeText = String(format: "%.0f ft", aircraft.altitude)
-        let altitudeNode = createTextLabel(
-            text: altitudeText,
-            color: .white,
-            position: SCNVector3(0, radius + 5, 0)
-        )
-        altitudeNode.scale = SCNVector3(0.7, 0.7, 0.7)
-        containerNode.addChildNode(altitudeNode)
 
         // Add velocity indicator (arrow showing direction)
         let arrowNode = createDirectionArrow(
@@ -131,10 +126,12 @@ class ARComponentFactory {
     /// - Parameters:
     ///   - position: Position in AR scene
     ///   - airport: Airport data
+    ///   - distanceNM: Distance from user to airport in nautical miles (shown in label)
     /// - Returns: SCNNode containing the airport visualization
     static func createAirportMarker(
         position: SCNVector3,
-        airport: Airport
+        airport: Airport,
+        distanceNM: Double
     ) -> SCNNode {
 
         let containerNode = SCNNode()
@@ -163,9 +160,10 @@ class ARComponentFactory {
 
         containerNode.addChildNode(coneNode)
 
-        // Add ICAO code label above the cone
+        // Add ICAO code + distance label above the cone
+        let airportLabelText = String(format: "%@\n%.1f NM", airport.icao, distanceNM)
         let labelNode = createTextLabel(
-            text: airport.icao,
+            text: airportLabelText,
             color: .cyan,
             position: SCNVector3(0, Float(coneHeight) + 10, 0)
         )
@@ -323,7 +321,7 @@ struct ARVisualizationSettings {
 
     // Airport settings
     var showAirports: Bool = true
-    var airportMaxDistance: Double = 20.0 // nautical miles
+    var airportMaxDistance: Double = 50.0 // nautical miles
 
     // Display settings
     var showGrid: Bool = false
@@ -447,9 +445,14 @@ class ARSceneManager {
 
             // Create or update node
             if airportNodes[airport.icao] == nil {
+                let distanceNM = CalculationsLogic.distanceInNauticalMiles(
+                    from: userLocation,
+                    to: airport.coordinate
+                )
                 let node = ARComponentFactory.createAirportMarker(
                     position: position,
-                    airport: airport
+                    airport: airport,
+                    distanceNM: distanceNM
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 airportNodes[airport.icao] = node

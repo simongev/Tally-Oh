@@ -140,9 +140,13 @@ class ADSBLolClient {
             verticalRate = 0
         }
 
+        // Aircraft type (e.g. "B738", "C172") — "t" field from adsb.lol
+        let aircraftType = ac["t"] as? String ?? ""
+
         return Aircraft(
             id: icao,
             callsign: callsign,
+            aircraftType: aircraftType,
             latitude: lat,
             longitude: lon,
             altitude: altitude,

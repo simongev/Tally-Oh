@@ -332,7 +332,7 @@ class ARTrafficViewController: UIViewController {
             let nearby = CalculationsLogic.filterAirportsInRange(
                 airports: airports,
                 userCoord: loc,
-                maxRangeNauticalMiles: 20.0
+                maxRangeNauticalMiles: 50.0
             )
             status += "🛫 Nearby airports: \(nearby.count)"
         }
