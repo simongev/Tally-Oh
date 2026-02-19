@@ -12,6 +12,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: List Xcode versions
+        run: ls /Applications/ | grep Xcode
+
       - name: Select Xcode version
         run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
