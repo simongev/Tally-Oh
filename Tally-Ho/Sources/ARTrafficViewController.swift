@@ -186,20 +186,47 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - Update Loop
 
+    /// The active position source: ADS-B ownship when receiving, otherwise iPhone GPS.
+    private var activeLocation: CLLocationCoordinate2D? {
+        if connectionLogic.connectionStatus == .receiving,
+           let ownship = connectionLogic.ownshipData,
+           ownship.latitude != 0 || ownship.longitude != 0 {
+            return ownship.coordinate
+        }
+        return userLocation
+    }
+
+    /// Active altitude: ADS-B ownship when receiving, otherwise iPhone barometer.
+    private var activeAltitude: Double {
+        if connectionLogic.connectionStatus == .receiving,
+           let ownship = connectionLogic.ownshipData,
+           ownship.altitude > -1000 {
+            return ownship.altitude   // already in feet from GDL90 parser
+        }
+        return userAltitude
+    }
+
+    /// Whether we're currently using ADS-B GPS.
+    private var usingADSBGPS: Bool {
+        connectionLogic.connectionStatus == .receiving && connectionLogic.ownshipData != nil
+    }
+
     private func updateVisualization() {
-        guard let loc = userLocation else { return }
+        guard let loc = activeLocation else { return }
         sceneManager?.updateAircraft(
             Array(connectionLogic.detectedAircraft.values),
             userLocation: loc,
-            userAltitude: userAltitude,
+            userAltitude: activeAltitude,
             userHeading: userHeading
         )
         sceneManager?.updateAirports(
             airports,
             userLocation: loc,
-            userAltitude: userAltitude,
+            userAltitude: activeAltitude,
             userHeading: userHeading
         )
+        // Also keep ConnectionLogic updated with the best location for internet queries
+        connectionLogic.updateLocation(loc)
         updateStatusLabel()
     }
 
@@ -219,10 +246,13 @@ class ARTrafficViewController: UIViewController {
         // Internet
         lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
 
-        // GPS — always from iPhone
-        if let loc = userLocation {
-            lines.append(String(format: "📍 %.4f°  %.4f°  (iPhone GPS)", loc.latitude, loc.longitude))
-            lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f°", userAltitude, userHeading))
+        // GPS — source-aware
+        let displayLoc = activeLocation
+        let displayAlt = activeAltitude
+        let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
+        if let loc = displayLoc {
+            lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource))", loc.latitude, loc.longitude))
+            lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f°", displayAlt, userHeading))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
