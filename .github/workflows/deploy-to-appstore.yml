@@ -5,7 +5,7 @@ on:
 
 jobs:
   build-and-upload:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 30
 
     steps:
@@ -50,9 +50,6 @@ jobs:
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/eca2bf89-ed32-42b4-b8bd-ac25e67a526b.mobileprovision
-
-      - name: Remove simulator platform
-        run: sudo rm -rf "$(xcode-select -p)/Platforms/iPhoneSimulator.platform"
 
       - name: Archive app
         run: |
