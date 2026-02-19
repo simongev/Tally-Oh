@@ -4,7 +4,7 @@
 //
 //  Contains all AR visualization components:
 //  - Red circles around aircraft
-//  - Blue cones for airports
+//  - Blue inverted cones for airports
 //  - Text labels
 //
 
@@ -18,63 +18,87 @@ import UIKit
 /// Factory class for creating AR visualization components
 class ARComponentFactory {
 
+    // MARK: - Sizing Constants
+
+    /// Maximum distance (meters) any marker is placed from the camera in the AR scene.
+    /// All real-world positions are scaled into this "viewable bubble" so they are always visible.
+    static let maxARRadius: Float = 150.0
+
+    /// Minimum AR placement distance (meters) — keeps very nearby targets off the nose.
+    static let minARRadius: Float = 8.0
+
+    /// Radius of the red torus ring around aircraft (meters in AR space).
+    static let aircraftRingRadius: Float = 18.0
+    static let aircraftPipeRadius: CGFloat = 1.8
+
+    /// Airport cone dimensions (meters in AR space).
+    static let coneHeight: CGFloat = 60.0
+    static let coneBaseRadius: CGFloat = 14.0
+
+    /// Label font size — SCNText uses points where 1 pt ≈ 1 m in scene units.
+    static let labelFontSize: CGFloat = 4.0
+    static let labelFontSizeAirport: CGFloat = 5.0
+
+    // MARK: - Position Scaling
+
+    /// Scale a raw AR position vector so it falls within [minARRadius, maxARRadius] metres
+    /// from the origin while preserving direction. This keeps all targets visible in the
+    /// AR "viewable bubble" regardless of real-world distance.
+    static func scaledPosition(_ raw: SCNVector3) -> SCNVector3 {
+        let len = sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z)
+        guard len > 0 else { return SCNVector3(0, minARRadius, 0) }
+        let clamped = max(minARRadius, min(maxARRadius, len))
+        let scale = clamped / len
+        return SCNVector3(raw.x * scale, raw.y * scale, raw.z * scale)
+    }
+
     // MARK: - Aircraft Components
 
-    /// Create a red circle to represent an aircraft in AR
-    /// - Parameters:
-    ///   - radius: Radius of the circle in meters
-    ///   - position: Position in AR scene
-    ///   - aircraft: Aircraft data
-    /// - Returns: SCNNode containing the aircraft visualization
+    /// Create a red circle to represent an aircraft in AR.
     static func createAircraftMarker(
-        radius: Float,
-        position: SCNVector3,
-        aircraft: Aircraft
+        rawPosition: SCNVector3,
+        aircraft: Aircraft,
+        settings: ARVisualizationSettings
     ) -> SCNNode {
 
         let containerNode = SCNNode()
         containerNode.name = "aircraft_\(aircraft.id)"
-        containerNode.position = position
+        containerNode.position = scaledPosition(rawPosition)
 
-        // Create red circle (torus with small thickness)
-        let circle = SCNTorus(ringRadius: CGFloat(radius), pipeRadius: 2.0)
+        // Red torus ring
+        let circle = SCNTorus(ringRadius: CGFloat(aircraftRingRadius), pipeRadius: aircraftPipeRadius)
         let circleMaterial = SCNMaterial()
         circleMaterial.diffuse.contents = UIColor.red
-        circleMaterial.emission.contents = UIColor.red.withAlphaComponent(0.3)
+        circleMaterial.emission.contents = UIColor(red: 1, green: 0.2, blue: 0.2, alpha: 0.6)
         circleMaterial.isDoubleSided = true
         circle.materials = [circleMaterial]
 
         let circleNode = SCNNode(geometry: circle)
-
-        // Rotate to be horizontal (parallel to ground)
+        // Rotate torus to lie in the horizontal plane (parallel to ground)
         circleNode.eulerAngles.x = .pi / 2
-
         containerNode.addChildNode(circleNode)
 
-        // Add pulsing animation
-        let scaleUp = SCNAction.scale(to: 1.1, duration: 1.0)
-        let scaleDown = SCNAction.scale(to: 1.0, duration: 1.0)
-        let pulse = SCNAction.sequence([scaleUp, scaleDown])
-        let repeatPulse = SCNAction.repeatForever(pulse)
-        circleNode.runAction(repeatPulse)
+        // Pulsing animation
+        let scaleUp   = SCNAction.scale(to: 1.15, duration: 0.9)
+        let scaleDown = SCNAction.scale(to: 1.0,  duration: 0.9)
+        circleNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
 
-        // Build combined label: "CALLSIGN / TYPE\nALT ft" (type only if non-empty)
-        let line1 = aircraft.aircraftType.isEmpty
-            ? aircraft.callsign
-            : "\(aircraft.callsign) / \(aircraft.aircraftType)"
-        let line2 = String(format: "%.0f ft", aircraft.altitude)
-        let labelText = "\(line1)\n\(line2)"
-        let labelNode = createTextLabel(
-            text: labelText,
-            color: .white,
-            position: SCNVector3(0, radius + 10, 0)
-        )
-        containerNode.addChildNode(labelNode)
+        // Label
+        if settings.showAircraftLabels {
+            let labelText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+            let labelNode = createTextLabel(
+                text: labelText,
+                color: .white,
+                fontSize: labelFontSize,
+                position: SCNVector3(0, aircraftRingRadius + 6, 0)
+            )
+            containerNode.addChildNode(labelNode)
+        }
 
-        // Add velocity indicator (arrow showing direction)
+        // Direction arrow
         let arrowNode = createDirectionArrow(
             heading: Float(aircraft.track),
-            length: radius * 1.5,
+            length: aircraftRingRadius * 1.4,
             color: .yellow
         )
         containerNode.addChildNode(arrowNode)
@@ -82,7 +106,26 @@ class ARComponentFactory {
         return containerNode
     }
 
-    /// Create a direction arrow showing aircraft heading
+    /// Build the aircraft label string based on settings toggles.
+    static func buildAircraftLabelText(aircraft: Aircraft, settings: ARVisualizationSettings) -> String {
+        var parts: [String] = []
+
+        // Line 1: callsign [/ type]
+        var line1 = aircraft.callsign
+        if settings.showAircraftType && !aircraft.aircraftType.isEmpty {
+            line1 += " / \(aircraft.aircraftType)"
+        }
+        parts.append(line1)
+
+        // Line 2: altitude
+        if settings.showAircraftAltitude {
+            parts.append(String(format: "%.0f ft", aircraft.altitude))
+        }
+
+        return parts.joined(separator: "\n")
+    }
+
+    /// Create a direction arrow showing aircraft heading.
     private static func createDirectionArrow(
         heading: Float,
         length: Float,
@@ -91,30 +134,24 @@ class ARComponentFactory {
 
         let arrow = SCNNode()
 
-        // Create arrow shaft
-        let shaft = SCNCylinder(radius: 0.5, height: CGFloat(length))
-        let shaftMaterial = SCNMaterial()
-        shaftMaterial.diffuse.contents = color
-        shaft.materials = [shaftMaterial]
-
+        let shaft = SCNCylinder(radius: 0.4, height: CGFloat(length))
+        let shaftMat = SCNMaterial()
+        shaftMat.diffuse.contents = color
+        shaft.materials = [shaftMat]
         let shaftNode = SCNNode(geometry: shaft)
         shaftNode.eulerAngles.x = .pi / 2
         shaftNode.position = SCNVector3(0, 0, -length / 2)
 
-        // Create arrow head (cone)
-        let head = SCNCone(topRadius: 0, bottomRadius: 2, height: 4)
-        let headMaterial = SCNMaterial()
-        headMaterial.diffuse.contents = color
-        head.materials = [headMaterial]
-
+        let head = SCNCone(topRadius: 0, bottomRadius: 1.8, height: 3.5)
+        let headMat = SCNMaterial()
+        headMat.diffuse.contents = color
+        head.materials = [headMat]
         let headNode = SCNNode(geometry: head)
         headNode.eulerAngles.x = .pi / 2
         headNode.position = SCNVector3(0, 0, -length)
 
         arrow.addChildNode(shaftNode)
         arrow.addChildNode(headNode)
-
-        // Rotate to match heading
         arrow.eulerAngles.y = -heading.toRadians()
 
         return arrow
@@ -122,94 +159,102 @@ class ARComponentFactory {
 
     // MARK: - Airport Components
 
-    /// Create a blue cone marker for an airport
-    /// - Parameters:
-    ///   - position: Position in AR scene
-    ///   - airport: Airport data
-    ///   - distanceNM: Distance from user to airport in nautical miles (shown in label)
-    /// - Returns: SCNNode containing the airport visualization
+    /// Create a blue inverted-cone marker for an airport.
+    /// The cone tip points down toward the airport, base extends upward — like a beacon
+    /// hanging from the sky above the airport location.
     static func createAirportMarker(
-        position: SCNVector3,
+        rawPosition: SCNVector3,
         airport: Airport,
-        distanceNM: Double
+        distanceNM: Double,
+        settings: ARVisualizationSettings
     ) -> SCNNode {
 
         let containerNode = SCNNode()
         containerNode.name = "airport_\(airport.icao)"
-        containerNode.position = position
+        // Place at the scaled horizontal position but force the Y to a comfortable
+        // eye-level height so the cone is always visible (airports are on the ground,
+        // user may be at similar altitude — the cone hangs above the location).
+        var scaled = scaledPosition(rawPosition)
+        // Ensure the cone is at least 10 m above the user's eye level so it's visible
+        if scaled.y < 10 { scaled.y = 10 }
+        containerNode.position = scaled
 
-        // Create blue cone pointing down
-        let coneHeight: CGFloat = 50.0
-        let coneRadius: CGFloat = 15.0
-
-        let cone = SCNCone(topRadius: 0, bottomRadius: coneRadius, height: coneHeight)
-        let coneMaterial = SCNMaterial()
-        coneMaterial.diffuse.contents = UIColor.systemBlue
-        coneMaterial.emission.contents = UIColor.systemBlue.withAlphaComponent(0.5)
-        coneMaterial.transparency = 0.8
-        coneMaterial.isDoubleSided = true
-        cone.materials = [coneMaterial]
+        let cone = SCNCone(topRadius: 0, bottomRadius: coneBaseRadius, height: coneHeight)
+        let coneMat = SCNMaterial()
+        coneMat.diffuse.contents = UIColor.systemBlue
+        coneMat.emission.contents = UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 0.5)
+        coneMat.transparency = 0.35
+        coneMat.isDoubleSided = true
+        cone.materials = [coneMat]
 
         let coneNode = SCNNode(geometry: cone)
-
-        // Point cone downward
-        coneNode.eulerAngles.x = .pi // 180 degrees
-
-        // Position cone above ground
+        // Flip 180° → topRadius (0, the tip) is now at the BOTTOM, base at the TOP
+        coneNode.eulerAngles.x = .pi
+        // Move so the tip (bottom) sits exactly at the container origin (airport ground point)
+        // SCNCone origin is at its centre, height is coneHeight, so centre is coneHeight/2 above tip
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
-
         containerNode.addChildNode(coneNode)
 
-        // Add ICAO code + distance label above the cone
-        let airportLabelText = String(format: "%@\n%.1f NM", airport.icao, distanceNM)
-        let labelNode = createTextLabel(
-            text: airportLabelText,
-            color: .cyan,
-            position: SCNVector3(0, Float(coneHeight) + 10, 0)
-        )
-        labelNode.scale = SCNVector3(1.5, 1.5, 1.5)
-        containerNode.addChildNode(labelNode)
+        // Subtle slow rotation
+        coneNode.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 12.0)))
 
-        // Add subtle rotation animation
-        let rotate = SCNAction.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 10.0)
-        let repeatRotate = SCNAction.repeatForever(rotate)
-        coneNode.runAction(repeatRotate)
+        // Label above the cone base
+        if settings.showAirportLabels {
+            let labelText = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
+            let labelNode = createTextLabel(
+                text: labelText,
+                color: .cyan,
+                fontSize: labelFontSizeAirport,
+                position: SCNVector3(0, Float(coneHeight) + 8, 0)
+            )
+            containerNode.addChildNode(labelNode)
+        }
 
         return containerNode
     }
 
+    /// Build the airport label string based on settings toggles.
+    static func buildAirportLabelText(airport: Airport, distanceNM: Double, settings: ARVisualizationSettings) -> String {
+        var parts: [String] = [airport.icao]
+
+        if settings.showAirportDistance {
+            parts.append(String(format: "%.1f NM", distanceNM))
+        }
+
+        return parts.joined(separator: "\n")
+    }
+
     // MARK: - Text Labels
 
-    /// Create a 3D text label
-    /// - Parameters:
-    ///   - text: Text to display
-    ///   - color: Text color
-    ///   - position: Position relative to parent
-    /// - Returns: SCNNode containing the text
+    /// Create a 3D text label that always faces the camera.
     static func createTextLabel(
         text: String,
         color: UIColor,
+        fontSize: CGFloat,
         position: SCNVector3
     ) -> SCNNode {
 
-        let textGeometry = SCNText(string: text, extrusionDepth: 1.0)
-        textGeometry.font = UIFont.systemFont(ofSize: 10, weight: .bold)
-        textGeometry.flatness = 0.1
+        let textGeometry = SCNText(string: text, extrusionDepth: 0.2)
+        textGeometry.font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+        textGeometry.flatness = 0.05
+        textGeometry.alignmentMode = CATextLayerAlignmentMode.center.rawValue
 
-        let textMaterial = SCNMaterial()
-        textMaterial.diffuse.contents = color
-        textMaterial.emission.contents = color.withAlphaComponent(0.5)
-        textGeometry.materials = [textMaterial]
+        let mat = SCNMaterial()
+        mat.diffuse.contents = color
+        mat.emission.contents = color.withAlphaComponent(0.7)
+        mat.isDoubleSided = true
+        textGeometry.materials = [mat]
 
         let textNode = SCNNode(geometry: textGeometry)
         textNode.position = position
 
-        // Center the text
-        let (min, max) = textNode.boundingBox
-        let width = max.x - min.x
-        textNode.pivot = SCNMatrix4MakeTranslation(width / 2, 0, 0)
+        // Centre the text horizontally
+        let (minB, maxB) = textNode.boundingBox
+        let w = maxB.x - minB.x
+        let h = maxB.y - minB.y
+        textNode.pivot = SCNMatrix4MakeTranslation(w / 2, h / 2, 0)
 
-        // Make text always face the camera (billboard effect)
+        // Billboard — always face the camera, free to rotate around Y
         let constraint = SCNBillboardConstraint()
         constraint.freeAxes = [.Y]
         textNode.constraints = [constraint]
@@ -217,96 +262,24 @@ class ARComponentFactory {
         return textNode
     }
 
-    // MARK: - Helper Components
-
-    /// Create a ground reference grid (optional, for debugging)
-    static func createReferenceGrid(size: Float, divisions: Int) -> SCNNode {
-        let gridNode = SCNNode()
-
-        let step = size / Float(divisions)
-        let halfSize = size / 2
-
-        for i in 0...divisions {
-            let offset = Float(i) * step - halfSize
-
-            // Vertical lines
-            let vLine = createLine(
-                from: SCNVector3(offset, 0, -halfSize),
-                to: SCNVector3(offset, 0, halfSize),
-                color: .gray
-            )
-            gridNode.addChildNode(vLine)
-
-            // Horizontal lines
-            let hLine = createLine(
-                from: SCNVector3(-halfSize, 0, offset),
-                to: SCNVector3(halfSize, 0, offset),
-                color: .gray
-            )
-            gridNode.addChildNode(hLine)
-        }
-
-        return gridNode
-    }
-
-    /// Create a line between two points
-    private static func createLine(
-        from: SCNVector3,
-        to: SCNVector3,
-        color: UIColor
-    ) -> SCNNode {
-
-        let vector = SCNVector3(to.x - from.x, to.y - from.y, to.z - from.z)
-        let length = sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z)
-
-        let cylinder = SCNCylinder(radius: 0.1, height: CGFloat(length))
-        let material = SCNMaterial()
-        material.diffuse.contents = color.withAlphaComponent(0.3)
-        cylinder.materials = [material]
-
-        let lineNode = SCNNode(geometry: cylinder)
-
-        // Position and orient the line
-        lineNode.position = SCNVector3(
-            (from.x + to.x) / 2,
-            (from.y + to.y) / 2,
-            (from.z + to.z) / 2
-        )
-
-        let direction = SCNVector3(to.x - from.x, to.y - from.y, to.z - from.z)
-        lineNode.look(at: to, up: SCNVector3(0, 1, 0), localFront: SCNVector3(0, 1, 0))
-
-        return lineNode
-    }
-
     // MARK: - Update Methods
 
-    /// Update an existing aircraft marker with new data
+    /// Smoothly move an existing aircraft node to a new raw position and refresh its label.
     static func updateAircraftMarker(
         node: SCNNode,
         aircraft: Aircraft,
-        newPosition: SCNVector3
+        rawPosition: SCNVector3,
+        settings: ARVisualizationSettings
     ) {
-        // Smoothly animate to new position
-        let moveAction = SCNAction.move(to: newPosition, duration: 1.0)
-        node.runAction(moveAction)
+        let newPos = scaledPosition(rawPosition)
+        node.runAction(.move(to: newPos, duration: 1.0))
 
-        // Update label if callsign changed
-        if let labelNode = node.childNode(withName: "label", recursively: false) {
-            if let textGeometry = labelNode.geometry as? SCNText {
-                textGeometry.string = aircraft.callsign
+        // Refresh label text
+        if let labelNode = node.childNodes.first(where: { $0.geometry is SCNText }) {
+            if let geo = labelNode.geometry as? SCNText {
+                geo.string = buildAircraftLabelText(aircraft: aircraft, settings: settings)
             }
-        }
-
-        // Update direction arrow
-        if let arrowNode = node.childNode(withName: "arrow", recursively: false) {
-            let rotateAction = SCNAction.rotateTo(
-                x: 0,
-                y: CGFloat(-aircraft.track.toRadians()),
-                z: 0,
-                duration: 0.5
-            )
-            arrowNode.runAction(rotateAction)
+            labelNode.isHidden = !settings.showAircraftLabels
         }
     }
 }
@@ -314,65 +287,83 @@ class ARComponentFactory {
 // MARK: - Settings and Configuration
 
 struct ARVisualizationSettings {
-    // Aircraft settings
+
+    // MARK: Aircraft
     var showAircraft: Bool = true
-    var aircraftMinDistance: Double = 0.0 // nautical miles
-    var aircraftMaxDistance: Double = 10.0 // nautical miles
+    var aircraftMaxDistance: Double = 50.0  // nautical miles
 
-    // Airport settings
+    // Aircraft label fields
+    var showAircraftLabels: Bool  = true
+    var showAircraftType:   Bool  = true   // e.g. "B738"
+    var showAircraftAltitude: Bool = true  // e.g. "35000 ft"
+
+    // MARK: Airports
     var showAirports: Bool = true
-    var airportMaxDistance: Double = 50.0 // nautical miles
+    var airportMaxDistance: Double = 50.0  // nautical miles
 
-    // Display settings
+    // Airport type filters
+    var showLargeAirports:  Bool = true
+    var showMediumAirports: Bool = true
+    var showSmallAirports:  Bool = true
+
+    // Airport label fields
+    var showAirportLabels:   Bool = true
+    var showAirportDistance: Bool = true   // e.g. "14.3 NM"
+
+    // MARK: Misc
     var showGrid: Bool = false
-    var showLabels: Bool = true
-    var labelScale: Float = 1.0
 
-    // Update settings
-    var updateInterval: TimeInterval = 1.0 // seconds
-
-    // Colors
-    var aircraftColor: UIColor = .red
-    var airportColor: UIColor = .systemBlue
-    var labelColor: UIColor = .white
+    /// Returns true if the given airport type should be displayed.
+    func shouldShow(airportType: String) -> Bool {
+        switch airportType {
+        case "large_airport":  return showLargeAirports
+        case "medium_airport": return showMediumAirports
+        case "small_airport":  return showSmallAirports
+        default:               return false
+        }
+    }
 }
 
 // MARK: - Scene Manager
 
-/// Manages the AR scene and updates visualizations
+/// Manages the AR scene and updates visualizations.
 class ARSceneManager {
 
     private weak var sceneView: ARSCNView?
     private var aircraftNodes: [String: SCNNode] = [:]
-    private var airportNodes: [String: SCNNode] = [:]
+    private var airportNodes:  [String: SCNNode] = [:]
     var settings = ARVisualizationSettings()
 
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
-        setupScene()
+        sceneView.autoenablesDefaultLighting = true
+        sceneView.automaticallyUpdatesLighting = true
     }
 
-    private func setupScene() {
-        sceneView?.autoenablesDefaultLighting = true
-        sceneView?.automaticallyUpdatesLighting = true
-    }
+    // MARK: Update Aircraft
 
-    /// Update aircraft visualizations
     func updateAircraft(
         _ aircraft: [Aircraft],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double
     ) {
-        guard settings.showAircraft else { return }
+        guard settings.showAircraft else {
+            // Hide all existing nodes
+            aircraftNodes.values.forEach { $0.isHidden = true }
+            return
+        }
 
-        var currentAircraftIDs = Set<String>()
+        var currentIDs = Set<String>()
 
         for ac in aircraft {
-            currentAircraftIDs.insert(ac.id)
+            // Distance filter
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
+            guard distNM <= settings.aircraftMaxDistance else { continue }
 
-            // Calculate AR position
-            let position = CalculationsLogic.calculateARPosition(
+            currentIDs.insert(ac.id)
+
+            let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: ac.coordinate,
                 targetAltitude: ac.altitude,
                 userCoord: userLocation,
@@ -380,103 +371,105 @@ class ARSceneManager {
                 userHeading: userHeading
             )
 
-            // Calculate circle radius
-            let distance = CalculationsLogic.distance(
-                from: userLocation,
-                to: ac.coordinate
-            )
-            let radius = CalculationsLogic.calculateAircraftCircleRadius(distance: distance)
-
-            // Update or create node
-            if let existingNode = aircraftNodes[ac.id] {
+            if let existing = aircraftNodes[ac.id] {
+                existing.isHidden = false
                 ARComponentFactory.updateAircraftMarker(
-                    node: existingNode,
+                    node: existing,
                     aircraft: ac,
-                    newPosition: position
+                    rawPosition: rawPos,
+                    settings: settings
                 )
             } else {
                 let node = ARComponentFactory.createAircraftMarker(
-                    radius: radius,
-                    position: position,
-                    aircraft: ac
+                    rawPosition: rawPos,
+                    aircraft: ac,
+                    settings: settings
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 aircraftNodes[ac.id] = node
             }
         }
 
-        // Remove aircraft that are no longer present
-        let removedAircraft = Set(aircraftNodes.keys).subtracting(currentAircraftIDs)
-        for id in removedAircraft {
+        // Remove stale aircraft
+        for id in Set(aircraftNodes.keys).subtracting(currentIDs) {
             aircraftNodes[id]?.removeFromParentNode()
             aircraftNodes.removeValue(forKey: id)
         }
     }
 
-    /// Update airport visualizations
+    // MARK: Update Airports
+
     func updateAirports(
         _ airports: [Airport],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double
     ) {
-        guard settings.showAirports else { return }
+        guard settings.showAirports else {
+            airportNodes.values.forEach { $0.isHidden = true }
+            return
+        }
 
-        // Filter airports in range
-        let nearbyAirports = CalculationsLogic.filterAirportsInRange(
+        let nearby = CalculationsLogic.filterAirportsInRange(
             airports: airports,
             userCoord: userLocation,
             maxRangeNauticalMiles: settings.airportMaxDistance
-        )
+        ).filter { settings.shouldShow(airportType: $0.type) }
 
-        var currentAirportIDs = Set<String>()
+        var currentIDs = Set<String>()
 
-        for airport in nearbyAirports {
-            currentAirportIDs.insert(airport.icao)
+        for airport in nearby {
+            currentIDs.insert(airport.icao)
 
-            // Calculate AR position
-            let position = CalculationsLogic.calculateAirportARPosition(
+            let rawPos = CalculationsLogic.calculateAirportARPosition(
                 airportCoord: airport.coordinate,
                 airportElevation: airport.elevation,
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading
             )
+            let distNM = CalculationsLogic.distanceInNauticalMiles(
+                from: userLocation,
+                to: airport.coordinate
+            )
 
-            // Create or update node
-            if airportNodes[airport.icao] == nil {
-                let distanceNM = CalculationsLogic.distanceInNauticalMiles(
-                    from: userLocation,
-                    to: airport.coordinate
-                )
+            if let existing = airportNodes[airport.icao] {
+                existing.isHidden = false
+                // Update label distance (user may have moved)
+                if let labelNode = existing.childNodes.first(where: { $0.geometry is SCNText }),
+                   let geo = labelNode.geometry as? SCNText {
+                    geo.string = ARComponentFactory.buildAirportLabelText(
+                        airport: airport,
+                        distanceNM: distNM,
+                        settings: settings
+                    )
+                    labelNode.isHidden = !settings.showAirportLabels
+                }
+            } else {
                 let node = ARComponentFactory.createAirportMarker(
-                    position: position,
+                    rawPosition: rawPos,
                     airport: airport,
-                    distanceNM: distanceNM
+                    distanceNM: distNM,
+                    settings: settings
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
                 airportNodes[airport.icao] = node
             }
         }
 
-        // Remove airports that are out of range
-        let removedAirports = Set(airportNodes.keys).subtracting(currentAirportIDs)
-        for icao in removedAirports {
+        // Remove out-of-range airports
+        for icao in Set(airportNodes.keys).subtracting(currentIDs) {
             airportNodes[icao]?.removeFromParentNode()
             airportNodes.removeValue(forKey: icao)
         }
     }
 
-    /// Clear all visualizations
-    func clearAll() {
-        for node in aircraftNodes.values {
-            node.removeFromParentNode()
-        }
-        aircraftNodes.removeAll()
+    // MARK: Clear
 
-        for node in airportNodes.values {
-            node.removeFromParentNode()
-        }
+    func clearAll() {
+        aircraftNodes.values.forEach { $0.removeFromParentNode() }
+        aircraftNodes.removeAll()
+        airportNodes.values.forEach { $0.removeFromParentNode() }
         airportNodes.removeAll()
     }
 }
