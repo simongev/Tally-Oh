@@ -423,14 +423,17 @@ struct ARVisualizationSettings {
 class ARSceneManager {
 
     private weak var sceneView: ARSCNView?
+    /// Protected by `nodesLock` — read on render thread, written on main thread.
     private var aircraftNodes: [String: SCNNode] = [:]
     private var airportNodes:  [String: SCNNode] = [:]
+    /// Serialises access to `aircraftNodes` between the main thread (4 Hz writes)
+    /// and the SceneKit render thread (60 Hz reads in tickAircraftPositions).
+    private let nodesLock = NSLock()
     var settings = ARVisualizationSettings()
 
-    // Live snapshot used by the 60 Hz render-thread position updater.
-    // Written on main thread by the 4 Hz timer; read on render thread.
-    // Both reads and writes of reference-typed arrays are atomic on 64-bit ARM,
-    // and we only ever replace the whole value — no concurrent mutation of elements.
+    // Live snapshot written on main thread, read on render thread.
+    // Replacing the whole array value is atomic on 64-bit ARM; elements are
+    // never mutated in-place, so no lock is needed for this snapshot.
     private(set) var liveAircraft: [Aircraft] = []
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
@@ -447,14 +450,21 @@ class ARSceneManager {
     /// Labels, visibility and node creation are handled by the 4 Hz `updateAircraft`.
     func tickAircraftPositions(cameraWorldPosition: SCNVector3) {
         guard settings.showAircraft else { return }
+
+        // Snapshot aircraft data (written by main thread — array replacement is atomic).
         let aircraft = liveAircraft
         let userLoc  = liveUserLocation
         let userAlt  = liveUserAltitude
-        let internet = 5.0 as Double   // internet latency compensation (seconds)
+
+        // Take a locked snapshot of the node references so the render thread
+        // never races with main-thread insertions/removals in aircraftNodes.
+        nodesLock.lock()
+        let nodeSnapshot = aircraftNodes   // [String: SCNNode] value-copy of the dict
+        nodesLock.unlock()
 
         for ac in aircraft {
-            guard let node = aircraftNodes[ac.id], !node.isHidden else { continue }
-            let extrapolationSecs: Double = (ac.source == .internet) ? internet : 0.0
+            guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
+            let extrapolationSecs: Double = (ac.source == .internet) ? 5.0 : 0.0
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
                 for: ac, aheadSeconds: extrapolationSecs)
             let rawPos = CalculationsLogic.calculateARPosition(
@@ -481,7 +491,10 @@ class ARSceneManager {
         cameraWorldPosition: SCNVector3 = .init()
     ) {
         guard settings.showAircraft else {
-            aircraftNodes.values.forEach { $0.isHidden = true }
+            nodesLock.lock()
+            let all = Array(aircraftNodes.values)
+            nodesLock.unlock()
+            all.forEach { $0.isHidden = true }
             liveAircraft = []
             return
         }
@@ -537,7 +550,9 @@ class ARSceneManager {
                 SCNTransaction.disableActions = true
                 sceneView?.scene.rootNode.addChildNode(node)
                 SCNTransaction.commit()
+                nodesLock.lock()
                 aircraftNodes[ac.id] = node
+                nodesLock.unlock()
             }
         }
 
@@ -547,12 +562,20 @@ class ARSceneManager {
         liveUserAltitude  = userAltitude
 
         // Remove aircraft that are out of range, filtered, or stale
-        for id in Set(aircraftNodes.keys).subtracting(currentIDs) {
+        nodesLock.lock()
+        let staleIDs = Set(aircraftNodes.keys).subtracting(currentIDs)
+        var staleNodes: [SCNNode] = []
+        for id in staleIDs {
+            if let n = aircraftNodes[id] { staleNodes.append(n) }
+            aircraftNodes.removeValue(forKey: id)
+        }
+        nodesLock.unlock()
+        // Do SceneKit removal outside the lock — removeFromParentNode is thread-safe
+        for n in staleNodes {
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
-            aircraftNodes[id]?.removeFromParentNode()
+            n.removeFromParentNode()
             SCNTransaction.commit()
-            aircraftNodes.removeValue(forKey: id)
         }
     }
 
@@ -658,12 +681,19 @@ class ARSceneManager {
     // MARK: Clear
 
     func clearAll() {
-        SCNTransaction.begin()
-        SCNTransaction.disableActions = true
-        aircraftNodes.values.forEach { $0.removeFromParentNode() }
-        airportNodes.values.forEach  { $0.removeFromParentNode() }
-        SCNTransaction.commit()
+        nodesLock.lock()
+        let acNodes  = Array(aircraftNodes.values)
+        let apNodes  = Array(airportNodes.values)
         aircraftNodes.removeAll()
         airportNodes.removeAll()
+        nodesLock.unlock()
+
+        liveAircraft = []
+
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        acNodes.forEach { $0.removeFromParentNode() }
+        apNodes.forEach { $0.removeFromParentNode() }
+        SCNTransaction.commit()
     }
 }
