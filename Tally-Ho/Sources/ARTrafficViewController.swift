@@ -6,6 +6,7 @@
 import UIKit
 import ARKit
 import CoreLocation
+import CoreMotion
 import Combine
 
 // MARK: - Selection State
@@ -113,14 +114,34 @@ class ARTrafficViewController: UIViewController {
 
     private var airports: [Airport] = []
 
+    /// Seed location passed from CalibrationViewController (may be nil if skipped).
+    var seedLocation: CLLocation?
+
     /// Always from iPhone CLLocationManager — primary positioning source.
     private var userLocation: CLLocationCoordinate2D?
-    /// Altitude from iPhone barometer/GPS (meters, converted to feet).
+    /// Best horizontal accuracy seen in the current flight session (metres). -1 = unknown.
+    private var bestHorizontalAccuracy: CLLocationAccuracy = -1
+    /// Last raw GPS horizontal accuracy for HUD display.
+    private var lastHorizontalAccuracy: CLLocationAccuracy = -1
+    /// Altitude from CMAltimeter (barometric, relative) + GPS MSL baseline, in feet.
     private var userAltitude: Double = 0
+    /// GPS MSL altitude in feet — used as baseline for barometric correction.
+    private var gpsMSLAltitudeFeet: Double = 0
     /// Heading from iPhone compass.
     private var userHeading: Double = 0
     /// Last heading accuracy reading from CLLocationManager (-1 = unknown).
     private var lastHeadingAccuracy: CLLocationDirectionAccuracy = -1
+    /// ARKit tracking state — used to warn user if tracking degrades.
+    private var arTrackingState: ARCamera.TrackingState = .notAvailable
+
+    /// CMAltimeter for barometric relative-altitude measurements.
+    private let altimeter = CMAltimeter()
+    /// Relative altitude change from altimeter since baseline (metres).
+    private var baroRelativeAltitude: Double = 0
+    /// Baseline GPS altitude set when altimeter starts (metres MSL).
+    private var baroBaselineAltitudeFeet: Double = 0
+    /// True once the altimeter has produced its first reading and baseline is set.
+    private var baroBaselineSet = false
 
     private var updateTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
@@ -131,6 +152,9 @@ class ARTrafficViewController: UIViewController {
     /// Current target selection state.
     private var selectionState: SelectionState = .none
 
+    /// GPS accuracy threshold — fixes worse than this are discarded.
+    private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -140,6 +164,7 @@ class ARTrafficViewController: UIViewController {
         setupUI()
         setupARScene()
         setupLocation()
+        setupAltimeter()
         setupObservers()
         setupGestures()
         loadAirports()
@@ -147,6 +172,17 @@ class ARTrafficViewController: UIViewController {
         // Load persisted settings before starting
         if let saved = ARVisualizationSettings.load() {
             sceneManager?.settings = saved
+        }
+
+        // Apply calibration seed location so we have a position immediately
+        if let seed = seedLocation {
+            userLocation        = seed.coordinate
+            gpsMSLAltitudeFeet  = seed.altitude * CalculationsLogic.metersToFeet
+            userAltitude        = gpsMSLAltitudeFeet
+            baroBaselineAltitudeFeet = gpsMSLAltitudeFeet
+            lastHorizontalAccuracy   = seed.horizontalAccuracy
+            bestHorizontalAccuracy   = seed.horizontalAccuracy
+            connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
         }
 
         // Begin listening for ADS-B broadcasts in background
@@ -167,6 +203,7 @@ class ARTrafficViewController: UIViewController {
         super.viewWillDisappear(animated)
         arSceneView.session.pause()
         updateTimer?.invalidate()
+        altimeter.stopRelativeAltitudeUpdates()
     }
 
     deinit {
@@ -287,6 +324,25 @@ class ARTrafficViewController: UIViewController {
         // target positions smooth enough for comfortable viewing in flight.
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
+        }
+    }
+
+    private func setupAltimeter() {
+        guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
+        altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
+            guard let self, let data, error == nil else { return }
+            let relM = data.relativeAltitude.doubleValue   // metres since altimeter start
+            // Set baseline on first reading using GPS MSL
+            if !self.baroBaselineSet {
+                self.baroBaselineAltitudeFeet = self.gpsMSLAltitudeFeet
+                self.baroBaselineSet = true
+                self.baroRelativeAltitude = 0
+            } else {
+                self.baroRelativeAltitude = relM
+            }
+            // Fused altitude: GPS MSL baseline + barometric delta (barometer is more precise for changes)
+            let fusedFeet = self.baroBaselineAltitudeFeet + relM * CalculationsLogic.metersToFeet
+            self.userAltitude = fusedFeet
         }
     }
 
@@ -561,6 +617,7 @@ class ARTrafficViewController: UIViewController {
     private func updateStatusLabel() {
         var lines: [String] = []
 
+        // ADS-B status
         switch connectionLogic.connectionStatus {
         case .receiving:     lines.append("📡 ADS-B: Receiving")
         case .searching:     lines.append("📡 ADS-B: Searching…")
@@ -570,25 +627,58 @@ class ARTrafficViewController: UIViewController {
 
         lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
 
+        // GPS position + accuracy
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
         let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
         if let loc = displayLoc {
-            lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource))", loc.latitude, loc.longitude))
-            // Show compass heading with live accuracy indicator
-            let accStr: String
-            if lastHeadingAccuracy < 0 {
-                accStr = "?"
-            } else if lastHeadingAccuracy > 20 {
-                accStr = "⚠️calibrate"
+            let gpsAccStr: String
+            if lastHorizontalAccuracy < 0 {
+                gpsAccStr = "?"
+            } else if lastHorizontalAccuracy > gpsAccuracyThreshold {
+                gpsAccStr = String(format: "⚠️ ±%.0fm", lastHorizontalAccuracy)
             } else {
-                accStr = String(format: "±%.0f°", lastHeadingAccuracy)
+                gpsAccStr = String(format: "±%.0fm", lastHorizontalAccuracy)
             }
-            lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f° (\(accStr))", displayAlt, userHeading))
+            lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource)  \(gpsAccStr))", loc.latitude, loc.longitude))
+
+            // Altitude + source
+            let altSource = baroBaselineSet ? "baro" : "GPS"
+            // Compass heading with live accuracy indicator
+            let compassAccStr: String
+            if lastHeadingAccuracy < 0 {
+                compassAccStr = "?"
+            } else if lastHeadingAccuracy > 20 {
+                compassAccStr = "⚠️calibrate"
+            } else {
+                compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
+            }
+            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)", displayAlt, altSource, userHeading, compassAccStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
 
+        // ARKit tracking state
+        let arStateStr: String
+        switch arTrackingState {
+        case .normal:
+            arStateStr = "AR: ✓"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:   arStateStr = "AR: Initializing…"
+            case .relocalizing:   arStateStr = "AR: Relocalizing…"
+            case .excessiveMotion: arStateStr = "AR: ⚠️ Motion"
+            case .insufficientFeatures: arStateStr = "AR: ⚠️ Features"
+            @unknown default:     arStateStr = "AR: Limited"
+            }
+        case .notAvailable:
+            arStateStr = "AR: Not available"
+        @unknown default:
+            arStateStr = "AR: Unknown"
+        }
+        lines.append("📷 \(arStateStr)")
+
+        // Aircraft count
         let total   = connectionLogic.detectedAircraft.count
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
@@ -622,6 +712,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
+
+    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+        arTrackingState = camera.trackingState
+        DispatchQueue.main.async { self.updateStatusLabel() }
+    }
+
     func session(_ session: ARSession, didFailWithError error: Error) {
         print("AR error: \(error.localizedDescription)")
     }
@@ -635,8 +732,36 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
+
+        // Reject fixes with poor accuracy or invalid data
+        let hAcc = loc.horizontalAccuracy
+        guard hAcc > 0 && hAcc <= gpsAccuracyThreshold else {
+            // Still update the HUD to show accuracy degradation
+            if hAcc > 0 { lastHorizontalAccuracy = hAcc }
+            updateStatusLabel()
+            return
+        }
+
+        lastHorizontalAccuracy = hAcc
+        if bestHorizontalAccuracy < 0 || hAcc < bestHorizontalAccuracy {
+            bestHorizontalAccuracy = hAcc
+        }
+
         userLocation = loc.coordinate
-        userAltitude = loc.altitude * CalculationsLogic.metersToFeet
+
+        // GPS MSL altitude — always update so barometric baseline stays current
+        let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
+        gpsMSLAltitudeFeet = newGPSFeet
+
+        // If altimeter is not running or baseline not set yet, fall back to GPS altitude
+        if !baroBaselineSet {
+            userAltitude = newGPSFeet
+        } else {
+            // Drift-correct barometric baseline periodically using GPS MSL
+            // (GPS MSL is accurate over long periods; baro is more precise for short-term changes)
+            baroBaselineAltitudeFeet = newGPSFeet - baroRelativeAltitude * CalculationsLogic.metersToFeet
+        }
+
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
         let needsRefresh: Bool

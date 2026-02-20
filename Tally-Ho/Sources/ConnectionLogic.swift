@@ -77,11 +77,14 @@ class ConnectionLogic: ObservableObject {
     private let adsbLolClient = ADSBLolClient()
     private let networkReachability = NetworkReachability()
     private var internetFetchTimer: Timer?
-    // At 250 kt the user moves ~1.9 NM in 15 s — fetch frequently enough to
+    // At 250 kt the user moves ~1.0 NM in 8 s — fetch frequently enough to
     // keep the traffic picture current as the aircraft flies.
-    private let internetFetchInterval: TimeInterval = 15.0
+    private let internetFetchInterval: TimeInterval = 8.0
     private var currentLocation: CLLocationCoordinate2D?
     private let internetQueryRadius: Double = 50.0
+    /// Timestamp of the most recent internet fetch request — used to compute
+    /// dynamic extrapolation latency in the dead-reckoning position predictor.
+    private(set) var lastInternetFetchTime: Date?
 
     // MARK: Private — Cleanup
 
@@ -374,6 +377,7 @@ class ConnectionLogic: ObservableObject {
 
     private func fetchInternetData() {
         guard let loc = currentLocation else { return }
+        lastInternetFetchTime = Date()
         adsbLolClient.fetchAircraft(
             latitude: loc.latitude,
             longitude: loc.longitude,
@@ -389,10 +393,14 @@ class ConnectionLogic: ObservableObject {
     }
 
     private func mergeInternetAircraft(_ list: [Aircraft]) {
+        let fetchTime = Date()   // record when the response was received
         DispatchQueue.main.async {
             var count = 0
-            for ac in list {
+            for var ac in list {
                 if let existing = self.detectedAircraft[ac.id], existing.source == .adsb { continue }
+                // Stamp lastUpdate with the fetch-response time so dead-reckoning
+                // uses the real age of the data rather than a fixed 5-second offset.
+                ac.lastUpdate = fetchTime
                 self.detectedAircraft[ac.id] = ac
                 count += 1
             }

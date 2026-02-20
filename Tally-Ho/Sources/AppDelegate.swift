@@ -20,10 +20,23 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // Create window
         window = UIWindow(frame: UIScreen.main.bounds)
 
-        // Set root view controller
-        let arViewController = ARTrafficViewController()
-        window?.rootViewController = arViewController
+        // Show calibration screen first; on completion transition to AR view.
+        let calibration = CalibrationViewController()
+        window?.rootViewController = calibration
         window?.makeKeyAndVisible()
+
+        calibration.onComplete = { [weak window] seedLocation in
+            let arVC = ARTrafficViewController()
+            arVC.seedLocation = seedLocation
+            // Crossfade from calibration to AR
+            UIView.transition(
+                with: window!,
+                duration: 0.5,
+                options: .transitionCrossDissolve,
+                animations: { window?.rootViewController = arVC },
+                completion: nil
+            )
+        }
 
         // Configure appearance
         configureAppearance()

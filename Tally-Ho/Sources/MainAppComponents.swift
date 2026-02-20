@@ -513,9 +513,12 @@ class ARSceneManager {
 
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
-            let extrapolationSecs: Double = (ac.source == .internet) ? 5.0 : 0.0
+            // No fixed latency offset — `lastUpdate` is stamped with the actual response
+            // receipt time (ConnectionLogic.mergeInternetAircraft), so `predictedPosition`
+            // already compensates for the real data age dynamically for both ADS-B and
+            // internet sources.
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
-                for: ac, aheadSeconds: extrapolationSecs)
+                for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
@@ -565,9 +568,8 @@ class ARSceneManager {
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
 
-            let extrapolationSecs: Double = (ac.source == .internet) ? 5.0 : 0.0
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
-                for: ac, aheadSeconds: extrapolationSecs)
+                for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
