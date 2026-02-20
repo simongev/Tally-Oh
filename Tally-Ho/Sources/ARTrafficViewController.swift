@@ -158,15 +158,35 @@ class ARTrafficViewController: UIViewController {
         }
     }
 
+    /// Full airport database — kept on the background thread only, never
+    /// assigned to the main-thread `airports` array directly.
+    private var allAirports: [Airport] = []
+
     private func loadAirports() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            if let airports = AirportDataParser.loadAirportsFromCSV() {
-                DispatchQueue.main.async {
-                    self?.airports = airports
-                    self?.updateStatusLabel()
-                }
+            guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
+            // Pre-filter to 200 NM on the background thread so the main thread
+            // never iterates the full ~70 k-row database on every update tick.
+            DispatchQueue.main.async {
+                self?.allAirports = parsed
+                self?.refreshNearbyAirports()
             }
         }
+    }
+
+    /// Re-filter allAirports down to 200 NM from the current position.
+    /// Called once after CSV load and again if the user moves significantly.
+    private func refreshNearbyAirports() {
+        guard let loc = userLocation ?? activeLocation else {
+            // No location yet — store nothing; called again on first GPS fix.
+            return
+        }
+        airports = CalculationsLogic.filterAirportsInRange(
+            airports: allAirports,
+            userCoord: loc,
+            maxRangeNauticalMiles: 200
+        )
+        updateStatusLabel()
     }
 
     private func startARSession() {
@@ -319,13 +339,28 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
 extension ARTrafficViewController: CLLocationManagerDelegate {
 
+    /// Last position used to centre the 200 NM airport pre-filter.
+    private var lastAirportFilterLocation: CLLocationCoordinate2D?
+
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
         userLocation = loc.coordinate
         userAltitude = loc.altitude * CalculationsLogic.metersToFeet
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
-        // State is updated here; the 4 Hz timer drives all scene updates to
-        // avoid concurrent mutations of aircraftNodes / airportNodes.
+
+        // Re-run the 200 NM pre-filter if: first fix, or user has moved > 50 NM
+        // since the last filter (at 250 kt that's ~12 minutes of flight).
+        let needsRefresh: Bool
+        if let last = lastAirportFilterLocation {
+            needsRefresh = CalculationsLogic.distanceInNauticalMiles(
+                from: last, to: loc.coordinate) > 50
+        } else {
+            needsRefresh = true   // first fix — always refresh
+        }
+        if needsRefresh && !allAirports.isEmpty {
+            lastAirportFilterLocation = loc.coordinate
+            refreshNearbyAirports()
+        }
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
