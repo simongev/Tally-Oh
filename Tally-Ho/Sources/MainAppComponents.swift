@@ -96,7 +96,7 @@ class ARComponentFactory {
         let ringNode = SCNNode(geometry: plane)
         // Billboard: always face camera on ALL axes so the ring stays flat to screen
         let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = []   // lock all axes → fully camera-facing
+        billboard.freeAxes = .all   // fully camera-facing on all axes
         ringNode.constraints = [billboard]
 
         // Pulsing scale animation
@@ -276,7 +276,7 @@ class ARComponentFactory {
         node.position = SCNVector3(0, Float(yOffset + h / 2), 0)
 
         let bill = SCNBillboardConstraint()
-        bill.freeAxes = []   // fully camera-facing
+        bill.freeAxes = .all   // fully camera-facing on all axes
         node.constraints = [bill]
 
         return node
