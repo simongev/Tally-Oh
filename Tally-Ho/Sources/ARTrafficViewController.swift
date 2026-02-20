@@ -324,15 +324,13 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         userLocation = loc.coordinate
         userAltitude = loc.altitude * CalculationsLogic.metersToFeet
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
-        // Immediately reposition AR targets on every GPS update — important
-        // in flight where position changes significantly between timer ticks.
-        updateVisualization()
+        // State is updated here; the 4 Hz timer drives all scene updates to
+        // avoid concurrent mutations of aircraftNodes / airportNodes.
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         userHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
-        // Heading changes mean the world is re-oriented — reposition immediately.
-        updateVisualization()
+        // State is updated here; the 4 Hz timer drives all scene updates.
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
