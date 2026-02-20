@@ -23,10 +23,15 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXBuildFile section */
+		B54AF2600001000000000001 /* airports.csv in Resources */ = {isa = PBXBuildFile; fileRef = B54AF2600001000000000002 /* airports.csv */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		B54AF2282EC0CEC90025784B /* Tally-Ho.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Tally-Ho.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B54AF2382EC0CECA0025784B /* Tally-HoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Tally-HoTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B54AF2422EC0CECA0025784B /* Tally-HoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Tally-HoUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B54AF2600001000000000002 /* airports.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Tally-Ho/Resources/airports.csv"; sourceTree = "<group>"; name = "airports.csv"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -79,6 +84,7 @@
 				B54AF23B2EC0CECA0025784B /* Tally-HoTests */,
 				B54AF2452EC0CECA0025784B /* Tally-HoUITests */,
 				B54AF2292EC0CEC90025784B /* Products */,
+				B54AF2600001000000000002 /* airports.csv */,
 			);
 			sourceTree = "<group>";
 		};
@@ -212,6 +218,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B54AF2600001000000000001 /* airports.csv in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -394,7 +401,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_ASSET_PATHS = "\"Tally-Ho/Preview Content\"";
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				ENABLE_PREVIEWS = YES;
@@ -424,7 +431,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_ASSET_PATHS = "\"Tally-Ho/Preview Content\"";
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				ENABLE_PREVIEWS = YES;
@@ -453,7 +460,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -472,7 +479,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -490,7 +497,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
@@ -507,7 +514,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 43;
+				CURRENT_PROJECT_VERSION = 44;
 				DEVELOPMENT_TEAM = QVLT3KZ5QL;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;

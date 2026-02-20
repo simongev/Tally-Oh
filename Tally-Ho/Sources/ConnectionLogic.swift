@@ -153,10 +153,10 @@ class ConnectionLogic: ObservableObject {
 
     func updateLocation(_ location: CLLocationCoordinate2D) {
         currentLocation = location
-        // Kick off internet fetching now that we have a location, if not already running
-        if isInternetAvailable {
-            ensureInternetFetchRunning()
-        }
+        // Kick off internet fetching now that we have a location.
+        // Check both the published flag AND the live path status so we don't
+        // miss the window where NWPathMonitor hasn't fired its first callback yet.
+        ensureInternetFetchRunning()
     }
 
     func addTestAircraft() {
@@ -342,7 +342,10 @@ class ConnectionLogic: ObservableObject {
 
     private func ensureInternetFetchRunning() {
         guard currentLocation != nil else { return }
+        guard isInternetAvailable || networkReachability.isConnected else { return }
         guard internetFetchTimer == nil else { return }
+        // Update published flag in case NWPathMonitor hasn't fired yet but we know we're connected
+        if !isInternetAvailable { isInternetAvailable = networkReachability.isConnected }
         fetchInternetData()
         internetFetchTimer = Timer.scheduledTimer(withTimeInterval: internetFetchInterval, repeats: true) { [weak self] _ in
             self?.fetchInternetData()
