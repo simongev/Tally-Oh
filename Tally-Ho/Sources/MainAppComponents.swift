@@ -168,6 +168,10 @@ class ARComponentFactory {
             parts.append(String(format: "%.0f ft", aircraft.altitude))
         }
 
+        if settings.showAircraftSpeed {
+            parts.append(String(format: "%.0f kts", aircraft.groundSpeed))
+        }
+
         return parts.joined(separator: "\n")
     }
 
@@ -379,23 +383,17 @@ struct ARVisualizationSettings {
     // Callsign filter — empty string = show all
     var callsignFilter: String = ""
 
-    // Speed filter — only show aircraft within [minSpeedKnots, maxSpeedKnots]
-    var minSpeedKnots: Double = 0
-    var maxSpeedKnots: Double = 700
+    // Whether to show ground speed in the aircraft label
+    var showAircraftSpeed: Bool = true
 
     /// Derived: show label if any label field is enabled
-    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign }
+    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed }
 
     /// Returns true if this aircraft passes the callsign filter.
     func passes(callsign: String) -> Bool {
         let f = callsignFilter.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !f.isEmpty else { return true }
         return callsign.uppercased().contains(f)
-    }
-
-    /// Returns true if this aircraft's speed is within the configured range.
-    func passesSpeed(_ groundSpeed: Double) -> Bool {
-        return groundSpeed >= minSpeedKnots && groundSpeed <= maxSpeedKnots
     }
 
     // MARK: Airports
@@ -501,9 +499,6 @@ class ARSceneManager {
 
             // Callsign filter
             guard settings.passes(callsign: ac.callsign) else { continue }
-
-            // Speed filter
-            guard settings.passesSpeed(ac.groundSpeed) else { continue }
 
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)

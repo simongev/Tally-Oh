@@ -19,8 +19,7 @@ extension ARVisualizationSettings {
             "showAircraftType":      showAircraftType,
             "showAircraftAltitude":  showAircraftAltitude,
             "callsignFilter":        callsignFilter,
-            "minSpeedKnots":         minSpeedKnots,
-            "maxSpeedKnots":         maxSpeedKnots,
+            "showAircraftSpeed":     showAircraftSpeed,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -40,8 +39,7 @@ extension ARVisualizationSettings {
         s.showAircraftType     = d["showAircraftType"]     as? Bool   ?? s.showAircraftType
         s.showAircraftAltitude = d["showAircraftAltitude"] as? Bool   ?? s.showAircraftAltitude
         s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
-        s.minSpeedKnots        = d["minSpeedKnots"]        as? Double ?? s.minSpeedKnots
-        s.maxSpeedKnots        = d["maxSpeedKnots"]        as? Double ?? s.maxSpeedKnots
+        s.showAircraftSpeed    = d["showAircraftSpeed"]    as? Bool   ?? s.showAircraftSpeed
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -125,21 +123,11 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.aircraftMaxDistance },
                 setter: { $0.aircraftMaxDistance = $1 }
             ),
-            .slider(
-                title: "Min Speed",
-                subtitle: "Hide aircraft slower than this",
-                unit: "kts",
-                min: 0, max: 600, step: 50,
-                getter: { $0.minSpeedKnots },
-                setter: { $0.minSpeedKnots = $1 }
-            ),
-            .slider(
-                title: "Max Speed",
-                subtitle: "Hide aircraft faster than this",
-                unit: "kts",
-                min: 100, max: 700, step: 50,
-                getter: { $0.maxSpeedKnots },
-                setter: { $0.maxSpeedKnots = $1 }
+            .toggle(
+                title: "Show Speed",
+                subtitle: "Ground speed in knots on label",
+                getter: { $0.showAircraftSpeed },
+                setter: { $0.showAircraftSpeed = $1 }
             ),
         ]),
         Section(header: "🛫  Airports", rows: [
