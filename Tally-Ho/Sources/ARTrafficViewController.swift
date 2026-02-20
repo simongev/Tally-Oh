@@ -248,7 +248,7 @@ class ARTrafficViewController: UIViewController {
             userHeading: userHeading
         )
         // Also keep ConnectionLogic updated with the best location for internet queries
-        connectionLogic.updateLocation(loc)
+        connectionLogic.updateLocation(loc, altitudeFeet: activeAltitude)
         updateStatusLabel()
     }
 
@@ -324,7 +324,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // Always use iPhone GPS for positioning
         userLocation = loc.coordinate
         userAltitude = loc.altitude * CalculationsLogic.metersToFeet
-        connectionLogic.updateLocation(loc.coordinate)
+        connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {

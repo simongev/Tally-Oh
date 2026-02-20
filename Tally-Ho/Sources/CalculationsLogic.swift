@@ -111,29 +111,27 @@ class CalculationsLogic {
         userHeading: Double
     ) -> SCNVector3 {
 
-        // Calculate horizontal distance and bearing
+        // With ARWorldTrackingConfiguration(.gravityAndHeading) the ARKit world
+        // coordinate system is FIXED to the real world:
+        //   +X = East,  -X = West
+        //   +Y = Up,    -Y = Down
+        //   -Z = North, +Z = South
+        // The scene does NOT rotate with the device, so we must NOT subtract
+        // userHeading here — just convert the absolute bearing to world axes.
+
         let horizontalDistance = distance(from: userCoord, to: targetCoord)
-        let bearing = self.bearing(from: userCoord, to: targetCoord)
+        let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
 
-        // Calculate relative bearing (bearing relative to user's heading)
-        var relativeBearing = bearing - userHeading
-        if relativeBearing < 0 {
-            relativeBearing += 360
-        }
-        if relativeBearing > 180 {
-            relativeBearing -= 360
-        }
+        // East component (+X in ARKit = East)
+        let x = Float(horizontalDistance * sin(bearingRad))
+        // North component (-Z in ARKit = North)
+        let z = Float(-horizontalDistance * cos(bearingRad))
 
-        let relativeBearingRad = relativeBearing.toRadians()
-
-        // Calculate altitude difference
-        let altitudeDifference = (targetAltitude - userAltitude) * feetToMeters
-
-        // Convert to AR coordinates
-        // In ARKit: +X is right, +Y is up, -Z is forward
-        let x = Float(horizontalDistance * sin(relativeBearingRad))
+        // Altitude difference in meters — clamped to ±50 m so objects stay
+        // in the camera's vertical field of view regardless of real altitude.
+        let rawAltDiff = (targetAltitude - userAltitude) * feetToMeters
+        let altitudeDifference = max(-50.0, min(50.0, rawAltDiff))
         let y = Float(altitudeDifference)
-        let z = Float(-horizontalDistance * cos(relativeBearingRad))
 
         return SCNVector3(x, y, z)
     }

@@ -20,36 +20,35 @@ class ARComponentFactory {
 
     // MARK: - Sizing Constants
 
-    /// Maximum distance (meters) any marker is placed from the camera in the AR scene.
-    /// All real-world positions are scaled into this "viewable bubble" so they are always visible.
-    static let maxARRadius: Float = 150.0
+    /// Maximum horizontal distance (meters) any marker is placed from the camera in the AR scene.
+    static let maxARRadius: Float = 80.0
 
-    /// Minimum AR placement distance (meters) — keeps very nearby targets off the nose.
-    static let minARRadius: Float = 8.0
+    /// Minimum horizontal placement distance (meters).
+    static let minARRadius: Float = 5.0
 
     /// Radius of the red torus ring around aircraft (meters in AR space).
-    static let aircraftRingRadius: Float = 18.0
-    static let aircraftPipeRadius: CGFloat = 1.8
+    static let aircraftRingRadius: Float = 3.0
+    static let aircraftPipeRadius: CGFloat = 0.4
 
     /// Airport cone dimensions (meters in AR space).
-    static let coneHeight: CGFloat = 60.0
-    static let coneBaseRadius: CGFloat = 14.0
+    static let coneHeight: CGFloat = 8.0
+    static let coneBaseRadius: CGFloat = 2.0
 
     /// Label font size — SCNText uses points where 1 pt ≈ 1 m in scene units.
-    static let labelFontSize: CGFloat = 4.0
-    static let labelFontSizeAirport: CGFloat = 5.0
+    static let labelFontSize: CGFloat = 0.6
+    static let labelFontSizeAirport: CGFloat = 0.7
 
     // MARK: - Position Scaling
 
-    /// Scale a raw AR position vector so it falls within [minARRadius, maxARRadius] metres
-    /// from the origin while preserving direction. This keeps all targets visible in the
-    /// AR "viewable bubble" regardless of real-world distance.
+    /// Scale the horizontal (XZ) component of a raw AR position so it falls within
+    /// [minARRadius, maxARRadius] metres, preserving compass direction.
+    /// Y (altitude) is already clamped in calculateARPosition to ±50 m.
     static func scaledPosition(_ raw: SCNVector3) -> SCNVector3 {
-        let len = sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z)
-        guard len > 0 else { return SCNVector3(0, minARRadius, 0) }
-        let clamped = max(minARRadius, min(maxARRadius, len))
-        let scale = clamped / len
-        return SCNVector3(raw.x * scale, raw.y * scale, raw.z * scale)
+        let horizLen = sqrt(raw.x * raw.x + raw.z * raw.z)
+        guard horizLen > 0 else { return SCNVector3(0, raw.y, -minARRadius) }
+        let clamped = max(minARRadius, min(maxARRadius, horizLen))
+        let scale = clamped / horizLen
+        return SCNVector3(raw.x * scale, raw.y, raw.z * scale)
     }
 
     // MARK: - Aircraft Components
@@ -83,14 +82,14 @@ class ARComponentFactory {
         let scaleDown = SCNAction.scale(to: 1.0,  duration: 0.9)
         circleNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
 
-        // Label
+        // Label just above the torus ring
         if settings.showAircraftLabels {
             let labelText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
             let labelNode = createTextLabel(
                 text: labelText,
                 color: .white,
                 fontSize: labelFontSize,
-                position: SCNVector3(0, aircraftRingRadius + 6, 0)
+                position: SCNVector3(0, aircraftRingRadius + 1.0, 0)
             )
             containerNode.addChildNode(labelNode)
         }
@@ -171,12 +170,10 @@ class ARComponentFactory {
 
         let containerNode = SCNNode()
         containerNode.name = "airport_\(airport.icao)"
-        // Place at the scaled horizontal position but force the Y to a comfortable
-        // eye-level height so the cone is always visible (airports are on the ground,
-        // user may be at similar altitude — the cone hangs above the location).
+        // Place at the scaled horizontal position. Force Y slightly above eye level
+        // (airports are at ground level — always push the marker up so it's visible).
         var scaled = scaledPosition(rawPosition)
-        // Ensure the cone is at least 10 m above the user's eye level so it's visible
-        if scaled.y < 10 { scaled.y = 10 }
+        scaled.y = 2.0   // 2 m above camera origin — always visible regardless of altitude diff
         containerNode.position = scaled
 
         let cone = SCNCone(topRadius: 0, bottomRadius: coneBaseRadius, height: coneHeight)
@@ -198,14 +195,14 @@ class ARComponentFactory {
         // Subtle slow rotation
         coneNode.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 12.0)))
 
-        // Label above the cone base
+        // Label just above the cone
         if settings.showAirportLabels {
             let labelText = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
             let labelNode = createTextLabel(
                 text: labelText,
                 color: .cyan,
                 fontSize: labelFontSizeAirport,
-                position: SCNVector3(0, Float(coneHeight) + 8, 0)
+                position: SCNVector3(0, Float(coneHeight) + 1.5, 0)
             )
             containerNode.addChildNode(labelNode)
         }

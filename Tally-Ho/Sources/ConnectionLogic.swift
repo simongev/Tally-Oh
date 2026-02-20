@@ -151,8 +151,9 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
-    func updateLocation(_ location: CLLocationCoordinate2D) {
+    func updateLocation(_ location: CLLocationCoordinate2D, altitudeFeet: Double = 0) {
         currentLocation = location
+        currentAltitudeFeet = altitudeFeet
         // Kick off internet fetching now that we have a location.
         // Check both the published flag AND the live path status so we don't
         // miss the window where NWPathMonitor hasn't fired its first callback yet.
@@ -160,21 +161,29 @@ class ConnectionLogic: ObservableObject {
     }
 
     func addTestAircraft() {
+        // Place test aircraft ~200 m due north of user at the same altitude
+        // so it appears straight ahead in the AR scene regardless of heading.
+        // 0.0018° latitude ≈ 200 m north.
+        let baseLat = currentLocation?.latitude  ?? 37.7749
+        let baseLon = currentLocation?.longitude ?? -122.4194
         let test = Aircraft(
             id: "TEST01",
-            callsign: "N12345",
+            callsign: "TEST",
             aircraftType: "C172",
-            latitude: (currentLocation?.latitude ?? 37.7749) + 0.05,
-            longitude: (currentLocation?.longitude ?? -122.4194) + 0.05,
-            altitude: 5500,
-            track: 270,
-            groundSpeed: 120,
+            latitude:  baseLat + 0.0018,   // ~200 m north
+            longitude: baseLon,
+            altitude:  currentAltitudeFeet, // same altitude as user → Y offset = 0
+            track: 180,                     // heading south (toward user)
+            groundSpeed: 0,
             verticalRate: 0,
             lastUpdate: Date(),
             source: .internet
         )
         DispatchQueue.main.async { self.detectedAircraft[test.id] = test }
     }
+
+    /// Last known user altitude in feet (set alongside currentLocation).
+    private var currentAltitudeFeet: Double = 0
 
     // MARK: - Private — ADS-B
 
