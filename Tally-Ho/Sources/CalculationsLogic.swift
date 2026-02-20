@@ -153,7 +153,7 @@ class CalculationsLogic {
     static func predictedPosition(
         for aircraft: Aircraft,
         aheadSeconds: Double = 0
-    ) -> (coord: CLLocationCoordinate2D, altitude: Double) {
+    ) -> (coordinate: CLLocationCoordinate2D, altitude: Double) {
         let age = -aircraft.lastUpdate.timeIntervalSinceNow  // seconds since last report
         let total = age + aheadSeconds
         guard total > 0, aircraft.groundSpeed > 0 else {
