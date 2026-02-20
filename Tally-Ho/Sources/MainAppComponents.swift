@@ -350,24 +350,27 @@ class ARComponentFactory {
         let shouldShow = settings.showAircraftLabels
         if let lbl = labelNode {
             lbl.isHidden = !shouldShow
+            // Only regenerate the label image when the text actually changes —
+            // altitude rounds to the nearest foot so re-renders are infrequent.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
-                let text  = buildAircraftLabelText(aircraft: aircraft, settings: settings)
-                let image = makeLabelImage(text: text, textColor: .white,
-                                           bgColor: UIColor(white: 0, alpha: 0.72),
-                                           fontSize: labelFontSize)
-                let scale: CGFloat = labelFontSize / 80.0
-                let w = CGFloat(image.size.width)  * scale
-                let h = CGFloat(image.size.height) * scale
-                // SCNTransaction gates geometry + material mutations so SceneKit's
-                // render thread never sees a half-updated object.
-                SCNTransaction.begin()
-                SCNTransaction.disableActions = true
-                plane.width  = w
-                plane.height = h
-                plane.materials.first?.diffuse.contents  = image
-                plane.materials.first?.emission.contents = image
-                lbl.position = SCNVector3(0, Float(CGFloat(aircraftRingRadius) + 0.9 + h / 2), 0)
-                SCNTransaction.commit()
+                let newText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+                if newText != lbl.name {
+                    lbl.name = newText   // cache rendered text in node name
+                    let image = makeLabelImage(text: newText, textColor: .white,
+                                               bgColor: UIColor(white: 0, alpha: 0.72),
+                                               fontSize: labelFontSize)
+                    let scale: CGFloat = labelFontSize / 80.0
+                    let w = CGFloat(image.size.width)  * scale
+                    let h = CGFloat(image.size.height) * scale
+                    SCNTransaction.begin()
+                    SCNTransaction.disableActions = true
+                    plane.width  = w
+                    plane.height = h
+                    plane.materials.first?.diffuse.contents  = image
+                    plane.materials.first?.emission.contents = image
+                    lbl.position = SCNVector3(0, Float(CGFloat(aircraftRingRadius) + 0.9 + h / 2), 0)
+                    SCNTransaction.commit()
+                }
             }
         }
     }
@@ -557,26 +560,32 @@ class ARSceneManager {
                 // Smooth repositioning for airports (they don't move, but user does)
                 let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
                 existing.runAction(.move(to: scaled, duration: 0.22))
-                // Update label distance
+                // Only regenerate the label image when the displayed text changes
+                // (distance rounds to 1 decimal, so re-render at most every ~185 m of travel).
                 let labelNode = existing.childNodes.first(where: { ($0.geometry as? SCNPlane) != nil })
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
-                    let text  = ARComponentFactory.buildAirportLabelText(
+                    let newText = ARComponentFactory.buildAirportLabelText(
                         airport: airport, distanceNM: distNM, settings: settings)
-                    let image = ARComponentFactory.makeLabelImage(
-                        text: text, textColor: .white,
-                        bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
-                        fontSize: ARComponentFactory.labelFontSizeAirport)
-                    let scale: CGFloat = ARComponentFactory.labelFontSizeAirport / 80.0
-                    let w = CGFloat(image.size.width)  * scale
-                    let h = CGFloat(image.size.height) * scale
-                    SCNTransaction.begin()
-                    SCNTransaction.disableActions = true
-                    plane.width  = w
-                    plane.height = h
-                    plane.materials.first?.diffuse.contents  = image
-                    plane.materials.first?.emission.contents = image
-                    lbl.isHidden = !settings.showAirportLabels
-                    SCNTransaction.commit()
+                    let oldText = (plane.materials.first?.diffuse.contents as? UIImage)
+                                      .flatMap { _ in lbl.name } ?? ""
+                    if newText != oldText {
+                        lbl.name = newText   // cache the rendered text in the node name
+                        let image = ARComponentFactory.makeLabelImage(
+                            text: newText, textColor: .white,
+                            bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
+                            fontSize: ARComponentFactory.labelFontSizeAirport)
+                        let scale: CGFloat = ARComponentFactory.labelFontSizeAirport / 80.0
+                        let w = CGFloat(image.size.width)  * scale
+                        let h = CGFloat(image.size.height) * scale
+                        SCNTransaction.begin()
+                        SCNTransaction.disableActions = true
+                        plane.width  = w
+                        plane.height = h
+                        plane.materials.first?.diffuse.contents  = image
+                        plane.materials.first?.emission.contents = image
+                        lbl.isHidden = !settings.showAirportLabels
+                        SCNTransaction.commit()
+                    }
                 }
             } else {
                 let node = ARComponentFactory.createAirportMarker(
