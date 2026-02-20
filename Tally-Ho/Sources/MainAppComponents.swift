@@ -358,11 +358,16 @@ class ARComponentFactory {
                 let scale: CGFloat = labelFontSize / 80.0
                 let w = CGFloat(image.size.width)  * scale
                 let h = CGFloat(image.size.height) * scale
+                // SCNTransaction gates geometry + material mutations so SceneKit's
+                // render thread never sees a half-updated object.
+                SCNTransaction.begin()
+                SCNTransaction.disableActions = true
                 plane.width  = w
                 plane.height = h
                 plane.materials.first?.diffuse.contents  = image
                 plane.materials.first?.emission.contents = image
                 lbl.position = SCNVector3(0, Float(CGFloat(aircraftRingRadius) + 0.9 + h / 2), 0)
+                SCNTransaction.commit()
             }
         }
     }
@@ -491,14 +496,20 @@ class ARSceneManager {
                     cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
+                SCNTransaction.begin()
+                SCNTransaction.disableActions = true
                 sceneView?.scene.rootNode.addChildNode(node)
+                SCNTransaction.commit()
                 aircraftNodes[ac.id] = node
             }
         }
 
         // Remove aircraft that are out of range, filtered, or stale
         for id in Set(aircraftNodes.keys).subtracting(currentIDs) {
+            SCNTransaction.begin()
+            SCNTransaction.disableActions = true
             aircraftNodes[id]?.removeFromParentNode()
+            SCNTransaction.commit()
             aircraftNodes.removeValue(forKey: id)
         }
     }
@@ -558,11 +569,14 @@ class ARSceneManager {
                     let scale: CGFloat = ARComponentFactory.labelFontSizeAirport / 80.0
                     let w = CGFloat(image.size.width)  * scale
                     let h = CGFloat(image.size.height) * scale
+                    SCNTransaction.begin()
+                    SCNTransaction.disableActions = true
                     plane.width  = w
                     plane.height = h
                     plane.materials.first?.diffuse.contents  = image
                     plane.materials.first?.emission.contents = image
                     lbl.isHidden = !settings.showAirportLabels
+                    SCNTransaction.commit()
                 }
             } else {
                 let node = ARComponentFactory.createAirportMarker(
@@ -572,13 +586,19 @@ class ARSceneManager {
                     cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
+                SCNTransaction.begin()
+                SCNTransaction.disableActions = true
                 sceneView?.scene.rootNode.addChildNode(node)
+                SCNTransaction.commit()
                 airportNodes[airport.icao] = node
             }
         }
 
         for icao in Set(airportNodes.keys).subtracting(currentIDs) {
+            SCNTransaction.begin()
+            SCNTransaction.disableActions = true
             airportNodes[icao]?.removeFromParentNode()
+            SCNTransaction.commit()
             airportNodes.removeValue(forKey: icao)
         }
     }
@@ -586,9 +606,12 @@ class ARSceneManager {
     // MARK: Clear
 
     func clearAll() {
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
         aircraftNodes.values.forEach { $0.removeFromParentNode() }
+        airportNodes.values.forEach  { $0.removeFromParentNode() }
+        SCNTransaction.commit()
         aircraftNodes.removeAll()
-        airportNodes.values.forEach { $0.removeFromParentNode() }
         airportNodes.removeAll()
     }
 }
