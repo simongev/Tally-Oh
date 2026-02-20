@@ -2,29 +2,23 @@
 //  SettingsViewController.swift
 //  TallyOh - AR Aviation Traffic Visualization
 //
-//  Two-section settings panel:
-//    ✈️  Aircraft  — Show, Type, Altitude, Distance range slider
-//    🛫  Airports  — Show, Distance label, Large/Medium/Small, Distance range slider
-//
-//  "Show Labels" is removed: a label appears automatically when at least one
-//  label field (type, altitude, distance) is enabled.
-//
 
 import UIKit
 
-// MARK: - ARVisualizationSettings  (persistence via UserDefaults)
+// MARK: - ARVisualizationSettings + Persistence
 
 extension ARVisualizationSettings {
 
     private static let udKey = "ARVisualizationSettings"
 
-    /// Persist settings to UserDefaults.
     func save() {
         let d: [String: Any] = [
             "showAircraft":          showAircraft,
             "aircraftMaxDistance":   aircraftMaxDistance,
+            "showCallsign":          showCallsign,
             "showAircraftType":      showAircraftType,
             "showAircraftAltitude":  showAircraftAltitude,
+            "callsignFilter":        callsignFilter,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -35,14 +29,15 @@ extension ARVisualizationSettings {
         UserDefaults.standard.set(d, forKey: ARVisualizationSettings.udKey)
     }
 
-    /// Load settings from UserDefaults. Returns nil if no saved settings exist.
     static func load() -> ARVisualizationSettings? {
         guard let d = UserDefaults.standard.dictionary(forKey: udKey) else { return nil }
         var s = ARVisualizationSettings()
         s.showAircraft         = d["showAircraft"]         as? Bool   ?? s.showAircraft
         s.aircraftMaxDistance  = d["aircraftMaxDistance"]  as? Double ?? s.aircraftMaxDistance
+        s.showCallsign         = d["showCallsign"]         as? Bool   ?? s.showCallsign
         s.showAircraftType     = d["showAircraftType"]     as? Bool   ?? s.showAircraftType
         s.showAircraftAltitude = d["showAircraftAltitude"] as? Bool   ?? s.showAircraftAltitude
+        s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -57,7 +52,7 @@ extension ARVisualizationSettings {
 
 class SettingsViewController: UITableViewController {
 
-    // MARK: Row types
+    // MARK: Row kinds
 
     private enum RowKind {
         case toggle(
@@ -69,11 +64,15 @@ class SettingsViewController: UITableViewController {
         case slider(
             title: String,
             subtitle: String,
-            min: Double,
-            max: Double,
-            step: Double,
+            min: Double, max: Double, step: Double,
             getter: (ARVisualizationSettings) -> Double,
             setter: (inout ARVisualizationSettings, Double) -> Void
+        )
+        case textField(
+            title: String,
+            placeholder: String,
+            getter: (ARVisualizationSettings) -> String,
+            setter: (inout ARVisualizationSettings, String) -> Void
         )
     }
 
@@ -96,8 +95,14 @@ class SettingsViewController: UITableViewController {
                 setter: { $0.showAircraft = $1 }
             ),
             .toggle(
+                title: "Show Callsign",
+                subtitle: "Callsign label on each aircraft",
+                getter: { $0.showCallsign },
+                setter: { $0.showCallsign = $1 }
+            ),
+            .toggle(
                 title: "Show Aircraft Type",
-                subtitle: "e.g. B738, C172 — label appears if any field is on",
+                subtitle: "e.g. B738, C172",
                 getter: { $0.showAircraftType },
                 setter: { $0.showAircraftType = $1 }
             ),
@@ -106,6 +111,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "Altitude in feet MSL",
                 getter: { $0.showAircraftAltitude },
                 setter: { $0.showAircraftAltitude = $1 }
+            ),
+            .textField(
+                title: "Callsign Filter",
+                placeholder: "e.g. UAL, N12 — empty = show all",
+                getter: { $0.callsignFilter },
+                setter: { $0.callsignFilter = $1 }
             ),
             .slider(
                 title: "Max Distance",
@@ -124,7 +135,7 @@ class SettingsViewController: UITableViewController {
             ),
             .toggle(
                 title: "Show Distance",
-                subtitle: "Distance in NM — label appears if any field is on",
+                subtitle: "Distance in NM on airport label",
                 getter: { $0.showAirportDistance },
                 setter: { $0.showAirportDistance = $1 }
             ),
@@ -159,7 +170,7 @@ class SettingsViewController: UITableViewController {
     // MARK: Init
 
     init(settings: ARVisualizationSettings, onDismiss: @escaping (ARVisualizationSettings) -> Void) {
-        self.settings = settings
+        self.settings  = settings
         self.onDismiss = onDismiss
         super.init(style: .insetGrouped)
     }
@@ -175,12 +186,15 @@ class SettingsViewController: UITableViewController {
             barButtonSystemItem: .done, target: self, action: #selector(doneTapped)
         )
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "toggle")
-        tableView.register(SliderCell.self, forCellReuseIdentifier: "slider")
+        tableView.register(SliderCell.self,      forCellReuseIdentifier: "slider")
+        tableView.register(TextFieldCell.self,   forCellReuseIdentifier: "textField")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
+        tableView.keyboardDismissMode = .onDrag
     }
 
     @objc private func doneTapped() {
+        view.endEditing(true)
         dismiss(animated: true) { self.onDismiss(self.settings) }
     }
 
@@ -210,26 +224,36 @@ class SettingsViewController: UITableViewController {
 
             let sw = UISwitch()
             sw.isOn = getter(settings)
-            sw.tag = indexPath.section * 1000 + indexPath.row
+            sw.tag  = indexPath.section * 1000 + indexPath.row
             sw.addTarget(self, action: #selector(switchToggled(_:)), for: .valueChanged)
             cell.accessoryView = sw
             return cell
 
         case let .slider(title, subtitle, min, max, step, getter, _):
             let cell = tableView.dequeueReusableCell(withIdentifier: "slider", for: indexPath) as! SliderCell
-            let current = getter(settings)
             cell.configure(
-                title: title,
-                subtitle: subtitle,
-                minValue: min,
-                maxValue: max,
-                step: step,
-                current: current
+                title: title, subtitle: subtitle,
+                minValue: min, maxValue: max, step: step,
+                current: getter(settings)
             ) { [weak self] newValue in
-                guard let self = self else { return }
-                // Find the matching slider row and apply its setter
+                guard let self else { return }
                 let rows = self.sections[indexPath.section].rows
                 if case let .slider(_, _, _, _, _, _, setter) = rows[indexPath.row] {
+                    setter(&self.settings, newValue)
+                }
+            }
+            return cell
+
+        case let .textField(title, placeholder, getter, setter):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "textField", for: indexPath) as! TextFieldCell
+            cell.configure(
+                title: title,
+                placeholder: placeholder,
+                current: getter(settings)
+            ) { [weak self] newValue in
+                guard let self else { return }
+                let rows = self.sections[indexPath.section].rows
+                if case let .textField(_, _, _, setter) = rows[indexPath.row] {
                     setter(&self.settings, newValue)
                 }
             }
@@ -251,7 +275,6 @@ class SettingsViewController: UITableViewController {
 
 // MARK: - SliderCell
 
-/// A table-view cell with a stepped UISlider showing current value as "X NM".
 final class SliderCell: UITableViewCell {
 
     private let titleLabel    = UILabel()
@@ -259,7 +282,7 @@ final class SliderCell: UITableViewCell {
     private let valueLabel    = UILabel()
     private let slider        = UISlider()
 
-    private var step: Double = 10
+    private var step: Double   = 10
     private var minVal: Double = 20
     private var onChange: ((Double) -> Void)?
 
@@ -267,22 +290,20 @@ final class SliderCell: UITableViewCell {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
         selectionStyle = .none
 
-        titleLabel.font = .systemFont(ofSize: 16, weight: .medium)
+        titleLabel.font    = .systemFont(ofSize: 16, weight: .medium)
         subtitleLabel.font = .systemFont(ofSize: 13)
-        subtitleLabel.textColor = .secondaryLabel
+        subtitleLabel.textColor    = .secondaryLabel
         subtitleLabel.numberOfLines = 2
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
-        valueLabel.textColor = .systemBlue
-        valueLabel.textAlignment = .right
+        valueLabel.font            = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        valueLabel.textColor       = .systemBlue
+        valueLabel.textAlignment   = .right
         valueLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         let topRow = UIStackView(arrangedSubviews: [titleLabel, valueLabel])
-        topRow.axis = .horizontal
-        topRow.spacing = 8
+        topRow.axis = .horizontal; topRow.spacing = 8
 
         let stack = UIStackView(arrangedSubviews: [topRow, subtitleLabel, slider])
-        stack.axis = .vertical
-        stack.spacing = 4
+        stack.axis = .vertical; stack.spacing = 4
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         contentView.addSubview(stack)
@@ -299,26 +320,17 @@ final class SliderCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(
-        title: String,
-        subtitle: String,
-        minValue: Double,
-        maxValue: Double,
-        step: Double,
-        current: Double,
-        onChange: @escaping (Double) -> Void
-    ) {
-        self.step = step
-        self.minVal = minValue
+    func configure(title: String, subtitle: String,
+                   minValue: Double, maxValue: Double, step: Double,
+                   current: Double, onChange: @escaping (Double) -> Void) {
+        self.step    = step
+        self.minVal  = minValue
         self.onChange = onChange
-
-        titleLabel.text = title
+        titleLabel.text    = title
         subtitleLabel.text = subtitle
-
         slider.minimumValue = Float(minValue)
         slider.maximumValue = Float(maxValue)
-        slider.value = Float(current)
-
+        slider.value        = Float(current)
         updateValueLabel(current)
     }
 
@@ -331,15 +343,63 @@ final class SliderCell: UITableViewCell {
         valueLabel.text = String(format: "%.0f NM", val)
     }
 
-    @objc private func sliderChanged() {
-        let v = snapped(slider.value)
-        updateValueLabel(v)
-    }
+    @objc private func sliderChanged() { updateValueLabel(snapped(slider.value)) }
 
     @objc private func sliderReleased() {
         let v = snapped(slider.value)
-        slider.value = Float(v)   // snap the thumb
+        slider.value = Float(v)
         updateValueLabel(v)
         onChange?(v)
     }
+}
+
+// MARK: - TextFieldCell
+
+final class TextFieldCell: UITableViewCell {
+
+    private let titleLabel = UILabel()
+    private let field      = UITextField()
+    private var onChange: ((String) -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+
+        titleLabel.font = .systemFont(ofSize: 16, weight: .medium)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        field.borderStyle       = .roundedRect
+        field.font              = .monospacedSystemFont(ofSize: 15, weight: .regular)
+        field.autocapitalizationType = .allCharacters
+        field.autocorrectionType     = .no
+        field.clearButtonMode        = .whileEditing
+        field.returnKeyType          = .done
+        field.addTarget(self, action: #selector(textChanged), for: .editingChanged)
+        field.addTarget(self, action: #selector(textDone),    for: .editingDidEndOnExit)
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, field])
+        stack.axis = .horizontal; stack.spacing = 12; stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, placeholder: String,
+                   current: String, onChange: @escaping (String) -> Void) {
+        titleLabel.text      = title
+        field.placeholder    = placeholder
+        field.text           = current
+        self.onChange        = onChange
+    }
+
+    @objc private func textChanged() { onChange?(field.text ?? "") }
+    @objc private func textDone()    { field.resignFirstResponder() }
 }

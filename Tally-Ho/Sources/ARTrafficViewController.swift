@@ -35,7 +35,6 @@ class ARTrafficViewController: UIViewController {
 
     private var updateTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
-    private var testAircraftButton: UIButton!
 
     // MARK: - Lifecycle
 
@@ -116,23 +115,6 @@ class ARTrafficViewController: UIViewController {
             settingsButton.widthAnchor.constraint(equalToConstant: 48),
             settingsButton.heightAnchor.constraint(equalToConstant: 48)
         ])
-
-        // Test aircraft button — inject a synthetic aircraft to verify AR rendering works
-        testAircraftButton = UIButton(type: .system)
-        testAircraftButton.translatesAutoresizingMaskIntoConstraints = false
-        testAircraftButton.setTitle("✈️+", for: .normal)
-        testAircraftButton.titleLabel?.font = UIFont.systemFont(ofSize: 18)
-        testAircraftButton.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-        testAircraftButton.layer.cornerRadius = 24
-        testAircraftButton.addTarget(self, action: #selector(addTestAircraft), for: .touchUpInside)
-        view.addSubview(testAircraftButton)
-
-        NSLayoutConstraint.activate([
-            testAircraftButton.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -12),
-            testAircraftButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            testAircraftButton.widthAnchor.constraint(equalToConstant: 48),
-            testAircraftButton.heightAnchor.constraint(equalToConstant: 48)
-        ])
     }
 
     private func setupARScene() {
@@ -189,10 +171,6 @@ class ARTrafficViewController: UIViewController {
     }
 
     // MARK: - Actions
-
-    @objc private func addTestAircraft() {
-        connectionLogic.addTestAircraft()
-    }
 
     @objc private func showSettings() {
         guard let settings = sceneManager?.settings else { return }

@@ -3,9 +3,9 @@
 //  TallyOh - AR Aviation Traffic Visualization
 //
 //  Contains all AR visualization components:
-//  - Red circles around aircraft
-//  - Blue inverted cones for airports
-//  - Text labels
+//  - Flat billboard red ring around aircraft (always faces camera)
+//  - Solid blue rounded-base inverted cones for airports
+//  - Text labels with opaque background panels
 //
 
 import Foundation
@@ -15,108 +15,145 @@ import UIKit
 
 // MARK: - AR Component Factory
 
-/// Factory class for creating AR visualization components
 class ARComponentFactory {
 
     // MARK: - Sizing Constants
 
-    /// Maximum horizontal distance (meters) any marker is placed from the camera in the AR scene.
     static let maxARRadius: Float = 80.0
-
-    /// Minimum horizontal placement distance (meters).
     static let minARRadius: Float = 5.0
 
-    /// Radius of the red torus ring around aircraft (meters in AR space).
-    static let aircraftRingRadius: Float = 3.0
-    static let aircraftPipeRadius: CGFloat = 0.4
+    /// Radius of the flat red ring (metres in AR space).
+    static let aircraftRingRadius: Float  = 3.0
+    static let aircraftRingThickness: Float = 0.35   // half-width of the ring stroke
 
-    /// Airport cone dimensions (meters in AR space).
+    /// Airport cone dimensions (metres in AR space).
     static let coneHeight: CGFloat = 8.0
     static let coneBaseRadius: CGFloat = 2.0
 
-    /// Label font size — SCNText uses points where 1 pt ≈ 1 m in scene units.
-    static let labelFontSize: CGFloat = 0.6
-    static let labelFontSizeAirport: CGFloat = 0.7
+    /// Label font size (1 scene-unit ≈ 1 m).
+    static let labelFontSize: CGFloat        = 1.1
+    static let labelFontSizeAirport: CGFloat = 1.2
+
+    /// Padding added around the label text background (scene units).
+    static let labelPadding: Float = 0.35
 
     // MARK: - Position Scaling
 
-    /// Scale the horizontal (XZ) component of a raw AR position so it falls within
-    /// [minARRadius, maxARRadius] metres, preserving compass direction.
-    /// Y (altitude) is already clamped in calculateARPosition to ±50 m.
+    /// Scale only the horizontal (XZ) component into [minARRadius, maxARRadius].
+    /// Y is already clamped to ±50 m in calculateARPosition.
     static func scaledPosition(_ raw: SCNVector3) -> SCNVector3 {
         let horizLen = sqrt(raw.x * raw.x + raw.z * raw.z)
         guard horizLen > 0 else { return SCNVector3(0, raw.y, -minARRadius) }
         let clamped = max(minARRadius, min(maxARRadius, horizLen))
-        let scale = clamped / horizLen
+        let scale   = clamped / horizLen
         return SCNVector3(raw.x * scale, raw.y, raw.z * scale)
     }
 
-    // MARK: - Aircraft Components
+    // MARK: - Aircraft Marker
 
-    /// Create a red circle to represent an aircraft in AR.
+    /// Create a flat red ring that always faces the camera, with an optional label.
     static func createAircraftMarker(
         rawPosition: SCNVector3,
         aircraft: Aircraft,
         settings: ARVisualizationSettings
     ) -> SCNNode {
 
-        let containerNode = SCNNode()
-        containerNode.name = "aircraft_\(aircraft.id)"
-        containerNode.position = scaledPosition(rawPosition)
+        let container = SCNNode()
+        container.name = "aircraft_\(aircraft.id)"
+        container.position = scaledPosition(rawPosition)
 
-        // Red torus ring
-        let circle = SCNTorus(ringRadius: CGFloat(aircraftRingRadius), pipeRadius: aircraftPipeRadius)
-        let circleMaterial = SCNMaterial()
-        circleMaterial.diffuse.contents = UIColor.red
-        circleMaterial.emission.contents = UIColor(red: 1, green: 0.2, blue: 0.2, alpha: 0.6)
-        circleMaterial.isDoubleSided = true
-        circle.materials = [circleMaterial]
+        // -- Flat ring: a thin torus with zero extrusion depth, billboard-constrained --
+        // We use an SCNPlane textured with a ring image drawn via Core Graphics,
+        // so it is always perfectly flat and camera-facing.
+        let ringSize = aircraftRingRadius * 2.2   // overall diameter with some margin
+        let plane = SCNPlane(width: CGFloat(ringSize), height: CGFloat(ringSize))
+        plane.cornerRadius = 0
 
-        let circleNode = SCNNode(geometry: circle)
-        // Rotate torus to lie in the horizontal plane (parallel to ground)
-        circleNode.eulerAngles.x = .pi / 2
-        containerNode.addChildNode(circleNode)
+        let ringImage = makeRingImage(
+            outerRadius: CGFloat(aircraftRingRadius),
+            thickness:   CGFloat(aircraftRingThickness),
+            color:       UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1)
+        )
+        let planeMat = SCNMaterial()
+        planeMat.diffuse.contents   = ringImage
+        planeMat.emission.contents  = ringImage
+        planeMat.isDoubleSided      = true
+        planeMat.transparencyMode   = .aOne
+        plane.materials = [planeMat]
 
-        // Pulsing animation
-        let scaleUp   = SCNAction.scale(to: 1.15, duration: 0.9)
-        let scaleDown = SCNAction.scale(to: 1.0,  duration: 0.9)
-        circleNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+        let ringNode = SCNNode(geometry: plane)
+        // Billboard: always face camera on ALL axes so the ring stays flat to screen
+        let billboard = SCNBillboardConstraint()
+        billboard.freeAxes = []   // lock all axes → fully camera-facing
+        ringNode.constraints = [billboard]
 
-        // Label just above the torus ring
+        // Pulsing scale animation
+        let scaleUp   = SCNAction.scale(to: 1.12, duration: 0.85)
+        let scaleDown = SCNAction.scale(to: 1.0,  duration: 0.85)
+        scaleUp.timingMode   = .easeInEaseOut
+        scaleDown.timingMode = .easeInEaseOut
+        ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+
+        container.addChildNode(ringNode)
+
+        // -- Label --
         if settings.showAircraftLabels {
-            let labelText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
-            let labelNode = createTextLabel(
-                text: labelText,
-                color: .white,
+            let text = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+            let labelNode = createLabelNode(
+                text: text,
+                textColor: .white,
+                bgColor: UIColor(white: 0, alpha: 0.72),
                 fontSize: labelFontSize,
-                position: SCNVector3(0, aircraftRingRadius + 1.0, 0)
+                yOffset: CGFloat(aircraftRingRadius) + 0.9
             )
-            containerNode.addChildNode(labelNode)
+            container.addChildNode(labelNode)
         }
 
-        // Direction arrow
-        let arrowNode = createDirectionArrow(
-            heading: Float(aircraft.track),
-            length: aircraftRingRadius * 1.4,
-            color: .yellow
-        )
-        containerNode.addChildNode(arrowNode)
-
-        return containerNode
+        return container
     }
 
-    /// Build the aircraft label string based on settings toggles.
+    /// Draw a ring (annulus) into a UIImage for use as a plane texture.
+    private static func makeRingImage(
+        outerRadius: CGFloat,
+        thickness: CGFloat,
+        color: UIColor
+    ) -> UIImage {
+        let dim = Int((outerRadius * 2 + 4).rounded()) * 16   // high-res for crisp anti-aliasing
+        let size = CGSize(width: dim, height: dim)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            let centre  = CGPoint(x: CGFloat(dim) / 2, y: CGFloat(dim) / 2)
+            let scale   = CGFloat(dim) / (outerRadius * 2 + 4)
+            let outerPx = outerRadius * scale
+            let innerPx = (outerRadius - thickness) * scale
+
+            // outer circle
+            ctx.cgContext.addEllipse(in: CGRect(
+                x: centre.x - outerPx, y: centre.y - outerPx,
+                width: outerPx * 2, height: outerPx * 2))
+            // inner circle (clip out centre)
+            ctx.cgContext.addEllipse(in: CGRect(
+                x: centre.x - innerPx, y: centre.y - innerPx,
+                width: innerPx * 2, height: innerPx * 2))
+
+            ctx.cgContext.setFillColor(color.cgColor)
+            // even-odd rule cuts the inner hole
+            ctx.cgContext.fillPath(using: .evenOdd)
+        }
+    }
+
+    // MARK: - Aircraft Label Text
+
     static func buildAircraftLabelText(aircraft: Aircraft, settings: ARVisualizationSettings) -> String {
         var parts: [String] = []
 
-        // Line 1: callsign [/ type]
+        // Line 1: callsign (always shown as part of label if labels are on)
         var line1 = aircraft.callsign
         if settings.showAircraftType && !aircraft.aircraftType.isEmpty {
             line1 += " / \(aircraft.aircraftType)"
         }
         parts.append(line1)
 
-        // Line 2: altitude
         if settings.showAircraftAltitude {
             parts.append(String(format: "%.0f ft", aircraft.altitude))
         }
@@ -124,43 +161,9 @@ class ARComponentFactory {
         return parts.joined(separator: "\n")
     }
 
-    /// Create a direction arrow showing aircraft heading.
-    private static func createDirectionArrow(
-        heading: Float,
-        length: Float,
-        color: UIColor
-    ) -> SCNNode {
+    // MARK: - Airport Marker
 
-        let arrow = SCNNode()
-
-        let shaft = SCNCylinder(radius: 0.4, height: CGFloat(length))
-        let shaftMat = SCNMaterial()
-        shaftMat.diffuse.contents = color
-        shaft.materials = [shaftMat]
-        let shaftNode = SCNNode(geometry: shaft)
-        shaftNode.eulerAngles.x = .pi / 2
-        shaftNode.position = SCNVector3(0, 0, -length / 2)
-
-        let head = SCNCone(topRadius: 0, bottomRadius: 1.8, height: 3.5)
-        let headMat = SCNMaterial()
-        headMat.diffuse.contents = color
-        head.materials = [headMat]
-        let headNode = SCNNode(geometry: head)
-        headNode.eulerAngles.x = .pi / 2
-        headNode.position = SCNVector3(0, 0, -length)
-
-        arrow.addChildNode(shaftNode)
-        arrow.addChildNode(headNode)
-        arrow.eulerAngles.y = -heading.toRadians()
-
-        return arrow
-    }
-
-    // MARK: - Airport Components
-
-    /// Create a blue inverted-cone marker for an airport.
-    /// The cone tip points down toward the airport, base extends upward — like a beacon
-    /// hanging from the sky above the airport location.
+    /// Solid blue inverted cone with a rounded (sphere-capped) base at the top.
     static func createAirportMarker(
         rawPosition: SCNVector3,
         airport: Airport,
@@ -168,100 +171,154 @@ class ARComponentFactory {
         settings: ARVisualizationSettings
     ) -> SCNNode {
 
-        let containerNode = SCNNode()
-        containerNode.name = "airport_\(airport.icao)"
-        // Place at the scaled horizontal position. Force Y slightly above eye level
-        // (airports are at ground level — always push the marker up so it's visible).
+        let container = SCNNode()
+        container.name = "airport_\(airport.icao)"
         var scaled = scaledPosition(rawPosition)
-        scaled.y = 2.0   // 2 m above camera origin — always visible regardless of altitude diff
-        containerNode.position = scaled
+        scaled.y = 2.0   // always push slightly above camera so it's visible
+        container.position = scaled
 
+        let blue = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
+
+        // Main cone (solid, no transparency)
         let cone = SCNCone(topRadius: 0, bottomRadius: coneBaseRadius, height: coneHeight)
         let coneMat = SCNMaterial()
-        coneMat.diffuse.contents = UIColor.systemBlue
-        coneMat.emission.contents = UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 0.5)
-        coneMat.transparency = 0.35
-        coneMat.isDoubleSided = true
+        coneMat.diffuse.contents  = blue
+        coneMat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
+        coneMat.isDoubleSided     = true
         cone.materials = [coneMat]
 
         let coneNode = SCNNode(geometry: cone)
-        // Flip 180° → topRadius (0, the tip) is now at the BOTTOM, base at the TOP
-        coneNode.eulerAngles.x = .pi
-        // Move so the tip (bottom) sits exactly at the container origin (airport ground point)
-        // SCNCone origin is at its centre, height is coneHeight, so centre is coneHeight/2 above tip
+        coneNode.eulerAngles.x = .pi                      // tip points down
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
-        containerNode.addChildNode(coneNode)
+        container.addChildNode(coneNode)
 
-        // Subtle slow rotation
-        coneNode.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 12.0)))
+        // Rounded cap: sphere sitting at the base (top) of the inverted cone
+        let capRadius = coneBaseRadius * 0.55
+        let sphere = SCNSphere(radius: capRadius)
+        let sphereMat = SCNMaterial()
+        sphereMat.diffuse.contents  = blue
+        sphereMat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
+        sphere.materials = [sphereMat]
+        let capNode = SCNNode(geometry: sphere)
+        capNode.position = SCNVector3(0, Float(coneHeight), 0)   // top of cone
+        container.addChildNode(capNode)
 
-        // Label just above the cone
+        // Slow rotation on the whole container
+        container.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 14.0)))
+
+        // Label
         if settings.showAirportLabels {
-            let labelText = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
-            let labelNode = createTextLabel(
-                text: labelText,
-                color: .cyan,
+            let text = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
+            let labelNode = createLabelNode(
+                text: text,
+                textColor: .white,
+                bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
                 fontSize: labelFontSizeAirport,
-                position: SCNVector3(0, Float(coneHeight) + 1.5, 0)
+                yOffset: CGFloat(coneHeight) + CGFloat(capRadius) + 1.0
             )
-            containerNode.addChildNode(labelNode)
+            container.addChildNode(labelNode)
         }
 
-        return containerNode
+        return container
     }
 
-    /// Build the airport label string based on settings toggles.
     static func buildAirportLabelText(airport: Airport, distanceNM: Double, settings: ARVisualizationSettings) -> String {
         var parts: [String] = [airport.icao]
-
         if settings.showAirportDistance {
             parts.append(String(format: "%.1f NM", distanceNM))
         }
-
         return parts.joined(separator: "\n")
     }
 
-    // MARK: - Text Labels
+    // MARK: - Label with Background
 
-    /// Create a 3D text label that always faces the camera.
-    static func createTextLabel(
+    /// Creates a label node: 3D text with an opaque rounded-rect background that
+    /// auto-sizes to the text. The whole node is billboard-constrained to always
+    /// face the camera.
+    static func createLabelNode(
         text: String,
-        color: UIColor,
+        textColor: UIColor,
+        bgColor: UIColor,
         fontSize: CGFloat,
-        position: SCNVector3
+        yOffset: CGFloat
     ) -> SCNNode {
 
-        let textGeometry = SCNText(string: text, extrusionDepth: 0.2)
-        textGeometry.font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
-        textGeometry.flatness = 0.05
-        textGeometry.alignmentMode = CATextLayerAlignmentMode.center.rawValue
+        // Render text + background into a UIImage so we get crisp pixels at any angle
+        let image = makeLabelImage(text: text, textColor: textColor, bgColor: bgColor, fontSize: fontSize)
 
+        // Scale: 1 scene-unit wide per ~80 pts of image width keeps text readable
+        let scale: CGFloat = fontSize / 80.0
+        let w = CGFloat(image.size.width)  * scale
+        let h = CGFloat(image.size.height) * scale
+
+        let plane = SCNPlane(width: w, height: h)
+        plane.cornerRadius = 0
         let mat = SCNMaterial()
-        mat.diffuse.contents = color
-        mat.emission.contents = color.withAlphaComponent(0.7)
-        mat.isDoubleSided = true
-        textGeometry.materials = [mat]
+        mat.diffuse.contents   = image
+        mat.emission.contents  = image
+        mat.isDoubleSided      = true
+        mat.transparencyMode   = .aOne
+        plane.materials = [mat]
 
-        let textNode = SCNNode(geometry: textGeometry)
-        textNode.position = position
+        let node = SCNNode(geometry: plane)
+        node.position = SCNVector3(0, Float(yOffset + h / 2), 0)
 
-        // Centre the text horizontally
-        let (minB, maxB) = textNode.boundingBox
-        let w = maxB.x - minB.x
-        let h = maxB.y - minB.y
-        textNode.pivot = SCNMatrix4MakeTranslation(w / 2, h / 2, 0)
+        let bill = SCNBillboardConstraint()
+        bill.freeAxes = []   // fully camera-facing
+        node.constraints = [bill]
 
-        // Billboard — always face the camera, free to rotate around Y
-        let constraint = SCNBillboardConstraint()
-        constraint.freeAxes = [.Y]
-        textNode.constraints = [constraint]
-
-        return textNode
+        return node
     }
 
-    // MARK: - Update Methods
+    /// Render multi-line text with a semi-opaque rounded-rect background into a UIImage.
+    static func makeLabelImage(
+        text: String,
+        textColor: UIColor,
+        bgColor: UIColor,
+        fontSize: CGFloat
+    ) -> UIImage {
+        let font      = UIFont.boldSystemFont(ofSize: fontSize * 80)
+        let paraStyle = NSMutableParagraphStyle()
+        paraStyle.alignment = .center
+        paraStyle.lineSpacing = fontSize * 6
 
-    /// Smoothly move an existing aircraft node to a new raw position and refresh its label.
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: textColor,
+            .paragraphStyle: paraStyle
+        ]
+        let attrStr  = NSAttributedString(string: text, attributes: attrs)
+        let textSize = attrStr.boundingRect(
+            with: CGSize(width: 2000, height: 2000),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        ).size
+
+        let hPad: CGFloat = fontSize * 28
+        let vPad: CGFloat = fontSize * 20
+        let imgW  = ceil(textSize.width  + hPad * 2)
+        let imgH  = ceil(textSize.height + vPad * 2)
+        let corner = fontSize * 22
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: imgW, height: imgH))
+        return renderer.image { ctx in
+            // Background rounded rect
+            let rect = CGRect(x: 0, y: 0, width: imgW, height: imgH)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: corner)
+            bgColor.setFill()
+            path.fill()
+
+            // Text centred in the rect
+            let textRect = CGRect(
+                x: hPad, y: vPad,
+                width: textSize.width, height: textSize.height
+            )
+            attrStr.draw(in: textRect)
+        }
+    }
+
+    // MARK: - Update
+
     static func updateAircraftMarker(
         node: SCNNode,
         aircraft: Aircraft,
@@ -271,47 +328,71 @@ class ARComponentFactory {
         let newPos = scaledPosition(rawPosition)
         node.runAction(.move(to: newPos, duration: 1.0))
 
-        // Refresh label text
-        if let labelNode = node.childNodes.first(where: { $0.geometry is SCNText }) {
-            if let geo = labelNode.geometry as? SCNText {
-                geo.string = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+        // Refresh label: find the plane node used for the label (not the ring plane)
+        // Ring plane is the first child; label is the second child if present.
+        let labelNode = node.childNodes.first(where: {
+            $0.geometry is SCNPlane && $0 !== node.childNodes.first
+        })
+
+        let shouldShow = settings.showAircraftLabels
+        if let lbl = labelNode {
+            lbl.isHidden = !shouldShow
+            if shouldShow, let plane = lbl.geometry as? SCNPlane {
+                let text  = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+                let image = makeLabelImage(text: text, textColor: .white,
+                                           bgColor: UIColor(white: 0, alpha: 0.72),
+                                           fontSize: labelFontSize)
+                let scale: CGFloat = labelFontSize / 80.0
+                let w = CGFloat(image.size.width)  * scale
+                let h = CGFloat(image.size.height) * scale
+                plane.width  = w
+                plane.height = h
+                plane.materials.first?.diffuse.contents  = image
+                plane.materials.first?.emission.contents = image
+                lbl.position = SCNVector3(0, Float(CGFloat(aircraftRingRadius) + 0.9 + h / 2), 0)
             }
-            labelNode.isHidden = !settings.showAircraftLabels
         }
     }
 }
 
-// MARK: - Settings and Configuration
+// MARK: - Settings
 
 struct ARVisualizationSettings {
 
     // MARK: Aircraft
     var showAircraft: Bool = true
-    var aircraftMaxDistance: Double = 50.0  // nautical miles
+    var aircraftMaxDistance: Double = 50.0
 
-    // Aircraft label fields — label auto-shown when any of these is true
-    var showAircraftType:     Bool = true   // e.g. "B738"
-    var showAircraftAltitude: Bool = true   // e.g. "35000 ft"
+    // Aircraft label fields
+    var showCallsign:        Bool = true   // always included in label when labels on
+    var showAircraftType:    Bool = true
+    var showAircraftAltitude:Bool = true
 
-    /// Derived: show label if any aircraft label field is enabled
-    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude }
+    // Callsign filter — empty string = show all
+    var callsignFilter: String = ""
+
+    /// Derived: show label if any label field is enabled
+    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign }
+
+    /// Returns true if this aircraft passes the callsign filter.
+    func passes(callsign: String) -> Bool {
+        let f = callsignFilter.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !f.isEmpty else { return true }
+        return callsign.uppercased().contains(f)
+    }
 
     // MARK: Airports
     var showAirports: Bool = true
-    var airportMaxDistance: Double = 50.0  // nautical miles
+    var airportMaxDistance: Double = 50.0
 
-    // Airport type filters
     var showLargeAirports:  Bool = true
     var showMediumAirports: Bool = true
     var showSmallAirports:  Bool = true
 
-    // Airport label fields — label auto-shown when any of these is true
-    var showAirportDistance: Bool = true   // e.g. "14.3 NM"
+    var showAirportDistance: Bool = true
 
-    /// Derived: show label if any airport label field is enabled
     var showAirportLabels: Bool { showAirportDistance }
 
-    /// Returns true if the given airport type should be displayed.
     func shouldShow(airportType: String) -> Bool {
         switch airportType {
         case "large_airport":  return showLargeAirports
@@ -324,7 +405,6 @@ struct ARVisualizationSettings {
 
 // MARK: - Scene Manager
 
-/// Manages the AR scene and updates visualizations.
 class ARSceneManager {
 
     private weak var sceneView: ARSCNView?
@@ -347,7 +427,6 @@ class ARSceneManager {
         userHeading: Double
     ) {
         guard settings.showAircraft else {
-            // Hide all existing nodes
             aircraftNodes.values.forEach { $0.isHidden = true }
             return
         }
@@ -358,6 +437,9 @@ class ARSceneManager {
             // Distance filter
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
             guard distNM <= settings.aircraftMaxDistance else { continue }
+
+            // Callsign filter
+            guard settings.passes(callsign: ac.callsign) else { continue }
 
             currentIDs.insert(ac.id)
 
@@ -388,7 +470,7 @@ class ARSceneManager {
             }
         }
 
-        // Remove stale aircraft
+        // Remove aircraft that are out of range, filtered, or stale
         for id in Set(aircraftNodes.keys).subtracting(currentIDs) {
             aircraftNodes[id]?.removeFromParentNode()
             aircraftNodes.removeValue(forKey: id)
@@ -433,15 +515,25 @@ class ARSceneManager {
 
             if let existing = airportNodes[airport.icao] {
                 existing.isHidden = false
-                // Update label distance (user may have moved)
-                if let labelNode = existing.childNodes.first(where: { $0.geometry is SCNText }),
-                   let geo = labelNode.geometry as? SCNText {
-                    geo.string = ARComponentFactory.buildAirportLabelText(
-                        airport: airport,
-                        distanceNM: distNM,
-                        settings: settings
-                    )
-                    labelNode.isHidden = !settings.showAirportLabels
+                // Update label
+                let labelNode = existing.childNodes.first(where: {
+                    ($0.geometry as? SCNPlane) != nil
+                })
+                if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
+                    let text  = ARComponentFactory.buildAirportLabelText(
+                        airport: airport, distanceNM: distNM, settings: settings)
+                    let image = ARComponentFactory.makeLabelImage(
+                        text: text, textColor: .white,
+                        bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
+                        fontSize: ARComponentFactory.labelFontSizeAirport)
+                    let scale: CGFloat = ARComponentFactory.labelFontSizeAirport / 80.0
+                    let w = CGFloat(image.size.width)  * scale
+                    let h = CGFloat(image.size.height) * scale
+                    plane.width  = w
+                    plane.height = h
+                    plane.materials.first?.diffuse.contents  = image
+                    plane.materials.first?.emission.contents = image
+                    lbl.isHidden = !settings.showAirportLabels
                 }
             } else {
                 let node = ARComponentFactory.createAirportMarker(
@@ -455,7 +547,6 @@ class ARSceneManager {
             }
         }
 
-        // Remove out-of-range airports
         for icao in Set(airportNodes.keys).subtracting(currentIDs) {
             airportNodes[icao]?.removeFromParentNode()
             airportNodes.removeValue(forKey: icao)
