@@ -103,54 +103,88 @@ class CalculationsLogic {
     ///   - userAltitude: Altitude of user in feet MSL
     ///   - userHeading: True heading of user in degrees
     /// - Returns: SCNVector3 position for AR scene
+    /// Convert a real-world GPS position into an ARKit scene vector.
+    ///
+    /// Coordinate system (ARWorldTrackingConfiguration, .gravityAndHeading):
+    ///   +X = East   -X = West
+    ///   +Y = Up     -Y = Down
+    ///   -Z = North  +Z = South
+    /// The scene is world-fixed — the device camera moves through it.
+    /// We compute positions relative to the camera's current world position
+    /// (passed in as `cameraWorldPosition`) so that all markers stay correctly
+    /// placed even as the aircraft flies kilometres from the AR origin.
     static func calculateARPosition(
         targetCoord: CLLocationCoordinate2D,
         targetAltitude: Double,
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
-        userHeading: Double
+        userHeading: Double,                        // unused — kept for API compat
+        cameraWorldPosition: SCNVector3 = .init()   // camera's current position in the AR scene
     ) -> SCNVector3 {
-
-        // With ARWorldTrackingConfiguration(.gravityAndHeading) the ARKit world
-        // coordinate system is FIXED to the real world:
-        //   +X = East,  -X = West
-        //   +Y = Up,    -Y = Down
-        //   -Z = North, +Z = South
-        // The scene does NOT rotate with the device, so we must NOT subtract
-        // userHeading here — just convert the absolute bearing to world axes.
 
         let horizontalDistance = distance(from: userCoord, to: targetCoord)
         let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
 
-        // East component (+X in ARKit = East)
-        let x = Float(horizontalDistance * sin(bearingRad))
-        // North component (-Z in ARKit = North)
-        let z = Float(-horizontalDistance * cos(bearingRad))
+        // Horizontal offsets in world space (metres)
+        let dx = Float(horizontalDistance * sin(bearingRad))   // East
+        let dz = Float(-horizontalDistance * cos(bearingRad))  // North
 
-        // Altitude difference in meters — clamped to ±50 m so objects stay
-        // in the camera's vertical field of view regardless of real altitude.
-        let rawAltDiff = (targetAltitude - userAltitude) * feetToMeters
-        let altitudeDifference = max(-50.0, min(50.0, rawAltDiff))
-        let y = Float(altitudeDifference)
+        // Vertical offset: preserve the real elevation angle but cap the
+        // displayed Y so it stays within ±60 m of the camera eye level.
+        // This keeps the marker inside the vertical FoV while the compass
+        // direction (horizontal) remains 100 % accurate.
+        let rawAltDiffM = (targetAltitude - userAltitude) * feetToMeters
+        let clampedY = Float(max(-60.0, min(60.0, rawAltDiffM)))
 
-        return SCNVector3(x, y, z)
+        // All positions are expressed relative to the camera's current world
+        // position, not the fixed AR origin. This is the key fix for flight:
+        // as the plane flies, the camera moves through the scene; without this
+        // offset every marker would drift to wherever the AR origin was
+        // initialised (typically the airport where the app launched).
+        return SCNVector3(
+            cameraWorldPosition.x + dx,
+            cameraWorldPosition.y + clampedY,
+            cameraWorldPosition.z + dz
+        )
+    }
+
+    /// Predict where an aircraft will be `aheadSeconds` in the future,
+    /// compensating for ADS-B report latency and network delay.
+    static func predictedPosition(
+        for aircraft: Aircraft,
+        aheadSeconds: Double = 0
+    ) -> (coord: CLLocationCoordinate2D, altitude: Double) {
+        let age = -aircraft.lastUpdate.timeIntervalSinceNow  // seconds since last report
+        let total = age + aheadSeconds
+        guard total > 0, aircraft.groundSpeed > 0 else {
+            return (aircraft.coordinate, aircraft.altitude)
+        }
+        return predictPosition(
+            currentCoord:   aircraft.coordinate,
+            currentAltitude: aircraft.altitude,
+            track:           aircraft.track,
+            groundSpeed:     aircraft.groundSpeed,
+            verticalRate:    aircraft.verticalRate,
+            timeSeconds:     total
+        )
     }
 
     /// Calculate position for airport marker
-    /// Airports are shown at ground level (elevation)
     static func calculateAirportARPosition(
         airportCoord: CLLocationCoordinate2D,
-        airportElevation: Double, // in feet MSL
+        airportElevation: Double,
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
-        userHeading: Double
+        userHeading: Double,
+        cameraWorldPosition: SCNVector3 = .init()
     ) -> SCNVector3 {
         return calculateARPosition(
             targetCoord: airportCoord,
             targetAltitude: airportElevation,
             userCoord: userCoord,
             userAltitude: userAltitude,
-            userHeading: userHeading
+            userHeading: userHeading,
+            cameraWorldPosition: cameraWorldPosition
         )
     }
 

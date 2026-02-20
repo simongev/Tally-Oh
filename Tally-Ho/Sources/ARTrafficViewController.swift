@@ -126,6 +126,10 @@ class ARTrafficViewController: UIViewController {
     private func setupLocation() {
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+        // Airborne mode gives the best GPS/barometric fusion for fast-moving aircraft
+        locationManager.activityType = .airborne
+        locationManager.distanceFilter = kCLDistanceFilterNone
+        locationManager.headingFilter = 1.0   // update every 1° of heading change
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
         locationManager.startUpdatingHeading()
@@ -147,7 +151,9 @@ class ARTrafficViewController: UIViewController {
             .sink { [weak self] _ in self?.updateStatusLabel() }
             .store(in: &cancellables)
 
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // 4 Hz — at 250 kt the user moves ~32 m per second; updating 4x/s keeps
+        // target positions smooth enough for comfortable viewing in flight.
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
     }
@@ -213,19 +219,35 @@ class ARTrafficViewController: UIViewController {
 
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
+
+        // Grab the camera's current world position in the AR scene.
+        // This is the key for accuracy in flight: as the aircraft flies,
+        // the AR origin stays fixed where ARKit started but the camera
+        // moves through the scene. All target positions must be expressed
+        // relative to where the camera IS NOW, not where the scene started.
+        let cameraPos: SCNVector3
+        if let pov = arSceneView.pointOfView {
+            let t = pov.worldTransform
+            cameraPos = SCNVector3(t.m41, t.m42, t.m43)
+        } else {
+            cameraPos = .init()
+        }
+
         sceneManager?.updateAircraft(
             Array(connectionLogic.detectedAircraft.values),
             userLocation: loc,
             userAltitude: activeAltitude,
-            userHeading: userHeading
+            userHeading: userHeading,
+            cameraWorldPosition: cameraPos
         )
         sceneManager?.updateAirports(
             airports,
             userLocation: loc,
             userAltitude: activeAltitude,
-            userHeading: userHeading
+            userHeading: userHeading,
+            cameraWorldPosition: cameraPos
         )
-        // Also keep ConnectionLogic updated with the best location for internet queries
+        // Keep ConnectionLogic updated with the best available position
         connectionLogic.updateLocation(loc, altitudeFeet: activeAltitude)
         updateStatusLabel()
     }
@@ -299,14 +321,18 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
-        // Always use iPhone GPS for positioning
         userLocation = loc.coordinate
         userAltitude = loc.altitude * CalculationsLogic.metersToFeet
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
+        // Immediately reposition AR targets on every GPS update — important
+        // in flight where position changes significantly between timer ticks.
+        updateVisualization()
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         userHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        // Heading changes mean the world is re-oriented — reposition immediately.
+        updateVisualization()
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

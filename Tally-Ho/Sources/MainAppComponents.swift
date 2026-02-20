@@ -39,14 +39,25 @@ class ARComponentFactory {
 
     // MARK: - Position Scaling
 
-    /// Scale only the horizontal (XZ) component into [minARRadius, maxARRadius].
-    /// Y is already clamped to ±50 m in calculateARPosition.
-    static func scaledPosition(_ raw: SCNVector3) -> SCNVector3 {
-        let horizLen = sqrt(raw.x * raw.x + raw.z * raw.z)
-        guard horizLen > 0 else { return SCNVector3(0, raw.y, -minARRadius) }
+    /// Scale the horizontal distance from the camera into [minARRadius, maxARRadius],
+    /// preserving the compass bearing. `raw` is already camera-relative
+    /// (calculateARPosition adds cameraWorldPosition). We subtract it back,
+    /// scale the offset, then re-add it so the final position is in world space.
+    static func scaledPosition(_ raw: SCNVector3, relativeTo cam: SCNVector3 = .init()) -> SCNVector3 {
+        let dx = raw.x - cam.x
+        let dz = raw.z - cam.z
+        let horizLen = sqrt(dx * dx + dz * dz)
+        guard horizLen > 0 else { return SCNVector3(cam.x, raw.y, cam.z - minARRadius) }
         let clamped = max(minARRadius, min(maxARRadius, horizLen))
         let scale   = clamped / horizLen
-        return SCNVector3(raw.x * scale, raw.y, raw.z * scale)
+        return SCNVector3(cam.x + dx * scale, raw.y, cam.z + dz * scale)
+    }
+
+    /// Like scaledPosition but for airports — forces Y 2 m above camera.
+    static func scaledAirportPosition(_ raw: SCNVector3, relativeTo cam: SCNVector3 = .init()) -> SCNVector3 {
+        var s = scaledPosition(raw, relativeTo: cam)
+        s.y = cam.y + 2.0
+        return s
     }
 
     // MARK: - Aircraft Marker
@@ -55,12 +66,13 @@ class ARComponentFactory {
     static func createAircraftMarker(
         rawPosition: SCNVector3,
         aircraft: Aircraft,
+        cameraWorldPosition: SCNVector3 = .init(),
         settings: ARVisualizationSettings
     ) -> SCNNode {
 
         let container = SCNNode()
         container.name = "aircraft_\(aircraft.id)"
-        container.position = scaledPosition(rawPosition)
+        container.position = scaledPosition(rawPosition, relativeTo: cameraWorldPosition)
 
         // -- Flat ring: a thin torus with zero extrusion depth, billboard-constrained --
         // We use an SCNPlane textured with a ring image drawn via Core Graphics,
@@ -168,13 +180,13 @@ class ARComponentFactory {
         rawPosition: SCNVector3,
         airport: Airport,
         distanceNM: Double,
+        cameraWorldPosition: SCNVector3 = .init(),
         settings: ARVisualizationSettings
     ) -> SCNNode {
 
         let container = SCNNode()
         container.name = "airport_\(airport.icao)"
-        var scaled = scaledPosition(rawPosition)
-        scaled.y = 2.0   // always push slightly above camera so it's visible
+        let scaled = scaledAirportPosition(rawPosition, relativeTo: cameraWorldPosition)
         container.position = scaled
 
         let blue = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
@@ -323,10 +335,11 @@ class ARComponentFactory {
         node: SCNNode,
         aircraft: Aircraft,
         rawPosition: SCNVector3,
+        cameraWorldPosition: SCNVector3 = .init(),
         settings: ARVisualizationSettings
     ) {
-        let newPos = scaledPosition(rawPosition)
-        node.runAction(.move(to: newPos, duration: 1.0))
+        // Position update is handled by the caller (ARSceneManager) with duration 0.22s
+        let _ = scaledPosition(rawPosition, relativeTo: cameraWorldPosition) // computed but move done by caller
 
         // Refresh label: find the plane node used for the label (not the ring plane)
         // Ring plane is the first child; label is the second child if present.
@@ -424,7 +437,8 @@ class ARSceneManager {
         _ aircraft: [Aircraft],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
-        userHeading: Double
+        userHeading: Double,
+        cameraWorldPosition: SCNVector3 = .init()
     ) {
         guard settings.showAircraft else {
             aircraftNodes.values.forEach { $0.isHidden = true }
@@ -434,7 +448,7 @@ class ARSceneManager {
         var currentIDs = Set<String>()
 
         for ac in aircraft {
-            // Distance filter
+            // Distance filter against reported position (not predicted)
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
             guard distNM <= settings.aircraftMaxDistance else { continue }
 
@@ -443,26 +457,38 @@ class ARSceneManager {
 
             currentIDs.insert(ac.id)
 
+            // Predict where this aircraft is right now, accounting for report age
+            // and the typical ~5 s one-way propagation delay via internet.
+            let extrapolationSecs: Double = (ac.source == .internet) ? 5.0 : 0.0
+            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
+                for: ac, aheadSeconds: extrapolationSecs)
+
             let rawPos = CalculationsLogic.calculateARPosition(
-                targetCoord: ac.coordinate,
-                targetAltitude: ac.altitude,
+                targetCoord: predCoord,
+                targetAltitude: predAlt,
                 userCoord: userLocation,
                 userAltitude: userAltitude,
-                userHeading: userHeading
+                userHeading: userHeading,
+                cameraWorldPosition: cameraWorldPosition
             )
 
             if let existing = aircraftNodes[ac.id] {
                 existing.isHidden = false
+                // Move smoothly: duration 0.25 s matches the 4 Hz update rate
+                let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
+                existing.runAction(.move(to: scaled, duration: 0.22))
                 ARComponentFactory.updateAircraftMarker(
                     node: existing,
                     aircraft: ac,
                     rawPosition: rawPos,
+                    cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
             } else {
                 let node = ARComponentFactory.createAircraftMarker(
                     rawPosition: rawPos,
                     aircraft: ac,
+                    cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
                 sceneView?.scene.rootNode.addChildNode(node)
@@ -483,7 +509,8 @@ class ARSceneManager {
         _ airports: [Airport],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
-        userHeading: Double
+        userHeading: Double,
+        cameraWorldPosition: SCNVector3 = .init()
     ) {
         guard settings.showAirports else {
             airportNodes.values.forEach { $0.isHidden = true }
@@ -506,7 +533,8 @@ class ARSceneManager {
                 airportElevation: airport.elevation,
                 userCoord: userLocation,
                 userAltitude: userAltitude,
-                userHeading: userHeading
+                userHeading: userHeading,
+                cameraWorldPosition: cameraWorldPosition
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,
@@ -515,10 +543,11 @@ class ARSceneManager {
 
             if let existing = airportNodes[airport.icao] {
                 existing.isHidden = false
-                // Update label
-                let labelNode = existing.childNodes.first(where: {
-                    ($0.geometry as? SCNPlane) != nil
-                })
+                // Smooth repositioning for airports (they don't move, but user does)
+                let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
+                existing.runAction(.move(to: scaled, duration: 0.22))
+                // Update label distance
+                let labelNode = existing.childNodes.first(where: { ($0.geometry as? SCNPlane) != nil })
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
                     let text  = ARComponentFactory.buildAirportLabelText(
                         airport: airport, distanceNM: distNM, settings: settings)
@@ -540,6 +569,7 @@ class ARSceneManager {
                     rawPosition: rawPos,
                     airport: airport,
                     distanceNM: distNM,
+                    cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
                 sceneView?.scene.rootNode.addChildNode(node)

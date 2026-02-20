@@ -77,7 +77,9 @@ class ConnectionLogic: ObservableObject {
     private let adsbLolClient = ADSBLolClient()
     private let networkReachability = NetworkReachability()
     private var internetFetchTimer: Timer?
-    private let internetFetchInterval: TimeInterval = 10.0
+    // At 250 kt the user moves ~1.9 NM in 15 s — fetch frequently enough to
+    // keep the traffic picture current as the aircraft flies.
+    private let internetFetchInterval: TimeInterval = 15.0
     private var currentLocation: CLLocationCoordinate2D?
     private let internetQueryRadius: Double = 50.0
 
