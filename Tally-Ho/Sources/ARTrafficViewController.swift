@@ -36,6 +36,9 @@ class ARTrafficViewController: UIViewController {
     private var updateTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
+    /// Last position used to centre the 200 NM airport pre-filter.
+    private var lastAirportFilterLocation: CLLocationCoordinate2D?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -338,9 +341,6 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 // MARK: - CLLocationManagerDelegate
 
 extension ARTrafficViewController: CLLocationManagerDelegate {
-
-    /// Last position used to centre the 200 NM airport pre-filter.
-    private var lastAirportFilterLocation: CLLocationCoordinate2D?
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
