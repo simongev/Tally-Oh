@@ -5,7 +5,7 @@ on:
 
 jobs:
   build-and-upload:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
@@ -15,7 +15,7 @@ jobs:
       - name: Select Xcode version
         run: |
           ls /Applications/ | grep -i xcode
-          XCODE_PATH=$(ls -d /Applications/Xcode_16* 2>/dev/null | head -1 || ls -d /Applications/Xcode* 2>/dev/null | sort -V | tail -1)
+          XCODE_PATH=$(ls -d /Applications/Xcode_26* 2>/dev/null | head -1 || ls -d /Applications/Xcode_16* 2>/dev/null | sort -V | tail -1 || ls -d /Applications/Xcode* 2>/dev/null | sort -V | tail -1)
           echo "Using: $XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
