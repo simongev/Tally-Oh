@@ -166,30 +166,46 @@ class ARTrafficViewController: UIViewController {
     private var allAirports: [Airport] = []
 
     private func loadAirports() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
-            // Pre-filter to 200 NM on the background thread so the main thread
-            // never iterates the full ~70 k-row database on every update tick.
+            // Do the 200 NM pre-filter on the background thread too —
+            // the full ~70 k-row scan never touches the main thread.
+            let loc = DispatchQueue.main.sync { self?.userLocation ?? self?.activeLocation }
+            let nearby: [Airport]
+            if let loc = loc {
+                nearby = CalculationsLogic.filterAirportsInRange(
+                    airports: parsed,
+                    userCoord: loc,
+                    maxRangeNauticalMiles: 200
+                )
+            } else {
+                nearby = []
+            }
             DispatchQueue.main.async {
                 self?.allAirports = parsed
-                self?.refreshNearbyAirports()
+                self?.airports = nearby
+                self?.lastAirportFilterLocation = loc
+                self?.updateStatusLabel()
             }
         }
     }
 
     /// Re-filter allAirports down to 200 NM from the current position.
-    /// Called once after CSV load and again if the user moves significantly.
+    /// Called on the main thread when the user moves > 50 NM.
     private func refreshNearbyAirports() {
-        guard let loc = userLocation ?? activeLocation else {
-            // No location yet — store nothing; called again on first GPS fix.
-            return
+        guard let loc = userLocation ?? activeLocation else { return }
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { return }
+            let nearby = CalculationsLogic.filterAirportsInRange(
+                airports: self.allAirports,
+                userCoord: loc,
+                maxRangeNauticalMiles: 200
+            )
+            DispatchQueue.main.async {
+                self.airports = nearby
+                self.updateStatusLabel()
+            }
         }
-        airports = CalculationsLogic.filterAirportsInRange(
-            airports: allAirports,
-            userCoord: loc,
-            maxRangeNauticalMiles: 200
-        )
-        updateStatusLabel()
     }
 
     private func startARSession() {

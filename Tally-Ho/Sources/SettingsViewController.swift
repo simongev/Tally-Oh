@@ -115,6 +115,12 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.showAircraftAltitude },
                 setter: { $0.showAircraftAltitude = $1 }
             ),
+            .toggle(
+                title: "Show Speed",
+                subtitle: "Ground speed in knots on label",
+                getter: { $0.showAircraftSpeed },
+                setter: { $0.showAircraftSpeed = $1 }
+            ),
             .slider(
                 title: "Max Distance",
                 subtitle: "Aircraft shown within this range",
@@ -122,12 +128,6 @@ class SettingsViewController: UITableViewController {
                 min: 5, max: 50, step: 5,
                 getter: { $0.aircraftMaxDistance },
                 setter: { $0.aircraftMaxDistance = $1 }
-            ),
-            .toggle(
-                title: "Show Speed",
-                subtitle: "Ground speed in knots on label",
-                getter: { $0.showAircraftSpeed },
-                setter: { $0.showAircraftSpeed = $1 }
             ),
         ]),
         Section(header: "🛫  Airports", rows: [

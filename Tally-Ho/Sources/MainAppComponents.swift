@@ -193,8 +193,8 @@ class ARComponentFactory {
 
         let blue = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
 
-        // Main cone (solid, no transparency)
-        let cone = SCNCone(topRadius: 0, bottomRadius: coneBaseRadius, height: coneHeight)
+        // Main cone — small non-zero topRadius gives a blunt/flat tip instead of a sharp point
+        let cone = SCNCone(topRadius: coneBaseRadius * 0.18, bottomRadius: coneBaseRadius, height: coneHeight)
         let coneMat = SCNMaterial()
         coneMat.diffuse.contents  = blue
         coneMat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
