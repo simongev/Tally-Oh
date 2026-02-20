@@ -323,6 +323,18 @@ class ARTrafficViewController: UIViewController {
 // MARK: - ARSCNViewDelegate
 
 extension ARTrafficViewController: ARSCNViewDelegate {
+
+    /// Called every display frame (~60 Hz) on the render thread.
+    /// We use it exclusively for aircraft position dead-reckoning — the most
+    /// accuracy-critical operation. Everything else (labels, node lifecycle)
+    /// stays on the 4 Hz main-thread timer to keep render-thread work minimal.
+    func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
+        guard let pov = arSceneView.pointOfView else { return }
+        let t = pov.worldTransform
+        let cam = SCNVector3(t.m41, t.m42, t.m43)
+        sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
+    }
+
     func session(_ session: ARSession, didFailWithError error: Error) {
         print("AR error: \(error.localizedDescription)")
     }

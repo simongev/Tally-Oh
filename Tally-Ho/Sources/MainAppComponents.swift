@@ -202,18 +202,6 @@ class ARComponentFactory {
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
         container.addChildNode(coneNode)
 
-        // Rounded cap: sphere at the tip (bottom) of the inverted cone,
-        // making it look like a traffic cone pointing down at the airport.
-        let capRadius = coneBaseRadius * 0.55
-        let sphere = SCNSphere(radius: capRadius)
-        let sphereMat = SCNMaterial()
-        sphereMat.diffuse.contents  = blue
-        sphereMat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
-        sphere.materials = [sphereMat]
-        let capNode = SCNNode(geometry: sphere)
-        capNode.position = SCNVector3(0, 0, 0)   // tip of the inverted cone (bottom)
-        container.addChildNode(capNode)
-
         // Slow rotation on the whole container
         container.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 14.0)))
 
@@ -391,6 +379,10 @@ struct ARVisualizationSettings {
     // Callsign filter — empty string = show all
     var callsignFilter: String = ""
 
+    // Speed filter — only show aircraft within [minSpeedKnots, maxSpeedKnots]
+    var minSpeedKnots: Double = 0
+    var maxSpeedKnots: Double = 700
+
     /// Derived: show label if any label field is enabled
     var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign }
 
@@ -399,6 +391,11 @@ struct ARVisualizationSettings {
         let f = callsignFilter.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !f.isEmpty else { return true }
         return callsign.uppercased().contains(f)
+    }
+
+    /// Returns true if this aircraft's speed is within the configured range.
+    func passesSpeed(_ groundSpeed: Double) -> Bool {
+        return groundSpeed >= minSpeedKnots && groundSpeed <= maxSpeedKnots
     }
 
     // MARK: Airports
@@ -432,13 +429,51 @@ class ARSceneManager {
     private var airportNodes:  [String: SCNNode] = [:]
     var settings = ARVisualizationSettings()
 
+    // Live snapshot used by the 60 Hz render-thread position updater.
+    // Written on main thread by the 4 Hz timer; read on render thread.
+    // Both reads and writes of reference-typed arrays are atomic on 64-bit ARM,
+    // and we only ever replace the whole value — no concurrent mutation of elements.
+    private(set) var liveAircraft: [Aircraft] = []
+    private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
+    private(set) var liveUserAltitude: Double = 0
+
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
         sceneView.autoenablesDefaultLighting = true
         sceneView.automaticallyUpdatesLighting = true
     }
 
-    // MARK: Update Aircraft
+    // MARK: - 60 Hz Position Update (called from ARSCNViewDelegate renderer)
+
+    /// Update only node *positions* — called every display frame for maximum accuracy.
+    /// Labels, visibility and node creation are handled by the 4 Hz `updateAircraft`.
+    func tickAircraftPositions(cameraWorldPosition: SCNVector3) {
+        guard settings.showAircraft else { return }
+        let aircraft = liveAircraft
+        let userLoc  = liveUserLocation
+        let userAlt  = liveUserAltitude
+        let internet = 5.0 as Double   // internet latency compensation (seconds)
+
+        for ac in aircraft {
+            guard let node = aircraftNodes[ac.id], !node.isHidden else { continue }
+            let extrapolationSecs: Double = (ac.source == .internet) ? internet : 0.0
+            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
+                for: ac, aheadSeconds: extrapolationSecs)
+            let rawPos = CalculationsLogic.calculateARPosition(
+                targetCoord: predCoord,
+                targetAltitude: predAlt,
+                userCoord: userLoc,
+                userAltitude: userAlt,
+                userHeading: 0,
+                cameraWorldPosition: cameraWorldPosition
+            )
+            // Direct assignment — no SCNAction, no interpolation lag.
+            let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
+            node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
+        }
+    }
+
+    // MARK: - 4 Hz Update (node lifecycle + labels)
 
     func updateAircraft(
         _ aircraft: [Aircraft],
@@ -449,13 +484,15 @@ class ARSceneManager {
     ) {
         guard settings.showAircraft else {
             aircraftNodes.values.forEach { $0.isHidden = true }
+            liveAircraft = []
             return
         }
 
         var currentIDs = Set<String>()
+        var visibleAircraft: [Aircraft] = []
 
         for ac in aircraft {
-            // Skip aircraft on or very near the ground (≤ 50 ft MSL — taxiing, parked, etc.)
+            // Skip aircraft on or very near the ground (≤ 50 ft MSL — taxiing, parked)
             guard ac.altitude > 50 else { continue }
 
             // Distance filter against reported position (not predicted)
@@ -465,14 +502,15 @@ class ARSceneManager {
             // Callsign filter
             guard settings.passes(callsign: ac.callsign) else { continue }
 
-            currentIDs.insert(ac.id)
+            // Speed filter
+            guard settings.passesSpeed(ac.groundSpeed) else { continue }
 
-            // Predict where this aircraft is right now, accounting for report age
-            // and the typical ~5 s one-way propagation delay via internet.
+            currentIDs.insert(ac.id)
+            visibleAircraft.append(ac)
+
             let extrapolationSecs: Double = (ac.source == .internet) ? 5.0 : 0.0
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(
                 for: ac, aheadSeconds: extrapolationSecs)
-
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
@@ -484,9 +522,8 @@ class ARSceneManager {
 
             if let existing = aircraftNodes[ac.id] {
                 existing.isHidden = false
-                // Move smoothly: duration 0.25 s matches the 4 Hz update rate
-                let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
-                existing.runAction(.move(to: scaled, duration: 0.22))
+                // Position is now driven at 60 Hz by tickAircraftPositions —
+                // just update the label here.
                 ARComponentFactory.updateAircraftMarker(
                     node: existing,
                     aircraft: ac,
@@ -508,6 +545,11 @@ class ARSceneManager {
                 aircraftNodes[ac.id] = node
             }
         }
+
+        // Store snapshot for 60 Hz position ticking
+        liveAircraft      = visibleAircraft
+        liveUserLocation  = userLocation
+        liveUserAltitude  = userAltitude
 
         // Remove aircraft that are out of range, filtered, or stale
         for id in Set(aircraftNodes.keys).subtracting(currentIDs) {
@@ -567,9 +609,9 @@ class ARSceneManager {
 
             if let existing = airportNodes[airport.icao] {
                 existing.isHidden = false
-                // Smooth repositioning (airports are static, but user moves)
+                // Airports are static — update position directly, no animation needed.
                 let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
-                existing.runAction(.move(to: scaled, duration: 0.22))
+                existing.position = scaled
                 // Only regenerate the label image when the displayed text changes
                 let labelNode = existing.childNodes.first(where: { ($0.geometry as? SCNPlane) != nil })
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {

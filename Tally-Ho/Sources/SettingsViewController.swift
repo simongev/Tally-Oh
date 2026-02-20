@@ -19,6 +19,8 @@ extension ARVisualizationSettings {
             "showAircraftType":      showAircraftType,
             "showAircraftAltitude":  showAircraftAltitude,
             "callsignFilter":        callsignFilter,
+            "minSpeedKnots":         minSpeedKnots,
+            "maxSpeedKnots":         maxSpeedKnots,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -38,6 +40,8 @@ extension ARVisualizationSettings {
         s.showAircraftType     = d["showAircraftType"]     as? Bool   ?? s.showAircraftType
         s.showAircraftAltitude = d["showAircraftAltitude"] as? Bool   ?? s.showAircraftAltitude
         s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
+        s.minSpeedKnots        = d["minSpeedKnots"]        as? Double ?? s.minSpeedKnots
+        s.maxSpeedKnots        = d["maxSpeedKnots"]        as? Double ?? s.maxSpeedKnots
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -64,6 +68,7 @@ class SettingsViewController: UITableViewController {
         case slider(
             title: String,
             subtitle: String,
+            unit: String,
             min: Double, max: Double, step: Double,
             getter: (ARVisualizationSettings) -> Double,
             setter: (inout ARVisualizationSettings, Double) -> Void
@@ -115,9 +120,26 @@ class SettingsViewController: UITableViewController {
             .slider(
                 title: "Max Distance",
                 subtitle: "Aircraft shown within this range",
+                unit: "NM",
                 min: 5, max: 50, step: 5,
                 getter: { $0.aircraftMaxDistance },
                 setter: { $0.aircraftMaxDistance = $1 }
+            ),
+            .slider(
+                title: "Min Speed",
+                subtitle: "Hide aircraft slower than this",
+                unit: "kts",
+                min: 0, max: 600, step: 50,
+                getter: { $0.minSpeedKnots },
+                setter: { $0.minSpeedKnots = $1 }
+            ),
+            .slider(
+                title: "Max Speed",
+                subtitle: "Hide aircraft faster than this",
+                unit: "kts",
+                min: 100, max: 700, step: 50,
+                getter: { $0.maxSpeedKnots },
+                setter: { $0.maxSpeedKnots = $1 }
             ),
         ]),
         Section(header: "🛫  Airports", rows: [
@@ -154,6 +176,7 @@ class SettingsViewController: UITableViewController {
             .slider(
                 title: "Max Distance",
                 subtitle: "Airports shown within this range",
+                unit: "NM",
                 min: 5, max: 50, step: 5,
                 getter: { $0.airportMaxDistance },
                 setter: { $0.airportMaxDistance = $1 }
@@ -223,16 +246,16 @@ class SettingsViewController: UITableViewController {
             cell.accessoryView = sw
             return cell
 
-        case let .slider(title, subtitle, min, max, step, getter, _):
+        case let .slider(title, subtitle, unit, min, max, step, getter, _):
             let cell = tableView.dequeueReusableCell(withIdentifier: "slider", for: indexPath) as! SliderCell
             cell.configure(
-                title: title, subtitle: subtitle,
+                title: title, subtitle: subtitle, unit: unit,
                 minValue: min, maxValue: max, step: step,
                 current: getter(settings)
             ) { [weak self] newValue in
                 guard let self else { return }
                 let rows = self.sections[indexPath.section].rows
-                if case let .slider(_, _, _, _, _, _, setter) = rows[indexPath.row] {
+                if case let .slider(_, _, _, _, _, _, _, setter) = rows[indexPath.row] {
                     setter(&self.settings, newValue)
                 }
             }
@@ -278,6 +301,7 @@ final class SliderCell: UITableViewCell {
 
     private var step: Double   = 10
     private var minVal: Double = 20
+    private var unit: String   = "NM"
     private var onChange: ((Double) -> Void)?
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
@@ -314,11 +338,12 @@ final class SliderCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(title: String, subtitle: String,
+    func configure(title: String, subtitle: String, unit: String = "NM",
                    minValue: Double, maxValue: Double, step: Double,
                    current: Double, onChange: @escaping (Double) -> Void) {
-        self.step    = step
-        self.minVal  = minValue
+        self.step     = step
+        self.minVal   = minValue
+        self.unit     = unit
         self.onChange = onChange
         titleLabel.text    = title
         subtitleLabel.text = subtitle
@@ -334,7 +359,7 @@ final class SliderCell: UITableViewCell {
     }
 
     private func updateValueLabel(_ val: Double) {
-        valueLabel.text = String(format: "%.0f NM", val)
+        valueLabel.text = String(format: "%.0f \(unit)", val)
     }
 
     @objc private func sliderChanged() { updateValueLabel(snapped(slider.value)) }
