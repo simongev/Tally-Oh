@@ -314,15 +314,7 @@ class ARTrafficViewController: UIViewController {
         lines.append(trafficLine)
 
         // Airports
-        lines.append("🛫 Airports: \(airports.count)")
-        if let loc = userLocation {
-            let nearby = CalculationsLogic.filterAirportsInRange(
-                airports: airports,
-                userCoord: loc,
-                maxRangeNauticalMiles: sceneManager?.settings.airportMaxDistance ?? 50
-            )
-            lines.append("🛫 Nearby: \(nearby.count)")
-        }
+        lines.append("🛫 Airports loaded: \(airports.count)")
 
         statusLabel.text = lines.map { "  \($0)  " }.joined(separator: "\n")
     }

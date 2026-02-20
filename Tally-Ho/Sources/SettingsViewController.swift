@@ -112,16 +112,10 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.showAircraftAltitude },
                 setter: { $0.showAircraftAltitude = $1 }
             ),
-            .textField(
-                title: "Callsign Filter",
-                placeholder: "e.g. UAL, N12 — empty = show all",
-                getter: { $0.callsignFilter },
-                setter: { $0.callsignFilter = $1 }
-            ),
             .slider(
                 title: "Max Distance",
                 subtitle: "Aircraft shown within this range",
-                min: 20, max: 100, step: 10,
+                min: 5, max: 50, step: 5,
                 getter: { $0.aircraftMaxDistance },
                 setter: { $0.aircraftMaxDistance = $1 }
             ),
@@ -160,7 +154,7 @@ class SettingsViewController: UITableViewController {
             .slider(
                 title: "Max Distance",
                 subtitle: "Airports shown within this range",
-                min: 20, max: 100, step: 10,
+                min: 5, max: 50, step: 5,
                 getter: { $0.airportMaxDistance },
                 setter: { $0.airportMaxDistance = $1 }
             ),

@@ -122,19 +122,30 @@ class CalculationsLogic {
         cameraWorldPosition: SCNVector3 = .init()   // camera's current position in the AR scene
     ) -> SCNVector3 {
 
-        let horizontalDistance = distance(from: userCoord, to: targetCoord)
+        let horizontalDistanceM = distance(from: userCoord, to: targetCoord)
         let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
 
         // Horizontal offsets in world space (metres)
-        let dx = Float(horizontalDistance * sin(bearingRad))   // East
-        let dz = Float(-horizontalDistance * cos(bearingRad))  // North
+        let dx = Float(horizontalDistanceM * sin(bearingRad))   // East
+        let dz = Float(-horizontalDistanceM * cos(bearingRad))  // North
 
-        // Vertical offset: preserve the real elevation angle but cap the
-        // displayed Y so it stays within ±60 m of the camera eye level.
-        // This keeps the marker inside the vertical FoV while the compass
-        // direction (horizontal) remains 100 % accurate.
-        let rawAltDiffM = (targetAltitude - userAltitude) * feetToMeters
-        let clampedY = Float(max(-60.0, min(60.0, rawAltDiffM)))
+        // Vertical offset: compute the true elevation angle, then project it
+        // onto the AR scene using the *scaled* horizontal radius so that the
+        // marker appears at the correct angle above/below the horizon.
+        // ARComponentFactory clamps horizontal distance to [minARRadius, maxARRadius];
+        // we apply the same clamping here so Y is consistent with X/Z.
+        let minR = Double(ARComponentFactory.minARRadius)
+        let maxR = Double(ARComponentFactory.maxARRadius)
+        let arHorizR = max(minR, min(maxR, horizontalDistanceM))
+
+        // True elevation angle from user to target (positive = above horizon)
+        let altDiffM = (targetAltitude - userAltitude) * feetToMeters
+        let elevationRad = atan2(altDiffM, max(horizontalDistanceM, 1.0))
+
+        // Map the elevation angle onto the scaled AR horizontal radius.
+        // Cap to ±45° (tan ≈ 1.0) so markers stay within vertical FoV.
+        let clampedElev = max(-Double.pi / 4, min(Double.pi / 4, elevationRad))
+        let arY = Float(arHorizR * tan(clampedElev))
 
         // All positions are expressed relative to the camera's current world
         // position, not the fixed AR origin. This is the key fix for flight:
@@ -143,7 +154,7 @@ class CalculationsLogic {
         // initialised (typically the airport where the app launched).
         return SCNVector3(
             cameraWorldPosition.x + dx,
-            cameraWorldPosition.y + clampedY,
+            cameraWorldPosition.y + arY,
             cameraWorldPosition.z + dz
         )
     }

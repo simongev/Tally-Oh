@@ -53,11 +53,9 @@ class ARComponentFactory {
         return SCNVector3(cam.x + dx * scale, raw.y, cam.z + dz * scale)
     }
 
-    /// Like scaledPosition but for airports — forces Y 2 m above camera.
+    /// Like scaledPosition but for airports — preserves the computed elevation Y.
     static func scaledAirportPosition(_ raw: SCNVector3, relativeTo cam: SCNVector3 = .init()) -> SCNVector3 {
-        var s = scaledPosition(raw, relativeTo: cam)
-        s.y = cam.y + 2.0
-        return s
+        return scaledPosition(raw, relativeTo: cam)
     }
 
     // MARK: - Aircraft Marker
@@ -204,7 +202,8 @@ class ARComponentFactory {
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
         container.addChildNode(coneNode)
 
-        // Rounded cap: sphere sitting at the base (top) of the inverted cone
+        // Rounded cap: sphere at the tip (bottom) of the inverted cone,
+        // making it look like a traffic cone pointing down at the airport.
         let capRadius = coneBaseRadius * 0.55
         let sphere = SCNSphere(radius: capRadius)
         let sphereMat = SCNMaterial()
@@ -212,13 +211,13 @@ class ARComponentFactory {
         sphereMat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
         sphere.materials = [sphereMat]
         let capNode = SCNNode(geometry: sphere)
-        capNode.position = SCNVector3(0, Float(coneHeight), 0)   // top of cone
+        capNode.position = SCNVector3(0, 0, 0)   // tip of the inverted cone (bottom)
         container.addChildNode(capNode)
 
         // Slow rotation on the whole container
         container.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 14.0)))
 
-        // Label
+        // Label sits above the wide base (top) of the cone
         if settings.showAirportLabels {
             let text = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
             let labelNode = createLabelNode(
@@ -226,7 +225,7 @@ class ARComponentFactory {
                 textColor: .white,
                 bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
                 fontSize: labelFontSizeAirport,
-                yOffset: CGFloat(coneHeight) + CGFloat(capRadius) + 1.0
+                yOffset: CGFloat(coneHeight) + 1.0
             )
             container.addChildNode(labelNode)
         }
@@ -382,7 +381,7 @@ struct ARVisualizationSettings {
 
     // MARK: Aircraft
     var showAircraft: Bool = true
-    var aircraftMaxDistance: Double = 50.0
+    var aircraftMaxDistance: Double = 20.0
 
     // Aircraft label fields
     var showCallsign:        Bool = true   // always included in label when labels on
@@ -404,7 +403,7 @@ struct ARVisualizationSettings {
 
     // MARK: Airports
     var showAirports: Bool = true
-    var airportMaxDistance: Double = 50.0
+    var airportMaxDistance: Double = 40.0
 
     var showLargeAirports:  Bool = true
     var showMediumAirports: Bool = true
@@ -456,6 +455,9 @@ class ARSceneManager {
         var currentIDs = Set<String>()
 
         for ac in aircraft {
+            // Skip aircraft on or very near the ground (≤ 50 ft MSL — taxiing, parked, etc.)
+            guard ac.altitude > 50 else { continue }
+
             // Distance filter against reported position (not predicted)
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
             guard distNM <= settings.aircraftMaxDistance else { continue }
@@ -526,22 +528,30 @@ class ARSceneManager {
         userHeading: Double,
         cameraWorldPosition: SCNVector3 = .init()
     ) {
-        guard settings.showAirports else {
-            airportNodes.values.forEach { $0.isHidden = true }
-            return
+        // Build the set of airports that should be visible right now
+        let nearby: [Airport]
+        if settings.showAirports {
+            nearby = CalculationsLogic.filterAirportsInRange(
+                airports: airports,
+                userCoord: userLocation,
+                maxRangeNauticalMiles: settings.airportMaxDistance
+            ).filter { settings.shouldShow(airportType: $0.type) }
+        } else {
+            nearby = []
         }
 
-        let nearby = CalculationsLogic.filterAirportsInRange(
-            airports: airports,
-            userCoord: userLocation,
-            maxRangeNauticalMiles: settings.airportMaxDistance
-        ).filter { settings.shouldShow(airportType: $0.type) }
+        let visibleIDs = Set(nearby.map { $0.icao })
 
-        var currentIDs = Set<String>()
+        // Build the set of all airports tracked in our node dict so we can
+        // look up any airport that has a node but is not currently in range.
+        // We need the full airport list for hiding/showing existing nodes.
+        let allTrackedAirports: [String: Airport] = Dictionary(
+            uniqueKeysWithValues: airports.compactMap { a in
+                airportNodes[a.icao] != nil ? (a.icao, a) : nil
+            }
+        )
 
         for airport in nearby {
-            currentIDs.insert(airport.icao)
-
             let rawPos = CalculationsLogic.calculateAirportARPosition(
                 airportCoord: airport.coordinate,
                 airportElevation: airport.elevation,
@@ -557,19 +567,16 @@ class ARSceneManager {
 
             if let existing = airportNodes[airport.icao] {
                 existing.isHidden = false
-                // Smooth repositioning for airports (they don't move, but user does)
+                // Smooth repositioning (airports are static, but user moves)
                 let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
                 existing.runAction(.move(to: scaled, duration: 0.22))
                 // Only regenerate the label image when the displayed text changes
-                // (distance rounds to 1 decimal, so re-render at most every ~185 m of travel).
                 let labelNode = existing.childNodes.first(where: { ($0.geometry as? SCNPlane) != nil })
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
                     let newText = ARComponentFactory.buildAirportLabelText(
                         airport: airport, distanceNM: distNM, settings: settings)
-                    let oldText = (plane.materials.first?.diffuse.contents as? UIImage)
-                                      .flatMap { _ in lbl.name } ?? ""
-                    if newText != oldText {
-                        lbl.name = newText   // cache the rendered text in the node name
+                    if newText != lbl.name {
+                        lbl.name = newText
                         let image = ARComponentFactory.makeLabelImage(
                             text: newText, textColor: .white,
                             bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
@@ -603,12 +610,11 @@ class ARSceneManager {
             }
         }
 
-        for icao in Set(airportNodes.keys).subtracting(currentIDs) {
-            SCNTransaction.begin()
-            SCNTransaction.disableActions = true
-            airportNodes[icao]?.removeFromParentNode()
-            SCNTransaction.commit()
-            airportNodes.removeValue(forKey: icao)
+        // Hide (not remove) nodes for airports outside current range/filter —
+        // hiding avoids the flicker caused by re-creating them each time the
+        // pre-filter window shifts or the CSV reloads.
+        for icao in Set(airportNodes.keys).subtracting(visibleIDs) {
+            airportNodes[icao]?.isHidden = true
         }
     }
 
