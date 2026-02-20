@@ -175,6 +175,50 @@ class ARComponentFactory {
         return parts.joined(separator: "\n")
     }
 
+    // MARK: - Selection Appearance
+
+    /// Apply or remove the selected visual state on a container node.
+    /// Aircraft ring: yellow, larger. Airport cone: cyan, larger.
+    static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
+        if selected {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.15
+            container.scale = SCNVector3(1.35, 1.35, 1.35)
+            SCNTransaction.commit()
+            // Tint every geometry in the container
+            container.enumerateChildNodes { node, _ in
+                if let mat = node.geometry?.firstMaterial {
+                    if node.geometry is SCNCone {
+                        // Airport cone → cyan
+                        mat.diffuse.contents  = UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
+                        mat.emission.contents = UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
+                    } else if node.geometry is SCNTorus {
+                        // Aircraft ring → yellow
+                        mat.diffuse.contents  = UIColor(red: 1.0, green: 0.9, blue: 0.0, alpha: 1.0)
+                        mat.emission.contents = UIColor(red: 0.5, green: 0.4, blue: 0.0, alpha: 1.0)
+                    }
+                }
+            }
+        } else {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.15
+            container.scale = SCNVector3(1.0, 1.0, 1.0)
+            SCNTransaction.commit()
+            // Restore original colours
+            container.enumerateChildNodes { node, _ in
+                if let mat = node.geometry?.firstMaterial {
+                    if node.geometry is SCNCone {
+                        mat.diffuse.contents  = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
+                        mat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
+                    } else if node.geometry is SCNTorus {
+                        mat.diffuse.contents  = UIColor.red
+                        mat.emission.contents = UIColor(red: 0.4, green: 0.0, blue: 0.0, alpha: 1.0)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Airport Marker
 
     /// Solid blue inverted cone with a rounded (sphere-capped) base at the top.
@@ -431,6 +475,11 @@ class ARSceneManager {
     private let nodesLock = NSLock()
     var settings = ARVisualizationSettings()
 
+    // MARK: Selection
+    private(set) var selectedNodeID: String? = nil
+    /// Called on the main thread when the currently selected node is removed.
+    var onSelectionInvalidated: (() -> Void)?
+
     // Live snapshot written on main thread, read on render thread.
     // Replacing the whole array value is atomic on 64-bit ARM; elements are
     // never mutated in-place, so no lock is needed for this snapshot.
@@ -565,18 +614,25 @@ class ARSceneManager {
         nodesLock.lock()
         let staleIDs = Set(aircraftNodes.keys).subtracting(currentIDs)
         var staleNodes: [SCNNode] = []
+        var selectedWasRemoved = false
         for id in staleIDs {
             if let n = aircraftNodes[id] { staleNodes.append(n) }
+            if "aircraft_\(id)" == selectedNodeID { selectedWasRemoved = true }
             aircraftNodes.removeValue(forKey: id)
         }
         nodesLock.unlock()
-        // Do SceneKit removal outside the lock — removeFromParentNode is thread-safe
         for n in staleNodes {
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
             n.removeFromParentNode()
             SCNTransaction.commit()
         }
+        if selectedWasRemoved {
+            DispatchQueue.main.async { [weak self] in self?.onSelectionInvalidated?() }
+        }
+
+        // Reapply selection visuals (new nodes may have been added)
+        applySelectionToAllNodes()
     }
 
     // MARK: Update Airports
@@ -676,6 +732,54 @@ class ARSceneManager {
         for icao in Set(airportNodes.keys).subtracting(visibleIDs) {
             airportNodes[icao]?.isHidden = true
         }
+
+        // Reapply selection visuals (new nodes may have been added)
+        applySelectionToAllNodes()
+    }
+
+    // MARK: - Selection
+
+    /// Set the selected node. Pass nil to deselect all.
+    func setSelection(nodeID: String?) {
+        selectedNodeID = nodeID
+        applySelectionToAllNodes()
+    }
+
+    /// Update label visibility and visual state for all nodes to reflect current selection.
+    func applySelectionToAllNodes() {
+        let sel = selectedNodeID
+        nodesLock.lock()
+        let acSnap = aircraftNodes
+        nodesLock.unlock()
+        let apSnap = airportNodes
+
+        let allContainers = Array(acSnap.values) + Array(apSnap.values)
+        for container in allContainers {
+            let isSelected = (container.name == sel)
+            let hasSelection = (sel != nil)
+            // Hide all label planes except the selected node's
+            for child in container.childNodes {
+                if child.geometry is SCNPlane {
+                    child.isHidden = hasSelection && !isSelected
+                }
+            }
+            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
+        }
+    }
+
+    /// Thread-safe lookup of a container node by its prefixed name
+    /// (e.g. "aircraft_ABC123" or "airport_KLAX").
+    func node(forID nodeID: String) -> SCNNode? {
+        if nodeID.hasPrefix("aircraft_") {
+            let id = String(nodeID.dropFirst("aircraft_".count))
+            nodesLock.lock()
+            defer { nodesLock.unlock() }
+            return aircraftNodes[id]
+        } else if nodeID.hasPrefix("airport_") {
+            let icao = String(nodeID.dropFirst("airport_".count))
+            return airportNodes[icao]
+        }
+        return nil
     }
 
     // MARK: Clear

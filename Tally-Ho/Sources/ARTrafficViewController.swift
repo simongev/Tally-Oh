@@ -8,6 +8,87 @@ import ARKit
 import CoreLocation
 import Combine
 
+// MARK: - Selection State
+
+private enum SelectionState: Equatable {
+    case none
+    case selected(nodeID: String)
+}
+
+// MARK: - Off-Screen Arrow View
+
+/// Full-screen transparent overlay that draws a single directional chevron
+/// at the screen edge when the selected target is outside the camera FOV.
+private final class OffScreenArrowView: UIView {
+
+    private var arrowAngle: CGFloat = 0      // radians: 0 = pointing up, clockwise +
+    private var arrowCenter: CGPoint = .zero
+    private var isVisible = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func hide() {
+        guard isVisible else { return }
+        isVisible = false
+        setNeedsDisplay()
+    }
+
+    func show(angle: CGFloat, center: CGPoint) {
+        arrowAngle  = angle
+        arrowCenter = center
+        isVisible   = true
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard isVisible else { return }
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+
+        let size: CGFloat  = 48
+        let half           = size / 2
+        let cornerRadius: CGFloat = 10
+        let bgRect = CGRect(x: arrowCenter.x - half,
+                            y: arrowCenter.y - half,
+                            width: size, height: size)
+
+        // Background rounded rect
+        ctx.saveGState()
+        let path = UIBezierPath(roundedRect: bgRect, cornerRadius: cornerRadius)
+        UIColor.black.withAlphaComponent(0.65).setFill()
+        path.fill()
+        ctx.restoreGState()
+
+        // Chevron: two lines forming a "^" shape, rotated to `arrowAngle`
+        ctx.saveGState()
+        ctx.translateBy(x: arrowCenter.x, y: arrowCenter.y)
+        ctx.rotate(by: arrowAngle)
+
+        let armLen: CGFloat = 10
+        let tipY: CGFloat   = -11   // tip of chevron (pointing up before rotation)
+        let baseY: CGFloat  =   5
+
+        ctx.setStrokeColor(UIColor.white.cgColor)
+        ctx.setLineWidth(3)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+
+        ctx.beginPath()
+        ctx.move(to: CGPoint(x: -armLen, y: baseY))
+        ctx.addLine(to: CGPoint(x: 0, y: tipY))
+        ctx.addLine(to: CGPoint(x: armLen, y: baseY))
+        ctx.strokePath()
+
+        ctx.restoreGState()
+    }
+}
+
+// MARK: - ARTrafficViewController
+
 class ARTrafficViewController: UIViewController {
 
     // MARK: - UI
@@ -15,6 +96,12 @@ class ARTrafficViewController: UIViewController {
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
     private var settingsButton: UIButton!
+    private var backButton: UIButton!
+    private var offScreenArrowView: OffScreenArrowView!
+
+    // Dynamic leading constraints on statusLabel (swapped when selection active)
+    private var statusLeadingToEdge: NSLayoutConstraint!
+    private var statusLeadingToBack: NSLayoutConstraint!
 
     // MARK: - Core
 
@@ -32,12 +119,17 @@ class ARTrafficViewController: UIViewController {
     private var userAltitude: Double = 0
     /// Heading from iPhone compass.
     private var userHeading: Double = 0
+    /// Last heading accuracy reading from CLLocationManager (-1 = unknown).
+    private var lastHeadingAccuracy: CLLocationDirectionAccuracy = -1
 
     private var updateTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
     /// Last position used to centre the 200 NM airport pre-filter.
     private var lastAirportFilterLocation: CLLocationCoordinate2D?
+
+    /// Current target selection state.
+    private var selectionState: SelectionState = .none
 
     // MARK: - Lifecycle
 
@@ -49,6 +141,7 @@ class ARTrafficViewController: UIViewController {
         setupARScene()
         setupLocation()
         setupObservers()
+        setupGestures()
         loadAirports()
 
         // Load persisted settings before starting
@@ -58,6 +151,11 @@ class ARTrafficViewController: UIViewController {
 
         // Begin listening for ADS-B broadcasts in background
         connectionLogic.startListening()
+
+        // Wire deselection callback for when a selected node is removed from the scene
+        sceneManager?.onSelectionInvalidated = { [weak self] in
+            self?.clearSelection()
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -85,6 +183,11 @@ class ARTrafficViewController: UIViewController {
         arSceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(arSceneView)
 
+        // Off-screen arrow overlay — sits above arSceneView, below all buttons
+        offScreenArrowView = OffScreenArrowView(frame: view.bounds)
+        offScreenArrowView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(offScreenArrowView)
+
         statusLabel = UILabel()
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.65)
@@ -97,9 +200,34 @@ class ARTrafficViewController: UIViewController {
         statusLabel.isUserInteractionEnabled = false
         view.addSubview(statusLabel)
 
+        // Back button — hidden until a target is selected
+        backButton = UIButton(type: .system)
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        backButton.setImage(UIImage(systemName: "arrow.left"), for: .normal)
+        backButton.tintColor = .white
+        backButton.titleLabel?.font = UIFont.systemFont(ofSize: 22, weight: .medium)
+        backButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        backButton.layer.cornerRadius = 24
+        backButton.isHidden = true
+        backButton.addTarget(self, action: #selector(backButtonTapped), for: .touchUpInside)
+        view.addSubview(backButton)
+
+        NSLayoutConstraint.activate([
+            backButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            backButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            backButton.widthAnchor.constraint(equalToConstant: 48),
+            backButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        // statusLabel leading: two variants — default (edge) and with-back-button
+        statusLeadingToEdge = statusLabel.leadingAnchor.constraint(
+            equalTo: view.leadingAnchor, constant: 12)
+        statusLeadingToBack = statusLabel.leadingAnchor.constraint(
+            equalTo: backButton.trailingAnchor, constant: 8)
+        statusLeadingToEdge.isActive = true   // default
+
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
 
@@ -129,10 +257,11 @@ class ARTrafficViewController: UIViewController {
     private func setupLocation() {
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
-        // Airborne mode gives the best GPS/barometric fusion for fast-moving aircraft
         locationManager.activityType = .airborne
         locationManager.distanceFilter = kCLDistanceFilterNone
-        locationManager.headingFilter = 1.0   // update every 1° of heading change
+        // kCLHeadingFilterNone gives every hardware sample so the system can
+        // apply maximum internal smoothing; we filter bad readings ourselves.
+        locationManager.headingFilter = kCLHeadingFilterNone
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
         locationManager.startUpdatingHeading()
@@ -161,15 +290,19 @@ class ARTrafficViewController: UIViewController {
         }
     }
 
-    /// Full airport database — kept on the background thread only, never
-    /// assigned to the main-thread `airports` array directly.
+    private func setupGestures() {
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        arSceneView.addGestureRecognizer(tap)
+    }
+
+    // MARK: - Airport Loading
+
+    /// Full airport database — loaded once in background, never iterated on main thread.
     private var allAirports: [Airport] = []
 
     private func loadAirports() {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
-            // Do the 200 NM pre-filter on the background thread too —
-            // the full ~70 k-row scan never touches the main thread.
             let loc = DispatchQueue.main.sync { self?.userLocation ?? self?.activeLocation }
             let nearby: [Airport]
             if let loc = loc {
@@ -190,8 +323,7 @@ class ARTrafficViewController: UIViewController {
         }
     }
 
-    /// Re-filter allAirports down to 200 NM from the current position.
-    /// Called on the main thread when the user moves > 50 NM.
+    /// Re-filter allAirports to 200 NM — called when user moves > 50 NM.
     private func refreshNearbyAirports() {
         guard let loc = userLocation ?? activeLocation else { return }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
@@ -229,6 +361,65 @@ class ARTrafficViewController: UIViewController {
         present(nav, animated: true)
     }
 
+    @objc private func backButtonTapped() {
+        clearSelection()
+    }
+
+    // MARK: - Hit Testing / Selection
+
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        let touchPoint = gesture.location(in: arSceneView)
+        let hits = arSceneView.hitTest(touchPoint, options: [
+            .searchMode: SCNHitTestSearchMode.closest.rawValue,
+            .ignoreHiddenNodes: true
+        ])
+        if let hit = hits.first, let nid = containerNodeID(for: hit.node) {
+            // Tapped a target
+            if case .selected(let current) = selectionState, current == nid {
+                clearSelection()    // tap same target again = deselect
+            } else {
+                applySelection(nodeID: nid)
+            }
+        } else {
+            // Tapped empty space
+            clearSelection()
+        }
+    }
+
+    /// Walk the node hierarchy to find the container node's name (e.g. "aircraft_ABC").
+    private func containerNodeID(for node: SCNNode) -> String? {
+        var current: SCNNode? = node
+        while let n = current {
+            if let name = n.name,
+               (name.hasPrefix("aircraft_") || name.hasPrefix("airport_")) {
+                return name
+            }
+            current = n.parent
+        }
+        return nil
+    }
+
+    private func applySelection(nodeID: String) {
+        selectionState = .selected(nodeID: nodeID)
+        sceneManager?.setSelection(nodeID: nodeID)
+        updateSelectionUI(active: true)
+    }
+
+    private func clearSelection() {
+        selectionState = .none
+        sceneManager?.setSelection(nodeID: nil)
+        offScreenArrowView.hide()
+        updateSelectionUI(active: false)
+    }
+
+    private func updateSelectionUI(active: Bool) {
+        backButton.isHidden = !active
+        offScreenArrowView.isHidden = !active
+        // Swap statusLabel leading constraint
+        statusLeadingToEdge.isActive = !active
+        statusLeadingToBack.isActive = active
+    }
+
     // MARK: - Update Loop
 
     /// The active position source: ADS-B ownship when receiving, otherwise iPhone GPS.
@@ -246,12 +437,11 @@ class ARTrafficViewController: UIViewController {
         if connectionLogic.connectionStatus == .receiving,
            let ownship = connectionLogic.ownshipData,
            ownship.altitude > -1000 {
-            return ownship.altitude   // already in feet from GDL90 parser
+            return ownship.altitude
         }
         return userAltitude
     }
 
-    /// Whether we're currently using ADS-B GPS.
     private var usingADSBGPS: Bool {
         connectionLogic.connectionStatus == .receiving && connectionLogic.ownshipData != nil
     }
@@ -259,11 +449,6 @@ class ARTrafficViewController: UIViewController {
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
 
-        // Grab the camera's current world position in the AR scene.
-        // This is the key for accuracy in flight: as the aircraft flies,
-        // the AR origin stays fixed where ARKit started but the camera
-        // moves through the scene. All target positions must be expressed
-        // relative to where the camera IS NOW, not where the scene started.
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
             let t = pov.worldTransform
@@ -286,9 +471,89 @@ class ARTrafficViewController: UIViewController {
             userHeading: userHeading,
             cameraWorldPosition: cameraPos
         )
-        // Keep ConnectionLogic updated with the best available position
         connectionLogic.updateLocation(loc, altitudeFeet: activeAltitude)
         updateStatusLabel()
+    }
+
+    // MARK: - Off-Screen Arrow
+
+    /// Projects the selected target onto the screen and, if outside the FOV,
+    /// positions the edge arrow. Called from the render thread; dispatches UI
+    /// updates to the main thread.
+    private func updateOffScreenArrow(for nodeID: String) {
+        guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else {
+            DispatchQueue.main.async { self.offScreenArrowView.hide() }
+            return
+        }
+
+        let worldPos  = node.worldPosition
+        let projected = arSceneView.projectPoint(worldPos)
+        let screenSize = arSceneView.bounds.size   // safe: bounds is read-only from render thread
+
+        let behindCamera = projected.z >= 1.0
+        let onScreen = !behindCamera
+            && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
+            && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
+
+        if onScreen {
+            DispatchQueue.main.async { self.offScreenArrowView.hide() }
+            return
+        }
+
+        let (edgePoint, angle) = screenEdgePoint(
+            projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
+            isBehindCamera: behindCamera,
+            screenSize: screenSize,
+            margin: 40
+        )
+        DispatchQueue.main.async { self.offScreenArrowView.show(angle: angle, center: edgePoint) }
+    }
+
+    /// Returns the screen-edge intersection point and the rotation angle (radians,
+    /// 0 = up, clockwise +) for the arrow chevron.
+    private func screenEdgePoint(
+        projected: CGPoint,
+        isBehindCamera: Bool,
+        screenSize: CGSize,
+        margin: CGFloat
+    ) -> (point: CGPoint, angle: CGFloat) {
+
+        let cx = screenSize.width  / 2
+        let cy = screenSize.height / 2
+
+        // When behind the camera the projected x/y are mirrored — flip through centre
+        var dir: CGPoint
+        if isBehindCamera {
+            dir = CGPoint(x: cx - projected.x, y: cy - projected.y)
+        } else {
+            dir = CGPoint(x: projected.x - cx, y: projected.y - cy)
+        }
+
+        // Avoid zero-length vector
+        if dir.x == 0 && dir.y == 0 { dir = CGPoint(x: 0, y: -1) }
+
+        // atan2 in screen space (+Y down): angle of the ray from screen centre
+        let angle = atan2(dir.y, dir.x)   // right = 0, clockwise in screen coords
+
+        // Find scale factor t so the ray reaches the nearest safe edge
+        let left   = margin
+        let right  = screenSize.width  - margin
+        let top    = margin
+        let bottom = screenSize.height - margin
+
+        var t = CGFloat.greatestFiniteMagnitude
+        if dir.x > 0 { t = min(t, (right  - cx) / dir.x) }
+        else if dir.x < 0 { t = min(t, (left   - cx) / dir.x) }
+        if dir.y > 0 { t = min(t, (bottom - cy) / dir.y) }
+        else if dir.y < 0 { t = min(t, (top    - cy) / dir.y) }
+
+        let edgePoint = CGPoint(x: cx + dir.x * t, y: cy + dir.y * t)
+
+        // Convert from atan2 convention (right=0, CCW+) to UIKit rotation
+        // (up=0, CW+): rotate 90° clockwise
+        let uiAngle = angle + .pi / 2
+
+        return (edgePoint, uiAngle)
     }
 
     // MARK: - HUD
@@ -296,7 +561,6 @@ class ARTrafficViewController: UIViewController {
     private func updateStatusLabel() {
         var lines: [String] = []
 
-        // ADS-B status
         switch connectionLogic.connectionStatus {
         case .receiving:     lines.append("📡 ADS-B: Receiving")
         case .searching:     lines.append("📡 ADS-B: Searching…")
@@ -304,21 +568,27 @@ class ARTrafficViewController: UIViewController {
         case .disconnected:  lines.append("📡 ADS-B: Off")
         }
 
-        // Internet
         lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
 
-        // GPS — source-aware
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
         let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
         if let loc = displayLoc {
             lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource))", loc.latitude, loc.longitude))
-            lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f°", displayAlt, userHeading))
+            // Show compass heading with live accuracy indicator
+            let accStr: String
+            if lastHeadingAccuracy < 0 {
+                accStr = "?"
+            } else if lastHeadingAccuracy > 20 {
+                accStr = "⚠️calibrate"
+            } else {
+                accStr = String(format: "±%.0f°", lastHeadingAccuracy)
+            }
+            lines.append(String(format: "✈️ %.0f ft MSL   🧭 %.0f° (\(accStr))", displayAlt, userHeading))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
 
-        // Traffic
         let total   = connectionLogic.detectedAircraft.count
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
@@ -329,7 +599,6 @@ class ARTrafficViewController: UIViewController {
         if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
         lines.append(trafficLine)
 
-        // Airports
         lines.append("🛫 Airports loaded: \(airports.count)")
 
         statusLabel.text = lines.map { "  \($0)  " }.joined(separator: "\n")
@@ -341,14 +610,16 @@ class ARTrafficViewController: UIViewController {
 extension ARTrafficViewController: ARSCNViewDelegate {
 
     /// Called every display frame (~60 Hz) on the render thread.
-    /// We use it exclusively for aircraft position dead-reckoning — the most
-    /// accuracy-critical operation. Everything else (labels, node lifecycle)
-    /// stays on the 4 Hz main-thread timer to keep render-thread work minimal.
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
         guard let pov = arSceneView.pointOfView else { return }
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
+
+        // Update off-screen arrow for the selected target every frame
+        if case .selected(let nodeID) = selectionState {
+            updateOffScreenArrow(for: nodeID)
+        }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -368,14 +639,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         userAltitude = loc.altitude * CalculationsLogic.metersToFeet
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
-        // Re-run the 200 NM pre-filter if: first fix, or user has moved > 50 NM
-        // since the last filter (at 250 kt that's ~12 minutes of flight).
         let needsRefresh: Bool
         if let last = lastAirportFilterLocation {
             needsRefresh = CalculationsLogic.distanceInNauticalMiles(
                 from: last, to: loc.coordinate) > 50
         } else {
-            needsRefresh = true   // first fix — always refresh
+            needsRefresh = true
         }
         if needsRefresh && !allAirports.isEmpty {
             lastAirportFilterLocation = loc.coordinate
@@ -384,8 +653,22 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        // Discard readings with unknown accuracy
+        guard newHeading.headingAccuracy >= 0 else { return }
+
+        let accuracy = newHeading.headingAccuracy
+
+        // If accuracy just crossed from good to bad, reset ARKit so the scene
+        // realigns to the corrected compass on the next good reading.
+        if lastHeadingAccuracy >= 0
+            && lastHeadingAccuracy <= 20
+            && accuracy > 20 {
+            startARSession()
+        }
+
+        lastHeadingAccuracy = accuracy
         userHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
-        // State is updated here; the 4 Hz timer drives all scene updates.
+        updateStatusLabel()
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
