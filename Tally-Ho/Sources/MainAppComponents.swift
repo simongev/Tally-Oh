@@ -487,6 +487,13 @@ class ARSceneManager {
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
 
+    /// Continuously-updated correction for the angular offset between ARKit's
+    /// world-north (frozen at session start) and the live compass true-north.
+    /// Written on the main thread by ARTrafficViewController.didUpdateHeading;
+    /// read on the render thread by tickAircraftPositions — a Double assignment
+    /// is atomic on 64-bit ARM so no lock is needed.
+    var arKitNorthCorrectionDeg: Double = 0
+
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
         sceneView.autoenablesDefaultLighting = true
@@ -511,6 +518,8 @@ class ARSceneManager {
         let nodeSnapshot = aircraftNodes   // [String: SCNNode] value-copy of the dict
         nodesLock.unlock()
 
+        let northCorrection = arKitNorthCorrectionDeg   // snapshot for this tick
+
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
             // No fixed latency offset — `lastUpdate` is stamped with the actual response
@@ -525,7 +534,8 @@ class ARSceneManager {
                 userCoord: userLoc,
                 userAltitude: userAlt,
                 userHeading: 0,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                northCorrectionDeg: northCorrection
             )
             // Direct assignment — no SCNAction, no interpolation lag.
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
@@ -576,7 +586,8 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                northCorrectionDeg: arKitNorthCorrectionDeg
             )
 
             if let existing = aircraftNodes[ac.id] {
@@ -676,7 +687,8 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                northCorrectionDeg: arKitNorthCorrectionDeg
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,

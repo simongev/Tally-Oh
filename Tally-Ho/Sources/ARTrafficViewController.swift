@@ -155,6 +155,21 @@ class ARTrafficViewController: UIViewController {
     /// GPS accuracy threshold — fixes worse than this are discarded.
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
+    /// Running correction for the angular drift between the ARKit world-north
+    /// (frozen at session.run() time) and the live compass true-north.
+    ///
+    /// ARKit sets its north once via the compass at session start, then relies
+    /// entirely on the gyroscope — so any initial compass error stays fixed for
+    /// the whole session. Every time we get a high-quality heading reading we
+    /// re-measure the difference between ARKit's yaw and the compass, and store
+    /// it here. All bearing calculations add this offset to cancel the drift.
+    ///
+    /// Value is in degrees; positive = ARKit north is clockwise of true north.
+    private var arKitNorthCorrectionDeg: Double = 0
+
+    /// Number of heading samples accumulated for the running correction average.
+    private var northCorrectionSampleCount: Int = 0
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -401,6 +416,11 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        // After a session reset, ARKit re-samples the compass for its new north.
+        // Reset the correction so we build a fresh measurement from the new north.
+        arKitNorthCorrectionDeg = 0
+        northCorrectionSampleCount = 0
+        sceneManager?.arKitNorthCorrectionDeg = 0
     }
 
     // MARK: - Actions
@@ -653,7 +673,10 @@ class ARTrafficViewController: UIViewController {
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)", displayAlt, altSource, userHeading, compassAccStr))
+            let corrStr = northCorrectionSampleCount == 0
+                ? "—"
+                : String(format: "%+.1f°", arKitNorthCorrectionDeg)
+            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -789,10 +812,45 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
             startARSession()
+            // Reset correction — the new session will re-establish its own north.
+            arKitNorthCorrectionDeg = 0
+            northCorrectionSampleCount = 0
         }
 
         lastHeadingAccuracy = accuracy
-        userHeading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        userHeading = trueNorth
+
+        // --- Compute ARKit north correction ---
+        // Only use high-quality readings (accuracy ≤ 10°) to update the correction.
+        if accuracy <= 10, let frame = arSceneView.session.currentFrame {
+            // ARKit camera yaw in world space (radians). With .gravityAndHeading
+            // the world is fixed: yaw = 0 means the camera faces ARKit's north.
+            // Negate because ARKit yaw is CCW-positive but compass is CW-positive.
+            let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
+
+            // The camera's compass direction = trueNorth (where the phone is pointing).
+            // ARKit thinks the camera is at `arYawDeg` from its own north.
+            // So: arKitNorth = trueNorth - arYawDeg
+            var sample = trueNorth - arYawDeg
+            // Normalise to [-180, 180]
+            while sample >  180 { sample -= 360 }
+            while sample < -180 { sample += 360 }
+
+            // Exponential moving average — weight recent readings more heavily.
+            // α = 0.15: slow enough to filter noise, fast enough to converge in ~20 readings.
+            let alpha = 0.15
+            if northCorrectionSampleCount == 0 {
+                arKitNorthCorrectionDeg = sample
+            } else {
+                arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
+            }
+            northCorrectionSampleCount += 1
+
+            // Pass the live correction into the scene manager so position ticks use it.
+            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+        }
+
         updateStatusLabel()
     }
 
