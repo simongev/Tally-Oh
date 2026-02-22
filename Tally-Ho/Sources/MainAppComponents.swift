@@ -31,8 +31,8 @@ class ARComponentFactory {
     static let coneBaseRadius: CGFloat = 2.0
 
     /// Label font size (1 scene-unit ≈ 1 m).
-    static let labelFontSize: CGFloat        = 1.1
-    static let labelFontSizeAirport: CGFloat = 1.2
+    static let labelFontSize: CGFloat        = 1.5
+    static let labelFontSizeAirport: CGFloat = 1.6
 
     /// Padding added around the label text background (scene units).
     static let labelPadding: Float = 0.35
@@ -477,6 +477,9 @@ class ARSceneManager {
 
     // MARK: Selection
     private(set) var selectedNodeID: String? = nil
+    /// The last selection ID for which `applySelectionToAllNodes` was fully applied.
+    /// Used to skip redundant re-application on every 4 Hz tick (which caused blinking).
+    private var lastAppliedSelectionID: String? = "___unset___"
     /// Called on the main thread when the currently selected node is removed.
     var onSelectionInvalidated: (() -> Void)?
 
@@ -563,6 +566,7 @@ class ARSceneManager {
 
         var currentIDs = Set<String>()
         var visibleAircraft: [Aircraft] = []
+        var nodesAdded = false
 
         for ac in aircraft {
             // Skip aircraft on or very near the ground (≤ 50 ft MSL — taxiing, parked)
@@ -615,6 +619,7 @@ class ARSceneManager {
                 nodesLock.lock()
                 aircraftNodes[ac.id] = node
                 nodesLock.unlock()
+                nodesAdded = true
             }
         }
 
@@ -644,7 +649,11 @@ class ARSceneManager {
             DispatchQueue.main.async { [weak self] in self?.onSelectionInvalidated?() }
         }
 
-        // Reapply selection visuals (new nodes may have been added)
+        // Reapply selection visuals if any node was added or removed (new nodes
+        // won't have the correct label-hidden / colour state yet).
+        if nodesAdded || !staleNodes.isEmpty {
+            lastAppliedSelectionID = "___unset___"
+        }
         applySelectionToAllNodes()
     }
 
@@ -737,17 +746,22 @@ class ARSceneManager {
                 sceneView?.scene.rootNode.addChildNode(node)
                 SCNTransaction.commit()
                 airportNodes[airport.icao] = node
+                airportNodesAdded = true
             }
         }
 
         // Hide (not remove) nodes for airports outside current range/filter —
         // hiding avoids the flicker caused by re-creating them each time the
         // pre-filter window shifts or the CSV reloads.
+        var airportNodesAdded = false
         for icao in Set(airportNodes.keys).subtracting(visibleIDs) {
             airportNodes[icao]?.isHidden = true
         }
 
-        // Reapply selection visuals (new nodes may have been added)
+        // Reapply selection visuals only if new airport nodes were added.
+        if airportNodesAdded {
+            lastAppliedSelectionID = "___unset___"
+        }
         applySelectionToAllNodes()
     }
 
@@ -756,12 +770,19 @@ class ARSceneManager {
     /// Set the selected node. Pass nil to deselect all.
     func setSelection(nodeID: String?) {
         selectedNodeID = nodeID
+        lastAppliedSelectionID = "___unset___"   // force re-apply on next tick
         applySelectionToAllNodes()
     }
 
     /// Update label visibility and visual state for all nodes to reflect current selection.
+    /// Only re-applies when the selection has actually changed; this prevents the
+    /// repeated isHidden assignments that caused labels to blink on every 4 Hz tick.
     func applySelectionToAllNodes() {
         let sel = selectedNodeID
+        // Skip if the selection state hasn't changed since last full apply.
+        guard sel != lastAppliedSelectionID else { return }
+        lastAppliedSelectionID = sel
+
         nodesLock.lock()
         let acSnap = aircraftNodes
         nodesLock.unlock()
@@ -769,9 +790,10 @@ class ARSceneManager {
 
         let allContainers = Array(acSnap.values) + Array(apSnap.values)
         for container in allContainers {
-            let isSelected = (container.name == sel)
+            let isSelected  = (container.name == sel)
             let hasSelection = (sel != nil)
-            // Hide all label planes except the selected node's
+            // Hide only the label planes of unselected nodes — the ring/cone itself
+            // stays visible so the user can still see all traffic.
             for child in container.childNodes {
                 if child.geometry is SCNPlane {
                     child.isHidden = hasSelection && !isSelected

@@ -428,9 +428,27 @@ class ARTrafficViewController: UIViewController {
     @objc private func showSettings() {
         guard let settings = sceneManager?.settings else { return }
         let vc = SettingsViewController(settings: settings) { [weak self] updated in
-            self?.sceneManager?.settings = updated
+            guard let self else { return }
+            let old = self.sceneManager?.settings
+            self.sceneManager?.settings = updated
             updated.save()
-            self?.sceneManager?.clearAll()
+
+            // Only rebuild nodes if a structural setting changed (show/hide toggles or
+            // distance filters). Pure label-content changes (callsign/altitude/speed/type
+            // visibility) are picked up automatically on the next 4 Hz updateVisualization tick
+            // without any node removal — avoiding the stutter from clearAll().
+            let needsRebuild =
+                updated.showAircraft        != old?.showAircraft ||
+                updated.showAirports        != old?.showAirports ||
+                updated.aircraftMaxDistance != old?.aircraftMaxDistance ||
+                updated.airportMaxDistance  != old?.airportMaxDistance ||
+                updated.showLargeAirports   != old?.showLargeAirports  ||
+                updated.showMediumAirports  != old?.showMediumAirports ||
+                updated.showSmallAirports   != old?.showSmallAirports
+
+            if needsRebuild {
+                self.sceneManager?.clearAll()
+            }
         }
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .formSheet
@@ -770,6 +788,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             bestHorizontalAccuracy = hAcc
         }
 
+        let isFirstFix = (userLocation == nil)
         userLocation = loc.coordinate
 
         // GPS MSL altitude — always update so barometric baseline stays current
@@ -786,6 +805,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         }
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
+
+        // On first GPS fix, immediately render airports so they appear before
+        // the first 4 Hz timer tick (which can be up to 250 ms away).
+        if isFirstFix {
+            updateVisualization()
+        }
 
         let needsRefresh: Bool
         if let last = lastAirportFilterLocation {
