@@ -689,6 +689,7 @@ class ARSceneManager {
             }
         )
 
+        var airportNodesAdded = false
         for airport in nearby {
             let rawPos = CalculationsLogic.calculateAirportARPosition(
                 airportCoord: airport.coordinate,
@@ -753,7 +754,6 @@ class ARSceneManager {
         // Hide (not remove) nodes for airports outside current range/filter —
         // hiding avoids the flicker caused by re-creating them each time the
         // pre-filter window shifts or the CSV reloads.
-        var airportNodesAdded = false
         for icao in Set(airportNodes.keys).subtracting(visibleIDs) {
             airportNodes[icao]?.isHidden = true
         }
