@@ -395,10 +395,11 @@ class ARComponentFactory {
             // altitude rounds to the nearest foot so re-renders are infrequent.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
                 let newText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
-                // Cache rendered text in a user attribute to keep lbl.name free for identification.
-                let cachedText = lbl.value(forKey: "cachedLabelText") as? String
-                if newText != cachedText {
-                    lbl.setValue(newText, forKey: "cachedLabelText")
+                // Cache the last-rendered text in the geometry's name (a real SCNGeometry
+                // property), so we avoid the NSUndefinedKeyException that setValue(forKey:)
+                // would throw on an SCNNode for an undeclared KVC key.
+                if newText != plane.name {
+                    plane.name = newText
                     let image = makeLabelImage(text: newText, textColor: .white,
                                                bgColor: UIColor(white: 0, alpha: 0.72),
                                                fontSize: labelFontSize)
@@ -725,10 +726,10 @@ class ARSceneManager {
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
                     let newText = ARComponentFactory.buildAirportLabelText(
                         airport: airport, distanceNM: distNM, settings: settings)
-                    // Cache rendered text in a user attribute (lbl.name is reserved for "label").
-                    let cachedText = lbl.value(forKey: "cachedLabelText") as? String
-                    if newText != cachedText {
-                        lbl.setValue(newText, forKey: "cachedLabelText")
+                    // Cache last-rendered text in the geometry's name (a real SCNGeometry
+                    // property) — avoids NSUndefinedKeyException from KVC on SCNNode.
+                    if newText != plane.name {
+                        plane.name = newText
                         let image = ARComponentFactory.makeLabelImage(
                             text: newText, textColor: .white,
                             bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
