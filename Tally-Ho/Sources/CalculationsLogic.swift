@@ -79,20 +79,6 @@ class CalculationsLogic {
         return meters / nauticalMileToMeters
     }
 
-    /// Calculate 3D distance including altitude difference
-    static func distance3D(
-        from coord1: CLLocationCoordinate2D,
-        altitude1: Double, // in feet
-        to coord2: CLLocationCoordinate2D,
-        altitude2: Double // in feet
-    ) -> Double {
-        let horizontalDistance = distance(from: coord1, to: coord2)
-        let verticalDistance = abs(altitude1 - altitude2) * feetToMeters
-
-        return sqrt(horizontalDistance * horizontalDistance +
-                   verticalDistance * verticalDistance)
-    }
-
     // MARK: - Bearing Calculations
 
     /// Calculate bearing (true heading) from one coordinate to another
@@ -230,88 +216,34 @@ class CalculationsLogic {
         )
     }
 
-    // MARK: - Aircraft Circle Radius Calculation
-
-    /// Calculate the radius for the red circle around an aircraft
-    /// The circle represents the approximate size/uncertainty of the aircraft position
-    /// - Parameter distance: Distance to the aircraft in meters
-    /// - Returns: Radius in meters for the AR circle
-    static func calculateAircraftCircleRadius(distance: Double) -> Float {
-        // Base radius: larger for distant aircraft, smaller for close ones
-        // This accounts for visual perspective and accuracy uncertainty
-
-        let baseRadius: Double
-
-        if distance < 500 { // Very close (< 0.27 NM)
-            baseRadius = 10.0 // 10 meters
-        } else if distance < 1852 { // < 1 NM
-            baseRadius = 20.0 // 20 meters
-        } else if distance < 5556 { // < 3 NM
-            baseRadius = 30.0 // 30 meters
-        } else if distance < 18520 { // < 10 NM
-            baseRadius = 50.0 // 50 meters
-        } else {
-            baseRadius = 100.0 // 100 meters for distant aircraft
-        }
-
-        return Float(baseRadius)
-    }
-
     // MARK: - Coordinate Filtering
 
-    /// Check if a coordinate is within range
-    static func isWithinRange(
-        targetCoord: CLLocationCoordinate2D,
-        userCoord: CLLocationCoordinate2D,
-        maxRangeNauticalMiles: Double
-    ) -> Bool {
-        let distance = distanceInNauticalMiles(from: userCoord, to: targetCoord)
-        return distance <= maxRangeNauticalMiles
-    }
-
-    /// Filter airports within specified range
+    /// Filter airports within specified range, using a fast lat/lon bounding-box
+    /// pre-check to skip expensive Haversine for obviously-distant airports.
     static func filterAirportsInRange(
         airports: [Airport],
         userCoord: CLLocationCoordinate2D,
         maxRangeNauticalMiles: Double
     ) -> [Airport] {
+        let maxRangeMeters = maxRangeNauticalMiles * nauticalMileToMeters
+        // 1° latitude ≈ 111,320 m — conservative (slightly over-includes near poles).
+        let latDegrees  = maxRangeMeters / 111_320.0
+        // Longitude degrees shrink with latitude — use cos(lat) for a tight box.
+        let lonDegrees  = maxRangeMeters / (111_320.0 * max(cos(userCoord.latitude.toRadians()), 0.01))
+
+        let minLat = userCoord.latitude  - latDegrees
+        let maxLat = userCoord.latitude  + latDegrees
+        let minLon = userCoord.longitude - lonDegrees
+        let maxLon = userCoord.longitude + lonDegrees
+
         return airports.filter { airport in
-            isWithinRange(
-                targetCoord: airport.coordinate,
-                userCoord: userCoord,
-                maxRangeNauticalMiles: maxRangeNauticalMiles
-            )
+            // Cheap bounding-box rejection first.
+            guard airport.latitude  >= minLat && airport.latitude  <= maxLat,
+                  airport.longitude >= minLon && airport.longitude <= maxLon
+            else { return false }
+            // Exact Haversine only for candidates that passed the box check.
+            return distanceInNauticalMiles(from: userCoord, to: airport.coordinate) <= maxRangeNauticalMiles
         }
-    }
-
-    // MARK: - Elevation Angle Calculation
-
-    /// Calculate elevation angle from user to target
-    /// Returns angle in degrees (positive = above horizon, negative = below)
-    static func elevationAngle(
-        targetCoord: CLLocationCoordinate2D,
-        targetAltitude: Double,
-        userCoord: CLLocationCoordinate2D,
-        userAltitude: Double
-    ) -> Double {
-        let horizontalDistance = distance(from: userCoord, to: targetCoord)
-        let verticalDistance = (targetAltitude - userAltitude) * feetToMeters
-
-        return atan2(verticalDistance, horizontalDistance).toDegrees()
-    }
-
-    // MARK: - Label Position Calculation
-
-    /// Calculate position for a text label above an object
-    static func calculateLabelPosition(
-        basePosition: SCNVector3,
-        offsetMeters: Float
-    ) -> SCNVector3 {
-        return SCNVector3(
-            basePosition.x,
-            basePosition.y + offsetMeters,
-            basePosition.z
-        )
     }
 
     // MARK: - Velocity Vector Calculations

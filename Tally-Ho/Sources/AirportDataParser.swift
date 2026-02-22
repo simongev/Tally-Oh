@@ -44,8 +44,10 @@ class AirportDataParser {
             return nil
         }
 
-        var airports: [Airport] = []
+        // Split on newlines; pre-allocate assuming ~50% of rows pass type filter.
         let lines = content.components(separatedBy: "\n")
+        var airports: [Airport] = []
+        airports.reserveCapacity(lines.count / 2)
 
         // Skip header row (index 0)
         for line in lines.dropFirst() {

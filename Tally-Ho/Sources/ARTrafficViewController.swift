@@ -184,7 +184,7 @@ class ARTrafficViewController: UIViewController {
         setupGestures()
         loadAirports()
 
-        // Load persisted settings before starting
+        // Load persisted settings before starting (load() calls updateFilter() internally).
         if let saved = ARVisualizationSettings.load() {
             sceneManager?.settings = saved
         }
@@ -430,21 +430,23 @@ class ARTrafficViewController: UIViewController {
         let vc = SettingsViewController(settings: settings) { [weak self] updated in
             guard let self else { return }
             let old = self.sceneManager?.settings
-            self.sceneManager?.settings = updated
-            updated.save()
+            var updatedSettings = updated
+            updatedSettings.updateFilter()   // rebuild normalised filter cache
+            self.sceneManager?.settings = updatedSettings
+            updatedSettings.save()
 
             // Only rebuild nodes if a structural setting changed (show/hide toggles or
             // distance filters). Pure label-content changes (callsign/altitude/speed/type
             // visibility) are picked up automatically on the next 4 Hz updateVisualization tick
             // without any node removal — avoiding the stutter from clearAll().
             let needsRebuild =
-                updated.showAircraft        != old?.showAircraft ||
-                updated.showAirports        != old?.showAirports ||
-                updated.aircraftMaxDistance != old?.aircraftMaxDistance ||
-                updated.airportMaxDistance  != old?.airportMaxDistance ||
-                updated.showLargeAirports   != old?.showLargeAirports  ||
-                updated.showMediumAirports  != old?.showMediumAirports ||
-                updated.showSmallAirports   != old?.showSmallAirports
+                updatedSettings.showAircraft        != old?.showAircraft ||
+                updatedSettings.showAirports        != old?.showAirports ||
+                updatedSettings.aircraftMaxDistance != old?.aircraftMaxDistance ||
+                updatedSettings.airportMaxDistance  != old?.airportMaxDistance ||
+                updatedSettings.showLargeAirports   != old?.showLargeAirports  ||
+                updatedSettings.showMediumAirports  != old?.showMediumAirports ||
+                updatedSettings.showSmallAirports   != old?.showSmallAirports
 
             if needsRebuild {
                 self.sceneManager?.clearAll()
@@ -732,7 +734,11 @@ class ARTrafficViewController: UIViewController {
 
         lines.append("🛫 Airports loaded: \(airports.count)")
 
-        statusLabel.text = lines.map { "  \($0)  " }.joined(separator: "\n")
+        let newText = lines.map { "  \($0)  " }.joined(separator: "\n")
+        // Skip the UILabel layout pass if nothing changed — this is called at
+        // up to 60 Hz (from heading updates) and UILabel re-layout is expensive.
+        guard newText != statusLabel.text else { return }
+        statusLabel.text = newText
     }
 }
 

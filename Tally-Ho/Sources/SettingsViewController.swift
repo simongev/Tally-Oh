@@ -46,6 +46,8 @@ extension ARVisualizationSettings {
         s.showMediumAirports   = d["showMediumAirports"]   as? Bool   ?? s.showMediumAirports
         s.showSmallAirports    = d["showSmallAirports"]    as? Bool   ?? s.showSmallAirports
         s.showAirportDistance  = d["showAirportDistance"]  as? Bool   ?? s.showAirportDistance
+        // Re-build the normalised filter cache after loading from disk.
+        s.updateFilter()
         return s
     }
 }

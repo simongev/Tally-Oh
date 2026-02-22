@@ -15,28 +15,71 @@ class ADSBLolClient {
     private let baseURL = "https://api.adsb.lol/v2"
     private let session: URLSession
 
+    // MARK: - Codable models (typed — faster and safer than JSONSerialization)
+
+    private struct Response: Decodable {
+        let ac: [AircraftEntry]
+    }
+
+    /// Raw JSON entry. Fields are Optional because adsb.lol omits absent values.
+    /// alt_baro / baro_rate / geom_rate may arrive as Int OR Double — use
+    /// a custom decoder that accepts both.
+    private struct AircraftEntry: Decodable {
+        let hex:      String
+        let lat:      Double?
+        let lon:      Double?
+        let altBaro:  FlexDouble?   // "alt_baro"
+        let altGeom:  FlexDouble?   // "alt_geom"
+        let flight:   String?
+        let r:        String?       // registration
+        let track:    Double?
+        let gs:       Double?       // ground speed (knots)
+        let baroRate: FlexDouble?   // "baro_rate"
+        let geomRate: FlexDouble?   // "geom_rate"
+        let t:        String?       // aircraft type e.g. "B738"
+
+        enum CodingKeys: String, CodingKey {
+            case hex, lat, lon, flight, r, track, gs, t
+            case altBaro  = "alt_baro"
+            case altGeom  = "alt_geom"
+            case baroRate = "baro_rate"
+            case geomRate = "geom_rate"
+        }
+    }
+
+    /// Decodes a JSON value that may be either an Int or a Double.
+    private struct FlexDouble: Decodable {
+        let value: Double
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let d = try? c.decode(Double.self) { value = d; return }
+            if let i = try? c.decode(Int.self)    { value = Double(i); return }
+            // "ground" or other string sentinel — treat as 0
+            value = 0
+        }
+    }
+
+    // MARK: - Init
+
     init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 10.0
+        config.timeoutIntervalForRequest  = 10.0
         config.timeoutIntervalForResource = 15.0
+        // Allow the system to reuse TCP connections across fetches.
+        config.httpMaximumConnectionsPerHost = 1
         session = URLSession(configuration: config)
     }
 
     // MARK: - Public API
 
-    /// Fetch aircraft within a radius of the given position
-    /// - Parameters:
-    ///   - latitude: Center latitude in decimal degrees
-    ///   - longitude: Center longitude in decimal degrees
-    ///   - radiusNM: Search radius in nautical miles
-    ///   - completion: Called on a background queue with the result
+    /// Fetch aircraft within a radius of the given position.
+    /// Completion is called on a background queue.
     func fetchAircraft(
-        latitude: Double,
+        latitude:  Double,
         longitude: Double,
-        radiusNM: Double,
+        radiusNM:  Double,
         completion: @escaping (Result<[Aircraft], Error>) -> Void
     ) {
-        // adsb.lol /v2 endpoint expects distance in nautical miles (integer)
         let distNM = max(1, Int(radiusNM.rounded()))
         let urlString = "\(baseURL)/lat/\(latitude)/lon/\(longitude)/dist/\(distNM)"
 
@@ -49,16 +92,9 @@ class ADSBLolClient {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        session.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-
-            guard let data = data else {
-                completion(.failure(ADSBError.noData))
-                return
-            }
+        session.dataTask(with: request) { data, _, error in
+            if let error { completion(.failure(error)); return }
+            guard let data else { completion(.failure(ADSBError.noData)); return }
 
             do {
                 let aircraft = try Self.parseResponse(data)
@@ -71,90 +107,59 @@ class ADSBLolClient {
 
     // MARK: - Private
 
-    /// Parse the adsb.lol JSON response into Aircraft objects
+    private static let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        // adsb.lol doesn't use date fields, but configure once for reuse.
+        return d
+    }()
+
     private static func parseResponse(_ data: Data) throws -> [Aircraft] {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let acArray = json["ac"] as? [[String: Any]] else {
+        let response: Response
+        do {
+            response = try decoder.decode(Response.self, from: data)
+        } catch {
             throw ADSBError.invalidResponse
         }
 
-        var aircraft: [Aircraft] = []
+        var result: [Aircraft] = []
+        result.reserveCapacity(response.ac.count)
 
-        for ac in acArray {
-            guard let parsed = parseAircraftObject(ac) else { continue }
-            aircraft.append(parsed)
+        for entry in response.ac {
+            guard let parsed = makeAircraft(from: entry) else { continue }
+            result.append(parsed)
         }
-
-        return aircraft
+        return result
     }
 
-    /// Parse a single aircraft JSON object
-    private static func parseAircraftObject(_ ac: [String: Any]) -> Aircraft? {
-        // ICAO hex address is required
-        guard let hex = ac["hex"] as? String, !hex.isEmpty else { return nil }
-        let icao = hex.uppercased()
+    private static func makeAircraft(from e: AircraftEntry) -> Aircraft? {
+        let icao = e.hex.uppercased()
+        guard !icao.isEmpty, let lat = e.lat, let lon = e.lon else { return nil }
 
-        // Position is required
-        guard let lat = ac["lat"] as? Double,
-              let lon = ac["lon"] as? Double else { return nil }
+        let altitude: Double = e.altBaro?.value ?? e.altGeom?.value ?? 0
 
-        // Altitude — prefer barometric, fall back to geometric
-        let altitude: Double
-        if let altBaro = ac["alt_baro"] as? Double {
-            altitude = altBaro
-        } else if let altBaro = ac["alt_baro"] as? Int {
-            altitude = Double(altBaro)
-        } else if let altGeom = ac["alt_geom"] as? Double {
-            altitude = altGeom
-        } else if let altGeom = ac["alt_geom"] as? Int {
-            altitude = Double(altGeom)
-        } else {
-            altitude = 0
-        }
-
-        // Callsign — use flight number, fall back to registration, then ICAO
         let callsign: String
-        if let flight = ac["flight"] as? String, !flight.trimmingCharacters(in: .whitespaces).isEmpty {
-            callsign = flight.trimmingCharacters(in: .whitespaces)
-        } else if let reg = ac["r"] as? String, !reg.isEmpty {
+        if let flight = e.flight?.trimmingCharacters(in: .whitespaces), !flight.isEmpty {
+            callsign = flight
+        } else if let reg = e.r, !reg.isEmpty {
             callsign = reg
         } else {
             callsign = icao
         }
 
-        // Track / heading
-        let track = ac["track"] as? Double ?? 0.0
-
-        // Ground speed in knots
-        let groundSpeed = ac["gs"] as? Double ?? 0.0
-
-        // Vertical rate in feet per minute
-        let verticalRate: Double
-        if let rate = ac["baro_rate"] as? Double {
-            verticalRate = rate
-        } else if let rate = ac["baro_rate"] as? Int {
-            verticalRate = Double(rate)
-        } else if let rate = ac["geom_rate"] as? Double {
-            verticalRate = rate
-        } else {
-            verticalRate = 0
-        }
-
-        // Aircraft type (e.g. "B738", "C172") — "t" field from adsb.lol
-        let aircraftType = ac["t"] as? String ?? ""
+        let verticalRate: Double = e.baroRate?.value ?? e.geomRate?.value ?? 0
 
         return Aircraft(
-            id: icao,
-            callsign: callsign,
-            aircraftType: aircraftType,
-            latitude: lat,
-            longitude: lon,
-            altitude: altitude,
-            track: track,
-            groundSpeed: groundSpeed,
+            id:           icao,
+            callsign:     callsign,
+            aircraftType: e.t ?? "",
+            latitude:     lat,
+            longitude:    lon,
+            altitude:     altitude,
+            track:        e.track ?? 0,
+            groundSpeed:  e.gs    ?? 0,
             verticalRate: verticalRate,
-            lastUpdate: Date(),
-            source: .internet
+            lastUpdate:   Date(),
+            source:       .internet
         )
     }
 }

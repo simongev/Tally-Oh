@@ -225,23 +225,24 @@ class ConnectionLogic: ObservableObject {
     }
 
     private func processGDL90Data(_ data: Data) {
-        // Scan for 0x7E frame boundaries — a UDP packet may contain multiple messages
-        var bytes = [UInt8](data)
-        var i = 0
-        while i < bytes.count {
-            guard bytes[i] == 0x7E else { i += 1; continue }
-            // Find closing flag
-            if let end = bytes[(i+1)...].firstIndex(of: 0x7E) {
-                let payload = Array(bytes[(i+1)..<end])
-                handleGDL90Message(payload)
-                i = end + 1
+        // Scan for 0x7E frame boundaries without copying the Data into [UInt8].
+        // Iterating Data directly avoids a heap allocation per UDP packet (which
+        // arrives up to ~10 times/second from an ADS-B receiver).
+        var i = data.startIndex
+        while i < data.endIndex {
+            guard data[i] == 0x7E else { i = data.index(after: i); continue }
+            let payloadStart = data.index(after: i)
+            guard payloadStart < data.endIndex else { break }
+            if let end = data[payloadStart...].firstIndex(of: 0x7E) {
+                handleGDL90Message(data[payloadStart..<end])
+                i = data.index(after: end)
             } else {
                 break
             }
         }
     }
 
-    private func handleGDL90Message(_ payload: [UInt8]) {
+    private func handleGDL90Message(_ payload: Data.SubSequence) {
         guard let msgType = payload.first else { return }
         switch msgType {
         case 0x00: break  // Heartbeat
@@ -253,75 +254,74 @@ class ConnectionLogic: ObservableObject {
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
             }
-        case 0x0B: break  // Ownship geometric alt (parsed inside ownship if needed)
+        case 0x0B: break  // Ownship geometric alt
         default: break
         }
     }
 
-    private func parseTrafficPayload(_ payload: [UInt8], isOwnship: Bool) -> Aircraft? {
-        // GDL 90 traffic report: 28 bytes after framing stripped
+    /// Parse a GDL90 traffic/ownship payload. Operates directly on a Data.SubSequence
+    /// so no heap copy is required — the indices are absolute within the original Data.
+    private func parseTrafficPayload(_ payload: Data.SubSequence, isOwnship: Bool) -> Aircraft? {
         guard payload.count >= 28 else { return nil }
 
-        var i = 1 // skip message ID byte
+        // Use an index cursor relative to the slice start.
+        var idx = payload.startIndex
 
-        // Status (1 byte)
-        i += 1
-        // Address type (1 byte) + ICAO (3 bytes)
-        i += 1
-        guard i + 3 <= payload.count else { return nil }
-        let icao = String(format: "%02X%02X%02X", payload[i], payload[i+1], payload[i+2])
-        i += 3
+        func advance(_ n: Int) { idx = payload.index(idx, offsetBy: n) }
+        func remaining() -> Int { payload.distance(from: idx, to: payload.endIndex) }
+        func byte(_ offset: Int) -> UInt8 { payload[payload.index(idx, offsetBy: offset)] }
 
-        // Latitude (3 bytes, two's complement, semicircles)
-        guard i + 3 <= payload.count else { return nil }
-        var latRaw = Int32(payload[i]) << 16 | Int32(payload[i+1]) << 8 | Int32(payload[i+2])
+        advance(1) // skip message ID
+        advance(1) // status
+        advance(1) // address type
+
+        guard remaining() >= 3 else { return nil }
+        let icao = String(format: "%02X%02X%02X", byte(0), byte(1), byte(2))
+        advance(3)
+
+        guard remaining() >= 3 else { return nil }
+        var latRaw = Int32(byte(0)) << 16 | Int32(byte(1)) << 8 | Int32(byte(2))
         if latRaw & 0x800000 != 0 { latRaw |= Int32(bitPattern: 0xFF000000) }
         let latitude = Double(latRaw) * (180.0 / 8_388_608.0)
-        i += 3
+        advance(3)
 
-        // Longitude (3 bytes, two's complement)
-        guard i + 3 <= payload.count else { return nil }
-        var lonRaw = Int32(payload[i]) << 16 | Int32(payload[i+1]) << 8 | Int32(payload[i+2])
+        guard remaining() >= 3 else { return nil }
+        var lonRaw = Int32(byte(0)) << 16 | Int32(byte(1)) << 8 | Int32(byte(2))
         if lonRaw & 0x800000 != 0 { lonRaw |= Int32(bitPattern: 0xFF000000) }
         let longitude = Double(lonRaw) * (180.0 / 8_388_608.0)
-        i += 3
+        advance(3)
 
-        // Altitude: upper 12 bits of next 2 bytes, 25 ft resolution, -1000 ft offset
-        guard i + 2 <= payload.count else { return nil }
-        let altCode = (UInt16(payload[i]) << 4) | (UInt16(payload[i+1]) >> 4)
+        guard remaining() >= 2 else { return nil }
+        let altCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
         let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
-        i += 2
+        advance(2)
 
-        // Misc (1), NIC (1), NACp (1)
-        i += 3
+        advance(3) // Misc / NIC / NACp
 
-        // Horizontal velocity: upper 12 bits of next 2 bytes (knots)
-        guard i + 2 <= payload.count else { return nil }
-        let hvCode = (UInt16(payload[i]) << 4) | (UInt16(payload[i+1]) >> 4)
+        guard remaining() >= 2 else { return nil }
+        let hvCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
         let groundSpeed = hvCode == 0xFFF ? 0.0 : Double(hvCode)
-        i += 1   // only advance 1 — vv shares the lower nibble
+        advance(1)
 
-        // Vertical velocity: lower nibble of byte at i, then full byte at i+1
-        guard i + 2 <= payload.count else { return nil }
-        let vvRaw = (Int16(payload[i] & 0x0F) << 8) | Int16(payload[i+1])
+        guard remaining() >= 2 else { return nil }
+        let vvRaw = (Int16(byte(0) & 0x0F) << 8) | Int16(byte(1))
         let vvSigned = vvRaw > 2047 ? vvRaw - 4096 : vvRaw
         let verticalRate = Double(vvSigned) * 64.0
-        i += 2
+        advance(2)
 
-        // Track (1 byte, 0–255 maps to 0–360°)
-        guard i < payload.count else { return nil }
-        let track = Double(payload[i]) * (360.0 / 256.0)
-        i += 1
+        guard remaining() >= 1 else { return nil }
+        let track = Double(byte(0)) * (360.0 / 256.0)
+        advance(1)
 
-        // Emitter category (1 byte)
-        i += 1
+        advance(1) // emitter category
 
-        // Callsign: up to 8 ASCII chars
         var callsign = icao
-        if !isOwnship, i + 8 <= payload.count {
-            let raw = String(bytes: payload[i..<(i+8)], encoding: .ascii) ?? ""
-            let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
-            if !trimmed.isEmpty { callsign = trimmed }
+        if !isOwnship, remaining() >= 8 {
+            let csEnd = payload.index(idx, offsetBy: 8)
+            if let raw = String(bytes: payload[idx..<csEnd], encoding: .ascii) {
+                let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
+                if !trimmed.isEmpty { callsign = trimmed }
+            }
         }
 
         return Aircraft(
