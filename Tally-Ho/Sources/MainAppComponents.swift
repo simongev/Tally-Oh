@@ -180,43 +180,33 @@ class ARComponentFactory {
     /// Apply or remove the selected visual state on a container node.
     /// Aircraft ring: yellow, larger. Airport cone: cyan, larger.
     static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
-        if selected {
-            SCNTransaction.begin()
-            SCNTransaction.animationDuration = 0.15
-            container.scale = SCNVector3(1.35, 1.35, 1.35)
-            SCNTransaction.commit()
-            // Tint every geometry in the container
-            container.enumerateChildNodes { node, _ in
-                if let mat = node.geometry?.firstMaterial {
-                    if node.geometry is SCNCone {
-                        // Airport cone → cyan
-                        mat.diffuse.contents  = UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
-                        mat.emission.contents = UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
-                    } else if node.geometry is SCNTorus {
-                        // Aircraft ring → yellow
-                        mat.diffuse.contents  = UIColor(red: 1.0, green: 0.9, blue: 0.0, alpha: 1.0)
-                        mat.emission.contents = UIColor(red: 0.5, green: 0.4, blue: 0.0, alpha: 1.0)
-                    }
-                }
-            }
-        } else {
-            SCNTransaction.begin()
-            SCNTransaction.animationDuration = 0.15
-            container.scale = SCNVector3(1.0, 1.0, 1.0)
-            SCNTransaction.commit()
-            // Restore original colours
-            container.enumerateChildNodes { node, _ in
-                if let mat = node.geometry?.firstMaterial {
-                    if node.geometry is SCNCone {
-                        mat.diffuse.contents  = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
-                        mat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
-                    } else if node.geometry is SCNTorus {
-                        mat.diffuse.contents  = UIColor.red
-                        mat.emission.contents = UIColor(red: 0.4, green: 0.0, blue: 0.0, alpha: 1.0)
-                    }
-                }
+        // All SceneKit mutations — scale, material colours — must be inside a single
+        // SCNTransaction so the render thread never observes a partial update.
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 0.15
+        container.scale = selected ? SCNVector3(1.35, 1.35, 1.35) : SCNVector3(1.0, 1.0, 1.0)
+        container.enumerateChildNodes { node, _ in
+            guard node.name != "label",           // skip label plane
+                  let mat = node.geometry?.firstMaterial else { return }
+            if node.geometry is SCNCone {
+                // Airport cone
+                mat.diffuse.contents  = selected
+                    ? UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
+                    : UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
+                mat.emission.contents = selected
+                    ? UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
+                    : UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
+            } else if node.geometry is SCNPlane {
+                // Aircraft ring: SCNPlane textured with a ring image drawn in Core Graphics.
+                // Diffuse must stay as the image texture (changing it to a UIColor would
+                // replace the ring shape with a solid square). Use emission to add a
+                // colour-tint glow on top of the texture for the selected state.
+                mat.emission.contents = selected
+                    ? UIColor(red: 0.6, green: 0.55, blue: 0.0, alpha: 0.7)
+                    : UIColor(red: 0.4, green: 0.0,  blue: 0.0, alpha: 1.0)
             }
         }
+        SCNTransaction.commit()
     }
 
     // MARK: - Airport Marker
@@ -815,19 +805,22 @@ class ARSceneManager {
             if let lbl = container.childNode(withName: "label", recursively: false) {
                 let shouldHide = hasSelection && !isSelected
                 if lbl.isHidden != shouldHide {
-                    SCNTransaction.begin()
-                    SCNTransaction.animationDuration = 0.18
-                    lbl.opacity = shouldHide ? 0 : 1
-                    SCNTransaction.commit()
-                    // isHidden drives hit-testing and layout; opacity drives the visual fade.
-                    // Set isHidden after the fade so there's no abrupt pop.
                     if shouldHide {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                            // Only hide if state hasn't changed again by the time fade completes.
-                            if lbl.opacity < 0.05 { lbl.isHidden = true }
-                        }
-                    } else {
+                        // Fade out then hide — keep isHidden = false during the fade
+                        // so SceneKit still renders it while opacity animates to 0.
                         lbl.isHidden = false
+                        SCNTransaction.begin()
+                        SCNTransaction.animationDuration = 0.18
+                        SCNTransaction.completionBlock = { lbl.isHidden = true }
+                        lbl.opacity = 0
+                        SCNTransaction.commit()
+                    } else {
+                        // Show immediately, then fade in.
+                        lbl.isHidden = false
+                        SCNTransaction.begin()
+                        SCNTransaction.animationDuration = 0.18
+                        lbl.opacity = 1
+                        SCNTransaction.commit()
                     }
                 }
             }
