@@ -308,6 +308,7 @@ class ARComponentFactory {
         plane.materials = [mat]
 
         let node = SCNNode(geometry: plane)
+        node.name = "label"   // distinguishes label planes from ring/cone geometry planes
         node.position = SCNVector3(0, Float(yOffset + h / 2), 0)
 
         let bill = SCNBillboardConstraint()
@@ -371,26 +372,33 @@ class ARComponentFactory {
         aircraft: Aircraft,
         rawPosition: SCNVector3,
         cameraWorldPosition: SCNVector3 = .init(),
-        settings: ARVisualizationSettings
+        settings: ARVisualizationSettings,
+        selectedNodeID: String? = nil
     ) {
         // Position update is handled by the caller (ARSceneManager) with duration 0.22s
         let _ = scaledPosition(rawPosition, relativeTo: cameraWorldPosition) // computed but move done by caller
 
-        // Refresh label: find the plane node used for the label (not the ring plane)
-        // Ring plane is the first child; label is the second child if present.
-        let labelNode = node.childNodes.first(where: {
-            $0.geometry is SCNPlane && $0 !== node.childNodes.first
-        })
+        // Refresh label: find the node named "label" (distinct from the ring SCNPlane).
+        let labelNode = node.childNode(withName: "label", recursively: false)
 
         let shouldShow = settings.showAircraftLabels
         if let lbl = labelNode {
-            lbl.isHidden = !shouldShow
+            // When no selection is active, enforce the settings-driven visibility.
+            // When a selection IS active, applySelectionToAllNodes owns visibility —
+            // don't touch it here to avoid fighting the opacity-fade it applies.
+            if selectedNodeID == nil {
+                lbl.isHidden  = !shouldShow
+                lbl.opacity   = 1          // restore in case a fade was in flight
+            }
+
             // Only regenerate the label image when the text actually changes —
             // altitude rounds to the nearest foot so re-renders are infrequent.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
                 let newText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
-                if newText != lbl.name {
-                    lbl.name = newText   // cache rendered text in node name
+                // Cache rendered text in a user attribute to keep lbl.name free for identification.
+                let cachedText = lbl.value(forKey: "cachedLabelText") as? String
+                if newText != cachedText {
+                    lbl.setValue(newText, forKey: "cachedLabelText")
                     let image = makeLabelImage(text: newText, textColor: .white,
                                                bgColor: UIColor(white: 0, alpha: 0.72),
                                                fontSize: labelFontSize)
@@ -603,7 +611,8 @@ class ARSceneManager {
                     aircraft: ac,
                     rawPosition: rawPos,
                     cameraWorldPosition: cameraWorldPosition,
-                    settings: settings
+                    settings: settings,
+                    selectedNodeID: selectedNodeID
                 )
             } else {
                 let node = ARComponentFactory.createAircraftMarker(
@@ -710,13 +719,16 @@ class ARSceneManager {
                 // Airports are static — update position directly, no animation needed.
                 let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
                 existing.position = scaled
-                // Only regenerate the label image when the displayed text changes
-                let labelNode = existing.childNodes.first(where: { ($0.geometry as? SCNPlane) != nil })
+                // Only regenerate the label image when the displayed text changes.
+                // Find the label node by name to avoid mistaking the cone geometry for a label.
+                let labelNode = existing.childNode(withName: "label", recursively: false)
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
                     let newText = ARComponentFactory.buildAirportLabelText(
                         airport: airport, distanceNM: distNM, settings: settings)
-                    if newText != lbl.name {
-                        lbl.name = newText
+                    // Cache rendered text in a user attribute (lbl.name is reserved for "label").
+                    let cachedText = lbl.value(forKey: "cachedLabelText") as? String
+                    if newText != cachedText {
+                        lbl.setValue(newText, forKey: "cachedLabelText")
                         let image = ARComponentFactory.makeLabelImage(
                             text: newText, textColor: .white,
                             bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
@@ -730,8 +742,13 @@ class ARSceneManager {
                         plane.height = h
                         plane.materials.first?.diffuse.contents  = image
                         plane.materials.first?.emission.contents = image
-                        lbl.isHidden = !settings.showAirportLabels
                         SCNTransaction.commit()
+                    }
+                    // When no selection is active, enforce settings-driven visibility.
+                    // When a selection IS active, applySelectionToAllNodes owns this — don't fight it.
+                    if selectedNodeID == nil {
+                        lbl.isHidden = !settings.showAirportLabels
+                        lbl.opacity  = 1
                     }
                 }
             } else {
@@ -790,13 +807,27 @@ class ARSceneManager {
 
         let allContainers = Array(acSnap.values) + Array(apSnap.values)
         for container in allContainers {
-            let isSelected  = (container.name == sel)
+            let isSelected   = (container.name == sel)
             let hasSelection = (sel != nil)
-            // Hide only the label planes of unselected nodes — the ring/cone itself
-            // stays visible so the user can still see all traffic.
-            for child in container.childNodes {
-                if child.geometry is SCNPlane {
-                    child.isHidden = hasSelection && !isSelected
+            // Only hide/show the label child node — the ring/cone geometry always stays
+            // visible so the user can see all traffic even when something is selected.
+            if let lbl = container.childNode(withName: "label", recursively: false) {
+                let shouldHide = hasSelection && !isSelected
+                if lbl.isHidden != shouldHide {
+                    SCNTransaction.begin()
+                    SCNTransaction.animationDuration = 0.18
+                    lbl.opacity = shouldHide ? 0 : 1
+                    SCNTransaction.commit()
+                    // isHidden drives hit-testing and layout; opacity drives the visual fade.
+                    // Set isHidden after the fade so there's no abrupt pop.
+                    if shouldHide {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            // Only hide if state hasn't changed again by the time fade completes.
+                            if lbl.opacity < 0.05 { lbl.isHidden = true }
+                        }
+                    } else {
+                        lbl.isHidden = false
+                    }
                 }
             }
             ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
