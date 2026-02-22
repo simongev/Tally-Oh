@@ -76,7 +76,7 @@ class ARComponentFactory {
     /// called hundreds of times per second; create it once per font size.
     private static let labelFont: UIFont =
         UIFont.boldSystemFont(ofSize: labelFontSize * 80)
-    private static let labelFontAirport: UIFont =
+    static let labelFontAirport: UIFont =
         UIFont.boldSystemFont(ofSize: labelFontSizeAirport * 80)
 
     // MARK: - Position Scaling
