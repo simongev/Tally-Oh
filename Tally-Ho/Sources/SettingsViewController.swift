@@ -20,6 +20,7 @@ extension ARVisualizationSettings {
             "showAircraftAltitude":  showAircraftAltitude,
             "callsignFilter":        callsignFilter,
             "showAircraftSpeed":     showAircraftSpeed,
+            "showAircraftDistance":  showAircraftDistance,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -40,6 +41,7 @@ extension ARVisualizationSettings {
         s.showAircraftAltitude = d["showAircraftAltitude"] as? Bool   ?? s.showAircraftAltitude
         s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
         s.showAircraftSpeed    = d["showAircraftSpeed"]    as? Bool   ?? s.showAircraftSpeed
+        s.showAircraftDistance = d["showAircraftDistance"] as? Bool   ?? s.showAircraftDistance
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -122,6 +124,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "Ground speed in knots on label",
                 getter: { $0.showAircraftSpeed },
                 setter: { $0.showAircraftSpeed = $1 }
+            ),
+            .toggle(
+                title: "Show Distance",
+                subtitle: "Distance in NM on aircraft label",
+                getter: { $0.showAircraftDistance },
+                setter: { $0.showAircraftDistance = $1 }
             ),
             .slider(
                 title: "Max Distance",

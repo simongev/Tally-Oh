@@ -451,7 +451,8 @@ class ARTrafficViewController: UIViewController {
                 updatedSettings.airportMaxDistance  != old?.airportMaxDistance ||
                 updatedSettings.showLargeAirports   != old?.showLargeAirports  ||
                 updatedSettings.showMediumAirports  != old?.showMediumAirports ||
-                updatedSettings.showSmallAirports   != old?.showSmallAirports
+                updatedSettings.showSmallAirports   != old?.showSmallAirports  ||
+                updatedSettings.callsignFilter      != old?.callsignFilter
 
             if needsRebuild {
                 self.sceneManager?.clearAll()

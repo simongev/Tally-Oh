@@ -104,6 +104,7 @@ class ARComponentFactory {
     static func createAircraftMarker(
         rawPosition: SCNVector3,
         aircraft: Aircraft,
+        distanceNM: Double = 0,
         cameraWorldPosition: SCNVector3 = .init(),
         settings: ARVisualizationSettings
     ) -> SCNNode {
@@ -127,19 +128,18 @@ class ARComponentFactory {
 
         container.addChildNode(ringNode)
 
-        // -- Label --
-        if settings.showAircraftLabels {
-            let text = buildAircraftLabelText(aircraft: aircraft, settings: settings)
-            let labelNode = createLabelNode(
-                text: text,
-                textColor: .white,
-                bgColor: UIColor(white: 0, alpha: 0.72),
-                fontSize: labelFontSize,
-                font: labelFont,
-                yOffset: CGFloat(aircraftRingRadius) + 0.9
-            )
-            container.addChildNode(labelNode)
-        }
+        // -- Label -- always created so it can be shown/hidden dynamically
+        let text = buildAircraftLabelText(aircraft: aircraft, distanceNM: distanceNM, settings: settings)
+        let labelNode = createLabelNode(
+            text: text,
+            textColor: .white,
+            bgColor: UIColor(white: 0, alpha: 0.72),
+            fontSize: labelFontSize,
+            font: labelFont,
+            yOffset: CGFloat(aircraftRingRadius) + 0.9
+        )
+        labelNode.isHidden = !settings.showAircraftLabels
+        container.addChildNode(labelNode)
 
         return container
     }
@@ -171,7 +171,7 @@ class ARComponentFactory {
 
     // MARK: - Aircraft Label Text
 
-    static func buildAircraftLabelText(aircraft: Aircraft, settings: ARVisualizationSettings) -> String {
+    static func buildAircraftLabelText(aircraft: Aircraft, distanceNM: Double = 0, settings: ARVisualizationSettings) -> String {
         var parts: [String] = []
         var line1 = aircraft.callsign
         if settings.showAircraftType && !aircraft.aircraftType.isEmpty {
@@ -183,6 +183,9 @@ class ARComponentFactory {
         }
         if settings.showAircraftSpeed {
             parts.append(String(format: "%.0f kts", aircraft.groundSpeed))
+        }
+        if settings.showAircraftDistance {
+            parts.append(String(format: "%.1f NM", distanceNM))
         }
         return parts.joined(separator: "\n")
     }
@@ -238,18 +241,17 @@ class ARComponentFactory {
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
         container.addChildNode(coneNode)
 
-        if settings.showAirportLabels {
-            let text = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
-            let labelNode = createLabelNode(
-                text: text,
-                textColor: .white,
-                bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
-                fontSize: labelFontSizeAirport,
-                font: labelFontAirport,
-                yOffset: CGFloat(coneHeight) + 1.0
-            )
-            container.addChildNode(labelNode)
-        }
+        // Always create the label node so it can be shown/hidden dynamically
+        let text = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
+        let labelNode = createLabelNode(
+            text: text,
+            textColor: .white,
+            bgColor: UIColor(red: 0.0, green: 0.15, blue: 0.45, alpha: 0.82),
+            fontSize: labelFontSizeAirport,
+            font: labelFontAirport,
+            yOffset: CGFloat(coneHeight) + 1.0
+        )
+        container.addChildNode(labelNode)
 
         return container
     }
@@ -348,6 +350,7 @@ class ARComponentFactory {
     static func updateAircraftMarker(
         node: SCNNode,
         aircraft: Aircraft,
+        distanceNM: Double = 0,
         settings: ARVisualizationSettings,
         selectedNodeID: String? = nil
     ) {
@@ -365,7 +368,7 @@ class ARComponentFactory {
 
             // Only regenerate the label image when the text actually changes.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
-                let newText = buildAircraftLabelText(aircraft: aircraft, settings: settings)
+                let newText = buildAircraftLabelText(aircraft: aircraft, distanceNM: distanceNM, settings: settings)
                 if newText != plane.name {
                     plane.name = newText
                     let image = makeLabelImage(text: newText, textColor: .white,
@@ -407,8 +410,11 @@ struct ARVisualizationSettings {
     // Whether to show ground speed in the aircraft label
     var showAircraftSpeed: Bool = true
 
+    // Whether to show distance in the aircraft label
+    var showAircraftDistance: Bool = false
+
     /// Derived: show label if any label field is enabled
-    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed }
+    var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed || showAircraftDistance }
 
     /// Pre-processed filter string (trimmed + uppercased) for fast matching.
     /// Recomputed only when callsignFilter changes.
@@ -433,7 +439,8 @@ struct ARVisualizationSettings {
 
     var showAirportDistance: Bool = true
 
-    var showAirportLabels: Bool { showAirportDistance }
+    // Airport labels always show (name always visible; distance is optional content)
+    var showAirportLabels: Bool { true }
 
     func shouldShow(airportType: String) -> Bool {
         switch airportType {
@@ -558,6 +565,7 @@ class ARSceneManager {
                 ARComponentFactory.updateAircraftMarker(
                     node: existing,
                     aircraft: ac,
+                    distanceNM: distNM,
                     settings: settings,
                     selectedNodeID: selectedNodeID
                 )
@@ -565,6 +573,7 @@ class ARSceneManager {
                 let node = ARComponentFactory.createAircraftMarker(
                     rawPosition: rawPos,
                     aircraft: ac,
+                    distanceNM: distNM,
                     cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
