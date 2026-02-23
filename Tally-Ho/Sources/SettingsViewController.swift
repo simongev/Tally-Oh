@@ -192,7 +192,7 @@ class SettingsViewController: UITableViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             barButtonSystemItem: .done, target: self, action: #selector(doneTapped)
         )
-        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "toggle")
+        tableView.register(ToggleCell.self, forCellReuseIdentifier: "toggle")
         tableView.register(SliderCell.self,      forCellReuseIdentifier: "slider")
         tableView.register(TextFieldCell.self,   forCellReuseIdentifier: "textField")
         tableView.rowHeight = UITableView.automaticDimension
@@ -220,7 +220,7 @@ class SettingsViewController: UITableViewController {
 
         switch row {
         case let .toggle(title, subtitle, getter, setter):
-            let cell = UITableViewCell(style: .subtitle, reuseIdentifier: "toggle")
+            let cell = tableView.dequeueReusableCell(withIdentifier: "toggle", for: indexPath)
             cell.textLabel?.text = title
             cell.textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
             cell.detailTextLabel?.text = subtitle
@@ -278,6 +278,22 @@ class SettingsViewController: UITableViewController {
             setter(&settings, sw.isOn)
         }
     }
+}
+
+// MARK: - ToggleCell
+
+final class ToggleCell: UITableViewCell {
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        detailTextLabel?.textColor = .secondaryLabel
+        detailTextLabel?.font = .systemFont(ofSize: 13)
+        detailTextLabel?.numberOfLines = 2
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 }
 
 // MARK: - SliderCell

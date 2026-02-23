@@ -374,22 +374,27 @@ class ARTrafficViewController: UIViewController {
     private func loadAirports() {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
-            let loc = DispatchQueue.main.sync { self?.userLocation ?? self?.activeLocation }
-            let nearby: [Airport]
-            if let loc = loc {
-                nearby = CalculationsLogic.filterAirportsInRange(
-                    airports: parsed,
-                    userCoord: loc,
-                    maxRangeNauticalMiles: 200
-                )
-            } else {
-                nearby = []
-            }
-            DispatchQueue.main.async {
-                self?.allAirports = parsed
-                self?.airports = nearby
-                self?.lastAirportFilterLocation = loc
-                self?.updateStatusLabel()
+            // Capture location on main thread safely via async, then filter on background.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let loc = self.userLocation ?? self.activeLocation
+                self.allAirports = parsed
+                if let loc = loc {
+                    DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                        let nearby = CalculationsLogic.filterAirportsInRange(
+                            airports: parsed,
+                            userCoord: loc,
+                            maxRangeNauticalMiles: 200
+                        )
+                        DispatchQueue.main.async {
+                            self?.airports = nearby
+                            self?.lastAirportFilterLocation = loc
+                            self?.updateStatusLabel()
+                        }
+                    }
+                } else {
+                    self.updateStatusLabel()
+                }
             }
         }
     }
