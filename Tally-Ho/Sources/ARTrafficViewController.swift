@@ -22,7 +22,7 @@ private enum SelectionState: Equatable {
 /// at the screen edge when the selected target is outside the camera FOV.
 private final class OffScreenArrowView: UIView {
 
-    private var arrowAngle: CGFloat = 0      // radians: 0 = pointing up, clockwise +
+    private var arrowAngle: CGFloat = 0
     private var arrowCenter: CGPoint = .zero
     private var isVisible = false
 
@@ -57,20 +57,18 @@ private final class OffScreenArrowView: UIView {
                             y: arrowCenter.y - half,
                             width: size, height: size)
 
-        // Background rounded rect
         ctx.saveGState()
         let path = UIBezierPath(roundedRect: bgRect, cornerRadius: cornerRadius)
         UIColor.black.withAlphaComponent(0.65).setFill()
         path.fill()
         ctx.restoreGState()
 
-        // Chevron: two lines forming a "^" shape, rotated to `arrowAngle`
         ctx.saveGState()
         ctx.translateBy(x: arrowCenter.x, y: arrowCenter.y)
         ctx.rotate(by: arrowAngle)
 
         let armLen: CGFloat = 10
-        let tipY: CGFloat   = -11   // tip of chevron (pointing up before rotation)
+        let tipY: CGFloat   = -11
         let baseY: CGFloat  =   5
 
         ctx.setStrokeColor(UIColor.white.cgColor)
@@ -97,12 +95,26 @@ class ARTrafficViewController: UIViewController {
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
     private var settingsButton: UIButton!
+    private var mapButton: UIButton!
     private var backButton: UIButton!
     private var offScreenArrowView: OffScreenArrowView!
 
-    // Dynamic leading constraints on statusLabel (swapped when selection active)
+    // Dynamic leading constraints on statusLabel
     private var statusLeadingToEdge: NSLayoutConstraint!
     private var statusLeadingToBack: NSLayoutConstraint!
+
+    /// Full-screen border overlay driven by TCAS alerts.
+    private var tcasOverlayView: UIView!
+    private var tcasFlashTimer: Timer?
+    private var tcasFlashState: Bool = false
+
+    // MARK: - METAR Panel
+
+    private var metarPanelView: UIView!
+    private var metarLabel: UILabel!
+    private var metarCloseButton: UIButton!
+    private var metarSelectedICAO: String?
+    private var metarFetchTask: URLSessionDataTask?
 
     // MARK: - Core
 
@@ -113,61 +125,32 @@ class ARTrafficViewController: UIViewController {
     // MARK: - State
 
     private var airports: [Airport] = []
+    private var currentTCASEvaluation: TCASEvaluation = .clear
 
-    /// Seed location passed from CalibrationViewController (may be nil if skipped).
     var seedLocation: CLLocation?
 
-    /// Always from iPhone CLLocationManager — primary positioning source.
     private var userLocation: CLLocationCoordinate2D?
-    /// Best horizontal accuracy seen in the current flight session (metres). -1 = unknown.
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
-    /// Last raw GPS horizontal accuracy for HUD display.
     private var lastHorizontalAccuracy: CLLocationAccuracy = -1
-    /// Altitude from CMAltimeter (barometric, relative) + GPS MSL baseline, in feet.
     private var userAltitude: Double = 0
-    /// GPS MSL altitude in feet — used as baseline for barometric correction.
     private var gpsMSLAltitudeFeet: Double = 0
-    /// Heading from iPhone compass.
     private var userHeading: Double = 0
-    /// Last heading accuracy reading from CLLocationManager (-1 = unknown).
     private var lastHeadingAccuracy: CLLocationDirectionAccuracy = -1
-    /// ARKit tracking state — used to warn user if tracking degrades.
     private var arTrackingState: ARCamera.TrackingState = .notAvailable
 
-    /// CMAltimeter for barometric relative-altitude measurements.
     private let altimeter = CMAltimeter()
-    /// Relative altitude change from altimeter since baseline (metres).
     private var baroRelativeAltitude: Double = 0
-    /// Baseline GPS altitude set when altimeter starts (metres MSL).
     private var baroBaselineAltitudeFeet: Double = 0
-    /// True once the altimeter has produced its first reading and baseline is set.
     private var baroBaselineSet = false
 
     private var updateTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
-    /// Last position used to centre the 200 NM airport pre-filter.
     private var lastAirportFilterLocation: CLLocationCoordinate2D?
-
-    /// Current target selection state.
     private var selectionState: SelectionState = .none
-
-    /// GPS accuracy threshold — fixes worse than this are discarded.
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
-    /// Running correction for the angular drift between the ARKit world-north
-    /// (frozen at session.run() time) and the live compass true-north.
-    ///
-    /// ARKit sets its north once via the compass at session start, then relies
-    /// entirely on the gyroscope — so any initial compass error stays fixed for
-    /// the whole session. Every time we get a high-quality heading reading we
-    /// re-measure the difference between ARKit's yaw and the compass, and store
-    /// it here. All bearing calculations add this offset to cancel the drift.
-    ///
-    /// Value is in degrees; positive = ARKit north is clockwise of true north.
     private var arKitNorthCorrectionDeg: Double = 0
-
-    /// Number of heading samples accumulated for the running correction average.
     private var northCorrectionSampleCount: Int = 0
 
     // MARK: - Lifecycle
@@ -184,12 +167,10 @@ class ARTrafficViewController: UIViewController {
         setupGestures()
         loadAirports()
 
-        // Load persisted settings before starting (load() calls updateFilter() internally).
         if let saved = ARVisualizationSettings.load() {
             sceneManager?.settings = saved
         }
 
-        // Apply calibration seed location so we have a position immediately
         if let seed = seedLocation {
             userLocation        = seed.coordinate
             gpsMSLAltitudeFeet  = seed.altitude * CalculationsLogic.metersToFeet
@@ -200,10 +181,8 @@ class ARTrafficViewController: UIViewController {
             connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
         }
 
-        // Begin listening for ADS-B broadcasts in background
         connectionLogic.startListening()
 
-        // Wire deselection callback for when a selected node is removed from the scene
         sceneManager?.onSelectionInvalidated = { [weak self] in
             self?.clearSelection()
         }
@@ -219,6 +198,7 @@ class ARTrafficViewController: UIViewController {
         arSceneView.session.pause()
         updateTimer?.invalidate()
         altimeter.stopRelativeAltitudeUpdates()
+        stopTCASFlash()
     }
 
     deinit {
@@ -235,7 +215,6 @@ class ARTrafficViewController: UIViewController {
         arSceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(arSceneView)
 
-        // Off-screen arrow overlay — sits above arSceneView, below all buttons
         offScreenArrowView = OffScreenArrowView(frame: view.bounds)
         offScreenArrowView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(offScreenArrowView)
@@ -252,7 +231,7 @@ class ARTrafficViewController: UIViewController {
         statusLabel.isUserInteractionEnabled = false
         view.addSubview(statusLabel)
 
-        // Back button — hidden until a target is selected
+        // Back button
         backButton = UIButton(type: .system)
         backButton.translatesAutoresizingMaskIntoConstraints = false
         backButton.setImage(UIImage(systemName: "arrow.left"), for: .normal)
@@ -271,18 +250,18 @@ class ARTrafficViewController: UIViewController {
             backButton.heightAnchor.constraint(equalToConstant: 48)
         ])
 
-        // statusLabel leading: two variants — default (edge) and with-back-button
         statusLeadingToEdge = statusLabel.leadingAnchor.constraint(
             equalTo: view.leadingAnchor, constant: 12)
         statusLeadingToBack = statusLabel.leadingAnchor.constraint(
             equalTo: backButton.trailingAnchor, constant: 8)
-        statusLeadingToEdge.isActive = true   // default
+        statusLeadingToEdge.isActive = true
 
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68)
         ])
 
+        // Settings button (bottom right)
         settingsButton = UIButton(type: .system)
         settingsButton.translatesAutoresizingMaskIntoConstraints = false
         settingsButton.setTitle("⚙️", for: .normal)
@@ -298,6 +277,75 @@ class ARTrafficViewController: UIViewController {
             settingsButton.widthAnchor.constraint(equalToConstant: 48),
             settingsButton.heightAnchor.constraint(equalToConstant: 48)
         ])
+
+        // Map button (top right, round)
+        mapButton = UIButton(type: .system)
+        mapButton.translatesAutoresizingMaskIntoConstraints = false
+        mapButton.setImage(UIImage(systemName: "map.fill"), for: .normal)
+        mapButton.tintColor = .white
+        mapButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        mapButton.layer.cornerRadius = 24
+        mapButton.addTarget(self, action: #selector(showMap), for: .touchUpInside)
+        view.addSubview(mapButton)
+
+        NSLayoutConstraint.activate([
+            mapButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            mapButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            mapButton.widthAnchor.constraint(equalToConstant: 48),
+            mapButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        // TCAS border overlay
+        tcasOverlayView = UIView(frame: view.bounds)
+        tcasOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tcasOverlayView.isUserInteractionEnabled = false
+        tcasOverlayView.layer.borderWidth = 8
+        tcasOverlayView.layer.borderColor = UIColor.clear.cgColor
+        tcasOverlayView.backgroundColor = .clear
+        view.insertSubview(tcasOverlayView, aboveSubview: arSceneView)
+
+        // METAR panel (hidden by default, shown when airport selected)
+        setupMetarPanel()
+    }
+
+    private func setupMetarPanel() {
+        metarPanelView = UIView()
+        metarPanelView.translatesAutoresizingMaskIntoConstraints = false
+        metarPanelView.backgroundColor = UIColor.black.withAlphaComponent(0.82)
+        metarPanelView.layer.cornerRadius = 12
+        metarPanelView.isHidden = true
+        view.addSubview(metarPanelView)
+
+        metarLabel = UILabel()
+        metarLabel.translatesAutoresizingMaskIntoConstraints = false
+        metarLabel.textColor = .white
+        metarLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        metarLabel.numberOfLines = 0
+        metarLabel.textAlignment = .left
+        metarPanelView.addSubview(metarLabel)
+
+        metarCloseButton = UIButton(type: .system)
+        metarCloseButton.translatesAutoresizingMaskIntoConstraints = false
+        metarCloseButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
+        metarCloseButton.tintColor = UIColor.white.withAlphaComponent(0.7)
+        metarCloseButton.addTarget(self, action: #selector(closeMetar), for: .touchUpInside)
+        metarPanelView.addSubview(metarCloseButton)
+
+        NSLayoutConstraint.activate([
+            metarPanelView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            metarPanelView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            metarPanelView.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -12),
+
+            metarCloseButton.topAnchor.constraint(equalTo: metarPanelView.topAnchor, constant: 8),
+            metarCloseButton.trailingAnchor.constraint(equalTo: metarPanelView.trailingAnchor, constant: -8),
+            metarCloseButton.widthAnchor.constraint(equalToConstant: 28),
+            metarCloseButton.heightAnchor.constraint(equalToConstant: 28),
+
+            metarLabel.topAnchor.constraint(equalTo: metarPanelView.topAnchor, constant: 10),
+            metarLabel.leadingAnchor.constraint(equalTo: metarPanelView.leadingAnchor, constant: 12),
+            metarLabel.trailingAnchor.constraint(equalTo: metarCloseButton.leadingAnchor, constant: -4),
+            metarLabel.bottomAnchor.constraint(equalTo: metarPanelView.bottomAnchor, constant: -10)
+        ])
     }
 
     private func setupARScene() {
@@ -311,8 +359,6 @@ class ARTrafficViewController: UIViewController {
         locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         locationManager.activityType = .airborne
         locationManager.distanceFilter = kCLDistanceFilterNone
-        // kCLHeadingFilterNone gives every hardware sample so the system can
-        // apply maximum internal smoothing; we filter bad readings ourselves.
         locationManager.headingFilter = kCLHeadingFilterNone
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
@@ -335,8 +381,6 @@ class ARTrafficViewController: UIViewController {
             .sink { [weak self] _ in self?.updateStatusLabel() }
             .store(in: &cancellables)
 
-        // 4 Hz — at 250 kt the user moves ~32 m per second; updating 4x/s keeps
-        // target positions smooth enough for comfortable viewing in flight.
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
@@ -346,8 +390,7 @@ class ARTrafficViewController: UIViewController {
         guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
         altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
             guard let self, let data, error == nil else { return }
-            let relM = data.relativeAltitude.doubleValue   // metres since altimeter start
-            // Set baseline on first reading using GPS MSL
+            let relM = data.relativeAltitude.doubleValue
             if !self.baroBaselineSet {
                 self.baroBaselineAltitudeFeet = self.gpsMSLAltitudeFeet
                 self.baroBaselineSet = true
@@ -355,7 +398,6 @@ class ARTrafficViewController: UIViewController {
             } else {
                 self.baroRelativeAltitude = relM
             }
-            // Fused altitude: GPS MSL baseline + barometric delta (barometer is more precise for changes)
             let fusedFeet = self.baroBaselineAltitudeFeet + relM * CalculationsLogic.metersToFeet
             self.userAltitude = fusedFeet
         }
@@ -368,13 +410,11 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - Airport Loading
 
-    /// Full airport database — loaded once in background, never iterated on main thread.
     private var allAirports: [Airport] = []
 
     private func loadAirports() {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
-            // Capture location on main thread safely via async, then filter on background.
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let loc = self.userLocation ?? self.activeLocation
@@ -399,7 +439,6 @@ class ARTrafficViewController: UIViewController {
         }
     }
 
-    /// Re-filter allAirports to 200 NM — called when user moves > 50 NM.
     private func refreshNearbyAirports() {
         guard let loc = userLocation ?? activeLocation else { return }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
@@ -421,8 +460,6 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        // After a session reset, ARKit re-samples the compass for its new north.
-        // Reset the correction so we build a fresh measurement from the new north.
         arKitNorthCorrectionDeg = 0
         northCorrectionSampleCount = 0
         sceneManager?.arKitNorthCorrectionDeg = 0
@@ -436,14 +473,10 @@ class ARTrafficViewController: UIViewController {
             guard let self else { return }
             let old = self.sceneManager?.settings
             var updatedSettings = updated
-            updatedSettings.updateFilter()   // rebuild normalised filter cache
+            updatedSettings.updateFilter()
             self.sceneManager?.settings = updatedSettings
             updatedSettings.save()
 
-            // Only rebuild nodes if a structural setting changed (show/hide toggles or
-            // distance filters). Pure label-content changes (callsign/altitude/speed/type
-            // visibility) are picked up automatically on the next 4 Hz updateVisualization tick
-            // without any node removal — avoiding the stutter from clearAll().
             let needsRebuild =
                 updatedSettings.showAircraft        != old?.showAircraft ||
                 updatedSettings.showAirports        != old?.showAirports ||
@@ -463,8 +496,26 @@ class ARTrafficViewController: UIViewController {
         present(nav, animated: true)
     }
 
+    @objc private func showMap() {
+        guard let loc = activeLocation else { return }
+        let aircraft = Array(connectionLogic.detectedAircraft.values)
+        let vc = MapViewController(
+            userLocation: loc,
+            userHeading: userHeading,
+            aircraft: aircraft,
+            airports: airports
+        )
+        let nav = UINavigationController(rootViewController: vc)
+        nav.modalPresentationStyle = .fullScreen
+        present(nav, animated: true)
+    }
+
     @objc private func backButtonTapped() {
         clearSelection()
+    }
+
+    @objc private func closeMetar() {
+        hideMetarPanel()
     }
 
     // MARK: - Hit Testing / Selection
@@ -476,19 +527,16 @@ class ARTrafficViewController: UIViewController {
             .ignoreHiddenNodes: true
         ])
         if let hit = hits.first, let nid = containerNodeID(for: hit.node) {
-            // Tapped a target
             if case .selected(let current) = selectionState, current == nid {
-                clearSelection()    // tap same target again = deselect
+                clearSelection()
             } else {
                 applySelection(nodeID: nid)
             }
         } else {
-            // Tapped empty space
             clearSelection()
         }
     }
 
-    /// Walk the node hierarchy to find the container node's name (e.g. "aircraft_ABC").
     private func containerNodeID(for node: SCNNode) -> String? {
         var current: SCNNode? = node
         while let n = current {
@@ -505,6 +553,14 @@ class ARTrafficViewController: UIViewController {
         selectionState = .selected(nodeID: nodeID)
         sceneManager?.setSelection(nodeID: nodeID)
         updateSelectionUI(active: true)
+
+        // If an airport was tapped, fetch and show its METAR
+        if nodeID.hasPrefix("airport_") {
+            let icao = String(nodeID.dropFirst("airport_".count))
+            showMetarPanel(for: icao)
+        } else {
+            hideMetarPanel()
+        }
     }
 
     private func clearSelection() {
@@ -512,19 +568,63 @@ class ARTrafficViewController: UIViewController {
         sceneManager?.setSelection(nodeID: nil)
         offScreenArrowView.hide()
         updateSelectionUI(active: false)
+        hideMetarPanel()
     }
 
     private func updateSelectionUI(active: Bool) {
         backButton.isHidden = !active
         offScreenArrowView.isHidden = !active
-        // Swap statusLabel leading constraint
         statusLeadingToEdge.isActive = !active
         statusLeadingToBack.isActive = active
     }
 
+    // MARK: - METAR Panel
+
+    private func showMetarPanel(for icao: String) {
+        metarSelectedICAO = icao
+        metarLabel.text = "METAR \(icao): fetching…"
+        metarPanelView.isHidden = false
+        fetchMETAR(for: icao)
+    }
+
+    private func hideMetarPanel() {
+        metarFetchTask?.cancel()
+        metarFetchTask = nil
+        metarPanelView.isHidden = true
+        metarSelectedICAO = nil
+    }
+
+    private func fetchMETAR(for icao: String) {
+        metarFetchTask?.cancel()
+
+        // Build aviationweather.gov request
+        let urlStr = "https://aviationweather.gov/api/data/metar?ids=\(icao)&format=raw&hours=2"
+        guard let url = URL(string: urlStr) else { return }
+
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self, self.metarSelectedICAO == icao else { return }
+                if let error = error {
+                    if (error as NSError).code == NSURLErrorCancelled { return }
+                    self.metarLabel.text = "METAR \(icao): unavailable"
+                    return
+                }
+                guard let data = data,
+                      let raw = String(data: data, encoding: .utf8)?
+                          .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !raw.isEmpty else {
+                    self.metarLabel.text = "METAR \(icao): no report available"
+                    return
+                }
+                self.metarLabel.text = "METAR\n\(raw)"
+            }
+        }
+        metarFetchTask = task
+        task.resume()
+    }
+
     // MARK: - Update Loop
 
-    /// The active position source: ADS-B ownship when receiving, otherwise iPhone GPS.
     private var activeLocation: CLLocationCoordinate2D? {
         if connectionLogic.connectionStatus == .receiving,
            let ownship = connectionLogic.ownshipData,
@@ -534,7 +634,6 @@ class ARTrafficViewController: UIViewController {
         return userLocation
     }
 
-    /// Active altitude: ADS-B ownship when receiving, otherwise iPhone barometer.
     private var activeAltitude: Double {
         if connectionLogic.connectionStatus == .receiving,
            let ownship = connectionLogic.ownshipData,
@@ -551,6 +650,8 @@ class ARTrafficViewController: UIViewController {
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
 
+        let aircraftList = Array(connectionLogic.detectedAircraft.values)
+
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
             let t = pov.worldTransform
@@ -559,12 +660,22 @@ class ARTrafficViewController: UIViewController {
             cameraPos = .init()
         }
 
+        // Evaluate TCAS state for this tick
+        let tcas = TCASSystem.evaluate(
+            aircraft: aircraftList,
+            userLocation: loc,
+            userAltitude: activeAltitude
+        )
+        currentTCASEvaluation = tcas
+        applyTCASOverlay(tcas)
+
         sceneManager?.updateAircraft(
-            Array(connectionLogic.detectedAircraft.values),
+            aircraftList,
             userLocation: loc,
             userAltitude: activeAltitude,
             userHeading: userHeading,
-            cameraWorldPosition: cameraPos
+            cameraWorldPosition: cameraPos,
+            tcasEvaluation: tcas
         )
         sceneManager?.updateAirports(
             airports,
@@ -579,9 +690,6 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - Off-Screen Arrow
 
-    /// Projects the selected target onto the screen and, if outside the FOV,
-    /// positions the edge arrow. Called from the render thread; dispatches UI
-    /// updates to the main thread.
     private func updateOffScreenArrow(for nodeID: String) {
         guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else {
             DispatchQueue.main.async { self.offScreenArrowView.hide() }
@@ -590,7 +698,7 @@ class ARTrafficViewController: UIViewController {
 
         let worldPos  = node.worldPosition
         let projected = arSceneView.projectPoint(worldPos)
-        let screenSize = arSceneView.bounds.size   // safe: bounds is read-only from render thread
+        let screenSize = arSceneView.bounds.size
 
         let behindCamera = projected.z >= 1.0
         let onScreen = !behindCamera
@@ -611,8 +719,6 @@ class ARTrafficViewController: UIViewController {
         DispatchQueue.main.async { self.offScreenArrowView.show(angle: angle, center: edgePoint) }
     }
 
-    /// Returns the screen-edge intersection point and the rotation angle (radians,
-    /// 0 = up, clockwise +) for the arrow chevron.
     private func screenEdgePoint(
         projected: CGPoint,
         isBehindCamera: Bool,
@@ -623,7 +729,6 @@ class ARTrafficViewController: UIViewController {
         let cx = screenSize.width  / 2
         let cy = screenSize.height / 2
 
-        // When behind the camera the projected x/y are mirrored — flip through centre
         var dir: CGPoint
         if isBehindCamera {
             dir = CGPoint(x: cx - projected.x, y: cy - projected.y)
@@ -631,13 +736,10 @@ class ARTrafficViewController: UIViewController {
             dir = CGPoint(x: projected.x - cx, y: projected.y - cy)
         }
 
-        // Avoid zero-length vector
         if dir.x == 0 && dir.y == 0 { dir = CGPoint(x: 0, y: -1) }
 
-        // atan2 in screen space (+Y down): angle of the ray from screen centre
-        let angle = atan2(dir.y, dir.x)   // right = 0, clockwise in screen coords
+        let angle = atan2(dir.y, dir.x)
 
-        // Find scale factor t so the ray reaches the nearest safe edge
         let left   = margin
         let right  = screenSize.width  - margin
         let top    = margin
@@ -650,12 +752,44 @@ class ARTrafficViewController: UIViewController {
         else if dir.y < 0 { t = min(t, (top    - cy) / dir.y) }
 
         let edgePoint = CGPoint(x: cx + dir.x * t, y: cy + dir.y * t)
-
-        // Convert from atan2 convention (right=0, CCW+) to UIKit rotation
-        // (up=0, CW+): rotate 90° clockwise
         let uiAngle = angle + .pi / 2
 
         return (edgePoint, uiAngle)
+    }
+
+    // MARK: - TCAS Overlay
+
+    private func applyTCASOverlay(_ tcas: TCASEvaluation) {
+        switch tcas.overallLevel {
+        case .none:
+            stopTCASFlash()
+            tcasOverlayView.layer.borderColor = UIColor.clear.cgColor
+        case .trafficAdvisory:
+            stopTCASFlash()
+            tcasOverlayView.layer.borderColor =
+                UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.85).cgColor
+        case .resolutionAdvisory:
+            startTCASFlashIfNeeded()
+        }
+    }
+
+    private func startTCASFlashIfNeeded() {
+        guard tcasFlashTimer == nil else { return }
+        tcasFlashState = true
+        tcasOverlayView.layer.borderColor = UIColor.red.cgColor
+        tcasFlashTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.tcasFlashState.toggle()
+            self.tcasOverlayView.layer.borderColor = self.tcasFlashState
+                ? UIColor.red.cgColor
+                : UIColor.clear.cgColor
+        }
+    }
+
+    private func stopTCASFlash() {
+        tcasFlashTimer?.invalidate()
+        tcasFlashTimer = nil
+        tcasFlashState = false
     }
 
     // MARK: - HUD
@@ -663,7 +797,6 @@ class ARTrafficViewController: UIViewController {
     private func updateStatusLabel() {
         var lines: [String] = []
 
-        // ADS-B status
         switch connectionLogic.connectionStatus {
         case .receiving:     lines.append("📡 ADS-B: Receiving")
         case .searching:     lines.append("📡 ADS-B: Searching…")
@@ -673,7 +806,6 @@ class ARTrafficViewController: UIViewController {
 
         lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
 
-        // GPS position + accuracy
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
         let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
@@ -688,9 +820,7 @@ class ARTrafficViewController: UIViewController {
             }
             lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource)  \(gpsAccStr))", loc.latitude, loc.longitude))
 
-            // Altitude + source
             let altSource = baroBaselineSet ? "baro" : "GPS"
-            // Compass heading with live accuracy indicator
             let compassAccStr: String
             if lastHeadingAccuracy < 0 {
                 compassAccStr = "?"
@@ -727,7 +857,19 @@ class ARTrafficViewController: UIViewController {
         }
         lines.append("📷 \(arStateStr)")
 
-        // Aircraft count
+        // TCAS status
+        switch currentTCASEvaluation.overallLevel {
+        case .none:
+            break
+        case .trafficAdvisory:
+            let count = currentTCASEvaluation.threats.count
+            lines.append("⚠️ TCAS TA: \(count) aircraft")
+        case .resolutionAdvisory:
+            let raCount = currentTCASEvaluation.threats.values.filter { $0 == .resolutionAdvisory }.count
+            lines.append("🔴 TCAS RA: \(raCount) aircraft")
+        }
+
+        // Traffic
         let total   = connectionLogic.detectedAircraft.count
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
@@ -741,8 +883,6 @@ class ARTrafficViewController: UIViewController {
         lines.append("🛫 Airports loaded: \(airports.count)")
 
         let newText = lines.map { "  \($0)  " }.joined(separator: "\n")
-        // Skip the UILabel layout pass if nothing changed — this is called at
-        // up to 60 Hz (from heading updates) and UILabel re-layout is expensive.
         guard newText != statusLabel.text else { return }
         statusLabel.text = newText
     }
@@ -752,14 +892,12 @@ class ARTrafficViewController: UIViewController {
 
 extension ARTrafficViewController: ARSCNViewDelegate {
 
-    /// Called every display frame (~60 Hz) on the render thread.
     func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
         guard let pov = arSceneView.pointOfView else { return }
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
 
-        // Update off-screen arrow for the selected target every frame
         if case .selected(let nodeID) = selectionState {
             updateOffScreenArrow(for: nodeID)
         }
@@ -786,10 +924,8 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
 
-        // Reject fixes with poor accuracy or invalid data
         let hAcc = loc.horizontalAccuracy
         guard hAcc > 0 && hAcc <= gpsAccuracyThreshold else {
-            // Still update the HUD to show accuracy degradation
             if hAcc > 0 { lastHorizontalAccuracy = hAcc }
             updateStatusLabel()
             return
@@ -803,23 +939,17 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         let isFirstFix = (userLocation == nil)
         userLocation = loc.coordinate
 
-        // GPS MSL altitude — always update so barometric baseline stays current
         let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
         gpsMSLAltitudeFeet = newGPSFeet
 
-        // If altimeter is not running or baseline not set yet, fall back to GPS altitude
         if !baroBaselineSet {
             userAltitude = newGPSFeet
         } else {
-            // Drift-correct barometric baseline periodically using GPS MSL
-            // (GPS MSL is accurate over long periods; baro is more precise for short-term changes)
             baroBaselineAltitudeFeet = newGPSFeet - baroRelativeAltitude * CalculationsLogic.metersToFeet
         }
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
-        // On first GPS fix, immediately render airports so they appear before
-        // the first 4 Hz timer tick (which can be up to 250 ms away).
         if isFirstFix {
             updateVisualization()
         }
@@ -838,18 +968,14 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
-        // Discard readings with unknown accuracy
         guard newHeading.headingAccuracy >= 0 else { return }
 
         let accuracy = newHeading.headingAccuracy
 
-        // If accuracy just crossed from good to bad, reset ARKit so the scene
-        // realigns to the corrected compass on the next good reading.
         if lastHeadingAccuracy >= 0
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
             startARSession()
-            // Reset correction — the new session will re-establish its own north.
             arKitNorthCorrectionDeg = 0
             northCorrectionSampleCount = 0
         }
@@ -858,24 +984,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         userHeading = trueNorth
 
-        // --- Compute ARKit north correction ---
-        // Only use high-quality readings (accuracy ≤ 10°) to update the correction.
         if accuracy <= 10, let frame = arSceneView.session.currentFrame {
-            // ARKit camera yaw in world space (radians). With .gravityAndHeading
-            // the world is fixed: yaw = 0 means the camera faces ARKit's north.
-            // Negate because ARKit yaw is CCW-positive but compass is CW-positive.
             let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
-
-            // The camera's compass direction = trueNorth (where the phone is pointing).
-            // ARKit thinks the camera is at `arYawDeg` from its own north.
-            // So: arKitNorth = trueNorth - arYawDeg
             var sample = trueNorth - arYawDeg
-            // Normalise to [-180, 180]
             while sample >  180 { sample -= 360 }
             while sample < -180 { sample += 360 }
 
-            // Exponential moving average — weight recent readings more heavily.
-            // α = 0.15: slow enough to filter noise, fast enough to converge in ~20 readings.
             let alpha = 0.15
             if northCorrectionSampleCount == 0 {
                 arKitNorthCorrectionDeg = sample
@@ -883,8 +997,6 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
                 arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
             }
             northCorrectionSampleCount += 1
-
-            // Pass the live correction into the scene manager so position ticks use it.
             sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         }
 

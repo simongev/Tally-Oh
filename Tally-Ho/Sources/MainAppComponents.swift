@@ -35,28 +35,6 @@ class ARComponentFactory {
     static let labelFontSizeAirport: CGFloat = 1.6
 
     // MARK: - Shared geometry / material (created once, reused for every node)
-    //
-    // SCNGeometry and SCNMaterial are reference types — sharing them across nodes
-    // is safe and avoids redundant GPU uploads of identical mesh/texture data.
-    // SceneKit renders shared geometry with a single draw call per unique geometry.
-
-    private static let sharedRingGeometry: SCNPlane = {
-        let ringSize = aircraftRingRadius * 2.2
-        let plane = SCNPlane(width: CGFloat(ringSize), height: CGFloat(ringSize))
-        plane.cornerRadius = 0
-        let ringImage = makeRingImage(
-            outerRadius: CGFloat(aircraftRingRadius),
-            thickness:   CGFloat(aircraftRingThickness),
-            color:       UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1)
-        )
-        let mat = SCNMaterial()
-        mat.diffuse.contents   = ringImage
-        mat.emission.contents  = ringImage
-        mat.isDoubleSided      = true
-        mat.transparencyMode   = .aOne
-        plane.materials = [mat]
-        return plane
-    }()
 
     private static let sharedConeGeometry: SCNCone = {
         let cone = SCNCone(
@@ -79,6 +57,31 @@ class ARComponentFactory {
     static let labelFontAirport: UIFont =
         UIFont.boldSystemFont(ofSize: labelFontSizeAirport * 80)
 
+    // MARK: - Pre-cached ring images per TCAS level
+
+    private static let ringImageNormal: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadius),
+        thickness: CGFloat(aircraftRingThickness),
+        color: UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1))
+
+    private static let ringImageTA: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadius),
+        thickness: CGFloat(aircraftRingThickness),
+        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0))
+
+    private static let ringImageRA: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadius),
+        thickness: CGFloat(aircraftRingThickness),
+        color: UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0))
+
+    private static func ringImage(for level: TCASAlertLevel) -> UIImage {
+        switch level {
+        case .none:               return ringImageNormal
+        case .trafficAdvisory:    return ringImageTA
+        case .resolutionAdvisory: return ringImageRA
+        }
+    }
+
     // MARK: - Position Scaling
 
     /// Scale the horizontal distance from the camera into [minARRadius, maxARRadius],
@@ -98,37 +101,76 @@ class ARComponentFactory {
         return scaledPosition(raw, relativeTo: cam)
     }
 
+    // MARK: - TCAS Colors
+
+    /// Ring color and glow for a given TCAS alert level.
+    static func aircraftRingColors(for tcasLevel: TCASAlertLevel) -> (fill: UIColor, glow: UIColor) {
+        switch tcasLevel {
+        case .none:
+            return (UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1),
+                    UIColor(red: 1, green: 0.2,  blue: 0.2,  alpha: 0.6))
+        case .trafficAdvisory:
+            return (UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0),
+                    UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.8))
+        case .resolutionAdvisory:
+            return (UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0),
+                    UIColor(red: 1.0, green: 0.3, blue: 0.0, alpha: 1.0))
+        }
+    }
+
+    /// Pulse duration (in seconds per half-cycle) for a given TCAS alert level.
+    static func pulseHalfDuration(for tcasLevel: TCASAlertLevel) -> Double {
+        switch tcasLevel {
+        case .none:               return 0.9
+        case .trafficAdvisory:    return 0.5
+        case .resolutionAdvisory: return 0.25
+        }
+    }
+
     // MARK: - Aircraft Marker
 
-    /// Create a flat red ring that always faces the camera, with an optional label.
+    /// Create a flat ring billboard with an optional label.
     static func createAircraftMarker(
         rawPosition: SCNVector3,
         aircraft: Aircraft,
         distanceNM: Double = 0,
         cameraWorldPosition: SCNVector3 = .init(),
-        settings: ARVisualizationSettings
+        settings: ARVisualizationSettings,
+        tcasLevel: TCASAlertLevel = .none
     ) -> SCNNode {
 
         let container = SCNNode()
         container.name = "aircraft_\(aircraft.id)"
         container.position = scaledPosition(rawPosition, relativeTo: cameraWorldPosition)
 
-        // Reuse the shared ring geometry so all aircraft share a single GPU mesh.
-        let ringNode = SCNNode(geometry: sharedRingGeometry)
+        // Per-aircraft plane with TCAS-appropriate ring image so color can change per aircraft.
+        let ringSize = aircraftRingRadius * 2.2
+        let plane = SCNPlane(width: CGFloat(ringSize), height: CGFloat(ringSize))
+        let mat = SCNMaterial()
+        let img = ringImage(for: tcasLevel)
+        mat.diffuse.contents   = img
+        mat.emission.contents  = img
+        mat.isDoubleSided      = true
+        mat.transparencyMode   = .aOne
+        plane.materials = [mat]
+
+        let ringNode = SCNNode(geometry: plane)
+        ringNode.name = "ring"
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
 
-        // Pulsing scale animation
-        let scaleUp   = SCNAction.scale(to: 1.12, duration: 0.85)
-        let scaleDown = SCNAction.scale(to: 1.0,  duration: 0.85)
+        // Pulsing animation — speed reflects TCAS urgency
+        let halfDur = pulseHalfDuration(for: tcasLevel)
+        let scaleUp   = SCNAction.scale(to: 1.12, duration: halfDur)
+        let scaleDown = SCNAction.scale(to: 1.0,  duration: halfDur)
         scaleUp.timingMode   = .easeInEaseOut
         scaleDown.timingMode = .easeInEaseOut
         ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
 
         container.addChildNode(ringNode)
 
-        // -- Label -- always created so it can be shown/hidden dynamically
+        // Label — always created so it can be shown/hidden dynamically
         let text = buildAircraftLabelText(aircraft: aircraft, distanceNM: distanceNM, settings: settings)
         let labelNode = createLabelNode(
             text: text,
@@ -193,8 +235,6 @@ class ARComponentFactory {
     // MARK: - Selection Appearance
 
     /// Apply or remove the selected visual state on a container node.
-    /// Aircraft ring: yellow glow. Airport cone: cyan. All wrapped in a single
-    /// SCNTransaction so the render thread never observes a partial update.
     static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.15
@@ -210,7 +250,7 @@ class ARComponentFactory {
                     ? UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
                     : UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
             } else if node.geometry is SCNPlane {
-                // Aircraft ring: keep diffuse texture, tint via emission only.
+                // Aircraft ring: tint via emission.
                 mat.emission.contents = selected
                     ? UIColor(red: 0.6, green: 0.55, blue: 0.0, alpha: 0.7)
                     : UIColor(red: 0.4, green: 0.0,  blue: 0.0, alpha: 1.0)
@@ -221,8 +261,7 @@ class ARComponentFactory {
 
     // MARK: - Airport Marker
 
-    /// Solid blue inverted cone with a rounded (sphere-capped) base at the top.
-    /// Shares geometry across all airport nodes — no rotation (saves CPU/GPU).
+    /// Solid blue inverted cone with a label.
     static func createAirportMarker(
         rawPosition: SCNVector3,
         airport: Airport,
@@ -235,13 +274,11 @@ class ARComponentFactory {
         container.name = "airport_\(airport.icao)"
         container.position = scaledAirportPosition(rawPosition, relativeTo: cameraWorldPosition)
 
-        // Reuse shared cone geometry.
         let coneNode = SCNNode(geometry: sharedConeGeometry)
-        coneNode.eulerAngles.x = .pi                      // tip points down
+        coneNode.eulerAngles.x = .pi
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
         container.addChildNode(coneNode)
 
-        // Always create the label node so it can be shown/hidden dynamically
         let text = buildAirportLabelText(airport: airport, distanceNM: distanceNM, settings: settings)
         let labelNode = createLabelNode(
             text: text,
@@ -303,7 +340,6 @@ class ARComponentFactory {
     }
 
     /// Render multi-line text with a semi-opaque rounded-rect background into a UIImage.
-    /// Accepts a pre-cached `font` to avoid redundant UIFont construction.
     static func makeLabelImage(
         text: String,
         textColor: UIColor,
@@ -352,21 +388,19 @@ class ARComponentFactory {
         aircraft: Aircraft,
         distanceNM: Double = 0,
         settings: ARVisualizationSettings,
-        selectedNodeID: String? = nil
+        selectedNodeID: String? = nil,
+        tcasLevel: TCASAlertLevel = .none
     ) {
-        // Refresh label: find the node named "label".
+        // Refresh label
         let labelNode = node.childNode(withName: "label", recursively: false)
 
         let shouldShow = settings.showAircraftLabels
         if let lbl = labelNode {
-            // When no selection is active, enforce settings-driven visibility.
-            // When a selection IS active, applySelectionToAllNodes owns visibility.
             if selectedNodeID == nil {
                 lbl.isHidden = !shouldShow
                 lbl.opacity  = 1
             }
 
-            // Only regenerate the label image when the text actually changes.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
                 let newText = buildAircraftLabelText(aircraft: aircraft, distanceNM: distanceNM, settings: settings)
                 if newText != plane.name {
@@ -388,6 +422,22 @@ class ARComponentFactory {
                 }
             }
         }
+
+        // Update ring texture and pulse speed to reflect current TCAS level
+        if let ringNode = node.childNode(withName: "ring", recursively: false) {
+            let img = ringImage(for: tcasLevel)
+            if let mat = ringNode.geometry?.materials.first {
+                mat.diffuse.contents  = img
+                mat.emission.contents = img
+            }
+            ringNode.removeAllActions()
+            let halfDur = pulseHalfDuration(for: tcasLevel)
+            let scaleUp   = SCNAction.scale(to: 1.12, duration: halfDur)
+            let scaleDown = SCNAction.scale(to: 1.0,  duration: halfDur)
+            scaleUp.timingMode   = .easeInEaseOut
+            scaleDown.timingMode = .easeInEaseOut
+            ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+        }
     }
 }
 
@@ -399,31 +449,23 @@ struct ARVisualizationSettings {
     var showAircraft: Bool = true
     var aircraftMaxDistance: Double = 20.0
 
-    // Aircraft label fields
     var showCallsign:        Bool = true
     var showAircraftType:    Bool = true
     var showAircraftAltitude:Bool = true
 
-    // Callsign filter — empty string = show all
     var callsignFilter: String = ""
 
-    // Whether to show ground speed in the aircraft label
     var showAircraftSpeed: Bool = true
 
-    // Whether to show distance in the aircraft label
     var showAircraftDistance: Bool = false
 
-    /// Derived: show label if any label field is enabled
     var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed || showAircraftDistance }
 
-    /// Pre-processed filter string (trimmed + uppercased) for fast matching.
-    /// Recomputed only when callsignFilter changes.
     private var _normalizedFilter: String = ""
     mutating func updateFilter() {
         _normalizedFilter = callsignFilter.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
 
-    /// Returns true if this aircraft passes the callsign filter.
     func passes(callsign: String) -> Bool {
         guard !_normalizedFilter.isEmpty else { return true }
         return callsign.uppercased().contains(_normalizedFilter)
@@ -439,7 +481,6 @@ struct ARVisualizationSettings {
 
     var showAirportDistance: Bool = true
 
-    // Airport labels always show (name always visible; distance is optional content)
     var showAirportLabels: Bool { true }
 
     func shouldShow(airportType: String) -> Bool {
@@ -457,7 +498,6 @@ struct ARVisualizationSettings {
 class ARSceneManager {
 
     private weak var sceneView: ARSCNView?
-    /// Protected by `nodesLock` — read on render thread, written on main thread.
     private var aircraftNodes: [String: SCNNode] = [:]
     private var airportNodes:  [String: SCNNode] = [:]
     private let nodesLock = NSLock()
@@ -468,19 +508,14 @@ class ARSceneManager {
     private var lastAppliedSelectionID: String? = "___unset___"
     var onSelectionInvalidated: (() -> Void)?
 
-    // Live snapshot written on main thread, read on render thread.
     private(set) var liveAircraft: [Aircraft] = []
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
 
-    /// ARKit-north vs compass-north correction in degrees.
-    /// Double assignment is atomic on 64-bit ARM — no lock needed.
     var arKitNorthCorrectionDeg: Double = 0
 
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
-        // Disable SceneKit's default lighting pipeline — this app uses
-        // emission-only materials so the lighting engine just wastes CPU/GPU.
         sceneView.autoenablesDefaultLighting  = false
         sceneView.automaticallyUpdatesLighting = false
     }
@@ -524,7 +559,8 @@ class ARSceneManager {
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,
-        cameraWorldPosition: SCNVector3 = .init()
+        cameraWorldPosition: SCNVector3 = .init(),
+        tcasEvaluation: TCASEvaluation = .clear
     ) {
         guard settings.showAircraft else {
             nodesLock.lock()
@@ -560,6 +596,8 @@ class ARSceneManager {
                 northCorrectionDeg: arKitNorthCorrectionDeg
             )
 
+            let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
+
             if let existing = aircraftNodes[ac.id] {
                 existing.isHidden = false
                 ARComponentFactory.updateAircraftMarker(
@@ -567,7 +605,8 @@ class ARSceneManager {
                     aircraft: ac,
                     distanceNM: distNM,
                     settings: settings,
-                    selectedNodeID: selectedNodeID
+                    selectedNodeID: selectedNodeID,
+                    tcasLevel: tcasLevel
                 )
             } else {
                 let node = ARComponentFactory.createAircraftMarker(
@@ -575,7 +614,8 @@ class ARSceneManager {
                     aircraft: ac,
                     distanceNM: distNM,
                     cameraWorldPosition: cameraWorldPosition,
-                    settings: settings
+                    settings: settings,
+                    tcasLevel: tcasLevel
                 )
                 SCNTransaction.begin()
                 SCNTransaction.disableActions = true
