@@ -3,7 +3,11 @@
 //  TallyOh - AR Aviation Traffic Visualization
 //
 //  2D top-down traffic map showing aircraft and airports around the user.
-//  Distance rings every 10 NM, adjustable range 10–50 NM.
+//  • Obeys the same show/hide and type filters set in the AR settings.
+//  • Shows ALL aircraft/airports within the map's own range (not the AR distance cap).
+//  • Default range 30 NM; the user's last chosen range is persisted across sessions.
+//  • Updates live at 1 Hz via a dataProvider closure supplied by ARTrafficViewController.
+//  • Tap an aircraft or airport to dismiss the map and select it in the AR view.
 //
 
 import UIKit
@@ -13,12 +17,13 @@ import CoreLocation
 
 private final class MapCanvasView: UIView {
 
-    // Data
+    // Data (refreshed every live-update tick)
     var userLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     var userHeading: Double = 0
     var aircraft: [Aircraft] = []
     var airports: [Airport] = []
-    var rangeNM: Double = 50
+    var rangeNM: Double = 30
+    var settings: ARVisualizationSettings = ARVisualizationSettings()
 
     // Drawing constants
     private let ringColor        = UIColor.white.withAlphaComponent(0.18)
@@ -29,6 +34,10 @@ private final class MapCanvasView: UIView {
     private let gridFont         = UIFont.monospacedSystemFont(ofSize: 9, weight: .regular)
     private let labelFont        = UIFont.boldSystemFont(ofSize: 10)
 
+    // Hit-test data — populated on every draw pass so tap detection is always current
+    private(set) var drawnAircraftHits: [(id: String, point: CGPoint)] = []
+    private(set) var drawnAirportHits:  [(icao: String, point: CGPoint)] = []
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = UIColor(white: 0.06, alpha: 1)
@@ -37,21 +46,18 @@ private final class MapCanvasView: UIView {
 
     // MARK: - Coordinate mapping
 
-    /// Convert a geographic coordinate to canvas point.
-    /// The user is always at the center; north is up.
+    /// Convert a geographic coordinate to a canvas point (user at centre, north up).
     private func canvasPoint(for coord: CLLocationCoordinate2D, in rect: CGRect) -> CGPoint {
         let cx = rect.midX
         let cy = rect.midY
         let pxPerNM = mapPixelsPerNM(in: rect)
 
-        let distM = CalculationsLogic.distance(from: userLocation, to: coord)
+        let distM  = CalculationsLogic.distance(from: userLocation, to: coord)
         let distNM = distM / CalculationsLogic.nauticalMileToMeters
 
-        // Bearing from user to target (0 = north, clockwise)
-        let bearing = CalculationsLogic.bearing(from: userLocation, to: coord)
+        let bearing    = CalculationsLogic.bearing(from: userLocation, to: coord)
         let bearingRad = bearing * .pi / 180.0
 
-        // North-up: x = east, y = north (inverted for screen)
         let dx = CGFloat(distNM * sin(bearingRad)) * pxPerNM
         let dy = CGFloat(distNM * cos(bearingRad)) * pxPerNM
 
@@ -68,10 +74,14 @@ private final class MapCanvasView: UIView {
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
 
-        let cx = rect.midX
-        let cy = rect.midY
+        let cx     = rect.midX
+        let cy     = rect.midY
         let pxPerNM = mapPixelsPerNM(in: rect)
         let ringStep: Double = 10
+
+        // Reset hit data for this frame
+        drawnAircraftHits = []
+        drawnAirportHits  = []
 
         // --- Distance rings ---
         ctx.setStrokeColor(ringColor.cgColor)
@@ -81,8 +91,7 @@ private final class MapCanvasView: UIView {
             let r = CGFloat(nm) * pxPerNM
             ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
 
-            // Ring label
-            let label = nm < 1000 ? "\(Int(nm)) NM" : "\(Int(nm)) NM"
+            let label = "\(Int(nm)) NM"
             let attrs: [NSAttributedString.Key: Any] = [.font: gridFont, .foregroundColor: ringLabelColor]
             let size = (label as NSString).size(withAttributes: attrs)
             (label as NSString).draw(
@@ -100,40 +109,48 @@ private final class MapCanvasView: UIView {
         ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
 
-        // --- Airports ---
-        for ap in airports {
-            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ap.coordinate)
-            guard distNM <= rangeNM else { continue }
+        // --- Airports (respects show/hide and size-category filters; ignores AR distance cap) ---
+        if settings.showAirports {
+            for ap in airports {
+                guard settings.shouldShow(airportType: ap.type) else { continue }
+                let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ap.coordinate)
+                guard distNM <= rangeNM else { continue }
 
-            let pt = canvasPoint(for: ap.coordinate, in: rect)
-            drawAirportSymbol(ctx: ctx, at: pt, color: airportColor)
+                let pt = canvasPoint(for: ap.coordinate, in: rect)
+                drawAirportSymbol(ctx: ctx, at: pt, color: airportColor)
+                drawnAirportHits.append((icao: ap.icao, point: pt))
 
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: labelFont,
-                .foregroundColor: airportColor
-            ]
-            (ap.icao as NSString).draw(at: CGPoint(x: pt.x + 8, y: pt.y - 6), withAttributes: attrs)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: labelFont,
+                    .foregroundColor: airportColor
+                ]
+                (ap.icao as NSString).draw(at: CGPoint(x: pt.x + 8, y: pt.y - 6), withAttributes: attrs)
+            }
         }
 
-        // --- Aircraft ---
-        for ac in aircraft {
-            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
-            guard distNM <= rangeNM else { continue }
+        // --- Aircraft (respects show/hide and callsign filter; ignores AR distance cap) ---
+        if settings.showAircraft {
+            for ac in aircraft {
+                guard settings.passes(callsign: ac.callsign) else { continue }
+                let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
+                guard distNM <= rangeNM else { continue }
 
-            let pt = canvasPoint(for: ac.coordinate, in: rect)
-            drawAircraftSymbol(ctx: ctx, at: pt, heading: ac.track, color: aircraftColor)
+                let pt = canvasPoint(for: ac.coordinate, in: rect)
+                drawAircraftSymbol(ctx: ctx, at: pt, heading: ac.track, color: aircraftColor)
+                drawnAircraftHits.append((id: ac.id, point: pt))
 
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: labelFont,
-                .foregroundColor: aircraftColor
-            ]
-            let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
-            (label as NSString).draw(
-                at: CGPoint(x: pt.x + 9, y: pt.y - 7),
-                withAttributes: attrs)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: labelFont,
+                    .foregroundColor: aircraftColor
+                ]
+                let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
+                (label as NSString).draw(
+                    at: CGPoint(x: pt.x + 9, y: pt.y - 7),
+                    withAttributes: attrs)
+            }
         }
 
-        // --- User dot ---
+        // --- User symbol ---
         drawUserSymbol(ctx: ctx, at: CGPoint(x: cx, y: cy), heading: userHeading)
 
         // --- "N" label at top ---
@@ -147,17 +164,17 @@ private final class MapCanvasView: UIView {
             withAttributes: northAttrs)
     }
 
+    // MARK: - Symbol helpers
+
     private func drawAircraftSymbol(ctx: CGContext, at pt: CGPoint, heading: Double, color: UIColor) {
         let r: CGFloat = 5
         ctx.saveGState()
         ctx.translateBy(x: pt.x, y: pt.y)
         ctx.rotate(by: CGFloat(heading) * .pi / 180.0)
 
-        // Dot
         ctx.setFillColor(color.cgColor)
         ctx.fillEllipse(in: CGRect(x: -r, y: -r, width: r * 2, height: r * 2))
 
-        // Track vector
         ctx.setStrokeColor(color.withAlphaComponent(0.7).cgColor)
         ctx.setLineWidth(1.5)
         ctx.move(to: .zero)
@@ -169,7 +186,6 @@ private final class MapCanvasView: UIView {
 
     private func drawAirportSymbol(ctx: CGContext, at pt: CGPoint, color: UIColor) {
         let r: CGFloat = 5
-        // Circle with crosshairs
         ctx.setStrokeColor(color.cgColor)
         ctx.setLineWidth(1.5)
         ctx.strokeEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
@@ -187,7 +203,6 @@ private final class MapCanvasView: UIView {
         ctx.translateBy(x: pt.x, y: pt.y)
         ctx.rotate(by: CGFloat(heading) * .pi / 180.0)
 
-        // Airplane silhouette (simple triangle)
         let path = UIBezierPath()
         path.move(to: CGPoint(x: 0, y: -r))
         path.addLine(to: CGPoint(x: r * 0.6, y: r * 0.7))
@@ -199,7 +214,6 @@ private final class MapCanvasView: UIView {
         ctx.addPath(path.cgPath)
         ctx.fillPath()
 
-        // White outline
         ctx.setStrokeColor(UIColor.white.cgColor)
         ctx.setLineWidth(1.0)
         ctx.addPath(path.cgPath)
@@ -213,13 +227,32 @@ private final class MapCanvasView: UIView {
 
 class MapViewController: UIViewController {
 
-    // Input data
-    private let userLocation: CLLocationCoordinate2D
-    private let userHeading: Double
-    private let aircraft: [Aircraft]
-    private let airports: [Airport]
+    // MARK: - Data
 
-    private var currentRangeNM: Double = 50
+    private var userLocation: CLLocationCoordinate2D
+    private var userHeading: Double
+    private var aircraft: [Aircraft]
+    private var airports: [Airport]
+    private var settings: ARVisualizationSettings
+
+    // MARK: - Callbacks
+
+    /// Returns a fresh snapshot of all live data; called every 1 s by the update timer.
+    var dataProvider: (() -> (aircraft: [Aircraft], airports: [Airport],
+                              location: CLLocationCoordinate2D, heading: Double)?)?
+
+    /// Called with "aircraft_<id>" or "airport_<icao>" when the user taps an item.
+    /// The map is dismissed immediately afterward.
+    var onSelect: ((String) -> Void)?
+
+    // MARK: - Range
+
+    private static let rangeDefaultsKey = "MapViewRangeNM"
+
+    /// Current map radius in NM.  Default 30 NM; persisted in UserDefaults.
+    private var currentRangeNM: Double = 30
+
+    // MARK: - UI
 
     private var canvasView: MapCanvasView!
     private var rangeLabel: UILabel!
@@ -227,19 +260,29 @@ class MapViewController: UIViewController {
     private var increaseButton: UIButton!
     private var scaleBarView: ScaleBarView!
 
+    // MARK: - Timer
+
+    private var updateTimer: Timer?
+
+    // MARK: - Init
+
     init(
         userLocation: CLLocationCoordinate2D,
         userHeading: Double,
         aircraft: [Aircraft],
-        airports: [Airport]
+        airports: [Airport],
+        settings: ARVisualizationSettings
     ) {
         self.userLocation = userLocation
         self.userHeading  = userHeading
         self.aircraft     = aircraft
         self.airports     = airports
+        self.settings     = settings
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -248,10 +291,39 @@ class MapViewController: UIViewController {
         navigationItem.leftBarButtonItem = UIBarButtonItem(
             barButtonSystemItem: .close, target: self, action: #selector(dismissMap))
 
+        // Restore persisted range; fall back to 30 NM
+        let saved = UserDefaults.standard.double(forKey: Self.rangeDefaultsKey)
+        if saved >= 10 && saved <= 50 { currentRangeNM = saved }
+
         setupCanvas()
         setupControls()
+        setupGestures()
+        refreshMap()
+
+        // Live updates at 1 Hz
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pullLiveData()
+        }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        updateTimer?.invalidate()
+        updateTimer = nil
+    }
+
+    // MARK: - Live Data
+
+    private func pullLiveData() {
+        guard let data = dataProvider?() else { return }
+        userLocation = data.location
+        userHeading  = data.heading
+        aircraft     = data.aircraft
+        airports     = data.airports
         refreshMap()
     }
+
+    // MARK: - Canvas
 
     private func setupCanvas() {
         canvasView = MapCanvasView()
@@ -266,8 +338,9 @@ class MapViewController: UIViewController {
         ])
     }
 
+    // MARK: - Controls
+
     private func setupControls() {
-        // Bottom control bar background
         let controlBar = UIView()
         controlBar.translatesAutoresizingMaskIntoConstraints = false
         controlBar.backgroundColor = UIColor(white: 0.1, alpha: 1)
@@ -280,22 +353,18 @@ class MapViewController: UIViewController {
             controlBar.heightAnchor.constraint(equalToConstant: 88)
         ])
 
-        // Range decrease button
         decreaseButton = makeRoundButton(symbol: "minus.circle.fill")
         decreaseButton.addTarget(self, action: #selector(decreaseRange), for: .touchUpInside)
 
-        // Range label
         rangeLabel = UILabel()
         rangeLabel.translatesAutoresizingMaskIntoConstraints = false
         rangeLabel.textColor = .white
         rangeLabel.font = UIFont.boldSystemFont(ofSize: 17)
         rangeLabel.textAlignment = .center
 
-        // Range increase button
         increaseButton = makeRoundButton(symbol: "plus.circle.fill")
         increaseButton.addTarget(self, action: #selector(increaseRange), for: .touchUpInside)
 
-        // Scale bar
         scaleBarView = ScaleBarView()
         scaleBarView.translatesAutoresizingMaskIntoConstraints = false
 
@@ -305,7 +374,6 @@ class MapViewController: UIViewController {
         controlBar.addSubview(scaleBarView)
 
         NSLayoutConstraint.activate([
-            // Center row: − [range label] +
             decreaseButton.centerYAnchor.constraint(equalTo: controlBar.centerYAnchor, constant: -10),
             decreaseButton.leadingAnchor.constraint(equalTo: controlBar.leadingAnchor, constant: 24),
             decreaseButton.widthAnchor.constraint(equalToConstant: 44),
@@ -320,7 +388,6 @@ class MapViewController: UIViewController {
             increaseButton.widthAnchor.constraint(equalToConstant: 44),
             increaseButton.heightAnchor.constraint(equalToConstant: 44),
 
-            // Scale bar below
             scaleBarView.topAnchor.constraint(equalTo: decreaseButton.bottomAnchor, constant: 6),
             scaleBarView.leadingAnchor.constraint(equalTo: controlBar.leadingAnchor, constant: 24),
             scaleBarView.trailingAnchor.constraint(equalTo: controlBar.trailingAnchor, constant: -24),
@@ -337,31 +404,87 @@ class MapViewController: UIViewController {
         return btn
     }
 
+    // MARK: - Gestures
+
+    private func setupGestures() {
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleMapTap(_:)))
+        canvasView.addGestureRecognizer(tap)
+    }
+
+    /// Hit-test a tap on the canvas.  Picks the closest aircraft or airport within 22 pt,
+    /// calls onSelect, then dismisses the map so the AR view becomes active with that item selected.
+    @objc private func handleMapTap(_ gesture: UITapGestureRecognizer) {
+        let point     = gesture.location(in: canvasView)
+        let hitRadius: CGFloat = 22
+
+        var bestAC: (id: String,   dist: CGFloat)?
+        for hit in canvasView.drawnAircraftHits {
+            let dx = hit.point.x - point.x
+            let dy = hit.point.y - point.y
+            let d  = sqrt(dx * dx + dy * dy)
+            if d <= hitRadius, bestAC == nil || d < bestAC!.dist {
+                bestAC = (id: hit.id, dist: d)
+            }
+        }
+
+        var bestAP: (icao: String, dist: CGFloat)?
+        for hit in canvasView.drawnAirportHits {
+            let dx = hit.point.x - point.x
+            let dy = hit.point.y - point.y
+            let d  = sqrt(dx * dx + dy * dy)
+            if d <= hitRadius, bestAP == nil || d < bestAP!.dist {
+                bestAP = (icao: hit.icao, dist: d)
+            }
+        }
+
+        // Pick whichever hit is closer to the tap
+        let nodeID: String?
+        if let ac = bestAC, let ap = bestAP {
+            nodeID = ac.dist < ap.dist ? "aircraft_\(ac.id)" : "airport_\(ap.icao)"
+        } else if let ac = bestAC {
+            nodeID = "aircraft_\(ac.id)"
+        } else if let ap = bestAP {
+            nodeID = "airport_\(ap.icao)"
+        } else {
+            nodeID = nil
+        }
+
+        guard let nid = nodeID else { return }
+        onSelect?(nid)
+        dismiss(animated: true)
+    }
+
+    // MARK: - Refresh
+
     private func refreshMap() {
         canvasView.userLocation = userLocation
         canvasView.userHeading  = userHeading
         canvasView.aircraft     = aircraft
         canvasView.airports     = airports
         canvasView.rangeNM      = currentRangeNM
+        canvasView.settings     = settings
         canvasView.setNeedsDisplay()
 
         rangeLabel.text = "\(Int(currentRangeNM)) NM"
         decreaseButton.alpha = currentRangeNM <= 10 ? 0.35 : 1.0
         increaseButton.alpha = currentRangeNM >= 50 ? 0.35 : 1.0
 
-        // Update scale bar: show width that represents the full range
         scaleBarView.rangeNM = currentRangeNM
     }
+
+    // MARK: - Range buttons
 
     @objc private func decreaseRange() {
         guard currentRangeNM > 10 else { return }
         currentRangeNM = max(10, currentRangeNM - 10)
+        UserDefaults.standard.set(currentRangeNM, forKey: Self.rangeDefaultsKey)
         refreshMap()
     }
 
     @objc private func increaseRange() {
         guard currentRangeNM < 50 else { return }
         currentRangeNM = min(50, currentRangeNM + 10)
+        UserDefaults.standard.set(currentRangeNM, forKey: Self.rangeDefaultsKey)
         refreshMap()
     }
 
@@ -374,7 +497,7 @@ class MapViewController: UIViewController {
 
 private final class ScaleBarView: UIView {
 
-    var rangeNM: Double = 50 {
+    var rangeNM: Double = 30 {
         didSet { setNeedsDisplay() }
     }
 
@@ -387,22 +510,17 @@ private final class ScaleBarView: UIView {
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
 
-        // The scale bar represents half the range (a meaningful segment)
         let scaleValueNM = Int(rangeNM / 2)
-        let barWidth = rect.width * 0.6    // 60% of available width
+        let barWidth  = rect.width * 0.6
         let barHeight: CGFloat = 4
         let barY = rect.midY - barHeight / 2
         let barX = (rect.width - barWidth) / 2
 
-        // Bar
         ctx.setFillColor(UIColor.white.withAlphaComponent(0.8).cgColor)
         ctx.fill(CGRect(x: barX, y: barY, width: barWidth, height: barHeight))
-
-        // End ticks
-        ctx.fill(CGRect(x: barX, y: barY - 4, width: 2, height: barHeight + 8))
+        ctx.fill(CGRect(x: barX,              y: barY - 4, width: 2, height: barHeight + 8))
         ctx.fill(CGRect(x: barX + barWidth - 2, y: barY - 4, width: 2, height: barHeight + 8))
 
-        // Label
         let label = "\(scaleValueNM) NM"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),

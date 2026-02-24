@@ -18,13 +18,20 @@ private enum SelectionState: Equatable {
 
 // MARK: - Off-Screen Arrow View
 
-/// Full-screen transparent overlay that draws a single directional chevron
-/// at the screen edge when the selected target is outside the camera FOV.
+/// Full-screen transparent overlay that draws directional chevrons at the
+/// screen edge for the selected target and/or TCAS threat aircraft.
 private final class OffScreenArrowView: UIView {
 
-    private var arrowAngle: CGFloat = 0
-    private var arrowCenter: CGPoint = .zero
-    private var isVisible = false
+    private struct ArrowEntry {
+        var angle: CGFloat
+        var center: CGPoint
+        var color: UIColor
+    }
+
+    /// Arrow for the user-selected node (white).
+    private var selectionArrow: ArrowEntry?
+    /// Arrows for TCAS threat aircraft (amber = TA, red = RA).
+    private var tcasArrows: [ArrowEntry] = []
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -33,28 +40,47 @@ private final class OffScreenArrowView: UIView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    // MARK: Selection arrow
+
     func hide() {
-        guard isVisible else { return }
-        isVisible = false
+        guard selectionArrow != nil else { return }
+        selectionArrow = nil
         setNeedsDisplay()
     }
 
     func show(angle: CGFloat, center: CGPoint) {
-        arrowAngle  = angle
-        arrowCenter = center
-        isVisible   = true
+        selectionArrow = ArrowEntry(angle: angle, center: center, color: .white)
         setNeedsDisplay()
     }
 
-    override func draw(_ rect: CGRect) {
-        guard isVisible else { return }
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+    // MARK: TCAS arrows
 
-        let size: CGFloat  = 48
-        let half           = size / 2
+    func setTCASArrows(_ arrows: [(angle: CGFloat, center: CGPoint, color: UIColor)]) {
+        tcasArrows = arrows.map { ArrowEntry(angle: $0.angle, center: $0.center, color: $0.color) }
+        setNeedsDisplay()
+    }
+
+    func clearTCASArrows() {
+        guard !tcasArrows.isEmpty else { return }
+        tcasArrows = []
+        setNeedsDisplay()
+    }
+
+    // MARK: Drawing
+
+    override func draw(_ rect: CGRect) {
+        let all: [ArrowEntry] = tcasArrows + (selectionArrow.map { [$0] } ?? [])
+        guard !all.isEmpty else { return }
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        for entry in all { drawArrow(ctx: ctx, entry: entry) }
+    }
+
+    private func drawArrow(ctx: CGContext, entry: ArrowEntry) {
+        let size: CGFloat     = 48
+        let half              = size / 2
         let cornerRadius: CGFloat = 10
-        let bgRect = CGRect(x: arrowCenter.x - half,
-                            y: arrowCenter.y - half,
+        let bgRect = CGRect(x: entry.center.x - half,
+                            y: entry.center.y - half,
                             width: size, height: size)
 
         ctx.saveGState()
@@ -64,14 +90,14 @@ private final class OffScreenArrowView: UIView {
         ctx.restoreGState()
 
         ctx.saveGState()
-        ctx.translateBy(x: arrowCenter.x, y: arrowCenter.y)
-        ctx.rotate(by: arrowAngle)
+        ctx.translateBy(x: entry.center.x, y: entry.center.y)
+        ctx.rotate(by: entry.angle)
 
         let armLen: CGFloat = 10
         let tipY: CGFloat   = -11
         let baseY: CGFloat  =   5
 
-        ctx.setStrokeColor(UIColor.white.cgColor)
+        ctx.setStrokeColor(entry.color.cgColor)
         ctx.setLineWidth(3)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
@@ -499,12 +525,32 @@ class ARTrafficViewController: UIViewController {
     @objc private func showMap() {
         guard let loc = activeLocation else { return }
         let aircraft = Array(connectionLogic.detectedAircraft.values)
+        let settings = sceneManager?.settings ?? ARVisualizationSettings()
+
         let vc = MapViewController(
             userLocation: loc,
             userHeading: userHeading,
             aircraft: aircraft,
-            airports: airports
+            airports: airports,
+            settings: settings
         )
+
+        // Provide fresh data every live-update tick
+        vc.dataProvider = { [weak self] in
+            guard let self, let loc = self.activeLocation else { return nil }
+            return (
+                aircraft: Array(self.connectionLogic.detectedAircraft.values),
+                airports: self.airports,
+                location: loc,
+                heading: self.userHeading
+            )
+        }
+
+        // When the user taps an item on the map, dismiss the map and select it in the AR view
+        vc.onSelect = { [weak self] nodeID in
+            self?.applySelection(nodeID: nodeID)
+        }
+
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .fullScreen
         present(nav, animated: true)
@@ -573,7 +619,6 @@ class ARTrafficViewController: UIViewController {
 
     private func updateSelectionUI(active: Bool) {
         backButton.isHidden = !active
-        offScreenArrowView.isHidden = !active
         statusLeadingToEdge.isActive = !active
         statusLeadingToBack.isActive = active
     }
@@ -616,7 +661,12 @@ class ARTrafficViewController: UIViewController {
                     self.metarLabel.text = "METAR \(icao): no report available"
                     return
                 }
-                self.metarLabel.text = "METAR\n\(raw)"
+                // The API may return multiple METAR lines (oldest…newest); keep only the latest
+                let latestMETAR = raw
+                    .components(separatedBy: .newlines)
+                    .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                    ?? raw
+                self.metarLabel.text = "METAR\n\(latestMETAR)"
             }
         }
         metarFetchTask = task
@@ -755,6 +805,54 @@ class ARTrafficViewController: UIViewController {
         let uiAngle = angle + .pi / 2
 
         return (edgePoint, uiAngle)
+    }
+
+    // MARK: - TCAS Off-Screen Arrows
+
+    /// Runs at 60 Hz. For every active TCAS threat that is off-screen,
+    /// draws a colored chevron at the screen edge pointing toward it.
+    private func updateTCASArrows() {
+        let tcas = currentTCASEvaluation
+        guard tcas.overallLevel != .none else {
+            DispatchQueue.main.async { self.offScreenArrowView.clearTCASArrows() }
+            return
+        }
+
+        let screenSize = arSceneView.bounds.size
+        var arrowData: [(angle: CGFloat, center: CGPoint, color: UIColor)] = []
+
+        for (id, level) in tcas.threats {
+            let nodeID = "aircraft_\(id)"
+            // Skip if this is the user-selected node — the white selection arrow already covers it
+            if case .selected(let sel) = selectionState, sel == nodeID { continue }
+
+            guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else { continue }
+
+            let projected = arSceneView.projectPoint(node.worldPosition)
+            let behindCamera = projected.z >= 1.0
+            let onScreen = !behindCamera
+                && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
+                && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
+
+            // Aircraft is already visible on screen — no arrow needed
+            if onScreen { continue }
+
+            let (edgePoint, angle) = screenEdgePoint(
+                projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
+                isBehindCamera: behindCamera,
+                screenSize: screenSize,
+                margin: 40
+            )
+
+            let color: UIColor = level == .resolutionAdvisory
+                ? UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0)   // RA — red-orange
+                : UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0)   // TA — amber
+
+            arrowData.append((angle: angle, center: edgePoint, color: color))
+        }
+
+        let data = arrowData
+        DispatchQueue.main.async { self.offScreenArrowView.setTCASArrows(data) }
     }
 
     // MARK: - TCAS Overlay
@@ -901,6 +999,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if case .selected(let nodeID) = selectionState {
             updateOffScreenArrow(for: nodeID)
         }
+        updateTCASArrows()
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
