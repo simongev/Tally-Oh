@@ -646,7 +646,8 @@ class ARSceneManager {
         userAltitude: Double,
         userHeading: Double,
         cameraWorldPosition: SCNVector3 = .init(),
-        tcasEvaluation: TCASEvaluation = .clear
+        tcasEvaluation: TCASEvaluation = .clear,
+        onGround: Bool = false
     ) {
         guard settings.showAircraft else {
             nodesLock.lock()
@@ -661,9 +662,10 @@ class ARSceneManager {
         var visibleAircraft: [Aircraft] = []
         var nodesAdded = false
         /// Hard ceiling on concurrent aircraft nodes. Each aircraft = 3 SceneKit nodes
-        /// (cone + ring plane + label plane), each with a GPU texture. 200 aircraft × 3
-        /// nodes = 600 nodes; beyond this SceneKit VRAM usage grows uncomfortably large.
-        let maxTotalNodes      = 200
+        /// (cone + ring plane + label plane), each with a GPU texture.
+        /// On the ground with ADS-B connected we reduce this sharply — the user is
+        /// surrounded by ground traffic that burns VRAM and is irrelevant to flight safety.
+        let maxTotalNodes      = onGround ? 50 : 200
         /// Cap new node creation per tick to avoid a main-thread spike when a filter
         /// suddenly makes many aircraft visible at once (e.g. enabling ground traffic).
         let maxNewNodesPerTick = 20

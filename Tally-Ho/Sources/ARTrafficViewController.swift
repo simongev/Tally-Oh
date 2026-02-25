@@ -823,6 +823,19 @@ class ARTrafficViewController: UIViewController {
         connectionLogic.connectionStatus == .receiving && connectionLogic.ownshipData != nil
     }
 
+    /// TCAS is only meaningful when airborne. Suppress it below 200 ft to avoid
+    /// false alerts from ground traffic and to reduce memory pressure on the ground.
+    /// Uses ADS-B ownship altitude when connected, iPhone GPS altitude otherwise.
+    private var tcasEnabled: Bool {
+        activeAltitude > 200
+    }
+
+    /// True when ADS-B is connected AND ownship altitude is at or below 200 ft.
+    /// Used to tighten the node cap so ground traffic doesn't fill VRAM while taxiing.
+    private var userIsOnGroundWithADSB: Bool {
+        usingADSBGPS && activeAltitude <= 200
+    }
+
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
 
@@ -836,16 +849,23 @@ class ARTrafficViewController: UIViewController {
             cameraPos = .init()
         }
 
-        // Evaluate TCAS state for this tick, passing ownship motion for CPA prediction
-        let ownship = connectionLogic.ownshipData
-        let tcas = TCASSystem.evaluate(
-            aircraft: aircraftList,
-            userLocation: loc,
-            userAltitude: activeAltitude,
-            userTrack: ownship?.track ?? userHeading,
-            userGroundSpeed: ownship?.groundSpeed ?? 0,
-            userVerticalRate: ownship?.verticalRate ?? 0
-        )
+        // Evaluate TCAS only when airborne (> 200 ft). On the ground the proximity
+        // of parked/taxiing aircraft would cause constant false TA/RA alerts.
+        let tcas: TCASEvaluation
+        if tcasEnabled {
+            let ownship = connectionLogic.ownshipData
+            tcas = TCASSystem.evaluate(
+                aircraft: aircraftList,
+                userLocation: loc,
+                userAltitude: activeAltitude,
+                userTrack: ownship?.track ?? userHeading,
+                userGroundSpeed: ownship?.groundSpeed ?? 0,
+                userVerticalRate: ownship?.verticalRate ?? 0
+            )
+        } else {
+            // Ground mode — clear any active TCAS alert and pass empty evaluation
+            tcas = .clear
+        }
         currentTCASEvaluation = tcas
         applyTCASOverlay(tcas)
 
@@ -855,7 +875,8 @@ class ARTrafficViewController: UIViewController {
             userAltitude: activeAltitude,
             userHeading: userHeading,
             cameraWorldPosition: cameraPos,
-            tcasEvaluation: tcas
+            tcasEvaluation: tcas,
+            onGround: userIsOnGroundWithADSB
         )
         sceneManager?.updateAirports(
             airports,
