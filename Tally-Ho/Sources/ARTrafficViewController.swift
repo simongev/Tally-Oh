@@ -18,27 +18,49 @@ private enum SelectionState: Equatable {
 
 // MARK: - Off-Screen Arrow View
 
-/// Full-screen transparent overlay that draws directional chevrons at the
-/// screen edge for the selected target and/or TCAS threat aircraft.
+/// Full-screen transparent overlay that draws directional chevrons:
+///  • Off-screen targets  → chevron pinned to the screen edge.
+///  • On-screen TCAS auto-selected target → orbiting arrow that circles the
+///    aircraft's screen position, pointing inward so it's impossible to miss.
 private final class OffScreenArrowView: UIView {
 
     private struct ArrowEntry {
         var angle: CGFloat
         var center: CGPoint
         var color: UIColor
+        var isOnScreen: Bool = false   // true = floating orbit arrow, false = edge chevron
     }
 
-    /// Arrow for the user-selected node (white).
+    /// Arrow for the user-selected node.
     private var selectionArrow: ArrowEntry?
     /// Arrows for TCAS threat aircraft (amber = TA, red = RA).
     private var tcasArrows: [ArrowEntry] = []
+
+    // Orbit animation
+    private var orbitAngle: CGFloat = 0
+    private var displayLink: CADisplayLink?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isUserInteractionEnabled = false
+        startOrbitAnimation()
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    private func startOrbitAnimation() {
+        displayLink = CADisplayLink(target: self, selector: #selector(tick))
+        displayLink?.add(to: .main, forMode: .common)
+    }
+
+    @objc private func tick() {
+        // Only redraw if we have an on-screen arrow that needs to animate
+        let hasOnScreen = (selectionArrow?.isOnScreen == true) ||
+                          tcasArrows.contains(where: { $0.isOnScreen })
+        guard hasOnScreen else { return }
+        orbitAngle += CGFloat(displayLink?.duration ?? 1.0/60.0) * 1.8   // ~1.8 rad/s
+        setNeedsDisplay()
+    }
 
     // MARK: Selection arrow
 
@@ -48,15 +70,24 @@ private final class OffScreenArrowView: UIView {
         setNeedsDisplay()
     }
 
+    /// Show an edge chevron for an off-screen target.
     func show(angle: CGFloat, center: CGPoint) {
-        selectionArrow = ArrowEntry(angle: angle, center: center, color: .white)
+        selectionArrow = ArrowEntry(angle: angle, center: center, color: .white, isOnScreen: false)
         setNeedsDisplay()
+    }
+
+    /// Show a floating orbit arrow pointing at an on-screen TCAS target.
+    func showOnScreen(at screenPoint: CGPoint, color: UIColor) {
+        selectionArrow = ArrowEntry(angle: 0, center: screenPoint, color: color, isOnScreen: true)
+        // tick() will handle redraws
     }
 
     // MARK: TCAS arrows
 
-    func setTCASArrows(_ arrows: [(angle: CGFloat, center: CGPoint, color: UIColor)]) {
-        tcasArrows = arrows.map { ArrowEntry(angle: $0.angle, center: $0.center, color: $0.color) }
+    func setTCASArrows(_ arrows: [(angle: CGFloat, center: CGPoint, color: UIColor, isOnScreen: Bool)]) {
+        tcasArrows = arrows.map {
+            ArrowEntry(angle: $0.angle, center: $0.center, color: $0.color, isOnScreen: $0.isOnScreen)
+        }
         setNeedsDisplay()
     }
 
@@ -72,12 +103,67 @@ private final class OffScreenArrowView: UIView {
         let all: [ArrowEntry] = tcasArrows + (selectionArrow.map { [$0] } ?? [])
         guard !all.isEmpty else { return }
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        for entry in all { drawArrow(ctx: ctx, entry: entry) }
+        for entry in all {
+            if entry.isOnScreen {
+                drawOrbitArrow(ctx: ctx, entry: entry)
+            } else {
+                drawEdgeChevron(ctx: ctx, entry: entry)
+            }
+        }
     }
 
-    private func drawArrow(ctx: CGContext, entry: ArrowEntry) {
-        let size: CGFloat     = 48
-        let half              = size / 2
+    /// Orbiting arrow that circles the on-screen aircraft position and points inward.
+    private func drawOrbitArrow(ctx: CGContext, entry: ArrowEntry) {
+        let orbitRadius: CGFloat = 52   // distance from aircraft screen centre
+        let arrowSize:   CGFloat = 22   // length of each arm of the chevron
+        let lineWidth:   CGFloat = 4
+
+        // Position on the orbit circle
+        let cx = entry.center.x + orbitRadius * cos(orbitAngle)
+        let cy = entry.center.y + orbitRadius * sin(orbitAngle)
+
+        // Arrow points inward (toward entry.center)
+        let inwardAngle = atan2(entry.center.y - cy, entry.center.x - cx)
+        let rotAngle    = inwardAngle + .pi / 2   // chevron tip points inward
+
+        // Dark background pill
+        let bgRadius: CGFloat = 18
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 8, color: entry.color.withAlphaComponent(0.9).cgColor)
+        UIColor.black.withAlphaComponent(0.7).setFill()
+        let bgPath = UIBezierPath(ovalIn: CGRect(x: cx - bgRadius, y: cy - bgRadius,
+                                                  width: bgRadius * 2, height: bgRadius * 2))
+        bgPath.fill()
+        ctx.restoreGState()
+
+        // Chevron
+        ctx.saveGState()
+        ctx.translateBy(x: cx, y: cy)
+        ctx.rotate(by: rotAngle)
+
+        let armLen   = arrowSize * 0.5
+        let tipY     = -arrowSize * 0.45
+        let baseY    =  arrowSize * 0.25
+
+        ctx.setShadow(offset: .zero, blur: 6, color: entry.color.withAlphaComponent(1.0).cgColor)
+        ctx.setStrokeColor(entry.color.cgColor)
+        ctx.setLineWidth(lineWidth)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+
+        ctx.beginPath()
+        ctx.move(to: CGPoint(x: -armLen, y: baseY))
+        ctx.addLine(to: CGPoint(x: 0,      y: tipY))
+        ctx.addLine(to: CGPoint(x:  armLen, y: baseY))
+        ctx.strokePath()
+
+        ctx.restoreGState()
+    }
+
+    /// Classic edge-pinned chevron for off-screen targets.
+    private func drawEdgeChevron(ctx: CGContext, entry: ArrowEntry) {
+        let size: CGFloat         = 48
+        let half                  = size / 2
         let cornerRadius: CGFloat = 10
         let bgRect = CGRect(x: entry.center.x - half,
                             y: entry.center.y - half,
@@ -752,8 +838,8 @@ class ARTrafficViewController: UIViewController {
             return
         }
 
-        let worldPos  = node.worldPosition
-        let projected = arSceneView.projectPoint(worldPos)
+        let worldPos   = node.worldPosition
+        let projected  = arSceneView.projectPoint(worldPos)
         let screenSize = arSceneView.bounds.size
 
         let behindCamera = projected.z >= 1.0
@@ -761,8 +847,26 @@ class ARTrafficViewController: UIViewController {
             && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
             && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
 
+        // Determine arrow color: TCAS threat color or plain white for manual selection
+        let arrowColor: UIColor
+        let isTCASAutoSelect = currentTCASEvaluation.overallLevel != .none
+        if isTCASAutoSelect {
+            let tcasID = nodeID.hasPrefix("aircraft_")
+                ? String(nodeID.dropFirst("aircraft_".count)) : nodeID
+            let level = currentTCASEvaluation.threats[tcasID] ?? currentTCASEvaluation.overallLevel
+            arrowColor = level == .resolutionAdvisory
+                ? UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0)
+                : UIColor(red: 1.0, green: 0.6,  blue: 0.0, alpha: 1.0)
+        } else {
+            arrowColor = .white
+        }
+
         if onScreen {
-            DispatchQueue.main.async { self.offScreenArrowView.hide() }
+            // Target visible on screen — show orbiting arrow around its screen position
+            let screenPt = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            DispatchQueue.main.async {
+                self.offScreenArrowView.showOnScreen(at: screenPt, color: arrowColor)
+            }
             return
         }
 
@@ -815,8 +919,8 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - TCAS Off-Screen Arrows
 
-    /// Runs at 60 Hz. For every active TCAS threat that is off-screen,
-    /// draws a colored chevron at the screen edge pointing toward it.
+    /// Runs at 60 Hz. For every active TCAS threat that is not the auto-selected node,
+    /// draws a colored chevron — at the screen edge if off-screen, orbiting if on-screen.
     private func updateTCASArrows() {
         let tcas = currentTCASEvaluation
         guard tcas.overallLevel != .none else {
@@ -825,11 +929,11 @@ class ARTrafficViewController: UIViewController {
         }
 
         let screenSize = arSceneView.bounds.size
-        var arrowData: [(angle: CGFloat, center: CGPoint, color: UIColor)] = []
+        var arrowData: [(angle: CGFloat, center: CGPoint, color: UIColor, isOnScreen: Bool)] = []
 
         for (id, level) in tcas.threats {
             let nodeID = "aircraft_\(id)"
-            // Skip if this is the user-selected node — the white selection arrow already covers it
+            // Skip the auto-selected node — its arrow is handled by updateOffScreenArrow
             if case .selected(let sel) = selectionState, sel == nodeID { continue }
 
             guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else { continue }
@@ -840,21 +944,22 @@ class ARTrafficViewController: UIViewController {
                 && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
                 && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
 
-            // Aircraft is already visible on screen — no arrow needed
-            if onScreen { continue }
-
-            let (edgePoint, angle) = screenEdgePoint(
-                projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
-                isBehindCamera: behindCamera,
-                screenSize: screenSize,
-                margin: 40
-            )
-
             let color: UIColor = level == .resolutionAdvisory
-                ? UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0)   // RA — red-orange
-                : UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0)   // TA — amber
+                ? UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0)  // RA — vivid red
+                : UIColor(red: 1.0, green: 0.6,  blue: 0.0, alpha: 1.0)  // TA — amber
 
-            arrowData.append((angle: angle, center: edgePoint, color: color))
+            if onScreen {
+                let screenPt = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+                arrowData.append((angle: 0, center: screenPt, color: color, isOnScreen: true))
+            } else {
+                let (edgePoint, angle) = screenEdgePoint(
+                    projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
+                    isBehindCamera: behindCamera,
+                    screenSize: screenSize,
+                    margin: 40
+                )
+                arrowData.append((angle: angle, center: edgePoint, color: color, isOnScreen: false))
+            }
         }
 
         let data = arrowData

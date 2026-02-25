@@ -22,9 +22,16 @@ class ARComponentFactory {
     static let maxARRadius: Float = 80.0
     static let minARRadius: Float = 5.0
 
-    /// Radius of the flat red ring (metres in AR space).
-    static let aircraftRingRadius: Float  = 3.0
-    static let aircraftRingThickness: Float = 0.35   // half-width of the ring stroke
+    /// Base ring radius for normal traffic (metres in AR space).
+    static let aircraftRingRadius: Float    = 3.0
+    /// Ring radius for TA threats — slightly larger so they stand out.
+    static let aircraftRingRadiusTA: Float  = 3.8
+    /// Ring radius for RA threats — even larger, impossible to miss.
+    static let aircraftRingRadiusRA: Float  = 4.6
+
+    static let aircraftRingThickness: Float   = 0.35   // normal ring stroke half-width
+    static let aircraftRingThicknessTA: Float = 0.55   // TA — noticeably thicker
+    static let aircraftRingThicknessRA: Float = 0.75   // RA — boldest
 
     /// Airport cone dimensions (metres in AR space).
     static let coneHeight: CGFloat = 8.0
@@ -33,6 +40,15 @@ class ARComponentFactory {
     /// Label font size (1 scene-unit ≈ 1 m).
     static let labelFontSize: CGFloat        = 1.5
     static let labelFontSizeAirport: CGFloat = 1.6
+
+    /// Ring geometry params (radius + thickness) per TCAS level.
+    static func ringParams(for level: TCASAlertLevel) -> (radius: Float, thickness: Float) {
+        switch level {
+        case .none:               return (aircraftRingRadius,   aircraftRingThickness)
+        case .trafficAdvisory:    return (aircraftRingRadiusTA, aircraftRingThicknessTA)
+        case .resolutionAdvisory: return (aircraftRingRadiusRA, aircraftRingThicknessRA)
+        }
+    }
 
     // MARK: - Shared geometry / material (created once, reused for every node)
 
@@ -58,21 +74,22 @@ class ARComponentFactory {
         UIFont.boldSystemFont(ofSize: labelFontSizeAirport * 80)
 
     // MARK: - Pre-cached ring images per TCAS level
+    // Each level gets its own radius + thickness so TCAS rings are visually distinct.
 
     private static let ringImageNormal: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadius),
-        thickness: CGFloat(aircraftRingThickness),
+        thickness:   CGFloat(aircraftRingThickness),
         color: UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1))
 
     private static let ringImageTA: UIImage = makeRingImage(
-        outerRadius: CGFloat(aircraftRingRadius),
-        thickness: CGFloat(aircraftRingThickness),
+        outerRadius: CGFloat(aircraftRingRadiusTA),
+        thickness:   CGFloat(aircraftRingThicknessTA),
         color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0))
 
     private static let ringImageRA: UIImage = makeRingImage(
-        outerRadius: CGFloat(aircraftRingRadius),
-        thickness: CGFloat(aircraftRingThickness),
-        color: UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0))
+        outerRadius: CGFloat(aircraftRingRadiusRA),
+        thickness:   CGFloat(aircraftRingThicknessRA),
+        color: UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0))
 
     private static func ringImage(for level: TCASAlertLevel) -> UIImage {
         switch level {
@@ -80,6 +97,11 @@ class ARComponentFactory {
         case .trafficAdvisory:    return ringImageTA
         case .resolutionAdvisory: return ringImageRA
         }
+    }
+
+    /// The SCNPlane size needed to fit a ring at the given TCAS level.
+    private static func ringPlaneSize(for level: TCASAlertLevel) -> CGFloat {
+        CGFloat(ringParams(for: level).radius) * 2.2
     }
 
     // MARK: - Position Scaling
@@ -118,12 +140,13 @@ class ARComponentFactory {
         }
     }
 
-    /// Pulse duration (in seconds per half-cycle) for a given TCAS alert level.
-    static func pulseHalfDuration(for tcasLevel: TCASAlertLevel) -> Double {
+    /// Pulse parameters (peak scale, half-cycle duration) for a given TCAS level.
+    /// Higher urgency = faster cycle + larger scale pop.
+    static func pulseParams(for tcasLevel: TCASAlertLevel) -> (maxScale: CGFloat, halfDuration: Double) {
         switch tcasLevel {
-        case .none:               return 0.9
-        case .trafficAdvisory:    return 0.5
-        case .resolutionAdvisory: return 0.25
+        case .none:               return (1.12, 0.90)   // subtle, slow
+        case .trafficAdvisory:    return (1.30, 0.45)   // noticeable, moderate speed
+        case .resolutionAdvisory: return (1.50, 0.22)   // urgent, fast, large pop
         }
     }
 
@@ -144,8 +167,8 @@ class ARComponentFactory {
         container.position = scaledPosition(rawPosition, relativeTo: cameraWorldPosition)
 
         // Per-aircraft plane with TCAS-appropriate ring image so color can change per aircraft.
-        let ringSize = aircraftRingRadius * 2.2
-        let plane = SCNPlane(width: CGFloat(ringSize), height: CGFloat(ringSize))
+        let ringSize = ringPlaneSize(for: tcasLevel)
+        let plane = SCNPlane(width: ringSize, height: ringSize)
         let mat = SCNMaterial()
         let img = ringImage(for: tcasLevel)
         mat.diffuse.contents   = img
@@ -160,10 +183,10 @@ class ARComponentFactory {
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
 
-        // Pulsing animation — speed reflects TCAS urgency
-        let halfDur = pulseHalfDuration(for: tcasLevel)
-        let scaleUp   = SCNAction.scale(to: 1.12, duration: halfDur)
-        let scaleDown = SCNAction.scale(to: 1.0,  duration: halfDur)
+        // Pulsing animation — speed AND scale amplitude reflect TCAS urgency
+        let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
+        let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
+        let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
         scaleUp.timingMode   = .easeInEaseOut
         scaleDown.timingMode = .easeInEaseOut
         ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
@@ -235,10 +258,12 @@ class ARComponentFactory {
     // MARK: - Selection Appearance
 
     /// Apply or remove the selected visual state on a container node.
+    /// Selected aircraft rings get a bright white emission halo + larger scale.
     static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.15
-        container.scale = selected ? SCNVector3(1.35, 1.35, 1.35) : SCNVector3(1.0, 1.0, 1.0)
+        // Selected node is scaled up more prominently so it dominates the scene
+        container.scale = selected ? SCNVector3(1.55, 1.55, 1.55) : SCNVector3(1.0, 1.0, 1.0)
         container.enumerateChildNodes { node, _ in
             guard node.name != "label",
                   let mat = node.geometry?.firstMaterial else { return }
@@ -249,10 +274,11 @@ class ARComponentFactory {
                 mat.emission.contents = selected
                     ? UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
                     : UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
-            } else if node.geometry is SCNPlane {
-                // Aircraft ring: tint via emission.
+            } else if node.name == "ring", node.geometry is SCNPlane {
+                // Aircraft ring: add a bright white/yellow halo emission when selected
+                // so the ring blazes against any background.
                 mat.emission.contents = selected
-                    ? UIColor(red: 0.6, green: 0.55, blue: 0.0, alpha: 0.7)
+                    ? UIColor(red: 1.0, green: 0.95, blue: 0.6, alpha: 1.0)  // warm white glow
                     : UIColor(red: 0.4, green: 0.0,  blue: 0.0, alpha: 1.0)
             }
         }
@@ -423,17 +449,23 @@ class ARComponentFactory {
             }
         }
 
-        // Update ring texture and pulse speed to reflect current TCAS level
+        // Update ring texture, size, and pulse to reflect current TCAS level
         if let ringNode = node.childNode(withName: "ring", recursively: false) {
-            let img = ringImage(for: tcasLevel)
-            if let mat = ringNode.geometry?.materials.first {
-                mat.diffuse.contents  = img
-                mat.emission.contents = img
+            let img      = ringImage(for: tcasLevel)
+            let newSize  = ringPlaneSize(for: tcasLevel)
+            if let plane = ringNode.geometry as? SCNPlane {
+                SCNTransaction.begin()
+                SCNTransaction.disableActions = true
+                plane.width  = newSize
+                plane.height = newSize
+                plane.materials.first?.diffuse.contents  = img
+                plane.materials.first?.emission.contents = img
+                SCNTransaction.commit()
             }
             ringNode.removeAllActions()
-            let halfDur = pulseHalfDuration(for: tcasLevel)
-            let scaleUp   = SCNAction.scale(to: 1.12, duration: halfDur)
-            let scaleDown = SCNAction.scale(to: 1.0,  duration: halfDur)
+            let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
+            let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
+            let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
             scaleUp.timingMode   = .easeInEaseOut
             scaleDown.timingMode = .easeInEaseOut
             ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
