@@ -73,7 +73,8 @@ class ARComponentFactory {
     static let labelFontAirport: UIFont =
         UIFont.boldSystemFont(ofSize: labelFontSizeAirport * 80)
 
-    // MARK: - Pre-cached ring images per TCAS level
+    // MARK: - Pre-cached ring images & materials per TCAS level
+    // Images and SCNMaterials are created once and shared across all aircraft nodes.
     // Each level gets its own radius + thickness so TCAS rings are visually distinct.
 
     private static let ringImageNormal: UIImage = makeRingImage(
@@ -91,11 +92,47 @@ class ARComponentFactory {
         thickness:   CGFloat(aircraftRingThicknessRA),
         color: UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0))
 
-    private static func ringImage(for level: TCASAlertLevel) -> UIImage {
+    static func ringImage(for level: TCASAlertLevel) -> UIImage {
         switch level {
         case .none:               return ringImageNormal
         case .trafficAdvisory:    return ringImageTA
         case .resolutionAdvisory: return ringImageRA
+        }
+    }
+
+    /// Shared SCNMaterial per TCAS level — all aircraft of the same level share one
+    /// material object, cutting GPU texture uploads from N to 3.
+    /// NOTE: selection appearance must copy the material before mutating it.
+    private static let ringMaterialNormal: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageNormal
+        m.emission.contents = ringImageNormal
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        return m
+    }()
+    private static let ringMaterialTA: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageTA
+        m.emission.contents = ringImageTA
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        return m
+    }()
+    private static let ringMaterialRA: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageRA
+        m.emission.contents = ringImageRA
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        return m
+    }()
+
+    static func ringMaterial(for level: TCASAlertLevel) -> SCNMaterial {
+        switch level {
+        case .none:               return ringMaterialNormal
+        case .trafficAdvisory:    return ringMaterialTA
+        case .resolutionAdvisory: return ringMaterialRA
         }
     }
 
@@ -166,19 +203,15 @@ class ARComponentFactory {
         container.name = "aircraft_\(aircraft.id)"
         container.position = scaledPosition(rawPosition, relativeTo: cameraWorldPosition)
 
-        // Per-aircraft plane with TCAS-appropriate ring image so color can change per aircraft.
+        // Ring plane — uses shared material per TCAS level so the GPU texture is
+        // uploaded only once and reused across all aircraft nodes at that level.
         let ringSize = ringPlaneSize(for: tcasLevel)
         let plane = SCNPlane(width: ringSize, height: ringSize)
-        let mat = SCNMaterial()
-        let img = ringImage(for: tcasLevel)
-        mat.diffuse.contents   = img
-        mat.emission.contents  = img
-        mat.isDoubleSided      = true
-        mat.transparencyMode   = .aOne
-        plane.materials = [mat]
+        plane.materials = [ringMaterial(for: tcasLevel)]
 
         let ringNode = SCNNode(geometry: plane)
         ringNode.name = "ring"
+        ringNode.accessibilityLabel = String(tcasLevel.rawValue)   // level tag for material restore
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
@@ -265,21 +298,29 @@ class ARComponentFactory {
         // Selected node is scaled up more prominently so it dominates the scene
         container.scale = selected ? SCNVector3(1.55, 1.55, 1.55) : SCNVector3(1.0, 1.0, 1.0)
         container.enumerateChildNodes { node, _ in
-            guard node.name != "label",
-                  let mat = node.geometry?.firstMaterial else { return }
-            if node.geometry is SCNCone {
+            guard node.name != "label" else { return }
+            if node.geometry is SCNCone, let mat = node.geometry?.firstMaterial {
                 mat.diffuse.contents  = selected
                     ? UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
                     : UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
                 mat.emission.contents = selected
                     ? UIColor(red: 0.0, green: 0.4,  blue: 0.6, alpha: 1.0)
                     : UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
-            } else if node.name == "ring", node.geometry is SCNPlane {
-                // Aircraft ring: add a bright white/yellow halo emission when selected
-                // so the ring blazes against any background.
-                mat.emission.contents = selected
-                    ? UIColor(red: 1.0, green: 0.95, blue: 0.6, alpha: 1.0)  // warm white glow
-                    : UIColor(red: 0.4, green: 0.0,  blue: 0.0, alpha: 1.0)
+            } else if node.name == "ring", let plane = node.geometry as? SCNPlane {
+                // The ring plane uses a *shared* SCNMaterial per TCAS level.
+                // NEVER mutate it directly — clone it for selection, restore shared on deselect.
+                if selected {
+                    if let existing = plane.materials.first {
+                        let copy = existing.copy() as! SCNMaterial
+                        copy.emission.contents = UIColor(red: 1.0, green: 0.95, blue: 0.6, alpha: 1.0)
+                        plane.materials = [copy]
+                    }
+                } else {
+                    // Restore the shared material using the stored TCAS level tag
+                    let levelRaw = node.accessibilityLabel.flatMap { Int($0) } ?? 0
+                    let level = TCASAlertLevel(rawValue: levelRaw) ?? .none
+                    plane.materials = [ringMaterial(for: level)]
+                }
             }
         }
         SCNTransaction.commit()
@@ -449,26 +490,31 @@ class ARComponentFactory {
             }
         }
 
-        // Update ring texture, size, and pulse to reflect current TCAS level
+        // Update ring size, shared material, and pulse only when TCAS level changes.
+        // Use the node's "accessibilityLabel" as a cheap String level-tag ("0"/"1"/"2")
+        // to skip no-op updates and allow applySelectedAppearance to restore the right material.
         if let ringNode = node.childNode(withName: "ring", recursively: false) {
-            let img      = ringImage(for: tcasLevel)
-            let newSize  = ringPlaneSize(for: tcasLevel)
-            if let plane = ringNode.geometry as? SCNPlane {
-                SCNTransaction.begin()
-                SCNTransaction.disableActions = true
-                plane.width  = newSize
-                plane.height = newSize
-                plane.materials.first?.diffuse.contents  = img
-                plane.materials.first?.emission.contents = img
-                SCNTransaction.commit()
+            let levelTag = String(tcasLevel.rawValue)   // "0" = none, "1" = TA, "2" = RA
+            if ringNode.accessibilityLabel != levelTag {
+                ringNode.accessibilityLabel = levelTag
+                let newSize = ringPlaneSize(for: tcasLevel)
+                if let plane = ringNode.geometry as? SCNPlane {
+                    SCNTransaction.begin()
+                    SCNTransaction.disableActions = true
+                    plane.width  = newSize
+                    plane.height = newSize
+                    // Swap to the shared material for this level
+                    plane.materials = [ringMaterial(for: tcasLevel)]
+                    SCNTransaction.commit()
+                }
+                ringNode.removeAllActions()
+                let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
+                let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
+                let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
+                scaleUp.timingMode   = .easeInEaseOut
+                scaleDown.timingMode = .easeInEaseOut
+                ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
             }
-            ringNode.removeAllActions()
-            let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
-            let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
-            let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
-            scaleUp.timingMode   = .easeInEaseOut
-            scaleDown.timingMode = .easeInEaseOut
-            ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
         }
     }
 }
@@ -614,7 +660,11 @@ class ARSceneManager {
         var currentIDs = Set<String>()
         var visibleAircraft: [Aircraft] = []
         var nodesAdded = false
-        /// Cap new node creation per tick to avoid freezing SceneKit when a filter
+        /// Hard ceiling on concurrent aircraft nodes. Each aircraft = 3 SceneKit nodes
+        /// (cone + ring plane + label plane), each with a GPU texture. 200 aircraft × 3
+        /// nodes = 600 nodes; beyond this SceneKit VRAM usage grows uncomfortably large.
+        let maxTotalNodes      = 200
+        /// Cap new node creation per tick to avoid a main-thread spike when a filter
         /// suddenly makes many aircraft visible at once (e.g. enabling ground traffic).
         let maxNewNodesPerTick = 20
         var newNodesThisTick   = 0
@@ -655,7 +705,8 @@ class ARSceneManager {
                     tcasLevel: tcasLevel
                 )
             } else {
-                // Throttle new node creation to avoid a main-thread spike
+                // Enforce hard total-node cap and per-tick creation rate limit
+                guard aircraftNodes.count < maxTotalNodes else { continue }
                 guard newNodesThisTick < maxNewNodesPerTick else { continue }
                 newNodesThisTick += 1
 
@@ -916,6 +967,34 @@ class ARSceneManager {
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
         acNodes.forEach { $0.removeFromParentNode() }
+        apNodes.forEach { $0.removeFromParentNode() }
+        SCNTransaction.commit()
+    }
+
+    // MARK: - Memory Pressure
+
+    /// Called when iOS sends a memory warning (before a potential jetsam kill).
+    /// Removes all hidden aircraft nodes and all airport nodes from the scene to
+    /// free SceneKit texture memory immediately. The next update tick will rebuild
+    /// only what's needed.
+    func pruneForMemoryPressure() {
+        nodesLock.lock()
+        var hiddenIDs: [String] = []
+        for (id, node) in aircraftNodes where node.isHidden {
+            hiddenIDs.append(id)
+        }
+        var pruned: [SCNNode] = []
+        for id in hiddenIDs {
+            if let n = aircraftNodes.removeValue(forKey: id) { pruned.append(n) }
+        }
+        // Also evict all airport nodes — they re-appear on the next tick.
+        let apNodes = Array(airportNodes.values)
+        airportNodes.removeAll()
+        nodesLock.unlock()
+
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        pruned.forEach { $0.removeFromParentNode() }
         apNodes.forEach { $0.removeFromParentNode() }
         SCNTransaction.commit()
     }

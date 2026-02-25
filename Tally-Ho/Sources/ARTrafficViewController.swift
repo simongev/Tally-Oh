@@ -40,6 +40,10 @@ private final class OffScreenArrowView: UIView {
     private var orbitAngle: CGFloat = 0
     private var displayLink: CADisplayLink?
 
+    // MARK: - Cached colors (avoid per-frame allocations in draw(_:))
+    private static let blackAlpha70 = UIColor.black.withAlphaComponent(0.70)
+    private static let blackAlpha65 = UIColor.black.withAlphaComponent(0.65)
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
@@ -48,9 +52,23 @@ private final class OffScreenArrowView: UIView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit {
+        // Must invalidate before release so the run-loop drops its strong reference.
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
     private func startOrbitAnimation() {
-        displayLink = CADisplayLink(target: self, selector: #selector(tick))
-        displayLink?.add(to: .main, forMode: .common)
+        // Use a weak-target proxy to avoid the run-loop holding a strong reference
+        // to self, which would prevent deallocation if the view is removed.
+        let link = CADisplayLink(target: WeakTarget(self), selector: #selector(WeakTarget.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    func stopAnimation() {
+        displayLink?.invalidate()
+        displayLink = nil
     }
 
     @objc private func tick() {
@@ -60,6 +78,14 @@ private final class OffScreenArrowView: UIView {
         guard hasOnScreen else { return }
         orbitAngle += CGFloat(displayLink?.duration ?? 1.0/60.0) * 1.8   // ~1.8 rad/s
         setNeedsDisplay()
+    }
+
+    /// Lightweight proxy that forwards CADisplayLink ticks with a weak reference,
+    /// preventing the run-loop from keeping OffScreenArrowView alive after removal.
+    private final class WeakTarget: NSObject {
+        weak var owner: OffScreenArrowView?
+        init(_ owner: OffScreenArrowView) { self.owner = owner }
+        @objc func tick(_ link: CADisplayLink) { owner?.tick() }
     }
 
     // MARK: Selection arrow
@@ -130,10 +156,10 @@ private final class OffScreenArrowView: UIView {
         let bgRadius: CGFloat = 18
         ctx.saveGState()
         ctx.setShadow(offset: .zero, blur: 8, color: entry.color.withAlphaComponent(0.9).cgColor)
-        UIColor.black.withAlphaComponent(0.7).setFill()
-        let bgPath = UIBezierPath(ovalIn: CGRect(x: cx - bgRadius, y: cy - bgRadius,
-                                                  width: bgRadius * 2, height: bgRadius * 2))
-        bgPath.fill()
+        OffScreenArrowView.blackAlpha70.setFill()
+        let bgRect = CGRect(x: cx - bgRadius, y: cy - bgRadius,
+                            width: bgRadius * 2, height: bgRadius * 2)
+        ctx.fillEllipse(in: bgRect)
         ctx.restoreGState()
 
         // Chevron
@@ -170,9 +196,9 @@ private final class OffScreenArrowView: UIView {
                             width: size, height: size)
 
         ctx.saveGState()
-        let path = UIBezierPath(roundedRect: bgRect, cornerRadius: cornerRadius)
-        UIColor.black.withAlphaComponent(0.65).setFill()
-        path.fill()
+        ctx.setFillColor(OffScreenArrowView.blackAlpha65.cgColor)
+        ctx.addPath(UIBezierPath(roundedRect: bgRect, cornerRadius: cornerRadius).cgPath)
+        ctx.fillPath()
         ctx.restoreGState()
 
         ctx.saveGState()
@@ -217,8 +243,6 @@ class ARTrafficViewController: UIViewController {
 
     /// Full-screen border overlay driven by TCAS alerts.
     private var tcasOverlayView: UIView!
-    private var tcasFlashTimer: Timer?
-    private var tcasFlashState: Bool = false
     private var lastAppliedTCASLevel: TCASAlertLevel = .none
 
     // MARK: - METAR Panel
@@ -306,12 +330,21 @@ class ARTrafficViewController: UIViewController {
         startARSession()
     }
 
+    // MARK: - Memory pressure
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        // iOS calls this before resorting to a jetsam kill. Prune airport nodes and
+        // hidden aircraft nodes immediately to free SceneKit texture memory.
+        sceneManager?.pruneForMemoryPressure()
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         arSceneView.session.pause()
         updateTimer?.invalidate()
         altimeter.stopRelativeAltitudeUpdates()
-        stopTCASFlash()
+        offScreenArrowView?.stopAnimation()
     }
 
     deinit {
@@ -980,7 +1013,6 @@ class ARTrafficViewController: UIViewController {
 
         switch newLevel {
         case .none:
-            stopTCASFlash()
             tcasOverlayView.layer.borderColor = UIColor.clear.cgColor
             // Returning to normal — restore all aircraft visibility and clear auto-selection
             if levelChanged {
@@ -989,7 +1021,6 @@ class ARTrafficViewController: UIViewController {
             }
 
         case .trafficAdvisory:
-            stopTCASFlash()
             tcasOverlayView.layer.borderColor =
                 UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.85).cgColor
             // Restore full aircraft visibility (RA isolation may have been active)
@@ -1002,7 +1033,6 @@ class ARTrafficViewController: UIViewController {
             }
 
         case .resolutionAdvisory:
-            stopTCASFlash()
             tcasOverlayView.layer.borderColor = UIColor.red.cgColor
             // Hide all non-threat aircraft — show only RA/TA targets
             let threatIDs = Set(tcas.threats.keys)
@@ -1015,12 +1045,6 @@ class ARTrafficViewController: UIViewController {
                 }
             }
         }
-    }
-
-    private func stopTCASFlash() {
-        tcasFlashTimer?.invalidate()
-        tcasFlashTimer = nil
-        tcasFlashState = false
     }
 
     // MARK: - HUD
