@@ -614,6 +614,10 @@ class ARSceneManager {
         var currentIDs = Set<String>()
         var visibleAircraft: [Aircraft] = []
         var nodesAdded = false
+        /// Cap new node creation per tick to avoid freezing SceneKit when a filter
+        /// suddenly makes many aircraft visible at once (e.g. enabling ground traffic).
+        let maxNewNodesPerTick = 20
+        var newNodesThisTick   = 0
 
         for ac in aircraft {
             // Filter out ground aircraft unless the user has enabled them
@@ -651,6 +655,10 @@ class ARSceneManager {
                     tcasLevel: tcasLevel
                 )
             } else {
+                // Throttle new node creation to avoid a main-thread spike
+                guard newNodesThisTick < maxNewNodesPerTick else { continue }
+                newNodesThisTick += 1
+
                 let node = ARComponentFactory.createAircraftMarker(
                     rawPosition: rawPos,
                     aircraft: ac,
