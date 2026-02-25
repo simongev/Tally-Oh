@@ -133,6 +133,7 @@ class ARTrafficViewController: UIViewController {
     private var tcasOverlayView: UIView!
     private var tcasFlashTimer: Timer?
     private var tcasFlashState: Bool = false
+    private var lastAppliedTCASLevel: TCASAlertLevel = .none
 
     // MARK: - METAR Panel
 
@@ -511,7 +512,8 @@ class ARTrafficViewController: UIViewController {
                 updatedSettings.showLargeAirports   != old?.showLargeAirports  ||
                 updatedSettings.showMediumAirports  != old?.showMediumAirports ||
                 updatedSettings.showSmallAirports   != old?.showSmallAirports  ||
-                updatedSettings.callsignFilter      != old?.callsignFilter
+                updatedSettings.callsignFilter      != old?.callsignFilter      ||
+                updatedSettings.showGroundAircraft  != old?.showGroundAircraft
 
             if needsRebuild {
                 self.sceneManager?.clearAll()
@@ -710,11 +712,15 @@ class ARTrafficViewController: UIViewController {
             cameraPos = .init()
         }
 
-        // Evaluate TCAS state for this tick
+        // Evaluate TCAS state for this tick, passing ownship motion for CPA prediction
+        let ownship = connectionLogic.ownshipData
         let tcas = TCASSystem.evaluate(
             aircraft: aircraftList,
             userLocation: loc,
-            userAltitude: activeAltitude
+            userAltitude: activeAltitude,
+            userTrack: ownship?.track ?? userHeading,
+            userGroundSpeed: ownship?.groundSpeed ?? 0,
+            userVerticalRate: ownship?.verticalRate ?? 0
         )
         currentTCASEvaluation = tcas
         applyTCASOverlay(tcas)
@@ -858,29 +864,46 @@ class ARTrafficViewController: UIViewController {
     // MARK: - TCAS Overlay
 
     private func applyTCASOverlay(_ tcas: TCASEvaluation) {
-        switch tcas.overallLevel {
+        let newLevel = tcas.overallLevel
+        let levelChanged = newLevel != lastAppliedTCASLevel
+        lastAppliedTCASLevel = newLevel
+
+        switch newLevel {
         case .none:
             stopTCASFlash()
             tcasOverlayView.layer.borderColor = UIColor.clear.cgColor
+            // Returning to normal — restore all aircraft visibility and clear auto-selection
+            if levelChanged {
+                sceneManager?.setRAFilterActive(false, threatIDs: [])
+                clearSelection()
+            }
+
         case .trafficAdvisory:
             stopTCASFlash()
             tcasOverlayView.layer.borderColor =
                 UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.85).cgColor
-        case .resolutionAdvisory:
-            startTCASFlashIfNeeded()
-        }
-    }
+            // Restore full aircraft visibility (RA isolation may have been active)
+            if levelChanged {
+                sceneManager?.setRAFilterActive(false, threatIDs: [])
+                // Auto-select the primary (closest) TA threat aircraft
+                if let primaryID = tcas.threats.keys.first {
+                    applySelection(nodeID: "aircraft_\(primaryID)")
+                }
+            }
 
-    private func startTCASFlashIfNeeded() {
-        guard tcasFlashTimer == nil else { return }
-        tcasFlashState = true
-        tcasOverlayView.layer.borderColor = UIColor.red.cgColor
-        tcasFlashTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            self.tcasFlashState.toggle()
-            self.tcasOverlayView.layer.borderColor = self.tcasFlashState
-                ? UIColor.red.cgColor
-                : UIColor.clear.cgColor
+        case .resolutionAdvisory:
+            stopTCASFlash()
+            tcasOverlayView.layer.borderColor = UIColor.red.cgColor
+            // Hide all non-threat aircraft — show only RA/TA targets
+            let threatIDs = Set(tcas.threats.keys)
+            sceneManager?.setRAFilterActive(true, threatIDs: threatIDs)
+            if levelChanged {
+                // Auto-select the primary RA threat
+                if let primaryID = tcas.threats.first(where: { $0.value == .resolutionAdvisory })?.key
+                    ?? tcas.threats.keys.first {
+                    applySelection(nodeID: "aircraft_\(primaryID)")
+                }
+            }
         }
     }
 

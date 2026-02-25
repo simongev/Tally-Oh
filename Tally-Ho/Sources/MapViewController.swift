@@ -132,6 +132,7 @@ private final class MapCanvasView: UIView {
         if settings.showAircraft {
             for ac in aircraft {
                 guard settings.passes(callsign: ac.callsign) else { continue }
+                if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
                 let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
                 guard distNM <= rangeNM else { continue }
 
@@ -258,7 +259,6 @@ class MapViewController: UIViewController {
     private var rangeLabel: UILabel!
     private var decreaseButton: UIButton!
     private var increaseButton: UIButton!
-    private var scaleBarView: ScaleBarView!
 
     // MARK: - Timer
 
@@ -334,7 +334,7 @@ class MapViewController: UIViewController {
             canvasView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             canvasView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             canvasView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            canvasView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -88)
+            canvasView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -60)
         ])
     }
 
@@ -350,7 +350,7 @@ class MapViewController: UIViewController {
             controlBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             controlBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             controlBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            controlBar.heightAnchor.constraint(equalToConstant: 88)
+            controlBar.heightAnchor.constraint(equalToConstant: 60)
         ])
 
         decreaseButton = makeRoundButton(symbol: "minus.circle.fill")
@@ -365,16 +365,12 @@ class MapViewController: UIViewController {
         increaseButton = makeRoundButton(symbol: "plus.circle.fill")
         increaseButton.addTarget(self, action: #selector(increaseRange), for: .touchUpInside)
 
-        scaleBarView = ScaleBarView()
-        scaleBarView.translatesAutoresizingMaskIntoConstraints = false
-
         controlBar.addSubview(decreaseButton)
         controlBar.addSubview(rangeLabel)
         controlBar.addSubview(increaseButton)
-        controlBar.addSubview(scaleBarView)
 
         NSLayoutConstraint.activate([
-            decreaseButton.centerYAnchor.constraint(equalTo: controlBar.centerYAnchor, constant: -10),
+            decreaseButton.centerYAnchor.constraint(equalTo: controlBar.centerYAnchor),
             decreaseButton.leadingAnchor.constraint(equalTo: controlBar.leadingAnchor, constant: 24),
             decreaseButton.widthAnchor.constraint(equalToConstant: 44),
             decreaseButton.heightAnchor.constraint(equalToConstant: 44),
@@ -387,11 +383,6 @@ class MapViewController: UIViewController {
             increaseButton.trailingAnchor.constraint(equalTo: controlBar.trailingAnchor, constant: -24),
             increaseButton.widthAnchor.constraint(equalToConstant: 44),
             increaseButton.heightAnchor.constraint(equalToConstant: 44),
-
-            scaleBarView.topAnchor.constraint(equalTo: decreaseButton.bottomAnchor, constant: 6),
-            scaleBarView.leadingAnchor.constraint(equalTo: controlBar.leadingAnchor, constant: 24),
-            scaleBarView.trailingAnchor.constraint(equalTo: controlBar.trailingAnchor, constant: -24),
-            scaleBarView.heightAnchor.constraint(equalToConstant: 24)
         ])
     }
 
@@ -468,8 +459,6 @@ class MapViewController: UIViewController {
         rangeLabel.text = "\(Int(currentRangeNM)) NM"
         decreaseButton.alpha = currentRangeNM <= 10 ? 0.35 : 1.0
         increaseButton.alpha = currentRangeNM >= 50 ? 0.35 : 1.0
-
-        scaleBarView.rangeNM = currentRangeNM
     }
 
     // MARK: - Range buttons
@@ -493,42 +482,3 @@ class MapViewController: UIViewController {
     }
 }
 
-// MARK: - Scale Bar View
-
-private final class ScaleBarView: UIView {
-
-    var rangeNM: Double = 30 {
-        didSet { setNeedsDisplay() }
-    }
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        backgroundColor = .clear
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ rect: CGRect) {
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
-
-        let scaleValueNM = Int(rangeNM / 2)
-        let barWidth  = rect.width * 0.6
-        let barHeight: CGFloat = 4
-        let barY = rect.midY - barHeight / 2
-        let barX = (rect.width - barWidth) / 2
-
-        ctx.setFillColor(UIColor.white.withAlphaComponent(0.8).cgColor)
-        ctx.fill(CGRect(x: barX, y: barY, width: barWidth, height: barHeight))
-        ctx.fill(CGRect(x: barX,              y: barY - 4, width: 2, height: barHeight + 8))
-        ctx.fill(CGRect(x: barX + barWidth - 2, y: barY - 4, width: 2, height: barHeight + 8))
-
-        let label = "\(scaleValueNM) NM"
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),
-            .foregroundColor: UIColor.white.withAlphaComponent(0.8)
-        ]
-        let labelSize = (label as NSString).size(withAttributes: attrs)
-        (label as NSString).draw(
-            at: CGPoint(x: rect.midX - labelSize.width / 2, y: barY - labelSize.height - 2),
-            withAttributes: attrs)
-    }
-}

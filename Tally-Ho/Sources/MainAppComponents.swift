@@ -459,6 +459,9 @@ struct ARVisualizationSettings {
 
     var showAircraftDistance: Bool = false
 
+    /// When false (default), aircraft at or below 50 ft AGL are hidden (ground traffic).
+    var showGroundAircraft: Bool = false
+
     var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed || showAircraftDistance }
 
     private var _normalizedFilter: String = ""
@@ -514,6 +517,10 @@ class ARSceneManager {
 
     var arKitNorthCorrectionDeg: Double = 0
 
+    /// When true, only aircraft whose IDs are in raFilterThreatIDs are shown.
+    private var raFilterActive: Bool = false
+    private var raFilterThreatIDs: Set<String> = []
+
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
         sceneView.autoenablesDefaultLighting  = false
@@ -537,6 +544,7 @@ class ARSceneManager {
 
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
+            if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
@@ -576,7 +584,8 @@ class ARSceneManager {
         var nodesAdded = false
 
         for ac in aircraft {
-            guard ac.altitude > 50 else { continue }
+            // Filter out ground aircraft unless the user has enabled them
+            if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
 
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
             guard distNM <= settings.aircraftMaxDistance else { continue }
@@ -599,7 +608,8 @@ class ARSceneManager {
             let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
 
             if let existing = aircraftNodes[ac.id] {
-                existing.isHidden = false
+                // In RA isolation mode only show threat aircraft
+                existing.isHidden = raFilterActive && !raFilterThreatIDs.contains(ac.id)
                 ARComponentFactory.updateAircraftMarker(
                     node: existing,
                     aircraft: ac,
@@ -772,10 +782,11 @@ class ARSceneManager {
         nodesLock.unlock()
         let apSnap = airportNodes
 
-        let allContainers = Array(acSnap.values) + Array(apSnap.values)
-        for container in allContainers {
-            let isSelected   = (container.name == sel)
-            let hasSelection = (sel != nil)
+        let hasSelection = (sel != nil)
+
+        // Aircraft: hide labels when another aircraft is selected (keep rings/geometry visible)
+        for container in acSnap.values {
+            let isSelected = (container.name == sel)
             if let lbl = container.childNode(withName: "label", recursively: false) {
                 let shouldHide = hasSelection && !isSelected
                 if lbl.isHidden != shouldHide {
@@ -797,6 +808,21 @@ class ARSceneManager {
             }
             ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
         }
+
+        // Airports: labels always visible regardless of selection; only highlight the selected one
+        for container in apSnap.values {
+            let isSelected = (container.name == sel)
+            if let lbl = container.childNode(withName: "label", recursively: false) {
+                if lbl.isHidden {
+                    lbl.isHidden = false
+                    SCNTransaction.begin()
+                    SCNTransaction.animationDuration = 0.18
+                    lbl.opacity = 1
+                    SCNTransaction.commit()
+                }
+            }
+            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
+        }
     }
 
     func node(forID nodeID: String) -> SCNNode? {
@@ -810,6 +836,29 @@ class ARSceneManager {
             return airportNodes[icao]
         }
         return nil
+    }
+
+    // MARK: - RA Filter (Resolution Advisory isolation)
+
+    /// Activates or deactivates RA isolation mode.
+    /// When active, only aircraft in `threatIDs` are visible; all others are hidden.
+    func setRAFilterActive(_ active: Bool, threatIDs: Set<String>) {
+        raFilterActive    = active
+        raFilterThreatIDs = threatIDs
+
+        nodesLock.lock()
+        let snapshot = aircraftNodes
+        nodesLock.unlock()
+
+        for (id, node) in snapshot {
+            if active {
+                node.isHidden = !threatIDs.contains(id)
+            } else {
+                // Restore — the next updateAircraft tick will set visibility correctly,
+                // but unhide immediately so there's no flash when returning to normal.
+                node.isHidden = false
+            }
+        }
     }
 
     // MARK: Clear

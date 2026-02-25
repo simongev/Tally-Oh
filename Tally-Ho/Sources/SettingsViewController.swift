@@ -21,6 +21,7 @@ extension ARVisualizationSettings {
             "callsignFilter":        callsignFilter,
             "showAircraftSpeed":     showAircraftSpeed,
             "showAircraftDistance":  showAircraftDistance,
+            "showGroundAircraft":    showGroundAircraft,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -42,6 +43,7 @@ extension ARVisualizationSettings {
         s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
         s.showAircraftSpeed    = d["showAircraftSpeed"]    as? Bool   ?? s.showAircraftSpeed
         s.showAircraftDistance = d["showAircraftDistance"] as? Bool   ?? s.showAircraftDistance
+        s.showGroundAircraft   = d["showGroundAircraft"]   as? Bool   ?? s.showGroundAircraft
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -112,6 +114,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "e.g. B738, C172",
                 getter: { $0.showAircraftType },
                 setter: { $0.showAircraftType = $1 }
+            ),
+            .toggle(
+                title: "Show Aircraft on Ground",
+                subtitle: "Include aircraft at or below 50 ft",
+                getter: { $0.showGroundAircraft },
+                setter: { $0.showGroundAircraft = $1 }
             ),
             .toggle(
                 title: "Show Altitude",
