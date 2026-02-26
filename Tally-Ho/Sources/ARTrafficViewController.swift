@@ -18,75 +18,33 @@ private enum SelectionState: Equatable {
 
 // MARK: - Off-Screen Arrow View
 
-/// Full-screen transparent overlay that draws directional chevrons:
-///  • Off-screen targets  → chevron pinned to the screen edge.
-///  • On-screen TCAS auto-selected target → orbiting arrow that circles the
-///    aircraft's screen position, pointing inward so it's impossible to miss.
+/// Full-screen transparent overlay that draws directional edge chevrons pointing
+/// toward off-screen targets (TCAS threats and the user-selected aircraft).
+/// On-screen targets do not get an overlay arrow — the colored ring on the AR node
+/// is already prominent enough, and removing the orbiting animation saves the
+/// CADisplayLink + 60 Hz redraws that were a non-trivial RAM/CPU cost.
 private final class OffScreenArrowView: UIView {
 
     private struct ArrowEntry {
         var angle: CGFloat
         var center: CGPoint
         var color: UIColor
-        var isOnScreen: Bool = false   // true = floating orbit arrow, false = edge chevron
     }
 
-    /// Arrow for the user-selected node.
+    /// Arrow for the user-selected node (white).
     private var selectionArrow: ArrowEntry?
     /// Arrows for TCAS threat aircraft (amber = TA, red = RA).
     private var tcasArrows: [ArrowEntry] = []
 
-    // Orbit animation
-    private var orbitAngle: CGFloat = 0
-    private var displayLink: CADisplayLink?
-
-    // MARK: - Cached colors (avoid per-frame allocations in draw(_:))
-    private static let blackAlpha70 = UIColor.black.withAlphaComponent(0.70)
+    // MARK: - Cached color (avoid per-frame allocations in draw(_:))
     private static let blackAlpha65 = UIColor.black.withAlphaComponent(0.65)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isUserInteractionEnabled = false
-        startOrbitAnimation()
     }
     required init?(coder: NSCoder) { fatalError() }
-
-    deinit {
-        // Must invalidate before release so the run-loop drops its strong reference.
-        displayLink?.invalidate()
-        displayLink = nil
-    }
-
-    private func startOrbitAnimation() {
-        // Use a weak-target proxy to avoid the run-loop holding a strong reference
-        // to self, which would prevent deallocation if the view is removed.
-        let link = CADisplayLink(target: WeakTarget(self), selector: #selector(WeakTarget.tick(_:)))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    func stopAnimation() {
-        displayLink?.invalidate()
-        displayLink = nil
-    }
-
-    @objc private func tick() {
-        // Only redraw if we have an on-screen arrow that needs to animate
-        let hasOnScreen = (selectionArrow?.isOnScreen == true) ||
-                          tcasArrows.contains(where: { $0.isOnScreen })
-        guard hasOnScreen else { return }
-        orbitAngle += CGFloat(displayLink?.duration ?? 1.0/60.0) * 1.8   // ~1.8 rad/s
-        setNeedsDisplay()
-    }
-
-    /// Lightweight proxy that forwards CADisplayLink ticks with a weak reference,
-    /// preventing the run-loop from keeping OffScreenArrowView alive after removal.
-    private final class WeakTarget: NSObject {
-        weak var owner: OffScreenArrowView?
-        init(_ owner: OffScreenArrowView) { self.owner = owner }
-        @objc func tick(_ link: CADisplayLink) { owner?.tick() }
-    }
 
     // MARK: Selection arrow
 
@@ -98,21 +56,15 @@ private final class OffScreenArrowView: UIView {
 
     /// Show an edge chevron for an off-screen target.
     func show(angle: CGFloat, center: CGPoint) {
-        selectionArrow = ArrowEntry(angle: angle, center: center, color: .white, isOnScreen: false)
+        selectionArrow = ArrowEntry(angle: angle, center: center, color: .white)
         setNeedsDisplay()
-    }
-
-    /// Show a floating orbit arrow pointing at an on-screen TCAS target.
-    func showOnScreen(at screenPoint: CGPoint, color: UIColor) {
-        selectionArrow = ArrowEntry(angle: 0, center: screenPoint, color: color, isOnScreen: true)
-        // tick() will handle redraws
     }
 
     // MARK: TCAS arrows
 
-    func setTCASArrows(_ arrows: [(angle: CGFloat, center: CGPoint, color: UIColor, isOnScreen: Bool)]) {
+    func setTCASArrows(_ arrows: [(angle: CGFloat, center: CGPoint, color: UIColor)]) {
         tcasArrows = arrows.map {
-            ArrowEntry(angle: $0.angle, center: $0.center, color: $0.color, isOnScreen: $0.isOnScreen)
+            ArrowEntry(angle: $0.angle, center: $0.center, color: $0.color)
         }
         setNeedsDisplay()
     }
@@ -130,60 +82,8 @@ private final class OffScreenArrowView: UIView {
         guard !all.isEmpty else { return }
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         for entry in all {
-            if entry.isOnScreen {
-                drawOrbitArrow(ctx: ctx, entry: entry)
-            } else {
-                drawEdgeChevron(ctx: ctx, entry: entry)
-            }
+            drawEdgeChevron(ctx: ctx, entry: entry)
         }
-    }
-
-    /// Orbiting arrow that circles the on-screen aircraft position and points inward.
-    private func drawOrbitArrow(ctx: CGContext, entry: ArrowEntry) {
-        let orbitRadius: CGFloat = 52   // distance from aircraft screen centre
-        let arrowSize:   CGFloat = 22   // length of each arm of the chevron
-        let lineWidth:   CGFloat = 4
-
-        // Position on the orbit circle
-        let cx = entry.center.x + orbitRadius * cos(orbitAngle)
-        let cy = entry.center.y + orbitRadius * sin(orbitAngle)
-
-        // Arrow points inward (toward entry.center)
-        let inwardAngle = atan2(entry.center.y - cy, entry.center.x - cx)
-        let rotAngle    = inwardAngle + .pi / 2   // chevron tip points inward
-
-        // Dark background pill
-        let bgRadius: CGFloat = 18
-        ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 8, color: entry.color.withAlphaComponent(0.9).cgColor)
-        OffScreenArrowView.blackAlpha70.setFill()
-        let bgRect = CGRect(x: cx - bgRadius, y: cy - bgRadius,
-                            width: bgRadius * 2, height: bgRadius * 2)
-        ctx.fillEllipse(in: bgRect)
-        ctx.restoreGState()
-
-        // Chevron
-        ctx.saveGState()
-        ctx.translateBy(x: cx, y: cy)
-        ctx.rotate(by: rotAngle)
-
-        let armLen   = arrowSize * 0.5
-        let tipY     = -arrowSize * 0.45
-        let baseY    =  arrowSize * 0.25
-
-        ctx.setShadow(offset: .zero, blur: 6, color: entry.color.withAlphaComponent(1.0).cgColor)
-        ctx.setStrokeColor(entry.color.cgColor)
-        ctx.setLineWidth(lineWidth)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-
-        ctx.beginPath()
-        ctx.move(to: CGPoint(x: -armLen, y: baseY))
-        ctx.addLine(to: CGPoint(x: 0,      y: tipY))
-        ctx.addLine(to: CGPoint(x:  armLen, y: baseY))
-        ctx.strokePath()
-
-        ctx.restoreGState()
     }
 
     /// Classic edge-pinned chevron for off-screen targets.
@@ -344,7 +244,6 @@ class ARTrafficViewController: UIViewController {
         arSceneView.session.pause()
         updateTimer?.invalidate()
         altimeter.stopRelativeAltitudeUpdates()
-        offScreenArrowView?.stopAnimation()
     }
 
     deinit {
@@ -886,6 +785,16 @@ class ARTrafficViewController: UIViewController {
             cameraWorldPosition: cameraPos
         )
         connectionLogic.updateLocation(loc, altitudeFeet: activeAltitude)
+
+        // Update off-screen arrows at 4 Hz alongside the rest of the visualization.
+        // Previously these ran at 60 Hz inside renderer(_:updateAtTime:); at 4 Hz
+        // the arrow positions are more than accurate enough (aircraft move < 0.1 NM
+        // between ticks) and this saves a significant chunk of CPU/RAM each second.
+        if case .selected(let nodeID) = selectionState {
+            updateOffScreenArrow(for: nodeID)
+        }
+        updateTCASArrows()
+
         updateStatusLabel()
     }
 
@@ -893,7 +802,7 @@ class ARTrafficViewController: UIViewController {
 
     private func updateOffScreenArrow(for nodeID: String) {
         guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else {
-            DispatchQueue.main.async { self.offScreenArrowView.hide() }
+            offScreenArrowView.hide()
             return
         }
 
@@ -906,26 +815,10 @@ class ARTrafficViewController: UIViewController {
             && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
             && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
 
-        // Determine arrow color: TCAS threat color or plain white for manual selection
-        let arrowColor: UIColor
-        let isTCASAutoSelect = currentTCASEvaluation.overallLevel != .none
-        if isTCASAutoSelect {
-            let tcasID = nodeID.hasPrefix("aircraft_")
-                ? String(nodeID.dropFirst("aircraft_".count)) : nodeID
-            let level = currentTCASEvaluation.threats[tcasID] ?? currentTCASEvaluation.overallLevel
-            arrowColor = level == .resolutionAdvisory
-                ? UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0)
-                : UIColor(red: 1.0, green: 0.6,  blue: 0.0, alpha: 1.0)
-        } else {
-            arrowColor = .white
-        }
-
+        // When the target is already visible on screen, no overlay arrow is needed —
+        // the TCAS ring on the 3D node is sufficient indication.
         if onScreen {
-            // Target visible on screen — show orbiting arrow around its screen position
-            let screenPt = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
-            DispatchQueue.main.async {
-                self.offScreenArrowView.showOnScreen(at: screenPt, color: arrowColor)
-            }
+            offScreenArrowView.hide()
             return
         }
 
@@ -935,7 +828,7 @@ class ARTrafficViewController: UIViewController {
             screenSize: screenSize,
             margin: 40
         )
-        DispatchQueue.main.async { self.offScreenArrowView.show(angle: angle, center: edgePoint) }
+        offScreenArrowView.show(angle: angle, center: edgePoint)
     }
 
     private func screenEdgePoint(
@@ -978,17 +871,19 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - TCAS Off-Screen Arrows
 
-    /// Runs at 60 Hz. For every active TCAS threat that is not the auto-selected node,
-    /// draws a colored chevron — at the screen edge if off-screen, orbiting if on-screen.
+    /// For every active TCAS threat that is not the auto-selected node,
+    /// draws a colored edge chevron when the aircraft is off-screen.
+    /// On-screen threats already have a colored TCAS ring; no overlay needed.
+    /// Called from the 4 Hz update loop — not the 60 Hz renderer callback.
     private func updateTCASArrows() {
         let tcas = currentTCASEvaluation
         guard tcas.overallLevel != .none else {
-            DispatchQueue.main.async { self.offScreenArrowView.clearTCASArrows() }
+            offScreenArrowView.clearTCASArrows()
             return
         }
 
         let screenSize = arSceneView.bounds.size
-        var arrowData: [(angle: CGFloat, center: CGPoint, color: UIColor, isOnScreen: Bool)] = []
+        var arrowData: [(angle: CGFloat, center: CGPoint, color: UIColor)] = []
 
         for (id, level) in tcas.threats {
             let nodeID = "aircraft_\(id)"
@@ -1003,26 +898,23 @@ class ARTrafficViewController: UIViewController {
                 && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
                 && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
 
+            // On-screen threats don't need an overlay — the ring is enough.
+            guard !onScreen else { continue }
+
             let color: UIColor = level == .resolutionAdvisory
                 ? UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0)  // RA — vivid red
                 : UIColor(red: 1.0, green: 0.6,  blue: 0.0, alpha: 1.0)  // TA — amber
 
-            if onScreen {
-                let screenPt = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
-                arrowData.append((angle: 0, center: screenPt, color: color, isOnScreen: true))
-            } else {
-                let (edgePoint, angle) = screenEdgePoint(
-                    projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
-                    isBehindCamera: behindCamera,
-                    screenSize: screenSize,
-                    margin: 40
-                )
-                arrowData.append((angle: angle, center: edgePoint, color: color, isOnScreen: false))
-            }
+            let (edgePoint, angle) = screenEdgePoint(
+                projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
+                isBehindCamera: behindCamera,
+                screenSize: screenSize,
+                margin: 40
+            )
+            arrowData.append((angle: angle, center: edgePoint, color: color))
         }
 
-        let data = arrowData
-        DispatchQueue.main.async { self.offScreenArrowView.setTCASArrows(data) }
+        offScreenArrowView.setTCASArrows(arrowData)
     }
 
     // MARK: - TCAS Overlay
@@ -1173,11 +1065,6 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
-
-        if case .selected(let nodeID) = selectionState {
-            updateOffScreenArrow(for: nodeID)
-        }
-        updateTCASArrows()
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
