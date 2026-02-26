@@ -600,6 +600,17 @@ class ARSceneManager {
     private weak var sceneView: ARSCNView?
     private var aircraftNodes: [String: SCNNode] = [:]
     private var airportNodes:  [String: SCNNode] = [:]
+
+    /// Read-only snapshot consumed by tickAircraftPositions() on the SceneKit thread.
+    /// Always written on the main thread (at the end of updateAircraft), read on the
+    /// SceneKit rendering thread. Accessing a Swift Dictionary from two threads is safe
+    /// when one side is purely reading and Dictionary is a value type (copy-on-write) —
+    /// the snapshot is replaced atomically via a single pointer swap by the runtime.
+    /// This removes the need for nodesLock in the 60 Hz hot path entirely.
+    private var tickNodeSnapshot: [String: SCNNode] = [:]
+
+    /// Legacy lock kept for the (rare) paths that still modify aircraftNodes and
+    /// airportNodes from non-main contexts. tickAircraftPositions no longer uses it.
     private let nodesLock = NSLock()
     var settings = ARVisualizationSettings()
 
@@ -633,9 +644,8 @@ class ARSceneManager {
         let userLoc  = liveUserLocation
         let userAlt  = liveUserAltitude
 
-        nodesLock.lock()
-        let nodeSnapshot = aircraftNodes
-        nodesLock.unlock()
+        // Use the pre-built snapshot written by the main thread — no lock needed.
+        let nodeSnapshot = tickNodeSnapshot
 
         let northCorrection = arKitNorthCorrectionDeg
 
@@ -778,6 +788,12 @@ class ARSceneManager {
             lastAppliedSelectionID = "___unset___"
         }
         applySelectionToAllNodes()
+
+        // Refresh the lock-free snapshot consumed by tickAircraftPositions().
+        // This always runs on the main thread, so the write is safe.
+        nodesLock.lock()
+        tickNodeSnapshot = aircraftNodes
+        nodesLock.unlock()
     }
 
     // MARK: Update Airports
@@ -996,6 +1012,7 @@ class ARSceneManager {
         let apNodes = Array(airportNodes.values)
         aircraftNodes.removeAll()
         airportNodes.removeAll()
+        tickNodeSnapshot.removeAll()
         nodesLock.unlock()
 
         liveAircraft = []
@@ -1033,5 +1050,11 @@ class ARSceneManager {
         pruned.forEach { $0.removeFromParentNode() }
         apNodes.forEach { $0.removeFromParentNode() }
         SCNTransaction.commit()
+
+        // Refresh the tick snapshot so the rendering thread doesn't try to
+        // position nodes that have just been removed from the scene.
+        nodesLock.lock()
+        tickNodeSnapshot = aircraftNodes
+        nodesLock.unlock()
     }
 }

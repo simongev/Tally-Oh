@@ -429,6 +429,23 @@ class ARTrafficViewController: UIViewController {
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
+
+        // Safety net: pause the ARSession the moment the app is backgrounded,
+        // regardless of whether viewWillDisappear was called first.
+        // ARKit running in the background causes a silent watchdog kill (no crash report).
+        NotificationCenter.default.addObserver(
+            forName: .appDidBackground, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.arSceneView.session.pause()
+            self?.updateTimer?.fireDate = .distantFuture   // suspend the 4 Hz tick too
+        }
+        NotificationCenter.default.addObserver(
+            forName: .appWillForeground, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.isViewLoaded, self.view.window != nil else { return }
+            self.startARSession()
+            self.updateTimer?.fireDate = Date()            // resume immediately
+        }
     }
 
     private func setupAltimeter() {
