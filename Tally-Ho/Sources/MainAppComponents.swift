@@ -73,6 +73,16 @@ class ARComponentFactory {
     static let labelFontAirport: UIFont =
         UIFont.boldSystemFont(ofSize: labelFontSizeAirport * 80)
 
+    /// Label image cache — avoids re-rendering UIGraphicsImageRenderer for text
+    /// that hasn't changed. Aircraft labels update at most a few times per minute
+    /// (altitude, speed, distance), so cache hits are very frequent.
+    /// Bounded to 50 entries (~2 MB max) so it can't grow unbounded.
+    private static let labelImageCache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.countLimit = 50
+        return c
+    }()
+
     // MARK: - Pre-cached ring images & materials per TCAS level
     // Images and SCNMaterials are created once and shared across all aircraft nodes.
     // Each level gets its own radius + thickness so TCAS rings are visually distinct.
@@ -407,6 +417,9 @@ class ARComponentFactory {
     }
 
     /// Render multi-line text with a semi-opaque rounded-rect background into a UIImage.
+    /// Results are cached by a composite key (text + fontSize) so repeated calls with
+    /// the same content skip the UIGraphicsImageRenderer entirely, cutting both CPU and
+    /// GPU upload work. The cache is bounded to 50 entries.
     static func makeLabelImage(
         text: String,
         textColor: UIColor,
@@ -414,6 +427,10 @@ class ARComponentFactory {
         fontSize: CGFloat,
         font: UIFont? = nil
     ) -> UIImage {
+        // Cache key encodes both content and size so different font sizes don't collide.
+        let cacheKey = "\(text)__\(fontSize)" as NSString
+        if let cached = labelImageCache.object(forKey: cacheKey) { return cached }
+
         let resolvedFont = font ?? UIFont.boldSystemFont(ofSize: fontSize * 80)
         let paraStyle = NSMutableParagraphStyle()
         paraStyle.alignment = .center
@@ -438,7 +455,7 @@ class ARComponentFactory {
         let corner = fontSize * 22
 
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: imgW, height: imgH))
-        return renderer.image { ctx in
+        let image = renderer.image { ctx in
             let rect = CGRect(x: 0, y: 0, width: imgW, height: imgH)
             let path = UIBezierPath(roundedRect: rect, cornerRadius: corner)
             bgColor.setFill()
@@ -446,6 +463,8 @@ class ARComponentFactory {
             let textRect = CGRect(x: hPad, y: vPad, width: textSize.width, height: textSize.height)
             attrStr.draw(in: textRect)
         }
+        labelImageCache.setObject(image, forKey: cacheKey)
+        return image
     }
 
     // MARK: - Update
@@ -763,6 +782,12 @@ class ARSceneManager {
 
     // MARK: Update Airports
 
+    /// Hard cap on the number of airport nodes allowed in the scene simultaneously.
+    /// Airports are sorted by distance first, so the nearest ones always win.
+    /// This limits peak VRAM from airport cone + label textures without affecting
+    /// which airports are *eligible* — all existing type and distance filters still apply.
+    private static let maxAirportNodes = 30
+
     func updateAirports(
         _ airports: [Airport],
         userLocation: CLLocationCoordinate2D,
@@ -772,11 +797,20 @@ class ARSceneManager {
     ) {
         let nearby: [Airport]
         if settings.showAirports {
-            nearby = CalculationsLogic.filterAirportsInRange(
+            // Apply type + distance filters, then keep only the nearest N.
+            // Sorting by distance ensures the cap removes the furthest airports first.
+            let filtered = CalculationsLogic.filterAirportsInRange(
                 airports: airports,
                 userCoord: userLocation,
                 maxRangeNauticalMiles: settings.airportMaxDistance
             ).filter { settings.shouldShow(airportType: $0.type) }
+             .sorted {
+                 CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: $0.coordinate)
+               < CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: $1.coordinate)
+             }
+            nearby = filtered.count <= ARSceneManager.maxAirportNodes
+                ? filtered
+                : Array(filtered.prefix(ARSceneManager.maxAirportNodes))
         } else {
             nearby = []
         }

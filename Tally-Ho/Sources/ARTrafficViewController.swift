@@ -458,6 +458,11 @@ class ARTrafficViewController: UIViewController {
     private var allAirports: [Airport] = []
 
     private func loadAirports() {
+        // Use the user's configured airport range, with a small safety margin so that
+        // airports just outside the display range are still available as the user moves.
+        // This keeps allAirports small — previously it always held every airport within
+        // 200 NM even when the user had set the display range to 10 NM.
+        let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
             DispatchQueue.main.async { [weak self] in
@@ -469,7 +474,7 @@ class ARTrafficViewController: UIViewController {
                         let nearby = CalculationsLogic.filterAirportsInRange(
                             airports: parsed,
                             userCoord: loc,
-                            maxRangeNauticalMiles: 200
+                            maxRangeNauticalMiles: rangeNM
                         )
                         DispatchQueue.main.async {
                             self?.airports = nearby
@@ -486,12 +491,15 @@ class ARTrafficViewController: UIViewController {
 
     private func refreshNearbyAirports() {
         guard let loc = userLocation ?? activeLocation else { return }
+        // Same 25% safety margin as loadAirports() — keeps the working set tight
+        // while ensuring airports at the edge of the display radius are included.
+        let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self else { return }
             let nearby = CalculationsLogic.filterAirportsInRange(
                 airports: self.allAirports,
                 userCoord: loc,
-                maxRangeNauticalMiles: 200
+                maxRangeNauticalMiles: rangeNM
             )
             DispatchQueue.main.async {
                 self.airports = nearby
