@@ -395,9 +395,46 @@ class ConnectionLogic: ObservableObject {
     private func mergeInternetAircraft(_ list: [Aircraft]) {
         let fetchTime = Date()   // record when the response was received
         DispatchQueue.main.async {
+            // Build an ownship filter set once per merge so the per-aircraft loop is fast.
+            // Filter 1 — ICAO hex match: when ADS-B is connected we know our own hex.
+            //   The ownship GDL90 message gives id = "OWNSHIP", but the ICAO hex is
+            //   embedded in the callsign field when the device sends both. We instead
+            //   derive the ownship hex from the ADS-B aircraft whose position exactly
+            //   matches ownshipData — but the simplest reliable approach is to store
+            //   the raw hex at parse time. For now, filter by position proximity only
+            //   (works for both ADS-B-connected and internet-only scenarios).
+            //
+            // Filter 2 — Position proximity: any internet aircraft within 0.1 NM of
+            //   the user's current GPS fix is almost certainly their own aircraft.
+            //   0.1 NM ≈ 185 m — tight enough to catch ownship, loose enough not to
+            //   accidentally drop a close-formation wingman (they'd be >0.1 NM at safe
+            //   separation).
+            let ownLoc = self.currentLocation
+
             var count = 0
             for var ac in list {
+                // Skip if an ADS-B aircraft with this ID already exists
                 if let existing = self.detectedAircraft[ac.id], existing.source == .adsb { continue }
+
+                // Skip if this is our own aircraft by ICAO hex (when ADS-B connected)
+                if let ownship = self.ownshipData {
+                    // ownshipData.id is "OWNSHIP" but the internet entry uses the real hex.
+                    // Match by position proximity: if the internet aircraft is within 0.1 NM
+                    // of our ADS-B-reported position it's us.
+                    let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude,
+                                                          longitude: ownship.longitude)
+                    let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownCoord,
+                                                                            to: ac.coordinate)
+                    if distNM < 0.1 { continue }
+                }
+
+                // Skip if within 0.1 NM of current iPhone GPS fix (internet-only mode)
+                if let ownLoc {
+                    let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc,
+                                                                            to: ac.coordinate)
+                    if distNM < 0.1 { continue }
+                }
+
                 // Stamp lastUpdate with the fetch-response time so dead-reckoning
                 // uses the real age of the data rather than a fixed 5-second offset.
                 ac.lastUpdate = fetchTime

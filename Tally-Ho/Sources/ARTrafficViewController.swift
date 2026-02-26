@@ -1242,6 +1242,46 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             lastAirportFilterLocation = loc.coordinate
             refreshNearbyAirports()
         }
+
+        // When airborne and moving fast enough for GPS track to be reliable, use
+        // it instead of the compass for north-correction. Inside an aircraft fuselage
+        // the magnetic field is distorted by engines/avionics, making the compass
+        // unreliable. GPS track is unaffected by electromagnetics and gives a stable,
+        // drift-free true-north reference at cruise speed.
+        // Speed threshold: 30 kt ≈ 15.4 m/s — below this GPS course can jump ±15°.
+        let speedMS = loc.speed   // m/s, negative means invalid
+        let courseValid = loc.courseAccuracy >= 0 && loc.courseAccuracy < 20 && speedMS >= 15.0
+        if tcasEnabled && courseValid, let frame = arSceneView.session.currentFrame {
+            // Prefer ADS-B ownship track (already true, high accuracy); fall back to
+            // iPhone GPS course (also true north, slightly noisier at low speeds).
+            let gpsTrueTrack: Double
+            if let ownship = connectionLogic.ownshipData, ownship.groundSpeed > 30 {
+                gpsTrueTrack = ownship.track
+            } else {
+                gpsTrueTrack = loc.course   // CLLocation.course is true north
+            }
+
+            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame)
+        }
+    }
+
+    /// Apply a single north-correction sample using the given true-north reference
+    /// and the current ARKit world yaw. Uses exponential smoothing (α = 0.15) to
+    /// filter noise; the first sample is applied instantly.
+    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame) {
+        let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
+        var sample = trueNorth - arYawDeg
+        while sample >  180 { sample -= 360 }
+        while sample < -180 { sample += 360 }
+
+        let alpha = 0.15
+        if northCorrectionSampleCount == 0 {
+            arKitNorthCorrectionDeg = sample
+        } else {
+            arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
+        }
+        northCorrectionSampleCount += 1
+        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
@@ -1261,20 +1301,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         userHeading = trueNorth
 
-        if accuracy <= 10, let frame = arSceneView.session.currentFrame {
-            let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
-            var sample = trueNorth - arYawDeg
-            while sample >  180 { sample -= 360 }
-            while sample < -180 { sample += 360 }
-
-            let alpha = 0.15
-            if northCorrectionSampleCount == 0 {
-                arKitNorthCorrectionDeg = sample
-            } else {
-                arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
-            }
-            northCorrectionSampleCount += 1
-            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+        // Use compass for north-correction only when NOT in airborne GPS-track mode.
+        // In-flight the compass is unreliable inside a metal fuselage; GPS track
+        // (applied in didUpdateLocations above) takes over when speed > 30 kt.
+        let usingGPSTrack = tcasEnabled && (connectionLogic.ownshipData?.groundSpeed ?? 0) > 30
+        if !usingGPSTrack, accuracy <= 10, let frame = arSceneView.session.currentFrame {
+            applyNorthCorrection(trueNorth: trueNorth, frame: frame)
         }
 
         updateStatusLabel()
