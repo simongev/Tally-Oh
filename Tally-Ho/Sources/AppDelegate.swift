@@ -36,15 +36,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         window?.rootViewController = calibration
         window?.makeKeyAndVisible()
 
-        calibration.onComplete = { [weak window] seedLocation in
+        calibration.onComplete = { [weak self] seedLocation in
+            guard let window = self?.window else { return }
             let arVC = ARTrafficViewController()
             arVC.seedLocation = seedLocation
             // Crossfade from calibration to AR
             UIView.transition(
-                with: window!,
+                with: window,
                 duration: 0.5,
                 options: .transitionCrossDissolve,
-                animations: { window?.rootViewController = arVC },
+                animations: { window.rootViewController = arVC },
                 completion: nil
             )
         }
