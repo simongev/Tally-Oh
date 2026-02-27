@@ -2,13 +2,15 @@
 //  CrashLogger.swift
 //  TallyOh - AR Aviation Traffic Visualization
 //
-//  Captures crashes that produce no .ips file (EXC_BAD_ACCESS, watchdog kills,
-//  uncaught exceptions) by installing a signal handler and an exception handler
-//  that write a plain-text log to the app's Documents directory before the
-//  process terminates. On the next launch the log is read and printed to the
-//  Xcode console (and stored so the user can retrieve it via Files).
+//  Captures crashes that produce no .ips file by installing signal and exception
+//  handlers that write a short log to UserDefaults before the process terminates.
+//  UserDefaults is backed by a memory-mapped plist that survives process death.
 //
-//  Usage: call CrashLogger.install() once in AppDelegate.application(_:didFinishLaunchingWithOptions:)
+//  On the next launch, if a log exists, an alert is shown on screen so the crash
+//  details can be read directly from the phone — no Xcode or USB required.
+//
+//  Usage: call CrashLogger.install() as the very first line of
+//         AppDelegate.application(_:didFinishLaunchingWithOptions:)
 //
 
 import Foundation
@@ -18,117 +20,100 @@ import UIKit
 
 final class CrashLogger {
 
-    static let logFileName = "tally_crash.log"
-
-    private static var logURL: URL? {
-        FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)
-            .first?
-            .appendingPathComponent(logFileName)
-    }
+    private static let udKey = "com.tallyoh.lastCrashLog"
 
     // MARK: - Install
 
-    /// Call once at app startup. Installs both an uncaught-exception handler and
-    /// POSIX signal handlers so crashes that bypass the normal crash reporter are
-    /// captured in a file that persists across launches.
     static func install() {
-        // Check for a crash log from the previous run first.
-        readAndPrintPreviousCrashLog()
+        // On next launch, show any crash log from the previous run.
+        // Call before setting up any other handlers so the alert fires early.
+        showPreviousCrashLogIfNeeded()
 
-        // Uncaught Swift/ObjC exceptions (e.g. force-unwrap of nil, bad cast).
+        // Uncaught Swift/ObjC exceptions (force-unwrap nil, bad cast, etc.)
         NSSetUncaughtExceptionHandler { exception in
-            let info = """
-            === Tally-Ho Uncaught Exception ===
-            Date: \(Date())
-            Name: \(exception.name.rawValue)
-            Reason: \(exception.reason ?? "nil")
-            Call Stack:
-            \(exception.callStackSymbols.joined(separator: "\n"))
-            User Info: \(exception.userInfo ?? [:])
+            let msg = """
+            EXCEPTION: \(exception.name.rawValue)
+            \(exception.reason ?? "no reason")
+            \(exception.callStackSymbols.prefix(20).joined(separator: "\n"))
             """
-            CrashLogger.write(info)
+            CrashLogger.save(msg)
         }
 
-        // POSIX signals: SIGSEGV (bad access), SIGABRT (abort/assertion),
-        // SIGBUS (bus error), SIGILL (illegal instruction), SIGFPE (float exception).
+        // Low-level signal crashes: EXC_BAD_ACCESS, abort, bus error, etc.
         for sig in [SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE] {
             signal(sig) { signum in
                 let name: String
                 switch signum {
                 case SIGSEGV: name = "SIGSEGV (EXC_BAD_ACCESS)"
-                case SIGABRT: name = "SIGABRT (abort / assertion failed)"
+                case SIGABRT: name = "SIGABRT (abort/assertion)"
                 case SIGBUS:  name = "SIGBUS  (bus error)"
                 case SIGILL:  name = "SIGILL  (illegal instruction)"
-                case SIGFPE:  name = "SIGFPE  (floating point exception)"
+                case SIGFPE:  name = "SIGFPE  (float exception)"
                 default:      name = "SIG\(signum)"
                 }
-                let info = """
-                === Tally-Ho Signal Crash ===
-                Date: \(Date())
-                Signal: \(name)
-                Thread: \(Thread.current) isMain=\(Thread.isMainThread)
-                """
-                CrashLogger.write(info)
-                // Re-raise so the OS default handler runs (generates a real crash report
-                // if conditions allow, and terminates the process).
+                let msg = "SIGNAL: \(name)\nThread: \(Thread.current)\nisMainThread: \(Thread.isMainThread)"
+                CrashLogger.save(msg)
                 signal(signum, SIG_DFL)
                 raise(signum)
             }
         }
     }
 
-    // MARK: - Write
+    // MARK: - Save
 
-    /// Write crash info to the persistent log file. Must be async-signal-safe enough
-    /// to run from a signal handler — uses only low-level file I/O.
-    static func write(_ text: String) {
-        guard let url = logURL else { return }
-        let entry = text + "\n\n"
-        if let data = entry.data(using: .utf8) {
-            // Append so multiple crashes in the same session accumulate.
-            if FileManager.default.fileExists(atPath: url.path) {
-                if let fh = try? FileHandle(forWritingTo: url) {
-                    fh.seekToEndOfFile()
-                    fh.write(data)
-                    try? fh.close()
-                }
-            } else {
-                try? data.write(to: url, options: .atomic)
-            }
+    /// Writes crash text to UserDefaults. UserDefaults is backed by a
+    /// memory-mapped file that the OS flushes to disk even if the process
+    /// is killed — making it reliable for crash-time writes.
+    static func save(_ text: String) {
+        let entry = "[\(Date())] Build \(buildNumber)\n\(text)"
+        // Append to any existing log so multiple crashes in one session accumulate.
+        let existing = UserDefaults.standard.string(forKey: udKey) ?? ""
+        let combined = existing.isEmpty ? entry : existing + "\n\n---\n\n" + entry
+        UserDefaults.standard.set(combined, forKey: udKey)
+        UserDefaults.standard.synchronize()   // flush immediately before process dies
+    }
+
+    // MARK: - Show on next launch
+
+    private static func showPreviousCrashLogIfNeeded() {
+        guard let log = UserDefaults.standard.string(forKey: udKey),
+              !log.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+
+        // Clear it now so it doesn't show again next time.
+        UserDefaults.standard.removeObject(forKey: udKey)
+        UserDefaults.standard.synchronize()
+
+        // Present the alert as soon as a window is available (after a short delay
+        // to let the UI settle after launch).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard let scene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene }).first,
+                  let window = scene.windows.first(where: { $0.isKeyWindow })
+                      ?? scene.windows.first,
+                  let root = window.rootViewController
+            else { return }
+
+            let alert = UIAlertController(
+                title: "⚠️ Previous Session Crashed",
+                message: log,
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "Copy & Dismiss", style: .default) { _ in
+                UIPasteboard.general.string = log
+            })
+            alert.addAction(UIAlertAction(title: "Dismiss", style: .cancel))
+
+            // Find the topmost presented controller to avoid presentation conflicts.
+            var presenter = root
+            while let next = presenter.presentedViewController { presenter = next }
+            presenter.present(alert, animated: true)
         }
     }
 
-    // MARK: - Read previous log
+    // MARK: - Helpers
 
-    private static func readAndPrintPreviousCrashLog() {
-        guard let url = logURL,
-              FileManager.default.fileExists(atPath: url.path),
-              let contents = try? String(contentsOf: url, encoding: .utf8),
-              !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return }
-
-        print("""
-
-        ╔══════════════════════════════════════════════╗
-        ║   TALLY-HO CRASH LOG FROM PREVIOUS SESSION   ║
-        ╚══════════════════════════════════════════════╝
-        \(contents)
-        ══════════════════════════════════════════════
-        Log saved at: \(url.path)
-        ══════════════════════════════════════════════
-
-        """)
-
-        // Archive and clear so it doesn't print again next launch.
-        let archiveURL = url.deletingLastPathComponent()
-            .appendingPathComponent("tally_crash_archive_\(Int(Date().timeIntervalSince1970)).log")
-        try? FileManager.default.moveItem(at: url, to: archiveURL)
-    }
-
-    // MARK: - Log path helper (for Settings display)
-
-    static var logDirectoryPath: String {
-        logURL?.deletingLastPathComponent().path ?? "unavailable"
+    private static var buildNumber: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
     }
 }
