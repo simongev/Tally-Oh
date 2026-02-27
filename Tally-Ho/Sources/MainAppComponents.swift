@@ -904,11 +904,26 @@ class ARSceneManager {
             }
         }
 
-        for icao in Set(airportNodes.keys).subtracting(visibleIDs) {
-            airportNodes[icao]?.isHidden = true
+        // Remove airport nodes that are no longer visible (out of range, filtered out,
+        // or bumped by the node cap). Previously these were only hidden, which meant
+        // airportNodes could grow beyond the cap and cause the visible set to oscillate
+        // each tick as slightly different airports won the cap — the "blinking" effect.
+        // Removing them outright keeps airportNodes ≤ maxAirportNodes and stable.
+        let staleAirportIDs = Set(airportNodes.keys).subtracting(visibleIDs)
+        var staleAirportNodes: [SCNNode] = []
+        for icao in staleAirportIDs {
+            if let n = airportNodes.removeValue(forKey: icao) {
+                staleAirportNodes.append(n)
+            }
+        }
+        if !staleAirportNodes.isEmpty {
+            SCNTransaction.begin()
+            SCNTransaction.disableActions = true
+            staleAirportNodes.forEach { $0.removeFromParentNode() }
+            SCNTransaction.commit()
         }
 
-        if airportNodesAdded {
+        if airportNodesAdded || !staleAirportNodes.isEmpty {
             lastAppliedSelectionID = "___unset___"
         }
         applySelectionToAllNodes()

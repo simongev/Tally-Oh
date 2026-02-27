@@ -28,6 +28,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
 
+        // Install crash logger FIRST — before any other setup — so signal and
+        // exception handlers are in place before the AR session, SceneKit, and
+        // network stack start up. On the next launch it prints any captured log
+        // to the Xcode console so crashes with no .ips file can be investigated.
+        CrashLogger.install()
+
         // Create window
         window = UIWindow(frame: UIScreen.main.bounds)
 
