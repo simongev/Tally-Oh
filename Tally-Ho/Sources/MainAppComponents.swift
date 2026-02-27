@@ -601,16 +601,15 @@ class ARSceneManager {
     private var aircraftNodes: [String: SCNNode] = [:]
     private var airportNodes:  [String: SCNNode] = [:]
 
-    /// Read-only snapshot consumed by tickAircraftPositions() on the SceneKit thread.
-    /// Always written on the main thread (at the end of updateAircraft), read on the
-    /// SceneKit rendering thread. Accessing a Swift Dictionary from two threads is safe
-    /// when one side is purely reading and Dictionary is a value type (copy-on-write) —
-    /// the snapshot is replaced atomically via a single pointer swap by the runtime.
-    /// This removes the need for nodesLock in the 60 Hz hot path entirely.
+    /// Snapshot of aircraftNodes consumed by tickAircraftPositions() on the SceneKit
+    /// rendering thread at 60 Hz. Both reads (SceneKit thread) and writes (main thread)
+    /// are protected by nodesLock to prevent a data race — Swift Dictionary's
+    /// copy-on-write does NOT guarantee thread safety; concurrent read+write on the
+    /// underlying buffer causes EXC_BAD_ACCESS with no crash report.
     private var tickNodeSnapshot: [String: SCNNode] = [:]
 
-    /// Legacy lock kept for the (rare) paths that still modify aircraftNodes and
-    /// airportNodes from non-main contexts. tickAircraftPositions no longer uses it.
+    /// Protects tickNodeSnapshot across the main thread (writer) and the SceneKit
+    /// rendering thread (reader). Also guards aircraftNodes during stale-node removal.
     private let nodesLock = NSLock()
     var settings = ARVisualizationSettings()
 
@@ -644,8 +643,13 @@ class ARSceneManager {
         let userLoc  = liveUserLocation
         let userAlt  = liveUserAltitude
 
-        // Use the pre-built snapshot written by the main thread — no lock needed.
+        // Take the snapshot under the lock — the main thread writes tickNodeSnapshot
+        // at 4 Hz and this runs at 60 Hz on the SceneKit thread; without the lock
+        // a concurrent read+write causes EXC_BAD_ACCESS (Swift Dictionary is not
+        // thread-safe; copy-on-write does not protect against concurrent mutation).
+        nodesLock.lock()
         let nodeSnapshot = tickNodeSnapshot
+        nodesLock.unlock()
 
         let northCorrection = arKitNorthCorrectionDeg
 
@@ -813,20 +817,23 @@ class ARSceneManager {
     ) {
         let nearby: [Airport]
         if settings.showAirports {
-            // Apply type + distance filters, then keep only the nearest N.
-            // Sorting by distance ensures the cap removes the furthest airports first.
+            // Apply type + distance filters, pre-compute distance once per airport
+            // (not twice per comparison pair), then sort and cap at maxAirportNodes.
             let filtered = CalculationsLogic.filterAirportsInRange(
                 airports: airports,
                 userCoord: userLocation,
                 maxRangeNauticalMiles: settings.airportMaxDistance
             ).filter { settings.shouldShow(airportType: $0.type) }
-             .sorted {
-                 CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: $0.coordinate)
-               < CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: $1.coordinate)
-             }
-            nearby = filtered.count <= ARSceneManager.maxAirportNodes
-                ? filtered
-                : Array(filtered.prefix(ARSceneManager.maxAirportNodes))
+
+            // Decorate-sort-undecorate: compute Haversine once per airport.
+            let withDist = filtered.map { airport -> (airport: Airport, dist: Double) in
+                (airport, CalculationsLogic.distanceInNauticalMiles(from: userLocation,
+                                                                     to: airport.coordinate))
+            }.sorted { $0.dist < $1.dist }
+
+            let capped = withDist.count <= ARSceneManager.maxAirportNodes
+                ? withDist : Array(withDist.prefix(ARSceneManager.maxAirportNodes))
+            nearby = capped.map { $0.airport }
         } else {
             nearby = []
         }
