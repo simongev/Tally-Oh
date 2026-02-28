@@ -91,7 +91,7 @@ class ARComponentFactory {
     private static let ringImageNormal: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadius),
         thickness:   CGFloat(aircraftRingThickness),
-        color: UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1))
+        color: UIColor(red: 1.0, green: 0.85, blue: 0.0, alpha: 1.0))  // yellow — unselected normal traffic
 
     private static let ringImageTA: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusTA),
@@ -311,13 +311,15 @@ class ARComponentFactory {
                 // The ring plane uses a *shared* SCNMaterial per TCAS level.
                 // NEVER mutate it directly — clone it for selection, restore shared on deselect.
                 if selected {
+                    // Selected aircraft: bright red ring so it stands out clearly.
                     if let existing = plane.materials.first {
                         let copy = existing.copy() as! SCNMaterial
-                        copy.emission.contents = UIColor(red: 1.0, green: 0.95, blue: 0.6, alpha: 1.0)
+                        copy.diffuse.contents  = UIColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0)
+                        copy.emission.contents = UIColor(red: 0.6, green: 0.0, blue: 0.0, alpha: 1.0)
                         plane.materials = [copy]
                     }
                 } else {
-                    // Restore the shared material using the stored TCAS level tag
+                    // Restore the shared material (yellow for normal, amber/red for TCAS).
                     let levelRaw = node.accessibilityLabel.flatMap { Int($0) } ?? 0
                     let level = TCASAlertLevel(rawValue: levelRaw) ?? .none
                     plane.materials = [ringMaterial(for: level)]
@@ -619,7 +621,7 @@ class ARSceneManager {
     // caused slightly different airports to win the distance-sort cap each tick,
     // producing the "blinking" effect.
     private var cachedNearbyAirports: [Airport] = []
-    private var lastAirportComputeLocation: CLLocationCoordinate2D? = nil
+    var lastAirportComputeLocation: CLLocationCoordinate2D? = nil   // internal(set) exposed for cache invalidation
     private let airportRecomputeThresholdNM: Double = 0.1
 
     init(sceneView: ARSCNView) {

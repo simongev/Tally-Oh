@@ -104,7 +104,11 @@ class ConnectionLogic: ObservableObject {
 
     // MARK: Private — Cleanup
 
-    private let aircraftTimeout: TimeInterval = 60.0
+    // Internet fetch runs every 8s. With a 60s timeout, a single slow fetch (network
+    // spike > 60s) causes aircraft to vanish then reappear. 90s gives 11 fetch cycles
+    // of slack — enough for transient connectivity hiccups without keeping stale data
+    // long enough to matter.
+    private let aircraftTimeout: TimeInterval = 90.0
     private var cleanupTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
@@ -446,7 +450,10 @@ class ConnectionLogic: ObservableObject {
     // MARK: - Private — Cleanup
 
     private func setupCleanupTimer() {
-        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+        // Run cleanup at 30s — long enough that the 8s fetch has multiple chances to
+        // refresh an aircraft before cleanup considers it stale. Previously at 10s the
+        // cleanup and fetch could race, causing brief disappearances.
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             let cutoff = Date().addingTimeInterval(-self.aircraftTimeout)
             DispatchQueue.main.async {

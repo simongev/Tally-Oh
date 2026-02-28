@@ -161,7 +161,13 @@ class ARTrafficViewController: UIViewController {
 
     // MARK: - State
 
-    private var airports: [Airport] = []
+    // Invalidate the scene manager's airport stable-set cache whenever the source
+    // list changes (async CSV load or range refresh). Without this, airports loaded
+    // after the first updateAirports() tick would be silently ignored because the
+    // cache thinks "nothing nearby" is the correct answer for the current location.
+    private var airports: [Airport] = [] {
+        didSet { sceneManager?.lastAirportComputeLocation = nil }
+    }
     private var currentTCASEvaluation: TCASEvaluation = .clear
 
     var seedLocation: CLLocation?
