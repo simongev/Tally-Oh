@@ -35,30 +35,49 @@ class AirportDataParser {
     /// Returns nil if the file cannot be found or parsed
     static func loadAirportsFromCSV() -> [Airport]? {
         guard let url = Bundle.main.url(forResource: "airports", withExtension: "csv") else {
-            print("⚠️ airports.csv not found in bundle")
             return nil
         }
 
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            print("⚠️ Could not read airports.csv")
-            return nil
-        }
+        // Stream line-by-line instead of loading the entire 12 MB file into one String
+        // and splitting it into 83,000 substrings simultaneously.  Each line is processed
+        // inside its own autoreleasepool so intermediate String allocations (field splits,
+        // trims) are freed immediately rather than surviving until the run-loop drains.
+        guard let stream = InputStream(url: url) else { return nil }
+        stream.open()
+        defer { stream.close() }
 
-        // Split on newlines; pre-allocate assuming ~50% of rows pass type filter.
-        let lines = content.components(separatedBy: "\n")
         var airports: [Airport] = []
-        airports.reserveCapacity(lines.count / 2)
+        airports.reserveCapacity(9_000)   // ~9k public airports in the OurAirports dataset
 
-        // Skip header row (index 0)
-        for line in lines.dropFirst() {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
+        var lineBuffer = ""
+        let bufSize = 65_536
+        var buf = [UInt8](repeating: 0, count: bufSize)
+        var isFirstLine = true
 
-            guard let airport = parseCSVLine(trimmed) else { continue }
-            airports.append(airport)
+        func processLine(_ line: String) {
+            if isFirstLine { isFirstLine = false; return }   // skip CSV header
+            autoreleasepool {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, let airport = parseCSVLine(trimmed) else { return }
+                airports.append(airport)
+            }
         }
 
-        print("✅ Loaded \(airports.count) airports from CSV")
+        while stream.hasBytesAvailable {
+            let bytesRead = stream.read(&buf, maxLength: bufSize)
+            guard bytesRead > 0 else { break }
+            let chunk = String(bytes: buf[..<bytesRead], encoding: .utf8) ?? ""
+            var searchStart = chunk.startIndex
+            while let newline = chunk[searchStart...].firstIndex(of: "\n") {
+                lineBuffer += chunk[searchStart..<newline]
+                processLine(lineBuffer)
+                lineBuffer = ""
+                searchStart = chunk.index(after: newline)
+            }
+            lineBuffer += chunk[searchStart...]
+        }
+        if !lineBuffer.isEmpty { processLine(lineBuffer) }
+
         return airports
     }
 
@@ -81,7 +100,6 @@ class AirportDataParser {
             return nil
         }
 
-        // Airport type — filter to public airports only
         let airportType = fields[Column.type.rawValue]
         guard publicAirportTypes.contains(airportType) else { return nil }
 
