@@ -188,17 +188,6 @@ class ARComponentFactory {
         }
     }
 
-    /// Pulse parameters (peak scale, half-cycle duration) for a given TCAS level.
-    /// Returns nil for .none — normal traffic rings are static (no animation),
-    /// which saves SceneKit from evaluating up to 200 repeatForever actions at 60 Hz.
-    /// Animation is reserved for TA/RA where it carries a real safety meaning.
-    static func pulseParams(for tcasLevel: TCASAlertLevel) -> (maxScale: CGFloat, halfDuration: Double)? {
-        switch tcasLevel {
-        case .none:               return nil              // static ring — no animation
-        case .trafficAdvisory:    return (1.30, 0.45)    // noticeable, moderate speed
-        case .resolutionAdvisory: return (1.50, 0.22)    // urgent, fast, large pop
-        }
-    }
 
     // MARK: - Aircraft Marker
 
@@ -229,15 +218,6 @@ class ARComponentFactory {
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
 
-        // Pulsing animation only for TCAS alerts (TA/RA) — normal traffic rings are static.
-        // Eliminating 200 simultaneous repeatForever actions at 60 Hz saves significant CPU/RAM.
-        if let (pulseMax, halfDur) = pulseParams(for: tcasLevel) {
-            let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
-            let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
-            scaleUp.timingMode   = .easeInEaseOut
-            scaleDown.timingMode = .easeInEaseOut
-            ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
-        }
 
         container.addChildNode(ringNode)
 
@@ -316,8 +296,7 @@ class ARComponentFactory {
     /// Selected aircraft rings get a bright white emission halo + larger scale.
     static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
         SCNTransaction.begin()
-        SCNTransaction.animationDuration = 0.15
-        // Selected node is scaled up more prominently so it dominates the scene
+        SCNTransaction.disableActions = true
         container.scale = selected ? SCNVector3(1.55, 1.55, 1.55) : SCNVector3(1.0, 1.0, 1.0)
         container.enumerateChildNodes { node, _ in
             guard node.name != "label" else { return }
@@ -539,15 +518,6 @@ class ARComponentFactory {
                     // Swap to the shared material for this level
                     plane.materials = [ringMaterial(for: tcasLevel)]
                     SCNTransaction.commit()
-                }
-                ringNode.removeAllActions()
-                ringNode.scale = SCNVector3(1, 1, 1)   // reset any mid-pulse scale
-                if let (pulseMax, halfDur) = pulseParams(for: tcasLevel) {
-                    let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
-                    let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
-                    scaleUp.timingMode   = .easeInEaseOut
-                    scaleDown.timingMode = .easeInEaseOut
-                    ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
                 }
             }
         }
@@ -970,20 +940,8 @@ class ARSceneManager {
             if let lbl = container.childNode(withName: "label", recursively: false) {
                 let shouldHide = hasSelection && !isSelected
                 if lbl.isHidden != shouldHide {
-                    if shouldHide {
-                        lbl.isHidden = false
-                        SCNTransaction.begin()
-                        SCNTransaction.animationDuration = 0.18
-                        SCNTransaction.completionBlock = { lbl.isHidden = true }
-                        lbl.opacity = 0
-                        SCNTransaction.commit()
-                    } else {
-                        lbl.isHidden = false
-                        SCNTransaction.begin()
-                        SCNTransaction.animationDuration = 0.18
-                        lbl.opacity = 1
-                        SCNTransaction.commit()
-                    }
+                    lbl.opacity   = shouldHide ? 0 : 1
+                    lbl.isHidden  = shouldHide
                 }
             }
             ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
@@ -993,13 +951,8 @@ class ARSceneManager {
         for container in apSnap.values {
             let isSelected = (container.name == sel)
             if let lbl = container.childNode(withName: "label", recursively: false) {
-                if lbl.isHidden {
-                    lbl.isHidden = false
-                    SCNTransaction.begin()
-                    SCNTransaction.animationDuration = 0.18
-                    lbl.opacity = 1
-                    SCNTransaction.commit()
-                }
+                lbl.opacity  = 1
+                lbl.isHidden = false
             }
             ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
         }

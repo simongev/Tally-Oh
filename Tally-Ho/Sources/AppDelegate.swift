@@ -28,12 +28,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
 
-        // Install crash logger FIRST — before any other setup — so signal and
-        // exception handlers are in place before the AR session, SceneKit, and
-        // network stack start up. On the next launch it prints any captured log
-        // to the Xcode console so crashes with no .ips file can be investigated.
-        CrashLogger.install()
-
         // Create window
         window = UIWindow(frame: UIScreen.main.bounds)
 
@@ -59,8 +53,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // Configure appearance
         configureAppearance()
 
-        print("✈️ TallyOh AR Aviation App Started")
-
         return true
     }
 
@@ -73,10 +65,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
         UINavigationBar.appearance().standardAppearance = appearance
         UINavigationBar.appearance().scrollEdgeAppearance = appearance
-    }
-
-    func applicationWillResignActive(_ application: UIApplication) {
-        // Sent when the application is about to move from active to inactive state
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
@@ -95,7 +83,5 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         NotificationCenter.default.post(name: .appWillForeground, object: nil)
     }
 
-    func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused
-    }
+
 }
