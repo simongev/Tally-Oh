@@ -548,24 +548,28 @@ class ARTrafficViewController: UIViewController {
             updatedSettings.save()
             self.connectionLogic.updateInternetQueryRadius(updatedSettings.aircraftMaxDistance)
 
-            // Only rebuild the scene when a filter that can ADD new nodes is tightened
-            // (removing nodes is safe; adding potentially thousands at once crashes SceneKit).
-            // showGroundAircraft toggled ON is handled gracefully by the per-tick node budget —
-            // we do NOT clearAll() for it, so existing airborne nodes stay and ground nodes
-            // trickle in over a few update ticks.
-            let needsRebuild =
-                updatedSettings.showAircraft        != old?.showAircraft ||
-                updatedSettings.showAirports        != old?.showAirports ||
-                updatedSettings.aircraftMaxDistance  < (old?.aircraftMaxDistance  ?? 0) ||
-                updatedSettings.airportMaxDistance   < (old?.airportMaxDistance   ?? 0) ||
-                updatedSettings.showLargeAirports   != old?.showLargeAirports  ||
-                updatedSettings.showMediumAirports  != old?.showMediumAirports ||
-                updatedSettings.showSmallAirports   != old?.showSmallAirports  ||
-                updatedSettings.callsignFilter      != old?.callsignFilter      ||
-                updatedSettings.showGroundAircraft  == false   // turning OFF ground → prune
+            // Selectively clear only what changed — never wipe aircraft when only
+            // airport settings changed, and vice versa.
 
-            if needsRebuild {
-                self.sceneManager?.clearAll()
+            let airportSettingsChanged =
+                updatedSettings.showAirports       != old?.showAirports      ||
+                updatedSettings.airportMaxDistance  < (old?.airportMaxDistance ?? 0) ||
+                updatedSettings.showLargeAirports  != old?.showLargeAirports  ||
+                updatedSettings.showMediumAirports != old?.showMediumAirports ||
+                updatedSettings.showSmallAirports  != old?.showSmallAirports  ||
+                updatedSettings.showAirportDistance != old?.showAirportDistance
+
+            let aircraftSettingsChanged =
+                updatedSettings.showAircraft       != old?.showAircraft      ||
+                updatedSettings.aircraftMaxDistance < (old?.aircraftMaxDistance ?? 0) ||
+                updatedSettings.callsignFilter     != old?.callsignFilter     ||
+                updatedSettings.showGroundAircraft == false   // turning OFF ground → prune
+
+            if airportSettingsChanged {
+                self.sceneManager?.clearAirports()
+            }
+            if aircraftSettingsChanged {
+                self.sceneManager?.clearAircraft()
             }
         }
         let nav = UINavigationController(rootViewController: vc)

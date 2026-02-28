@@ -614,6 +614,14 @@ class ARSceneManager {
     private var raFilterActive: Bool = false
     private var raFilterThreatIDs: Set<String> = []
 
+    // Airport stable-set cache — recomputed only when the user moves >0.1 NM,
+    // not on every 4 Hz tick. GPS jitter within a stationary position previously
+    // caused slightly different airports to win the distance-sort cap each tick,
+    // producing the "blinking" effect.
+    private var cachedNearbyAirports: [Airport] = []
+    private var lastAirportComputeLocation: CLLocationCoordinate2D? = nil
+    private let airportRecomputeThresholdNM: Double = 0.1
+
     init(sceneView: ARSCNView) {
         self.sceneView = sceneView
         sceneView.autoenablesDefaultLighting  = false
@@ -803,23 +811,37 @@ class ARSceneManager {
     ) {
         let nearby: [Airport]
         if settings.showAirports {
-            // Apply type + distance filters, pre-compute distance once per airport
-            // (not twice per comparison pair), then sort and cap at maxAirportNodes.
-            let filtered = CalculationsLogic.filterAirportsInRange(
-                airports: airports,
-                userCoord: userLocation,
-                maxRangeNauticalMiles: settings.airportMaxDistance
-            ).filter { settings.shouldShow(airportType: $0.type) }
+            // Recompute the visible airport set only when the user has moved more than
+            // 0.1 NM from the last compute location. GPS jitter at a stationary position
+            // used to cause slightly different airports to win the distance-sort cap on
+            // every tick, making airport nodes blink as stale ones were removed and new
+            // ones were added. The cache keeps the set stable between meaningful moves.
+            let needsRecompute: Bool
+            if let last = lastAirportComputeLocation {
+                needsRecompute = CalculationsLogic.distanceInNauticalMiles(
+                    from: last, to: userLocation) > airportRecomputeThresholdNM
+            } else {
+                needsRecompute = true
+            }
 
-            // Decorate-sort-undecorate: compute Haversine once per airport.
-            let withDist = filtered.map { airport -> (airport: Airport, dist: Double) in
-                (airport, CalculationsLogic.distanceInNauticalMiles(from: userLocation,
-                                                                     to: airport.coordinate))
-            }.sorted { $0.dist < $1.dist }
+            if needsRecompute {
+                let filtered = CalculationsLogic.filterAirportsInRange(
+                    airports: airports,
+                    userCoord: userLocation,
+                    maxRangeNauticalMiles: settings.airportMaxDistance
+                ).filter { settings.shouldShow(airportType: $0.type) }
 
-            let capped = withDist.count <= ARSceneManager.maxAirportNodes
-                ? withDist : Array(withDist.prefix(ARSceneManager.maxAirportNodes))
-            nearby = capped.map { $0.airport }
+                let withDist = filtered.map { airport -> (airport: Airport, dist: Double) in
+                    (airport, CalculationsLogic.distanceInNauticalMiles(from: userLocation,
+                                                                         to: airport.coordinate))
+                }.sorted { $0.dist < $1.dist }
+
+                let capped = withDist.count <= ARSceneManager.maxAirportNodes
+                    ? withDist : Array(withDist.prefix(ARSceneManager.maxAirportNodes))
+                cachedNearbyAirports = capped.map { $0.airport }
+                lastAirportComputeLocation = userLocation
+            }
+            nearby = cachedNearbyAirports
         } else {
             nearby = []
         }
@@ -996,6 +1018,34 @@ class ARSceneManager {
 
     // MARK: Clear
 
+    /// Remove only airport nodes. Used when airport-specific settings change
+    /// so aircraft nodes are not unnecessarily destroyed and recreated.
+    func clearAirports() {
+        let apNodes = Array(airportNodes.values)
+        airportNodes.removeAll()
+        cachedNearbyAirports = []
+        lastAirportComputeLocation = nil
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        apNodes.forEach { $0.removeFromParentNode() }
+        SCNTransaction.commit()
+    }
+
+    /// Remove only aircraft nodes. Used when aircraft-specific settings change
+    /// so airport nodes are not unnecessarily destroyed and recreated.
+    func clearAircraft() {
+        nodesLock.lock()
+        let acNodes = Array(aircraftNodes.values)
+        aircraftNodes.removeAll()
+        tickNodeSnapshot.removeAll()
+        nodesLock.unlock()
+        liveAircraft = []
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        acNodes.forEach { $0.removeFromParentNode() }
+        SCNTransaction.commit()
+    }
+
     func clearAll() {
         nodesLock.lock()
         let acNodes = Array(aircraftNodes.values)
@@ -1006,6 +1056,10 @@ class ARSceneManager {
         nodesLock.unlock()
 
         liveAircraft = []
+        // Invalidate the airport stable-set cache so the next tick recomputes
+        // using the new settings rather than the stale pre-change set.
+        cachedNearbyAirports = []
+        lastAirportComputeLocation = nil
 
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
