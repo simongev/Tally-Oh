@@ -81,14 +81,34 @@ class ConnectionLogic: ObservableObject {
     // keep the traffic picture current as the aircraft flies.
     private let internetFetchInterval: TimeInterval = 8.0
     private var currentLocation: CLLocationCoordinate2D?
-    private let internetQueryRadius: Double = 50.0
+
+    /// Query radius for the internet fetch.  Kept in sync with the scene manager's
+    /// aircraftMaxDistance (set via updateInternetQueryRadius) so we never fetch a
+    /// much larger bubble than we can display — avoids storing thousands of aircraft
+    /// in detectedAircraft when only ~200 within 20 NM will ever be rendered.
+    private var internetQueryRadius: Double = 25.0
+
+    /// Called by ARSceneManager whenever aircraftMaxDistance changes.
+    func updateInternetQueryRadius(_ distanceNM: Double) {
+        // Fetch 25 % beyond the render limit so aircraft don't pop in at the edge.
+        internetQueryRadius = max(10, distanceNM * 1.25)
+    }
+
+    /// Hard cap on total internet aircraft stored.  Only 200 nodes can ever be
+    /// rendered, and the closest 200 by distance are chosen, so storing more than
+    /// ~100 provides no visual benefit while inflating the dictionary copied every tick.
+    private let maxInternetAircraft = 100
     /// Timestamp of the most recent internet fetch request — used to compute
     /// dynamic extrapolation latency in the dead-reckoning position predictor.
     private(set) var lastInternetFetchTime: Date?
 
     // MARK: Private — Cleanup
 
-    private let aircraftTimeout: TimeInterval = 60.0
+    // Internet fetch runs every 8s. With a 60s timeout, a single slow fetch (network
+    // spike > 60s) causes aircraft to vanish then reappear. 90s gives 11 fetch cycles
+    // of slack — enough for transient connectivity hiccups without keeping stale data
+    // long enough to matter.
+    private let aircraftTimeout: TimeInterval = 90.0
     private var cleanupTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
@@ -163,28 +183,6 @@ class ConnectionLogic: ObservableObject {
         // Check both the published flag AND the live path status so we don't
         // miss the window where NWPathMonitor hasn't fired its first callback yet.
         ensureInternetFetchRunning()
-    }
-
-    func addTestAircraft() {
-        // Place test aircraft ~200 m due north of user at the same altitude
-        // so it appears straight ahead in the AR scene regardless of heading.
-        // 0.0018° latitude ≈ 200 m north.
-        let baseLat = currentLocation?.latitude  ?? 37.7749
-        let baseLon = currentLocation?.longitude ?? -122.4194
-        let test = Aircraft(
-            id: "TEST01",
-            callsign: "TEST",
-            aircraftType: "C172",
-            latitude:  baseLat + 0.0018,   // ~200 m north
-            longitude: baseLon,
-            altitude:  currentAltitudeFeet, // same altitude as user → Y offset = 0
-            track: 180,                     // heading south (toward user)
-            groundSpeed: 0,
-            verticalRate: 0,
-            lastUpdate: Date(),
-            source: .internet
-        )
-        DispatchQueue.main.async { self.detectedAircraft[test.id] = test }
     }
 
     /// Last known user altitude in feet (set alongside currentLocation).
@@ -393,25 +391,69 @@ class ConnectionLogic: ObservableObject {
     }
 
     private func mergeInternetAircraft(_ list: [Aircraft]) {
-        let fetchTime = Date()   // record when the response was received
-        DispatchQueue.main.async {
-            var count = 0
+        let fetchTime = Date()
+
+        // Do all filtering on a background thread — no main-thread work until the
+        // single final assignment. This avoids jamming the main run loop with
+        // hundreds of individual dictionary mutations each firing @Published.
+        let currentAircraft = detectedAircraft   // value-type snapshot, safe to read here
+        let ownship         = ownshipData
+        let ownLoc          = currentLocation
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            let maxRadius      = self.internetQueryRadius   // render range + 25% buffer
+            let existingCount  = currentAircraft.values.filter { $0.source == .internet }.count
+            var slotsRemaining = max(0, self.maxInternetAircraft - existingCount)
+
+            var updates: [String: Aircraft] = [:]
             for var ac in list {
-                if let existing = self.detectedAircraft[ac.id], existing.source == .adsb { continue }
-                // Stamp lastUpdate with the fetch-response time so dead-reckoning
-                // uses the real age of the data rather than a fixed 5-second offset.
+                guard slotsRemaining > 0 else { break }
+
+                // Pre-filter by distance — aircraft outside render range are never stored.
+                // This keeps the dictionary small regardless of how many the API returns.
+                if let ownLoc {
+                    let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
+                    guard distNM <= maxRadius else { continue }
+
+                    // Skip ownship (within 0.1 NM of GPS fix)
+                    if distNM < 0.1 { continue }
+                }
+
+                // Skip if an ADS-B aircraft with this ID already exists
+                if let existing = currentAircraft[ac.id], existing.source == .adsb { continue }
+
+                // Skip ownship by proximity to ADS-B ownship position
+                if let ownship {
+                    let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude, longitude: ownship.longitude)
+                    if CalculationsLogic.distanceInNauticalMiles(from: ownCoord, to: ac.coordinate) < 0.1 { continue }
+                }
+
                 ac.lastUpdate = fetchTime
-                self.detectedAircraft[ac.id] = ac
-                count += 1
+                updates[ac.id] = ac
+                slotsRemaining -= 1
             }
-            self.internetAircraftCount = count
+
+            guard !updates.isEmpty else { return }
+
+            // Single assignment on main thread → one @Published fire, not one per aircraft.
+            DispatchQueue.main.async {
+                var merged = self.detectedAircraft
+                for (id, ac) in updates { merged[id] = ac }
+                self.detectedAircraft = merged
+                self.internetAircraftCount = updates.count
+            }
         }
     }
 
     // MARK: - Private — Cleanup
 
     private func setupCleanupTimer() {
-        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+        // Run cleanup at 30s — long enough that the 8s fetch has multiple chances to
+        // refresh an aircraft before cleanup considers it stale. Previously at 10s the
+        // cleanup and fetch could race, causing brief disappearances.
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             let cutoff = Date().addingTimeInterval(-self.aircraftTimeout)
             DispatchQueue.main.async {

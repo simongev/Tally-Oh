@@ -21,6 +21,7 @@ extension ARVisualizationSettings {
             "callsignFilter":        callsignFilter,
             "showAircraftSpeed":     showAircraftSpeed,
             "showAircraftDistance":  showAircraftDistance,
+            "showGroundAircraft":    showGroundAircraft,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -42,6 +43,7 @@ extension ARVisualizationSettings {
         s.callsignFilter       = d["callsignFilter"]       as? String ?? s.callsignFilter
         s.showAircraftSpeed    = d["showAircraftSpeed"]    as? Bool   ?? s.showAircraftSpeed
         s.showAircraftDistance = d["showAircraftDistance"] as? Bool   ?? s.showAircraftDistance
+        s.showGroundAircraft   = d["showGroundAircraft"]   as? Bool   ?? s.showGroundAircraft
         s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
@@ -114,6 +116,12 @@ class SettingsViewController: UITableViewController {
                 setter: { $0.showAircraftType = $1 }
             ),
             .toggle(
+                title: "Show Aircraft on Ground",
+                subtitle: "Include aircraft at or below 50 ft",
+                getter: { $0.showGroundAircraft },
+                setter: { $0.showGroundAircraft = $1 }
+            ),
+            .toggle(
                 title: "Show Altitude",
                 subtitle: "Altitude in feet MSL",
                 getter: { $0.showAircraftAltitude },
@@ -142,18 +150,6 @@ class SettingsViewController: UITableViewController {
         ]),
         Section(header: "🛫  Airports", rows: [
             .toggle(
-                title: "Show Airports",
-                subtitle: "Display airport cone markers in AR",
-                getter: { $0.showAirports },
-                setter: { $0.showAirports = $1 }
-            ),
-            .toggle(
-                title: "Show Distance",
-                subtitle: "Distance in NM on airport label",
-                getter: { $0.showAirportDistance },
-                setter: { $0.showAirportDistance = $1 }
-            ),
-            .toggle(
                 title: "Large Airports",
                 subtitle: "International & major airports",
                 getter: { $0.showLargeAirports },
@@ -170,6 +166,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "Local & general aviation airports",
                 getter: { $0.showSmallAirports },
                 setter: { $0.showSmallAirports = $1 }
+            ),
+            .toggle(
+                title: "Show Distance",
+                subtitle: "Distance in NM on airport label",
+                getter: { $0.showAirportDistance },
+                setter: { $0.showAirportDistance = $1 }
             ),
             .slider(
                 title: "Max Distance",
@@ -228,20 +230,15 @@ class SettingsViewController: UITableViewController {
 
         switch row {
         case let .toggle(title, subtitle, getter, setter):
-            let cell = tableView.dequeueReusableCell(withIdentifier: "toggle", for: indexPath)
-            cell.textLabel?.text = title
-            cell.textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
-            cell.detailTextLabel?.text = subtitle
-            cell.detailTextLabel?.textColor = .secondaryLabel
-            cell.detailTextLabel?.font = .systemFont(ofSize: 13)
-            cell.detailTextLabel?.numberOfLines = 2
-            cell.selectionStyle = .none
-
-            let sw = UISwitch()
-            sw.isOn = getter(settings)
-            sw.tag  = indexPath.section * 1000 + indexPath.row
-            sw.addTarget(self, action: #selector(switchToggled(_:)), for: .valueChanged)
-            cell.accessoryView = sw
+            let cell = tableView.dequeueReusableCell(withIdentifier: "toggle", for: indexPath) as! ToggleCell
+            cell.configure(
+                title: title,
+                subtitle: subtitle,
+                isOn: getter(settings)
+            ) { [weak self] newValue in
+                guard let self else { return }
+                setter(&self.settings, newValue)
+            }
             return cell
 
         case let .slider(title, subtitle, unit, min, max, step, getter, _):
@@ -278,19 +275,16 @@ class SettingsViewController: UITableViewController {
 
     // MARK: Actions
 
-    @objc private func switchToggled(_ sw: UISwitch) {
-        let sec = sw.tag / 1000
-        let row = sw.tag % 1000
-        guard sec < sections.count, row < sections[sec].rows.count else { return }
-        if case let .toggle(_, _, _, setter) = sections[sec].rows[row] {
-            setter(&settings, sw.isOn)
-        }
-    }
 }
 
 // MARK: - ToggleCell
 
+/// Reusable toggle cell that owns its UISwitch.
+/// Using configure(onChange:) avoids adding a new target on every dequeue.
 final class ToggleCell: UITableViewCell {
+
+    private let toggle = UISwitch()
+    private var onChange: ((Bool) -> Void)?
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
@@ -299,9 +293,22 @@ final class ToggleCell: UITableViewCell {
         detailTextLabel?.textColor = .secondaryLabel
         detailTextLabel?.font = .systemFont(ofSize: 13)
         detailTextLabel?.numberOfLines = 2
+        accessoryView = toggle
+        toggle.addTarget(self, action: #selector(switchChanged), for: .valueChanged)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, subtitle: String, isOn: Bool, onChange: @escaping (Bool) -> Void) {
+        textLabel?.text       = title
+        detailTextLabel?.text = subtitle
+        toggle.isOn           = isOn
+        self.onChange         = onChange
+    }
+
+    @objc private func switchChanged() {
+        onChange?(toggle.isOn)
+    }
 }
 
 // MARK: - SliderCell
