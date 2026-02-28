@@ -150,18 +150,6 @@ class SettingsViewController: UITableViewController {
         ]),
         Section(header: "🛫  Airports", rows: [
             .toggle(
-                title: "Show Airports",
-                subtitle: "Display airport cone markers in AR",
-                getter: { $0.showAirports },
-                setter: { $0.showAirports = $1 }
-            ),
-            .toggle(
-                title: "Show Distance",
-                subtitle: "Distance in NM on airport label",
-                getter: { $0.showAirportDistance },
-                setter: { $0.showAirportDistance = $1 }
-            ),
-            .toggle(
                 title: "Large Airports",
                 subtitle: "International & major airports",
                 getter: { $0.showLargeAirports },
@@ -178,6 +166,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "Local & general aviation airports",
                 getter: { $0.showSmallAirports },
                 setter: { $0.showSmallAirports = $1 }
+            ),
+            .toggle(
+                title: "Show Distance",
+                subtitle: "Distance in NM on airport label",
+                getter: { $0.showAirportDistance },
+                setter: { $0.showAirportDistance = $1 }
             ),
             .slider(
                 title: "Max Distance",

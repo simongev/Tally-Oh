@@ -88,20 +88,31 @@ class ARComponentFactory {
     // Images and SCNMaterials are created once and shared across all aircraft nodes.
     // Each level gets its own radius + thickness so TCAS rings are visually distinct.
 
+    // Default (no selection): all rings are RED — the most visible colour on a sky background.
+    // When a selection is active: selected ring stays RED, all other rings dim to YELLOW
+    // so the selected target stands out clearly.
+
     private static let ringImageNormal: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadius),
         thickness:   CGFloat(aircraftRingThickness),
-        color: UIColor(red: 1.0, green: 0.85, blue: 0.0, alpha: 1.0))  // yellow — unselected normal traffic
+        color: UIColor(red: 1.0, green: 0.15, blue: 0.15, alpha: 1.0))  // red — default, no selection
 
     private static let ringImageTA: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusTA),
         thickness:   CGFloat(aircraftRingThicknessTA),
-        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0))
+        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0))    // amber for TA
 
     private static let ringImageRA: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusRA),
         thickness:   CGFloat(aircraftRingThicknessRA),
-        color: UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0))
+        color: UIColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0))    // deep red for RA
+
+    /// Yellow ring used for UNSELECTED aircraft when a selection is active.
+    /// Must be an image (not a flat UIColor) so the SCNPlane stays an annulus, not a rectangle.
+    private static let ringImageSelected: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadius),
+        thickness:   CGFloat(aircraftRingThickness),
+        color: UIColor(red: 1.0, green: 0.85, blue: 0.0, alpha: 1.0))   // yellow — dimmed, not selected
 
     static func ringImage(for level: TCASAlertLevel) -> UIImage {
         switch level {
@@ -292,15 +303,24 @@ class ARComponentFactory {
 
     // MARK: - Selection Appearance
 
-    /// Apply or remove the selected visual state on a container node.
-    /// Selected aircraft rings get a bright white emission halo + larger scale.
-    static func applySelectedAppearance(to container: SCNNode, selected: Bool) {
+    /// Apply selection visual state to a container node.
+    ///
+    /// Ring colour rules:
+    ///   - No selection active  → all rings RED (default, `ringMaterial` / `ringImageNormal`)
+    ///   - Selection active, this node IS selected   → ring stays RED + scale up
+    ///   - Selection active, this node is NOT selected → ring dims to YELLOW (`ringImageSelected`)
+    ///
+    /// - Parameters:
+    ///   - selected:     True only when this specific container is the chosen target.
+    ///   - hasSelection: True when any node is currently selected (even if not this one).
+    static func applySelectedAppearance(to container: SCNNode, selected: Bool, hasSelection: Bool = false) {
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
         container.scale = selected ? SCNVector3(1.55, 1.55, 1.55) : SCNVector3(1.0, 1.0, 1.0)
         container.enumerateChildNodes { node, _ in
             guard node.name != "label" else { return }
             if node.geometry is SCNCone, let mat = node.geometry?.firstMaterial {
+                // Airport cone: highlight selected one cyan, keep others blue
                 mat.diffuse.contents  = selected
                     ? UIColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
                     : UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
@@ -309,19 +329,22 @@ class ARComponentFactory {
                     : UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1.0)
             } else if node.name == "ring", let plane = node.geometry as? SCNPlane {
                 // The ring plane uses a *shared* SCNMaterial per TCAS level.
-                // NEVER mutate it directly — clone it for selection, restore shared on deselect.
-                if selected {
-                    // Selected aircraft: bright red ring so it stands out clearly.
+                // NEVER mutate the shared material directly — clone for any per-node override.
+                let levelRaw = node.accessibilityLabel.flatMap { Int($0) } ?? 0
+                let level    = TCASAlertLevel(rawValue: levelRaw) ?? .none
+
+                if hasSelection && !selected {
+                    // A different node is selected — dim this ring to yellow so the
+                    // selected target stands out. Clone to avoid mutating the shared material.
                     if let existing = plane.materials.first {
                         let copy = existing.copy() as! SCNMaterial
-                        copy.diffuse.contents  = UIColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0)
-                        copy.emission.contents = UIColor(red: 0.6, green: 0.0, blue: 0.0, alpha: 1.0)
+                        copy.diffuse.contents  = ringImageSelected   // yellow
+                        copy.emission.contents = ringImageSelected
                         plane.materials = [copy]
                     }
                 } else {
-                    // Restore the shared material (yellow for normal, amber/red for TCAS).
-                    let levelRaw = node.accessibilityLabel.flatMap { Int($0) } ?? 0
-                    let level = TCASAlertLevel(rawValue: levelRaw) ?? .none
+                    // Either no selection is active (all rings red) or this IS the selected
+                    // node (selected ring stays red). Restore the shared red material.
                     plane.materials = [ringMaterial(for: level)]
                 }
             }
@@ -478,11 +501,9 @@ class ARComponentFactory {
 
         let shouldShow = settings.showAircraftLabels
         if let lbl = labelNode {
-            if selectedNodeID == nil {
-                lbl.isHidden = !shouldShow
-                lbl.opacity  = 1
-            }
-
+            // Only update text content when labels are shown — visibility is managed
+            // by applySelectionToAllNodes() which correctly handles both selection state
+            // and the showAircraftLabels flag in a single consistent pass.
             if shouldShow, let plane = lbl.geometry as? SCNPlane {
                 let newText = buildAircraftLabelText(aircraft: aircraft, distanceNM: distanceNM, settings: settings)
                 if newText != plane.name {
@@ -958,27 +979,37 @@ class ARSceneManager {
 
         let hasSelection = (sel != nil)
 
-        // Aircraft: hide labels when another aircraft is selected (keep rings/geometry visible)
+        // Aircraft: hide labels when another aircraft is selected (keep rings/geometry visible).
+        // When no selection is active, respect settings.showAircraftLabels so label-only
+        // toggles (altitude, speed, etc.) actually take effect.
+        let labelsEnabled = settings.showAircraftLabels
         for container in acSnap.values {
             let isSelected = (container.name == sel)
             if let lbl = container.childNode(withName: "label", recursively: false) {
-                let shouldHide = hasSelection && !isSelected
+                // Hide when: (a) another node is selected, or (b) all label settings are off
+                let shouldHide = (hasSelection && !isSelected) || !labelsEnabled
                 if lbl.isHidden != shouldHide {
                     lbl.opacity   = shouldHide ? 0 : 1
                     lbl.isHidden  = shouldHide
                 }
             }
-            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
+            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected, hasSelection: hasSelection)
         }
 
-        // Airports: labels always visible regardless of selection; only highlight the selected one
+        // Airports: labels always visible regardless of selection; only highlight the selected one.
+        // hasSelection is NOT passed here — airport cones never change colour when an aircraft
+        // is selected (and vice versa). Airport cone appearance only changes when an airport itself
+        // is the selected target.
+        let airportSelected = sel?.hasPrefix("airport_") ?? false
         for container in apSnap.values {
             let isSelected = (container.name == sel)
             if let lbl = container.childNode(withName: "label", recursively: false) {
                 lbl.opacity  = 1
                 lbl.isHidden = false
             }
-            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected)
+            // Pass hasSelection only within the airport set so non-selected airports
+            // aren't affected when an aircraft (not an airport) is selected.
+            ARComponentFactory.applySelectedAppearance(to: container, selected: isSelected, hasSelection: airportSelected)
         }
     }
 

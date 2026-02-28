@@ -358,6 +358,10 @@ class ARTrafficViewController: UIViewController {
 
         // METAR panel (hidden by default, shown when airport selected)
         setupMetarPanel()
+
+        // Keep the off-screen arrow overlay on top of all other views so chevrons
+        // are never obscured by the status label, buttons, or METAR panel.
+        view.bringSubviewToFront(offScreenArrowView)
     }
 
     private func setupMetarPanel() {
@@ -558,7 +562,6 @@ class ARTrafficViewController: UIViewController {
             // airport settings changed, and vice versa.
 
             let airportSettingsChanged =
-                updatedSettings.showAirports       != old?.showAirports      ||
                 updatedSettings.airportMaxDistance  < (old?.airportMaxDistance ?? 0) ||
                 updatedSettings.showLargeAirports  != old?.showLargeAirports  ||
                 updatedSettings.showMediumAirports != old?.showMediumAirports ||
@@ -566,10 +569,15 @@ class ARTrafficViewController: UIViewController {
                 updatedSettings.showAirportDistance != old?.showAirportDistance
 
             let aircraftSettingsChanged =
-                updatedSettings.showAircraft       != old?.showAircraft      ||
-                updatedSettings.aircraftMaxDistance < (old?.aircraftMaxDistance ?? 0) ||
-                updatedSettings.callsignFilter     != old?.callsignFilter     ||
-                updatedSettings.showGroundAircraft == false   // turning OFF ground → prune
+                updatedSettings.showAircraft        != old?.showAircraft       ||
+                updatedSettings.aircraftMaxDistance  < (old?.aircraftMaxDistance ?? 0) ||
+                updatedSettings.callsignFilter      != old?.callsignFilter      ||
+                updatedSettings.showGroundAircraft  != old?.showGroundAircraft  ||  // ON or OFF → rebuild to avoid flood
+                updatedSettings.showAircraftAltitude != old?.showAircraftAltitude || // label-only toggles — rebuild so
+                updatedSettings.showAircraftSpeed   != old?.showAircraftSpeed   ||  // createAircraftMarker re-evaluates
+                updatedSettings.showAircraftDistance != old?.showAircraftDistance || // showAircraftLabels correctly
+                updatedSettings.showCallsign        != old?.showCallsign        ||
+                updatedSettings.showAircraftType    != old?.showAircraftType
 
             if airportSettingsChanged {
                 self.sceneManager?.clearAirports()
