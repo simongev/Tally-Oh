@@ -189,12 +189,14 @@ class ARComponentFactory {
     }
 
     /// Pulse parameters (peak scale, half-cycle duration) for a given TCAS level.
-    /// Higher urgency = faster cycle + larger scale pop.
-    static func pulseParams(for tcasLevel: TCASAlertLevel) -> (maxScale: CGFloat, halfDuration: Double) {
+    /// Returns nil for .none — normal traffic rings are static (no animation),
+    /// which saves SceneKit from evaluating up to 200 repeatForever actions at 60 Hz.
+    /// Animation is reserved for TA/RA where it carries a real safety meaning.
+    static func pulseParams(for tcasLevel: TCASAlertLevel) -> (maxScale: CGFloat, halfDuration: Double)? {
         switch tcasLevel {
-        case .none:               return (1.12, 0.90)   // subtle, slow
-        case .trafficAdvisory:    return (1.30, 0.45)   // noticeable, moderate speed
-        case .resolutionAdvisory: return (1.50, 0.22)   // urgent, fast, large pop
+        case .none:               return nil              // static ring — no animation
+        case .trafficAdvisory:    return (1.30, 0.45)    // noticeable, moderate speed
+        case .resolutionAdvisory: return (1.50, 0.22)    // urgent, fast, large pop
         }
     }
 
@@ -227,13 +229,15 @@ class ARComponentFactory {
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
 
-        // Pulsing animation — speed AND scale amplitude reflect TCAS urgency
-        let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
-        let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
-        let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
-        scaleUp.timingMode   = .easeInEaseOut
-        scaleDown.timingMode = .easeInEaseOut
-        ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+        // Pulsing animation only for TCAS alerts (TA/RA) — normal traffic rings are static.
+        // Eliminating 200 simultaneous repeatForever actions at 60 Hz saves significant CPU/RAM.
+        if let (pulseMax, halfDur) = pulseParams(for: tcasLevel) {
+            let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
+            let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
+            scaleUp.timingMode   = .easeInEaseOut
+            scaleDown.timingMode = .easeInEaseOut
+            ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+        }
 
         container.addChildNode(ringNode)
 
@@ -537,12 +541,14 @@ class ARComponentFactory {
                     SCNTransaction.commit()
                 }
                 ringNode.removeAllActions()
-                let (pulseMax, halfDur) = pulseParams(for: tcasLevel)
-                let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
-                let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
-                scaleUp.timingMode   = .easeInEaseOut
-                scaleDown.timingMode = .easeInEaseOut
-                ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+                ringNode.scale = SCNVector3(1, 1, 1)   // reset any mid-pulse scale
+                if let (pulseMax, halfDur) = pulseParams(for: tcasLevel) {
+                    let scaleUp   = SCNAction.scale(to: pulseMax, duration: halfDur)
+                    let scaleDown = SCNAction.scale(to: 1.0,      duration: halfDur)
+                    scaleUp.timingMode   = .easeInEaseOut
+                    scaleDown.timingMode = .easeInEaseOut
+                    ringNode.runAction(.repeatForever(.sequence([scaleUp, scaleDown])))
+                }
             }
         }
     }
