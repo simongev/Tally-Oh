@@ -421,11 +421,10 @@ class ARTrafficViewController: UIViewController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateStatusLabel() }
             .store(in: &cancellables)
-
-        connectionLogic.$detectedAircraft
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.updateStatusLabel() }
-            .store(in: &cancellables)
+        // Note: $detectedAircraft is NOT observed here — updateStatusLabel() is
+        // already called every 250ms by updateVisualization(). Subscribing to
+        // $detectedAircraft caused a Combine storm (500+ events per merge) that
+        // jammed the main run loop on the first internet fetch.
 
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
