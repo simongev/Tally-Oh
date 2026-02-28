@@ -75,11 +75,12 @@ class ARComponentFactory {
 
     /// Label image cache — avoids re-rendering UIGraphicsImageRenderer for text
     /// that hasn't changed. Aircraft labels update at most a few times per minute
-    /// (altitude, speed, distance), so cache hits are very frequent.
-    /// Bounded to 50 entries (~2 MB max) so it can't grow unbounded.
+    /// (altitude, speed, distance), so cache hits are very frequent after value quantization.
+    /// Bounded to 200 entries. With quantized values most aircraft share very few distinct
+    /// label strings (e.g. all aircraft at FL350 share one texture) so 200 is generous.
     private static let labelImageCache: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
-        c.countLimit = 50
+        c.countLimit = 200
         return c
     }()
 
@@ -287,13 +288,20 @@ class ARComponentFactory {
         }
         parts.append(line1)
         if settings.showAircraftAltitude {
-            parts.append(String(format: "%.0f ft", aircraft.altitude))
+            // Quantize to nearest 100 ft so the label text (and its texture cache key) only
+            // changes when altitude meaningfully changes, not on every raw ADS-B update.
+            let altQ = Int((aircraft.altitude / 100).rounded()) * 100
+            parts.append("\(altQ) ft")
         }
         if settings.showAircraftSpeed {
-            parts.append(String(format: "%.0f kts", aircraft.groundSpeed))
+            // Quantize to nearest 10 kts.
+            let spdQ = Int((aircraft.groundSpeed / 10).rounded()) * 10
+            parts.append("\(spdQ) kts")
         }
         if settings.showAircraftDistance {
-            parts.append(String(format: "%.1f NM", distanceNM))
+            // Quantize to nearest 0.5 NM so distance jitter doesn't thrash the cache.
+            let distQ = (distanceNM * 2).rounded() / 2
+            parts.append(String(format: "%.1f NM", distQ))
         }
         return parts.joined(separator: "\n")
     }
@@ -373,7 +381,10 @@ class ARComponentFactory {
     static func buildAirportLabelText(airport: Airport, distanceNM: Double, settings: ARVisualizationSettings) -> String {
         var parts: [String] = [airport.icao]
         if settings.showAirportDistance {
-            parts.append(String(format: "%.1f NM", distanceNM))
+            // Quantize to nearest 0.5 NM — airports move very slowly relative to user
+            // so 0.5 NM steps are plenty of precision and greatly reduce texture thrashing.
+            let distQ = (distanceNM * 2).rounded() / 2
+            parts.append(String(format: "%.1f NM", distQ))
         }
         return parts.joined(separator: "\n")
     }
@@ -399,8 +410,8 @@ class ARComponentFactory {
         let plane = SCNPlane(width: w, height: h)
         plane.cornerRadius = 0
         let mat = SCNMaterial()
-        mat.diffuse.contents   = image
-        mat.emission.contents  = image
+        mat.lightingModel      = .constant   // unlit: full brightness without emission copy
+        mat.diffuse.contents   = image       // single GPU texture upload (no emission duplicate)
         mat.isDoubleSided      = true
         mat.transparencyMode   = .aOne
         plane.materials = [mat]
@@ -501,8 +512,7 @@ class ARComponentFactory {
                     SCNTransaction.disableActions = true
                     plane.width  = w
                     plane.height = h
-                    plane.materials.first?.diffuse.contents  = image
-                    plane.materials.first?.emission.contents = image
+                    plane.materials.first?.diffuse.contents  = image  // .constant lighting: no emission needed
                     lbl.position = SCNVector3(0, Float(CGFloat(aircraftRingRadius) + 0.9 + h / 2), 0)
                     SCNTransaction.commit()
                 }
@@ -878,8 +888,7 @@ class ARSceneManager {
                         SCNTransaction.disableActions = true
                         plane.width  = w
                         plane.height = h
-                        plane.materials.first?.diffuse.contents  = image
-                        plane.materials.first?.emission.contents = image
+                        plane.materials.first?.diffuse.contents  = image  // .constant lighting: no emission needed
                         SCNTransaction.commit()
                     }
                     if selectedNodeID == nil {
