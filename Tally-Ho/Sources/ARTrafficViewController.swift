@@ -206,6 +206,7 @@ class ARTrafficViewController: UIViewController {
 
         if let saved = ARVisualizationSettings.load() {
             sceneManager?.settings = saved
+            connectionLogic.updateInternetQueryRadius(saved.aircraftMaxDistance)
         }
 
         if let seed = seedLocation {
@@ -546,6 +547,7 @@ class ARTrafficViewController: UIViewController {
             updatedSettings.updateFilter()
             self.sceneManager?.settings = updatedSettings
             updatedSettings.save()
+            self.connectionLogic.updateInternetQueryRadius(updatedSettings.aircraftMaxDistance)
 
             // Only rebuild the scene when a filter that can ADD new nodes is tightened
             // (removing nodes is safe; adding potentially thousands at once crashes SceneKit).

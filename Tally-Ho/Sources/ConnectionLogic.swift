@@ -81,7 +81,22 @@ class ConnectionLogic: ObservableObject {
     // keep the traffic picture current as the aircraft flies.
     private let internetFetchInterval: TimeInterval = 8.0
     private var currentLocation: CLLocationCoordinate2D?
-    private let internetQueryRadius: Double = 50.0
+
+    /// Query radius for the internet fetch.  Kept in sync with the scene manager's
+    /// aircraftMaxDistance (set via updateInternetQueryRadius) so we never fetch a
+    /// much larger bubble than we can display — avoids storing thousands of aircraft
+    /// in detectedAircraft when only ~200 within 20 NM will ever be rendered.
+    private var internetQueryRadius: Double = 25.0
+
+    /// Called by ARSceneManager whenever aircraftMaxDistance changes.
+    func updateInternetQueryRadius(_ distanceNM: Double) {
+        // Fetch 25 % beyond the render limit so aircraft don't pop in at the edge.
+        internetQueryRadius = max(10, distanceNM * 1.25)
+    }
+
+    /// Hard cap on total internet aircraft stored.  At 200 max rendered nodes there
+    /// is no value in keeping more than a modest multiple of that in memory.
+    private let maxInternetAircraft = 500
     /// Timestamp of the most recent internet fetch request — used to compute
     /// dynamic extrapolation latency in the dead-reckoning position predictor.
     private(set) var lastInternetFetchTime: Date?
@@ -395,32 +410,27 @@ class ConnectionLogic: ObservableObject {
     private func mergeInternetAircraft(_ list: [Aircraft]) {
         let fetchTime = Date()   // record when the response was received
         DispatchQueue.main.async {
-            // Build an ownship filter set once per merge so the per-aircraft loop is fast.
-            // Filter 1 — ICAO hex match: when ADS-B is connected we know our own hex.
-            //   The ownship GDL90 message gives id = "OWNSHIP", but the ICAO hex is
-            //   embedded in the callsign field when the device sends both. We instead
-            //   derive the ownship hex from the ADS-B aircraft whose position exactly
-            //   matches ownshipData — but the simplest reliable approach is to store
-            //   the raw hex at parse time. For now, filter by position proximity only
-            //   (works for both ADS-B-connected and internet-only scenarios).
-            //
-            // Filter 2 — Position proximity: any internet aircraft within 0.1 NM of
-            //   the user's current GPS fix is almost certainly their own aircraft.
-            //   0.1 NM ≈ 185 m — tight enough to catch ownship, loose enough not to
-            //   accidentally drop a close-formation wingman (they'd be >0.1 NM at safe
-            //   separation).
+            // Filter 1 — ADS-B priority: skip aircraft already tracked via ADS-B.
+            // Filter 2 — Ownship exclusion: skip aircraft that are our own plane
+            //   (matched by position proximity to ADS-B ownship or iPhone GPS fix).
             let ownLoc = self.currentLocation
+
+            // Count existing internet aircraft so we know how much room is left.
+            let existingInternetCount = self.detectedAircraft.values.filter { $0.source == .internet }.count
+            var slotsRemaining = max(0, self.maxInternetAircraft - existingInternetCount)
 
             var count = 0
             for var ac in list {
+                // Hard cap: once the internet aircraft budget is exhausted, stop adding.
+                // This prevents detectedAircraft from growing to thousands of entries near
+                // busy hubs (New York, LA, etc.) which caused ~2 GB OOM kills.
+                guard slotsRemaining > 0 else { break }
+
                 // Skip if an ADS-B aircraft with this ID already exists
                 if let existing = self.detectedAircraft[ac.id], existing.source == .adsb { continue }
 
                 // Skip if this is our own aircraft by ICAO hex (when ADS-B connected)
                 if let ownship = self.ownshipData {
-                    // ownshipData.id is "OWNSHIP" but the internet entry uses the real hex.
-                    // Match by position proximity: if the internet aircraft is within 0.1 NM
-                    // of our ADS-B-reported position it's us.
                     let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude,
                                                           longitude: ownship.longitude)
                     let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownCoord,
@@ -440,6 +450,7 @@ class ConnectionLogic: ObservableObject {
                 ac.lastUpdate = fetchTime
                 self.detectedAircraft[ac.id] = ac
                 count += 1
+                slotsRemaining -= 1
             }
             self.internetAircraftCount = count
         }
