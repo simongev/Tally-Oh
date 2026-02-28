@@ -764,7 +764,16 @@ class ARTrafficViewController: UIViewController {
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
 
-        let aircraftList = Array(connectionLogic.detectedAircraft.values)
+        // Pre-filter by distance and basic visibility before touching SceneKit.
+        // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
+        // rather than iterating all stored aircraft on the main thread every tick.
+        let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
+        let maxDist = currentSettings.aircraftMaxDistance
+        let showGround = currentSettings.showGroundAircraft
+        let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
+            guard showGround || ac.altitude > 50 else { return false }
+            return CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate) <= maxDist
+        }
 
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {

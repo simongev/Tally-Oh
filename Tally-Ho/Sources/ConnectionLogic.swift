@@ -94,9 +94,10 @@ class ConnectionLogic: ObservableObject {
         internetQueryRadius = max(10, distanceNM * 1.25)
     }
 
-    /// Hard cap on total internet aircraft stored.  At 200 max rendered nodes there
-    /// is no value in keeping more than a modest multiple of that in memory.
-    private let maxInternetAircraft = 500
+    /// Hard cap on total internet aircraft stored.  Only 200 nodes can ever be
+    /// rendered, and the closest 200 by distance are chosen, so storing more than
+    /// ~100 provides no visual benefit while inflating the dictionary copied every tick.
+    private let maxInternetAircraft = 100
     /// Timestamp of the most recent internet fetch request — used to compute
     /// dynamic extrapolation latency in the dead-reckoning position predictor.
     private(set) var lastInternetFetchTime: Date?
@@ -398,27 +399,31 @@ class ConnectionLogic: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
 
-            let existingInternetCount = currentAircraft.values.filter { $0.source == .internet }.count
-            var slotsRemaining = max(0, self.maxInternetAircraft - existingInternetCount)
+            let maxRadius      = self.internetQueryRadius   // render range + 25% buffer
+            let existingCount  = currentAircraft.values.filter { $0.source == .internet }.count
+            var slotsRemaining = max(0, self.maxInternetAircraft - existingCount)
 
-            // Build all new/updated entries locally — zero @Published fires yet.
             var updates: [String: Aircraft] = [:]
             for var ac in list {
                 guard slotsRemaining > 0 else { break }
+
+                // Pre-filter by distance — aircraft outside render range are never stored.
+                // This keeps the dictionary small regardless of how many the API returns.
+                if let ownLoc {
+                    let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
+                    guard distNM <= maxRadius else { continue }
+
+                    // Skip ownship (within 0.1 NM of GPS fix)
+                    if distNM < 0.1 { continue }
+                }
 
                 // Skip if an ADS-B aircraft with this ID already exists
                 if let existing = currentAircraft[ac.id], existing.source == .adsb { continue }
 
                 // Skip ownship by proximity to ADS-B ownship position
                 if let ownship {
-                    let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude,
-                                                          longitude: ownship.longitude)
+                    let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude, longitude: ownship.longitude)
                     if CalculationsLogic.distanceInNauticalMiles(from: ownCoord, to: ac.coordinate) < 0.1 { continue }
-                }
-
-                // Skip ownship by proximity to iPhone GPS fix (internet-only mode)
-                if let ownLoc {
-                    if CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate) < 0.1 { continue }
                 }
 
                 ac.lastUpdate = fetchTime
@@ -428,13 +433,8 @@ class ConnectionLogic: ObservableObject {
 
             guard !updates.isEmpty else { return }
 
-            // Single main-thread assignment → exactly ONE @Published notification
-            // instead of one per aircraft. Prevents a 500-event Combine storm that
-            // was jamming the main run loop and causing the ~10s watchdog kill.
+            // Single assignment on main thread → one @Published fire, not one per aircraft.
             DispatchQueue.main.async {
-                // Merge updates into a local copy then assign the whole dictionary
-                // at once — @Published only fires on the final = assignment, not
-                // on each individual key write.
                 var merged = self.detectedAircraft
                 for (id, ac) in updates { merged[id] = ac }
                 self.detectedAircraft = merged
