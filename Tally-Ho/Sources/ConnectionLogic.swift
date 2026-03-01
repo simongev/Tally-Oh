@@ -314,7 +314,7 @@ class ConnectionLogic: ObservableObject {
         advance(1) // emitter category
 
         var callsign = icao
-        if !isOwnship, remaining() >= 8 {
+        if remaining() >= 8 {
             let csEnd = payload.index(idx, offsetBy: 8)
             if let raw = String(bytes: payload[idx..<csEnd], encoding: .ascii) {
                 let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
@@ -324,7 +324,7 @@ class ConnectionLogic: ObservableObject {
 
         return Aircraft(
             id: isOwnship ? "OWNSHIP" : icao,
-            callsign: isOwnship ? "OWNSHIP" : callsign,
+            callsign: callsign,
             latitude: latitude,
             longitude: longitude,
             altitude: altitude,

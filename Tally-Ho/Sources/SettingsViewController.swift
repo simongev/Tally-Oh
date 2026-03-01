@@ -93,6 +93,8 @@ class SettingsViewController: UITableViewController {
             getter: (ARVisualizationSettings) -> String?,
             setter: (inout ARVisualizationSettings, String?) -> Void
         )
+        /// A non-interactive row that displays an auto-detected value (e.g. ADS-B ownship).
+        case readOnlyValue(title: String, subtitle: String, value: String)
     }
 
     private struct Section {
@@ -111,10 +113,13 @@ class SettingsViewController: UITableViewController {
     private var settings: ARVisualizationSettings
     private let onDismiss: (ARVisualizationSettings) -> Void
     /// Whether the user is currently airborne on a WiFi-only connection.
-    /// When true an extra "My Airplane" section is shown.
+    /// When true an extra "My Airplane" section is shown with a picker.
     private let wifiInAir: Bool
     /// Callsigns of aircraft detected within 2 NM at the time settings was opened.
     private let nearbyCallsigns: [String]
+    /// Callsign of the ownship as reported by the ADS-B receiver (nil when not connected).
+    /// When non-nil, "My Airplane" is shown as a read-only display instead of a picker.
+    private let adsbOwnshipCallsign: String?
 
     private lazy var sections: [Section] = {
         var result: [Section] = [
@@ -222,6 +227,18 @@ class SettingsViewController: UITableViewController {
                     )
                 ]
             ))
+        } else if let ownship = adsbOwnshipCallsign {
+            result.append(Section(
+                header: "🛩️  My Airplane",
+                footer: "Your aircraft is automatically identified by the ADS-B receiver.",
+                rows: [
+                    .readOnlyValue(
+                        title: "I'm Flying",
+                        subtitle: "Auto-detected from ADS-B",
+                        value: ownship
+                    )
+                ]
+            ))
         }
         return result
     }()
@@ -231,11 +248,13 @@ class SettingsViewController: UITableViewController {
     init(settings: ARVisualizationSettings,
          wifiInAir: Bool = false,
          nearbyCallsigns: [String] = [],
+         adsbOwnshipCallsign: String? = nil,
          onDismiss: @escaping (ARVisualizationSettings) -> Void) {
-        self.settings        = settings
-        self.wifiInAir       = wifiInAir
-        self.nearbyCallsigns = nearbyCallsigns
-        self.onDismiss       = onDismiss
+        self.settings             = settings
+        self.wifiInAir            = wifiInAir
+        self.nearbyCallsigns      = nearbyCallsigns
+        self.adsbOwnshipCallsign  = adsbOwnshipCallsign
+        self.onDismiss            = onDismiss
         super.init(style: .insetGrouped)
     }
 
@@ -253,6 +272,7 @@ class SettingsViewController: UITableViewController {
         tableView.register(SliderCell.self,         forCellReuseIdentifier: "slider")
         tableView.register(TextFieldCell.self,      forCellReuseIdentifier: "textField")
         tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "callsignPicker")
+        tableView.register(ReadOnlyValueCell.self,  forCellReuseIdentifier: "readOnlyValue")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
         tableView.keyboardDismissMode = .onDrag
@@ -322,6 +342,11 @@ class SettingsViewController: UITableViewController {
         case let .callsignPicker(title, subtitle, _, getter, _):
             let cell = tableView.dequeueReusableCell(withIdentifier: "callsignPicker", for: indexPath) as! CallsignPickerCell
             cell.configure(title: title, subtitle: subtitle, current: getter(settings))
+            return cell
+
+        case let .readOnlyValue(title, subtitle, value):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "readOnlyValue", for: indexPath) as! ReadOnlyValueCell
+            cell.configure(title: title, subtitle: subtitle, value: value)
             return cell
         }
     }
@@ -590,5 +615,37 @@ final class CallsignPickerCell: UITableViewCell {
             let size = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
             stack.frame = CGRect(origin: .zero, size: size)
         }
+    }
+}
+
+// MARK: - ReadOnlyValueCell
+
+/// Non-interactive row that displays an auto-detected value (e.g. the ADS-B ownship callsign).
+/// Styled identically to CallsignPickerCell but without a disclosure indicator or selection.
+final class ReadOnlyValueCell: UITableViewCell {
+
+    private let valueLabel = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        detailTextLabel?.textColor = .secondaryLabel
+        detailTextLabel?.font      = .systemFont(ofSize: 13)
+        detailTextLabel?.numberOfLines = 2
+
+        valueLabel.font      = .systemFont(ofSize: 15)
+        valueLabel.textColor = .secondaryLabel
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+        accessoryView = valueLabel
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, subtitle: String, value: String) {
+        textLabel?.text       = title
+        detailTextLabel?.text = subtitle
+        valueLabel.text       = value
+        valueLabel.sizeToFit()
     }
 }

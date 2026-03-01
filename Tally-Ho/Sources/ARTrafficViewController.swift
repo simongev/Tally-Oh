@@ -568,10 +568,17 @@ class ARTrafficViewController: UIViewController {
                 .sorted()
         }
 
+        // When connected via ADS-B, surface the ownship callsign as a read-only
+        // display so the user can confirm which aircraft the receiver identified.
+        let adsbCallsign: String? = usingADSBGPS
+            ? connectionLogic.ownshipData?.callsign
+            : nil
+
         let vc = SettingsViewController(
             settings: settings,
             wifiInAir: wifiMode,
-            nearbyCallsigns: nearbyCallsigns
+            nearbyCallsigns: nearbyCallsigns,
+            adsbOwnshipCallsign: adsbCallsign
         ) { [weak self] updated in
             guard let self else { return }
             let old = self.sceneManager?.settings
