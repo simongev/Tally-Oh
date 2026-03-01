@@ -195,6 +195,9 @@ class ARTrafficViewController: UIViewController {
 
     private var arKitNorthCorrectionDeg: Double = 0
     private var northCorrectionSampleCount: Int = 0
+    // Previous-sample snapshots used to detect user camera rotation vs. airplane turn.
+    private var prevNorthCorrectionArYawDeg: Double? = nil
+    private var prevNorthCorrectionTrueTrack: Double? = nil
 
     // MARK: - Lifecycle
 
@@ -542,6 +545,8 @@ class ARTrafficViewController: UIViewController {
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         arKitNorthCorrectionDeg = 0
         northCorrectionSampleCount = 0
+        prevNorthCorrectionArYawDeg = nil
+        prevNorthCorrectionTrueTrack = nil
         sceneManager?.arKitNorthCorrectionDeg = 0
     }
 
@@ -1208,11 +1213,44 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     /// Apply a single north-correction sample using the given true-north reference
     /// and the current ARKit world yaw. Uses exponential smoothing (α = 0.15) to
     /// filter noise; the first sample is applied instantly.
+    ///
+    /// When flying, `trueNorth` is the airplane's GPS track — it represents the
+    /// airplane's heading, NOT the camera's heading. The formula
+    ///   northCorrectionDeg = gpsTrueTrack − arYawDeg
+    /// is only valid when the camera faces in the flight direction.
+    ///
+    /// To avoid corrupting the correction when the user looks sideways, we compare
+    /// the change in `arYawDeg` with the change in `trueNorth` between consecutive
+    /// calls. When the airplane turns, both values shift by the same amount (the
+    /// gyro-tracked phone rotation matches the heading change), so their difference
+    /// is near zero. When the user rotates the phone, only `arYawDeg` changes while
+    /// `trueNorth` is constant — we detect this and skip the update.
     private func applyNorthCorrection(trueNorth: Double, frame: ARFrame) {
         let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
         var sample = trueNorth - arYawDeg
         while sample >  180 { sample -= 360 }
         while sample < -180 { sample += 360 }
+
+        // Skip samples where the camera has rotated independently of the airplane.
+        // Δ(arYawDeg) − Δ(gpsTrueTrack) isolates user-induced camera rotation:
+        // it is ~0 for airplane turns (both deltas match) and non-zero when the
+        // user pans the phone sideways. A 5° threshold accommodates GPS track
+        // noise (< 1° at airliner speed) while catching deliberate panning.
+        if northCorrectionSampleCount > 0,
+           let prevYaw = prevNorthCorrectionArYawDeg,
+           let prevTrack = prevNorthCorrectionTrueTrack {
+            var deltaYaw = arYawDeg - prevYaw
+            while deltaYaw >  180 { deltaYaw -= 360 }
+            while deltaYaw < -180 { deltaYaw += 360 }
+            var deltaTrack = trueNorth - prevTrack
+            while deltaTrack >  180 { deltaTrack -= 360 }
+            while deltaTrack < -180 { deltaTrack += 360 }
+            if abs(deltaYaw - deltaTrack) > 5.0 {
+                prevNorthCorrectionArYawDeg = arYawDeg
+                prevNorthCorrectionTrueTrack = trueNorth
+                return
+            }
+        }
 
         let alpha = 0.15
         if northCorrectionSampleCount == 0 {
@@ -1221,6 +1259,8 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
         }
         northCorrectionSampleCount += 1
+        prevNorthCorrectionArYawDeg = arYawDeg
+        prevNorthCorrectionTrueTrack = trueNorth
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
     }
 
@@ -1235,6 +1275,8 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             startARSession()
             arKitNorthCorrectionDeg = 0
             northCorrectionSampleCount = 0
+            prevNorthCorrectionArYawDeg = nil
+            prevNorthCorrectionTrueTrack = nil
         }
 
         lastHeadingAccuracy = accuracy
