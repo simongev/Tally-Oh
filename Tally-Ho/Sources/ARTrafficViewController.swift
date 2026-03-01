@@ -554,7 +554,25 @@ class ARTrafficViewController: UIViewController {
 
     @objc private func showSettings() {
         guard let settings = sceneManager?.settings else { return }
-        let vc = SettingsViewController(settings: settings) { [weak self] updated in
+
+        // Collect callsigns of aircraft within 2 NM so the picker offers meaningful
+        // options. We look at the raw (unfiltered) aircraft dictionary so the user
+        // can see their own aircraft even when the 2 NM exclusion zone hides it.
+        let wifiMode = wifiInAir
+        var nearbyCallsigns: [String] = []
+        if wifiMode, let loc = activeLocation {
+            nearbyCallsigns = connectionLogic.detectedAircraft.values
+                .filter { CalculationsLogic.distanceInNauticalMiles(from: loc, to: $0.coordinate) < 2.0 }
+                .map { $0.callsign }
+                .filter { !$0.isEmpty && $0 != "OWNSHIP" }
+                .sorted()
+        }
+
+        let vc = SettingsViewController(
+            settings: settings,
+            wifiInAir: wifiMode,
+            nearbyCallsigns: nearbyCallsigns
+        ) { [weak self] updated in
             guard let self else { return }
             let old = self.sceneManager?.settings
             var updatedSettings = updated
@@ -582,7 +600,8 @@ class ARTrafficViewController: UIViewController {
                 updatedSettings.showAircraftSpeed   != old?.showAircraftSpeed   ||  // createAircraftMarker re-evaluates
                 updatedSettings.showAircraftDistance != old?.showAircraftDistance || // showAircraftLabels correctly
                 updatedSettings.showCallsign        != old?.showCallsign        ||
-                updatedSettings.showAircraftType    != old?.showAircraftType
+                updatedSettings.showAircraftType    != old?.showAircraftType    ||
+                updatedSettings.wifiOwnshipCallsign != old?.wifiOwnshipCallsign
 
             if airportSettingsChanged {
                 self.sceneManager?.clearAirports()
@@ -784,6 +803,13 @@ class ARTrafficViewController: UIViewController {
         usingADSBGPS && activeAltitude <= 200
     }
 
+    /// True when the user is airborne on a WiFi-only connection (no ADS-B device).
+    /// In this mode the app cannot auto-identify the user's aircraft, so we either
+    /// hide all traffic within 2 NM (default) or hide only the chosen callsign.
+    private var wifiInAir: Bool {
+        tcasEnabled && !usingADSBGPS
+    }
+
     private func updateVisualization() {
         guard let loc = activeLocation else { return }
 
@@ -793,9 +819,22 @@ class ARTrafficViewController: UIViewController {
         let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
         let maxDist = currentSettings.aircraftMaxDistance
         let showGround = currentSettings.showGroundAircraft
+        let wifiMode = wifiInAir
+        let wifiOwnshipCallsign = currentSettings.wifiOwnshipCallsign
         let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
             guard showGround || ac.altitude > 50 else { return false }
-            return CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate) <= maxDist
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate)
+            guard distNM <= maxDist else { return false }
+            if wifiMode {
+                if let selected = wifiOwnshipCallsign {
+                    // User identified their plane: hide only that callsign, show everything else.
+                    if ac.callsign == selected { return false }
+                } else {
+                    // No plane identified: hide all traffic within 2 NM to mask own aircraft.
+                    if distNM < 2.0 { return false }
+                }
+            }
+            return true
         }
 
         let cameraPos: SCNVector3
