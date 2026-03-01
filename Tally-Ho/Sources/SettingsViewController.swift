@@ -83,19 +83,41 @@ class SettingsViewController: UITableViewController {
             getter: (ARVisualizationSettings) -> String,
             setter: (inout ARVisualizationSettings, String) -> Void
         )
+        /// A tappable row that lets the user pick one value from a list of callsigns.
+        /// Tapping presents an action sheet. `options` is the list of nearby callsigns;
+        /// `nil` in getter/setter means "None — hide all within 2 NM".
+        case callsignPicker(
+            title: String,
+            subtitle: String,
+            options: [String],
+            getter: (ARVisualizationSettings) -> String?,
+            setter: (inout ARVisualizationSettings, String?) -> Void
+        )
     }
 
     private struct Section {
         let header: String
+        let footer: String?
         let rows: [RowKind]
+        init(header: String, footer: String? = nil, rows: [RowKind]) {
+            self.header = header
+            self.footer = footer
+            self.rows   = rows
+        }
     }
 
     // MARK: Data
 
     private var settings: ARVisualizationSettings
     private let onDismiss: (ARVisualizationSettings) -> Void
+    /// Whether the user is currently airborne on a WiFi-only connection.
+    /// When true an extra "My Airplane" section is shown.
+    private let wifiInAir: Bool
+    /// Callsigns of aircraft detected within 2 NM at the time settings was opened.
+    private let nearbyCallsigns: [String]
 
-    private lazy var sections: [Section] = [
+    private lazy var sections: [Section] = {
+        var result: [Section] = [
         Section(header: "✈️  Aircraft", rows: [
             .toggle(
                 title: "Show Aircraft",
@@ -181,14 +203,39 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.airportMaxDistance },
                 setter: { $0.airportMaxDistance = $1 }
             ),
-        ])
-    ]
+        ])]
+        if wifiInAir {
+            result.append(Section(
+                header: "🛩️  My Airplane",
+                footer: "On WiFi, the app cannot auto-detect which aircraft you are on. " +
+                        "Select your callsign to hide only your aircraft and show everything else. " +
+                        "Without a selection, all traffic within 2 NM is hidden.",
+                rows: [
+                    .callsignPicker(
+                        title: "I'm Flying",
+                        subtitle: nearbyCallsigns.isEmpty
+                            ? "No aircraft detected within 2 NM yet"
+                            : "Select your aircraft from those nearby",
+                        options: nearbyCallsigns,
+                        getter: { $0.wifiOwnshipCallsign },
+                        setter: { $0.wifiOwnshipCallsign = $1 }
+                    )
+                ]
+            ))
+        }
+        return result
+    }()
 
     // MARK: Init
 
-    init(settings: ARVisualizationSettings, onDismiss: @escaping (ARVisualizationSettings) -> Void) {
-        self.settings  = settings
-        self.onDismiss = onDismiss
+    init(settings: ARVisualizationSettings,
+         wifiInAir: Bool = false,
+         nearbyCallsigns: [String] = [],
+         onDismiss: @escaping (ARVisualizationSettings) -> Void) {
+        self.settings        = settings
+        self.wifiInAir       = wifiInAir
+        self.nearbyCallsigns = nearbyCallsigns
+        self.onDismiss       = onDismiss
         super.init(style: .insetGrouped)
     }
 
@@ -202,9 +249,10 @@ class SettingsViewController: UITableViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             barButtonSystemItem: .done, target: self, action: #selector(doneTapped)
         )
-        tableView.register(ToggleCell.self, forCellReuseIdentifier: "toggle")
-        tableView.register(SliderCell.self,      forCellReuseIdentifier: "slider")
-        tableView.register(TextFieldCell.self,   forCellReuseIdentifier: "textField")
+        tableView.register(ToggleCell.self,         forCellReuseIdentifier: "toggle")
+        tableView.register(SliderCell.self,         forCellReuseIdentifier: "slider")
+        tableView.register(TextFieldCell.self,      forCellReuseIdentifier: "textField")
+        tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "callsignPicker")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
         tableView.keyboardDismissMode = .onDrag
@@ -270,7 +318,59 @@ class SettingsViewController: UITableViewController {
                 }
             }
             return cell
+
+        case let .callsignPicker(title, subtitle, _, getter, _):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "callsignPicker", for: indexPath) as! CallsignPickerCell
+            cell.configure(title: title, subtitle: subtitle, current: getter(settings))
+            return cell
         }
+    }
+
+    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+        sections[section].footer
+    }
+
+    // MARK: Selection (callsign picker)
+
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        let row = sections[indexPath.section].rows[indexPath.row]
+        guard case let .callsignPicker(_, _, options, _, setter) = row else { return }
+
+        let alert = UIAlertController(
+            title: "Which airplane are you on?",
+            message: nil,
+            preferredStyle: .actionSheet
+        )
+
+        // "None" resets to the default 2 NM exclusion zone.
+        let noneTitle = (settings.wifiOwnshipCallsign == nil ? "✓ " : "") + "None — hide all within 2 NM"
+        alert.addAction(UIAlertAction(title: noneTitle, style: .default) { [weak self] _ in
+            guard let self else { return }
+            setter(&self.settings, nil)
+            tableView.reloadRows(at: [indexPath], with: .none)
+        })
+
+        for callsign in options {
+            let isSelected = settings.wifiOwnshipCallsign == callsign
+            let title = (isSelected ? "✓ " : "") + callsign
+            alert.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+                guard let self else { return }
+                setter(&self.settings, callsign)
+                tableView.reloadRows(at: [indexPath], with: .none)
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        // Required for iPad popover presentation.
+        if let popover = alert.popoverPresentationController,
+           let cell = tableView.cellForRow(at: indexPath) {
+            popover.sourceView = cell
+            popover.sourceRect = cell.bounds
+        }
+
+        present(alert, animated: true)
     }
 
     // MARK: Actions
@@ -442,4 +542,53 @@ final class TextFieldCell: UITableViewCell {
 
     @objc private func textChanged() { onChange?(field.text ?? "") }
     @objc private func textDone()    { field.resignFirstResponder() }
+}
+
+// MARK: - CallsignPickerCell
+
+/// Tappable row that shows the currently-selected callsign (or "None") with a
+/// disclosure indicator. The action sheet is driven by SettingsViewController's
+/// didSelectRowAt, not by the cell itself.
+final class CallsignPickerCell: UITableViewCell {
+
+    private let valueLabel = UILabel()
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .default
+        textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        detailTextLabel?.textColor = .secondaryLabel
+        detailTextLabel?.font      = .systemFont(ofSize: 13)
+        detailTextLabel?.numberOfLines = 2
+
+        valueLabel.font      = .systemFont(ofSize: 15)
+        valueLabel.textColor = .systemBlue
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let arrow = UIImageView(image: UIImage(systemName: "chevron.right"))
+        arrow.tintColor = .systemGray3
+        arrow.preferredSymbolConfiguration = .init(textStyle: .footnote)
+
+        // Build the accessory once; configure() just updates valueLabel.text.
+        let stack = UIStackView(arrangedSubviews: [valueLabel, arrow])
+        stack.axis      = .horizontal
+        stack.spacing   = 4
+        stack.alignment = .center
+        let size = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
+        stack.frame = CGRect(origin: .zero, size: size)
+        accessoryView = stack
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, subtitle: String, current: String?) {
+        textLabel?.text       = title
+        detailTextLabel?.text = subtitle
+        valueLabel.text = current ?? "None"
+        // Re-fit the accessory stack after the label text changes.
+        if let stack = accessoryView {
+            let size = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
+            stack.frame = CGRect(origin: .zero, size: size)
+        }
+    }
 }

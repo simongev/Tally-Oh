@@ -568,6 +568,12 @@ struct ARVisualizationSettings {
     /// When false (default), aircraft at or below 50 ft AGL are hidden (ground traffic).
     var showGroundAircraft: Bool = false
 
+    /// Callsign of the user's own aircraft when flying on WiFi.
+    /// When nil (default), all aircraft within 2 NM are hidden.
+    /// When set, only the aircraft with this callsign is hidden and all others are visible.
+    /// Never persisted — reset to nil at every app launch.
+    var wifiOwnshipCallsign: String? = nil
+
     var showAircraftLabels: Bool { showAircraftType || showAircraftAltitude || showCallsign || showAircraftSpeed || showAircraftDistance }
 
     private var _normalizedFilter: String = ""
