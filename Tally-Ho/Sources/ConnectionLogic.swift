@@ -77,6 +77,13 @@ class ConnectionLogic: ObservableObject {
     private let adsbLolClient = ADSBLolClient()
     private let networkReachability = NetworkReachability()
     private var internetFetchTimer: Timer?
+    /// How many consecutive adsb.lol fetches have failed. After a threshold we treat
+    /// the path as having no real internet (e.g. phone joined a Sentry WiFi hotspot
+    /// that provides no internet — NWPathMonitor reports the WiFi link as satisfied even
+    /// though api.adsb.lol is unreachable). Resets to 0 on any successful fetch or when
+    /// NWPathMonitor triggers ensureInternetFetchRunning() after a path change.
+    private var consecutiveInternetFailures = 0
+    private let maxInternetFailuresBeforeOffline = 3
     // At 250 kt the user moves ~1.0 NM in 8 s — fetch frequently enough to
     // keep the traffic picture current as the aircraft flies.
     private let internetFetchInterval: TimeInterval = 8.0
@@ -358,6 +365,7 @@ class ConnectionLogic: ObservableObject {
         guard internetFetchTimer == nil else { return }
         // Update published flag in case NWPathMonitor hasn't fired yet but we know we're connected
         if !isInternetAvailable { isInternetAvailable = networkReachability.isConnected }
+        consecutiveInternetFailures = 0   // fresh start after a network-path change
         fetchInternetData()
         internetFetchTimer = Timer.scheduledTimer(withTimeInterval: internetFetchInterval, repeats: true) { [weak self] _ in
             self?.fetchInternetData()
@@ -383,9 +391,23 @@ class ConnectionLogic: ObservableObject {
         ) { [weak self] result in
             switch result {
             case .success(let aircraft):
+                self?.consecutiveInternetFailures = 0
                 self?.mergeInternetAircraft(aircraft)
             case .failure(let err):
                 print("⚠️ adsb.lol fetch failed: \(err.localizedDescription)")
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.consecutiveInternetFailures += 1
+                    if self.consecutiveInternetFailures >= self.maxInternetFailuresBeforeOffline {
+                        // Treat the path as having no real internet (e.g. Sentry WiFi hotspot).
+                        // stopInternetFetching() is safe here: no internet aircraft were stored
+                        // (all fetches failed), so the filter inside it is a no-op. NWPathMonitor
+                        // remains active and will call ensureInternetFetchRunning() if the path
+                        // genuinely becomes internet-capable later.
+                        self.isInternetAvailable = false
+                        self.stopInternetFetching()
+                    }
+                }
             }
         }
     }
