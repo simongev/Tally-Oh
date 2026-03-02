@@ -393,56 +393,71 @@ class ConnectionLogic: ObservableObject {
     private func mergeInternetAircraft(_ list: [Aircraft]) {
         let fetchTime = Date()
 
-        // Do all filtering on a background thread — no main-thread work until the
-        // single final assignment. This avoids jamming the main run loop with
-        // hundreds of individual dictionary mutations each firing @Published.
-        let currentAircraft = detectedAircraft   // value-type snapshot, safe to read here
-        let ownship         = ownshipData
-        let ownLoc          = currentLocation
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // ── Step 1: snapshot — must happen on the main thread ──────────────────────
+        // detectedAircraft, ownshipData, and currentLocation are @Published properties
+        // owned by the main thread.  Reading them from the URLSession background callback
+        // without synchronisation is a data race.  Jump to the main queue first so the
+        // snapshot is always taken on the correct thread, then hop to background for the
+        // CPU-heavy distance-filter pass, then back to main to commit.
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let currentAircraft = self.detectedAircraft
+            let ownship         = self.ownshipData
+            let ownLoc          = self.currentLocation
+            let maxRadius       = self.internetQueryRadius
+            let cap             = self.maxInternetAircraft
 
-            let maxRadius      = self.internetQueryRadius   // render range + 25% buffer
-            let existingCount  = currentAircraft.values.filter { $0.source == .internet }.count
-            var slotsRemaining = max(0, self.maxInternetAircraft - existingCount)
+            // ── Step 2: filter on background thread ────────────────────────────────
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
 
-            var updates: [String: Aircraft] = [:]
-            for var ac in list {
-                guard slotsRemaining > 0 else { break }
+                let existingCount     = currentAircraft.values.filter { $0.source == .internet }.count
+                var newSlotsRemaining = max(0, cap - existingCount)
 
-                // Pre-filter by distance — aircraft outside render range are never stored.
-                // This keeps the dictionary small regardless of how many the API returns.
-                if let ownLoc {
-                    let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
-                    guard distNM <= maxRadius else { continue }
+                var updates: [String: Aircraft] = [:]
+                for var ac in list {
+                    // Pre-filter by distance — aircraft outside render range are never stored.
+                    if let ownLoc {
+                        let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
+                        guard distNM <= maxRadius else { continue }
+                        if distNM < 0.1 { continue }   // skip ownship by GPS proximity
+                    }
 
-                    // Skip ownship (within 0.1 NM of GPS fix)
-                    if distNM < 0.1 { continue }
+                    // Skip if an ADS-B aircraft with this ID already exists.
+                    if let existing = currentAircraft[ac.id], existing.source == .adsb { continue }
+
+                    // Skip ownship by proximity to ADS-B ownship position.
+                    if let ownship {
+                        let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude, longitude: ownship.longitude)
+                        if CalculationsLogic.distanceInNauticalMiles(from: ownCoord, to: ac.coordinate) < 0.1 { continue }
+                    }
+
+                    // Existing internet aircraft: always refresh position + timestamp so
+                    // the 4 Hz visualization loop sees current data every 8-second fetch.
+                    // New aircraft: only add while below the cap.
+                    // Use `continue` (not `break`) so the loop keeps scanning — existing
+                    // aircraft that appear later in the list still get their update even
+                    // when no new slots are available.
+                    let isUpdate = currentAircraft[ac.id]?.source == .internet
+                    if !isUpdate {
+                        guard newSlotsRemaining > 0 else { continue }
+                        newSlotsRemaining -= 1
+                    }
+
+                    ac.lastUpdate = fetchTime
+                    updates[ac.id] = ac
                 }
 
-                // Skip if an ADS-B aircraft with this ID already exists
-                if let existing = currentAircraft[ac.id], existing.source == .adsb { continue }
+                guard !updates.isEmpty else { return }
 
-                // Skip ownship by proximity to ADS-B ownship position
-                if let ownship {
-                    let ownCoord = CLLocationCoordinate2D(latitude: ownship.latitude, longitude: ownship.longitude)
-                    if CalculationsLogic.distanceInNauticalMiles(from: ownCoord, to: ac.coordinate) < 0.1 { continue }
+                // ── Step 3: merge on main thread — one @Published fire ──────────────
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    var merged = self.detectedAircraft
+                    for (id, ac) in updates { merged[id] = ac }
+                    self.detectedAircraft = merged
+                    self.internetAircraftCount = merged.values.filter { $0.source == .internet }.count
                 }
-
-                ac.lastUpdate = fetchTime
-                updates[ac.id] = ac
-                slotsRemaining -= 1
-            }
-
-            guard !updates.isEmpty else { return }
-
-            // Single assignment on main thread → one @Published fire, not one per aircraft.
-            DispatchQueue.main.async {
-                var merged = self.detectedAircraft
-                for (id, ac) in updates { merged[id] = ac }
-                self.detectedAircraft = merged
-                self.internetAircraftCount = updates.count
             }
         }
     }
