@@ -536,6 +536,7 @@ class ARTrafficViewController: UIViewController {
                 maxRangeNauticalMiles: rangeNM
             )
             DispatchQueue.main.async {
+                guard let self else { return }
                 self.airports = nearby
                 self.updateStatusLabel()
             }
