@@ -524,10 +524,14 @@ class ARTrafficViewController: UIViewController {
         // Same 25% safety margin as loadAirports() — keeps the working set tight
         // while ensuring airports at the edge of the display radius are included.
         let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
+        // Capture allAirports on the main thread before hopping to the background.
+        // Accessing self.allAirports directly on the background thread is a data race:
+        // the main thread writes it in loadAirports() and any concurrent read on the
+        // background risks an EXC_BAD_ACCESS via Swift's non-atomic COW bookkeeping.
+        let snapshot = allAirports
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            guard let self else { return }
             let nearby = CalculationsLogic.filterAirportsInRange(
-                airports: self.allAirports,
+                airports: snapshot,
                 userCoord: loc,
                 maxRangeNauticalMiles: rangeNM
             )
