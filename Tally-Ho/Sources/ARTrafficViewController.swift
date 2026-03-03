@@ -909,12 +909,55 @@ class ARTrafficViewController: UIViewController {
     // MARK: - Off-Screen Arrow
 
     private func updateOffScreenArrow(for nodeID: String) {
-        guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else {
+        // Prefer the live AR SceneKit node (exact 3D position already in world space).
+        // Fall back to computing the AR world position from GPS coordinates so that
+        // targets selected from the 2D map still get a directional arrow even when
+        // they have no AR node (e.g. outside aircraftMaxDistance, filtered from scene).
+        let cameraPos: SCNVector3
+        if let pov = arSceneView.pointOfView {
+            let t = pov.worldTransform
+            cameraPos = SCNVector3(t.m41, t.m42, t.m43)
+        } else {
+            cameraPos = .init()
+        }
+
+        let worldPos: SCNVector3
+        if let node = sceneManager?.node(forID: nodeID), !node.isHidden {
+            worldPos = node.worldPosition
+        } else if let loc = activeLocation {
+            // No AR node — derive direction from GPS.
+            let targetCoord: CLLocationCoordinate2D?
+            let targetAlt: Double
+            if nodeID.hasPrefix("aircraft_") {
+                let id = String(nodeID.dropFirst("aircraft_".count))
+                if let ac = connectionLogic.detectedAircraft[id] {
+                    targetCoord = ac.coordinate
+                    targetAlt   = ac.altitude
+                } else { targetCoord = nil; targetAlt = 0 }
+            } else if nodeID.hasPrefix("airport_") {
+                let icao = String(nodeID.dropFirst("airport_".count))
+                if let ap = airports.first(where: { $0.icao == icao }) {
+                    targetCoord = ap.coordinate
+                    targetAlt   = ap.elevation
+                } else { targetCoord = nil; targetAlt = 0 }
+            } else { targetCoord = nil; targetAlt = 0 }
+
+            guard let coord = targetCoord else { offScreenArrowView.hide(); return }
+            let rawPos = CalculationsLogic.calculateARPosition(
+                targetCoord:      coord,
+                targetAltitude:   targetAlt,
+                userCoord:        loc,
+                userAltitude:     activeAltitude,
+                userHeading:      userHeading,
+                cameraWorldPosition: cameraPos,
+                northCorrectionDeg:  arKitNorthCorrectionDeg
+            )
+            worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
+        } else {
             offScreenArrowView.hide()
             return
         }
 
-        let worldPos   = node.worldPosition
         let projected  = arSceneView.projectPoint(worldPos)
         let screenSize = arSceneView.bounds.size
 
