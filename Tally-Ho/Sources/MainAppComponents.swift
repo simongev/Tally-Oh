@@ -76,13 +76,23 @@ class ARComponentFactory {
     /// Label image cache — avoids re-rendering UIGraphicsImageRenderer for text
     /// that hasn't changed. Aircraft labels update at most a few times per minute
     /// (altitude, speed, distance), so cache hits are very frequent after value quantization.
-    /// Bounded to 200 entries. With quantized values most aircraft share very few distinct
-    /// label strings (e.g. all aircraft at FL350 share one texture) so 200 is generous.
+    /// Bounded to 200 entries and 40 MB total. Because callsigns are unique per aircraft,
+    /// each aircraft produces its own cache key, so the byte budget is the primary guard
+    /// against OOM kills in dense traffic. NSCache evicts automatically under memory pressure
+    /// when cost is tracked.
     private static let labelImageCache: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
         c.countLimit = 200
+        c.totalCostLimit = 40_000_000   // 40 MB — at 1× scale (~200–400 KB per image) this
+                                        // holds 100–200 labels; evicts before iOS kills us.
         return c
     }()
+
+    /// Flush the label image cache. Called from pruneForMemoryPressure() so that
+    /// both SceneKit nodes and their backing textures are released together.
+    static func evictLabelCache() {
+        labelImageCache.removeAllObjects()
+    }
 
     // MARK: - Pre-cached ring images & materials per TCAS level
     // Images and SCNMaterials are created once and shared across all aircraft nodes.
@@ -473,7 +483,14 @@ class ARComponentFactory {
         let imgH  = ceil(textSize.height + vPad * 2)
         let corner = fontSize * 22
 
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: imgW, height: imgH))
+        // Render at 1× instead of UIScreen.main.scale (2× or 3× on modern iPhones).
+        // Label textures are displayed on SCNPlanes in AR world space — the plane is
+        // scaled to fit the scene in metres, not screen points — so @2x/@3x bitmaps
+        // waste 4–9× the memory with no visible improvement at typical viewing distances
+        // (labels are viewed at 0.1 – 25 NM, where even 1× looks perfectly sharp).
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: imgW, height: imgH), format: format)
         let image = renderer.image { ctx in
             let rect = CGRect(x: 0, y: 0, width: imgW, height: imgH)
             let path = UIBezierPath(roundedRect: rect, cornerRadius: corner)
@@ -482,7 +499,9 @@ class ARComponentFactory {
             let textRect = CGRect(x: hPad, y: vPad, width: textSize.width, height: textSize.height)
             attrStr.draw(in: textRect)
         }
-        labelImageCache.setObject(image, forKey: cacheKey)
+        // Pass a byte-level cost so totalCostLimit can enforce the 40 MB budget.
+        let cost = Int(imgW * imgH * 4)
+        labelImageCache.setObject(image, forKey: cacheKey, cost: cost)
         return image
     }
 
@@ -1133,6 +1152,12 @@ class ARSceneManager {
         pruned.forEach { $0.removeFromParentNode() }
         apNodes.forEach { $0.removeFromParentNode() }
         SCNTransaction.commit()
+
+        // Flush the label texture cache — each image is a few hundred KB at 1× scale,
+        // and holding 200 of them can reach 40+ MB. Evicting here frees that memory
+        // immediately alongside the SceneKit node removal above. Labels will be
+        // regenerated (and re-cached) as nodes are rebuilt on the next tick.
+        ARComponentFactory.evictLabelCache()
 
         // Refresh the tick snapshot so the rendering thread doesn't try to
         // position nodes that have just been removed from the scene.
