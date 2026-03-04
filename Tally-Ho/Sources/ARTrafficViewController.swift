@@ -238,6 +238,30 @@ class ARTrafficViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         startARSession()
+
+        // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
+        // (pausing the AR session, invalidating the timer, stopping the altimeter).
+        // Restart everything here so the AR view is fully live again when it reappears.
+
+        // Restart the altimeter (stopped in viewWillDisappear).
+        setupAltimeter()
+
+        // Restart the 4 Hz update loop if it was invalidated while we were away.
+        if !(updateTimer?.isValid ?? false) {
+            updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.updateVisualization()
+            }
+        }
+
+        // ARKit resets its world-north reference when the session is restarted with
+        // .resetTracking (called inside startARSession above), so the stored north
+        // correction is now relative to a different ARKit frame.  Reset the sample
+        // counters so the GPS-track correction re-converges immediately from the
+        // current (warm-start) correction value rather than fighting a stale base.
+        northCorrectionSampleCount = 0
+        prevNorthCorrectionArYawDeg = nil
+        prevNorthCorrectionTrueTrack = nil
+        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
     }
 
     // MARK: - Memory pressure
@@ -627,10 +651,27 @@ class ARTrafficViewController: UIViewController {
         present(nav, animated: true)
     }
 
+    /// Returns the aircraft list to show on the 2D map.
+    /// Applies the WiFi ownship callsign filter (same as the AR view) so the user's
+    /// own aircraft is not shown on the map once they have identified it in Settings.
+    /// The 2 NM exclusion zone is intentionally NOT applied here — the map is used
+    /// specifically to identify nearby aircraft, and hiding close traffic would defeat
+    /// that purpose.
+    private func mapFilteredAircraft() -> [Aircraft] {
+        var list = Array(connectionLogic.detectedAircraft.values)
+        if wifiInAir, let ownCallsign = sceneManager?.settings.wifiOwnshipCallsign {
+            list = list.filter { $0.callsign != ownCallsign }
+        }
+        return list
+    }
+
     @objc private func showMap() {
         guard let loc = activeLocation else { return }
-        let aircraft = Array(connectionLogic.detectedAircraft.values)
         let settings = sceneManager?.settings ?? ARVisualizationSettings()
+
+        // Apply the same WiFi ownship filter used in the AR view so the user's own
+        // aircraft (identified via the "I'm Flying" setting) is hidden on the map too.
+        let aircraft = mapFilteredAircraft()
 
         let vc = MapViewController(
             userLocation: loc,
@@ -640,11 +681,11 @@ class ARTrafficViewController: UIViewController {
             settings: settings
         )
 
-        // Provide fresh data every live-update tick
+        // Provide fresh data every live-update tick, applying the same ownship filter.
         vc.dataProvider = { [weak self] in
             guard let self, let loc = self.activeLocation else { return nil }
             return (
-                aircraft: Array(self.connectionLogic.detectedAircraft.values),
+                aircraft: self.mapFilteredAircraft(),
                 airports: self.airports,
                 location: loc,
                 heading: self.userHeading
@@ -962,7 +1003,24 @@ class ARTrafficViewController: UIViewController {
         let projected  = arSceneView.projectPoint(worldPos)
         let screenSize = arSceneView.bounds.size
 
-        let behindCamera = projected.z >= 1.0
+        // Determine behind-camera via dot product: SCNView.projectPoint returns
+        // undefined z values for behind-camera points (can be < 1.0 on Metal),
+        // so we use the sign of (cameraForward · toTarget) instead.
+        let toTargetVec = SIMD3<Float>(
+            worldPos.x - cameraPos.x,
+            worldPos.y - cameraPos.y,
+            worldPos.z - cameraPos.z
+        )
+        let camForwardSel: SIMD3<Float>
+        if let t = arSceneView.session.currentFrame?.camera.transform {
+            // ARKit camera looks along its local -Z; that axis in world space is
+            // the negative of the third column of the camera-to-world transform.
+            camForwardSel = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+        } else {
+            camForwardSel = SIMD3<Float>(0, 0, -1)
+        }
+        let behindCamera = simd_dot(camForwardSel, toTargetVec) <= 0
+
         let onScreen = !behindCamera
             && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
             && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
@@ -1045,7 +1103,23 @@ class ARTrafficViewController: UIViewController {
             guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else { continue }
 
             let projected = arSceneView.projectPoint(node.worldPosition)
-            let behindCamera = projected.z >= 1.0
+
+            // Behind-camera via dot product (see updateOffScreenArrow for rationale).
+            let camPos = arSceneView.pointOfView?.worldPosition ?? SCNVector3Zero
+            let nodePos = node.worldPosition
+            let toNodeVec = SIMD3<Float>(
+                nodePos.x - camPos.x,
+                nodePos.y - camPos.y,
+                nodePos.z - camPos.z
+            )
+            let camFwdTCAS: SIMD3<Float>
+            if let t = arSceneView.session.currentFrame?.camera.transform {
+                camFwdTCAS = SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z)
+            } else {
+                camFwdTCAS = SIMD3<Float>(0, 0, -1)
+            }
+            let behindCamera = simd_dot(camFwdTCAS, toNodeVec) <= 0
+
             let onScreen = !behindCamera
                 && projected.x >= 0 && CGFloat(projected.x) <= screenSize.width
                 && projected.y >= 0 && CGFloat(projected.y) <= screenSize.height
@@ -1241,7 +1315,13 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
 
         let hAcc = loc.horizontalAccuracy
-        guard hAcc > 0 && hAcc <= gpsAccuracyThreshold else {
+        // Inside an aircraft fuselage the GPS signal is attenuated; accuracy
+        // typically degrades to 30–150 m, which would make the strict ground
+        // threshold (30 m) reject every fix.  In flight (tcasEnabled = altitude
+        // > 200 ft) allow up to 500 m — aircraft are separated by > 1 NM so
+        // this is still well within useful precision for AR positioning.
+        let effectiveThreshold = tcasEnabled ? 500.0 : gpsAccuracyThreshold
+        guard hAcc > 0 && hAcc <= effectiveThreshold else {
             if hAcc > 0 { lastHorizontalAccuracy = hAcc }
             updateStatusLabel()
             return
@@ -1380,7 +1460,11 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // Use compass for north-correction only when NOT in airborne GPS-track mode.
         // In-flight the compass is unreliable inside a metal fuselage; GPS track
         // (applied in didUpdateLocations above) takes over when speed > 30 kt.
-        let usingGPSTrack = tcasEnabled && (connectionLogic.ownshipData?.groundSpeed ?? 0) > 30
+        // Check ADS-B ownship speed first; fall back to iPhone GPS speed so that
+        // WiFi-only flights (no ADS-B receiver) also suppress compass correction.
+        let ownshipSpeedKt = connectionLogic.ownshipData?.groundSpeed ?? 0
+        let iPhoneSpeedKt  = (locationManager.location?.speed ?? -1) * 1.944  // m/s → kt
+        let usingGPSTrack  = tcasEnabled && (ownshipSpeedKt > 30 || iPhoneSpeedKt > 30)
         if !usingGPSTrack, accuracy <= 10, let frame = arSceneView.session.currentFrame {
             applyNorthCorrection(trueNorth: trueNorth, frame: frame)
         }
