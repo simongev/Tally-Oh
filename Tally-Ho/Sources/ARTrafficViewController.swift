@@ -442,6 +442,7 @@ class ARTrafficViewController: UIViewController {
         locationManager.activityType = .airborne
         locationManager.distanceFilter = kCLDistanceFilterNone
         locationManager.headingFilter = kCLHeadingFilterNone
+        locationManager.headingOrientation = .portrait   // fixes 90° offset in landscape: always report heading of physical top (camera axis)
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
         locationManager.startUpdatingHeading()
