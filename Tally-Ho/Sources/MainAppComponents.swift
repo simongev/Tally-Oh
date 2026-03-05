@@ -220,6 +220,13 @@ class ARComponentFactory {
         Float(max(0.3, 1.0 / (1.0 + 0.035 * distanceNM)))
     }
 
+    /// Draw order for marker container + child nodes based on real-world distance.
+    /// Closer targets (higher value) render on top of farther ones (lower value).
+    /// Range: 0 NM → 1000 (topmost), 50 NM → 0 (bottommost).
+    static func markerRenderingOrder(_ distanceNM: Double) -> Int {
+        max(0, 1000 - Int(distanceNM * 20))
+    }
+
     // MARK: - Aircraft Marker
 
     /// Create a flat ring billboard with an optional label.
@@ -267,6 +274,11 @@ class ARComponentFactory {
 
         // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
         container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
+
+        // Closer aircraft render on top of farther ones.
+        let ro = markerRenderingOrder(distanceNM)
+        container.renderingOrder = ro
+        container.enumerateChildNodes { child, _ in child.renderingOrder = ro }
 
         return container
     }
@@ -410,6 +422,11 @@ class ARComponentFactory {
 
         // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
         container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
+
+        // Closer airports render on top of farther ones.
+        let ro = markerRenderingOrder(distanceNM)
+        container.renderingOrder = ro
+        container.enumerateChildNodes { child, _ in child.renderingOrder = ro }
 
         return container
     }
@@ -593,6 +610,11 @@ class ARComponentFactory {
         SCNTransaction.disableActions = true
         node.scale = SCNVector3(distScale * selMult, distScale * selMult, distScale * selMult)
         SCNTransaction.commit()
+
+        // Update rendering order at 4 Hz so depth sorting stays correct as aircraft move.
+        let ro = markerRenderingOrder(distanceNM)
+        node.renderingOrder = ro
+        node.enumerateChildNodes { child, _ in child.renderingOrder = ro }
     }
 }
 
@@ -1060,6 +1082,11 @@ class ARSceneManager {
                 SCNTransaction.disableActions = true
                 existing.scale = SCNVector3(distScale * selMult, distScale * selMult, distScale * selMult)
                 SCNTransaction.commit()
+
+                // Update rendering order so closer airports always render on top.
+                let ro = ARComponentFactory.markerRenderingOrder(distNM)
+                existing.renderingOrder = ro
+                existing.enumerateChildNodes { child, _ in child.renderingOrder = ro }
             } else {
                 let node = ARComponentFactory.createAirportMarker(
                     rawPosition: rawPos,
