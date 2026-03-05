@@ -656,6 +656,19 @@ class ARSceneManager {
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
 
+    /// Dead-reckoning inputs — written on the main thread at GPS-fix rate (1–5 Hz),
+    /// read on the SceneKit thread at 60 Hz. Swift Double and Date are 64-bit aligned
+    /// value types; reads are effectively atomic on ARM64. Follows the same pattern
+    /// as liveUserLocation / liveUserAltitude (no lock required for scalar values).
+    private var liveUserSpeedKt: Double = 0
+    private var liveUserCourse: Double = 0
+    private var liveUserLocationTimestamp: Date = .distantPast
+
+    /// Airport node snapshot for the 60 Hz airport tick — analogous to tickNodeSnapshot.
+    /// Protected by nodesLock: written on the main thread at 4 Hz (end of updateAirports),
+    /// read on the SceneKit thread at 60 Hz (tickAirportPositions).
+    private var tickAirportSnapshot: [(airport: Airport, node: SCNNode)] = []
+
     var arKitNorthCorrectionDeg: Double = 0
 
     /// When true, only aircraft whose IDs are in raFilterThreatIDs are shown.
@@ -682,7 +695,7 @@ class ARSceneManager {
         guard settings.showAircraft else { return }
 
         let aircraft = liveAircraft
-        let userLoc  = liveUserLocation
+        let userLoc  = deadReckonedUserLocation()   // dead-reckoned from latest GPS fix
         let userAlt  = liveUserAltitude
 
         // Take the snapshot under the lock — the main thread writes tickNodeSnapshot
@@ -710,6 +723,72 @@ class ARSceneManager {
             )
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
             node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
+        }
+    }
+
+    // MARK: - User Velocity (dead reckoning support)
+
+    /// Push the latest iPhone GPS velocity state immediately when a valid fix arrives
+    /// (not throttled to the 4 Hz timer). Gives the SceneKit tick the freshest
+    /// possible baseline for dead reckoning.
+    func updateUserVelocity(speedKt: Double, course: Double,
+                            location: CLLocationCoordinate2D, timestamp: Date) {
+        liveUserSpeedKt           = speedKt
+        liveUserCourse            = course
+        liveUserLocation          = location
+        liveUserLocationTimestamp = timestamp
+    }
+
+    /// Best-estimate user position for the current frame.
+    /// Above 5 kt, dead-reckons from the last GPS fix using stored speed + course,
+    /// reducing the effective position staleness from ≤250 ms (4 Hz) to ≈0 ms.
+    /// At 500 kt this eliminates ≈62 m of positional error per 4 Hz interval,
+    /// preventing the bearing drift/snap cycle visible when panning the phone.
+    /// Capped at 2 s to guard against a stale fix (GPS loss or app backgrounding).
+    private func deadReckonedUserLocation() -> CLLocationCoordinate2D {
+        let elapsed = Date().timeIntervalSince(liveUserLocationTimestamp)
+        guard liveUserSpeedKt > 5.0, elapsed > 0, elapsed < 2.0 else {
+            return liveUserLocation
+        }
+        let (predCoord, _) = CalculationsLogic.predictPosition(
+            currentCoord:    liveUserLocation,
+            currentAltitude: liveUserAltitude,
+            track:           liveUserCourse,
+            groundSpeed:     liveUserSpeedKt,
+            verticalRate:    0,
+            timeSeconds:     elapsed
+        )
+        return predCoord
+    }
+
+    // MARK: - 60 Hz Airport Position Update
+
+    /// Repositions all airport nodes every SceneKit frame (60 Hz), eliminating the
+    /// 4 Hz drift/snap cycle that was visible when panning the phone on a fast-moving
+    /// aircraft. Mirrors tickAircraftPositions — see that method for thread-safety rationale.
+    func tickAirportPositions(cameraWorldPosition: SCNVector3) {
+        guard settings.showAirports else { return }
+
+        nodesLock.lock()
+        let snapshot = tickAirportSnapshot
+        nodesLock.unlock()
+
+        let userLoc         = deadReckonedUserLocation()
+        let userAlt         = liveUserAltitude
+        let northCorrection = arKitNorthCorrectionDeg
+
+        for entry in snapshot {
+            let rawPos = CalculationsLogic.calculateAirportARPosition(
+                airportCoord:        entry.airport.coordinate,
+                airportElevation:    entry.airport.elevation,
+                userCoord:           userLoc,
+                userAltitude:        userAlt,
+                userHeading:         0,
+                cameraWorldPosition: cameraWorldPosition,
+                northCorrectionDeg:  northCorrection
+            )
+            let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
+            entry.node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
         }
     }
 
@@ -982,6 +1061,16 @@ class ARSceneManager {
             lastAppliedSelectionID = "___unset___"
         }
         applySelectionToAllNodes()
+
+        // Refresh the lock-protected snapshot consumed by tickAirportPositions() at 60 Hz.
+        // Runs on the main thread here (4 Hz timer), so the write is safe as long as
+        // we hold nodesLock to protect the concurrent SceneKit thread reader.
+        nodesLock.lock()
+        tickAirportSnapshot = nearby.compactMap { airport in
+            guard let node = airportNodes[airport.icao] else { return nil }
+            return (airport: airport, node: node)
+        }
+        nodesLock.unlock()
     }
 
     // MARK: - Selection

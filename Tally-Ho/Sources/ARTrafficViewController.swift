@@ -237,7 +237,16 @@ class ARTrafficViewController: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        startARSession()
+
+        // Save the north correction BEFORE startARSession() zeroes it.
+        // startARSession() resets arKitNorthCorrectionDeg = 0 (new ARKit world frame).
+        // By seeding from the saved value, nodes hold the correct bearing immediately
+        // on re-entry, and the first GPS sample in applyNorthCorrection will hard-set
+        // to a fresh (but very similar) value, cutting the visual spin from ≈10 s → 0.
+        let savedCorrection = arKitNorthCorrectionDeg
+        startARSession()                                        // resets arKitNorthCorrectionDeg → 0
+        arKitNorthCorrectionDeg = savedCorrection               // restore warm-start seed
+        sceneManager?.arKitNorthCorrectionDeg = savedCorrection
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
         // (pausing the AR session, invalidating the timer, stopping the altimeter).
@@ -252,16 +261,6 @@ class ARTrafficViewController: UIViewController {
                 self?.updateVisualization()
             }
         }
-
-        // ARKit resets its world-north reference when the session is restarted with
-        // .resetTracking (called inside startARSession above), so the stored north
-        // correction is now relative to a different ARKit frame.  Reset the sample
-        // counters so the GPS-track correction re-converges immediately from the
-        // current (warm-start) correction value rather than fighting a stale base.
-        northCorrectionSampleCount = 0
-        prevNorthCorrectionArYawDeg = nil
-        prevNorthCorrectionTrueTrack = nil
-        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
     }
 
     // MARK: - Memory pressure
@@ -1291,6 +1290,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
+        sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
@@ -1346,6 +1346,20 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
+        // Push velocity state immediately (not throttled to the 4 Hz timer) so the
+        // 60 Hz dead-reckoning tick has the freshest possible baseline. At 500 kt
+        // this eliminates ≈62 m of positional error that accumulates between 4 Hz ticks.
+        // courseAccuracy < 30° is a loose guard; the dead-reckoner further requires
+        // speed > 5 kt before extrapolating, so no harm if the course is slightly noisy.
+        if loc.speed >= 0, loc.courseAccuracy >= 0, loc.courseAccuracy < 30 {
+            sceneManager?.updateUserVelocity(
+                speedKt:   loc.speed * 1.944,   // m/s → knots
+                course:    loc.course,
+                location:  loc.coordinate,
+                timestamp: loc.timestamp
+            )
+        }
+
         if isFirstFix {
             updateVisualization()
         }
@@ -1380,7 +1394,9 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
                 gpsTrueTrack = loc.course   // CLLocation.course is true north
             }
 
-            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame)
+            // Use α = 0.25 in flight: GPS course at cruise speed has < 1° std dev so
+            // the higher weight is safe, and it halves convergence time (≈19 s → ≈10 s).
+            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame, alpha: 0.25)
         }
     }
 
@@ -1399,7 +1415,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     /// gyro-tracked phone rotation matches the heading change), so their difference
     /// is near zero. When the user rotates the phone, only `arYawDeg` changes while
     /// `trueNorth` is constant — we detect this and skip the update.
-    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame) {
+    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame, alpha: Double = 0.15) {
         let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
         var sample = trueNorth - arYawDeg
         while sample >  180 { sample -= 360 }
@@ -1426,7 +1442,6 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             }
         }
 
-        let alpha = 0.15
         if northCorrectionSampleCount == 0 {
             arKitNorthCorrectionDeg = sample
         } else {
