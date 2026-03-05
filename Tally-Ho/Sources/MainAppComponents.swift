@@ -210,6 +210,16 @@ class ARComponentFactory {
     }
 
 
+    // MARK: - Distance Scaling
+
+    /// Uniform scale factor for aircraft/airport marker container nodes.
+    /// 1.0 at 0 NM, ~0.74 at 10 NM, ~0.36 at 50 NM, floored at 0.3.
+    /// Stored in node userData["distanceScale"] so applySelectedAppearance can
+    /// compose it with the selection multiplier (1.55×) on selection change.
+    static func markerDistanceScale(_ distanceNM: Double) -> Float {
+        Float(max(0.3, 1.0 / (1.0 + 0.035 * distanceNM)))
+    }
+
     // MARK: - Aircraft Marker
 
     /// Create a flat ring billboard with an optional label.
@@ -254,6 +264,9 @@ class ARComponentFactory {
         )
         labelNode.isHidden = !settings.showAircraftLabels
         container.addChildNode(labelNode)
+
+        // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
+        container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
 
         return container
     }
@@ -326,7 +339,9 @@ class ARComponentFactory {
     static func applySelectedAppearance(to container: SCNNode, selected: Bool, hasSelection: Bool = false) {
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
-        container.scale = selected ? SCNVector3(1.55, 1.55, 1.55) : SCNVector3(1.0, 1.0, 1.0)
+        let distScale = (container.value(forKey: "distanceScale") as? NSNumber)?.floatValue ?? 1.0
+        let finalScale = distScale * (selected ? 1.55 : 1.0)
+        container.scale = SCNVector3(finalScale, finalScale, finalScale)
         container.enumerateChildNodes { node, _ in
             guard node.name != "label" else { return }
             if node.geometry is SCNCone, let mat = node.geometry?.firstMaterial {
@@ -392,6 +407,9 @@ class ARComponentFactory {
             yOffset: CGFloat(coneHeight) + 1.0
         )
         container.addChildNode(labelNode)
+
+        // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
+        container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
 
         return container
     }
@@ -563,6 +581,18 @@ class ARComponentFactory {
                 }
             }
         }
+
+        // Update distance-based scale at 4 Hz so it stays current as the aircraft moves.
+        // applySelectedAppearance also reads "distanceScale" on selection change — both
+        // paths compose the distance factor with the selection multiplier (1.55×).
+        let distScale = markerDistanceScale(distanceNM)
+        node.setValue(NSNumber(value: distScale), forKey: "distanceScale")
+        let isSelected = selectedNodeID == aircraft.id
+        let selMult: Float = isSelected ? 1.55 : 1.0
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        node.scale = SCNVector3(distScale * selMult, distScale * selMult, distScale * selMult)
+        SCNTransaction.commit()
     }
 }
 
@@ -1021,6 +1051,15 @@ class ARSceneManager {
                         lbl.opacity  = 1
                     }
                 }
+                // Update distance-based scale at 4 Hz so it shrinks as the user moves away.
+                let distScale = ARComponentFactory.markerDistanceScale(distNM)
+                existing.setValue(NSNumber(value: distScale), forKey: "distanceScale")
+                let isSelected = selectedNodeID == airport.icao
+                let selMult: Float = isSelected ? 1.55 : 1.0
+                SCNTransaction.begin()
+                SCNTransaction.disableActions = true
+                existing.scale = SCNVector3(distScale * selMult, distScale * selMult, distScale * selMult)
+                SCNTransaction.commit()
             } else {
                 let node = ARComponentFactory.createAirportMarker(
                     rawPosition: rawPos,

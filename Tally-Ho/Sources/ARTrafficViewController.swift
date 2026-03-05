@@ -1397,7 +1397,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
             // Use α = 0.25 in flight: GPS course at cruise speed has < 1° std dev so
             // the higher weight is safe, and it halves convergence time (≈19 s → ≈10 s).
-            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame, alpha: 0.25)
+            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame, alpha: 0.25, cameraForwardOnly: true)
         }
     }
 
@@ -1416,7 +1416,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
     /// gyro-tracked phone rotation matches the heading change), so their difference
     /// is near zero. When the user rotates the phone, only `arYawDeg` changes while
     /// `trueNorth` is constant — we detect this and skip the update.
-    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame, alpha: Double = 0.15) {
+    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame, alpha: Double = 0.15, cameraForwardOnly: Bool = false) {
         let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
         var sample = trueNorth - arYawDeg
         while sample >  180 { sample -= 360 }
@@ -1439,6 +1439,24 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             if abs(deltaYaw - deltaTrack) > 5.0 {
                 prevNorthCorrectionArYawDeg = arYawDeg
                 prevNorthCorrectionTrueTrack = trueNorth
+                return
+            }
+        }
+
+        // Self-consistency guard (GPS track path only, cameraForwardOnly: true).
+        // sample = gpsTrueTrack − arYawDeg is valid only when the camera faces the travel
+        // direction. The pan-detection block catches active rotation but misses "camera
+        // held still at a sideways angle": deltaYaw=0, deltaTrack=0 → not caught → bad
+        // sample (alpha 0.25) drifts all nodes to camera-forward within ~4 GPS updates.
+        // Reject if the sample disagrees with the current correction by more than 20°.
+        // NOTE: blocking GPS updates while looking sideways does NOT prevent seeing side
+        // targets — nodes are fixed in ARKit world space and remain at correct bearings.
+        // Skipped on first sample (northCorrectionSampleCount == 0) to allow seeding.
+        if cameraForwardOnly && northCorrectionSampleCount > 0 {
+            var diff = sample - arKitNorthCorrectionDeg
+            while diff >  180 { diff -= 360 }
+            while diff < -180 { diff += 360 }
+            if abs(diff) > 20.0 {
                 return
             }
         }
