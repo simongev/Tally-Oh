@@ -194,10 +194,6 @@ class ARTrafficViewController: UIViewController {
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
     private var arKitNorthCorrectionDeg: Double = 0
-    private var northCorrectionSampleCount: Int = 0
-    // Previous-sample snapshots used to detect user camera rotation vs. airplane turn.
-    private var prevNorthCorrectionArYawDeg: Double? = nil
-    private var prevNorthCorrectionTrueTrack: Double? = nil
 
     // MARK: - Lifecycle
 
@@ -238,15 +234,12 @@ class ARTrafficViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
-        // Save the north correction BEFORE startARSession() zeroes it.
-        // startARSession() resets arKitNorthCorrectionDeg = 0 (new ARKit world frame).
-        // By seeding from the saved value, nodes hold the correct bearing immediately
-        // on re-entry, and the first GPS sample in applyNorthCorrection will hard-set
-        // to a fresh (but very similar) value, cutting the visual spin from ≈10 s → 0.
-        let savedCorrection = arKitNorthCorrectionDeg
-        startARSession()                                        // resets arKitNorthCorrectionDeg → 0
-        arKitNorthCorrectionDeg = savedCorrection               // restore warm-start seed
-        sceneManager?.arKitNorthCorrectionDeg = savedCorrection
+        // startARSession() resets ARKit world tracking but no longer clears the
+        // north correction (which is the stable geographic declination).  The scene
+        // manager is synced here so nodes placed immediately on re-entry use the
+        // correct bearing offset without waiting for the next heading callback.
+        startARSession()
+        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
         // (pausing the AR session, invalidating the timer, stopping the altimeter).
@@ -572,11 +565,6 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        arKitNorthCorrectionDeg = 0
-        northCorrectionSampleCount = 0
-        prevNorthCorrectionArYawDeg = nil
-        prevNorthCorrectionTrueTrack = nil
-        sceneManager?.arKitNorthCorrectionDeg = 0
     }
 
     // MARK: - Actions
@@ -1223,9 +1211,7 @@ class ARTrafficViewController: UIViewController {
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = northCorrectionSampleCount == 0
-                ? "—"
-                : String(format: "%+.1f°", arKitNorthCorrectionDeg)
+            let corrStr = String(format: "%+.1f°", arKitNorthCorrectionDeg)
             lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
@@ -1377,99 +1363,6 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             refreshNearbyAirports()
         }
 
-        // When airborne and moving fast enough for GPS track to be reliable, use
-        // it instead of the compass for north-correction. Inside an aircraft fuselage
-        // the magnetic field is distorted by engines/avionics, making the compass
-        // unreliable. GPS track is unaffected by electromagnetics and gives a stable,
-        // drift-free true-north reference at cruise speed.
-        // Speed threshold: 30 kt ≈ 15.4 m/s — below this GPS course can jump ±15°.
-        let speedMS = loc.speed   // m/s, negative means invalid
-        let courseValid = loc.courseAccuracy >= 0 && loc.courseAccuracy < 20 && speedMS >= 15.0
-        if tcasEnabled && courseValid, let frame = arSceneView.session.currentFrame {
-            // Prefer ADS-B ownship track (already true, high accuracy); fall back to
-            // iPhone GPS course (also true north, slightly noisier at low speeds).
-            let gpsTrueTrack: Double
-            if let ownship = connectionLogic.ownshipData, ownship.groundSpeed > 30 {
-                gpsTrueTrack = ownship.track
-            } else {
-                gpsTrueTrack = loc.course   // CLLocation.course is true north
-            }
-
-            // Use α = 0.25 in flight: GPS course at cruise speed has < 1° std dev so
-            // the higher weight is safe, and it halves convergence time (≈19 s → ≈10 s).
-            applyNorthCorrection(trueNorth: gpsTrueTrack, frame: frame, alpha: 0.25, cameraForwardOnly: true)
-        }
-    }
-
-    /// Apply a single north-correction sample using the given true-north reference
-    /// and the current ARKit world yaw. Uses exponential smoothing (α = 0.15) to
-    /// filter noise; the first sample is applied instantly.
-    ///
-    /// When flying, `trueNorth` is the airplane's GPS track — it represents the
-    /// airplane's heading, NOT the camera's heading. The formula
-    ///   northCorrectionDeg = gpsTrueTrack − arYawDeg
-    /// is only valid when the camera faces in the flight direction.
-    ///
-    /// To avoid corrupting the correction when the user looks sideways, we compare
-    /// the change in `arYawDeg` with the change in `trueNorth` between consecutive
-    /// calls. When the airplane turns, both values shift by the same amount (the
-    /// gyro-tracked phone rotation matches the heading change), so their difference
-    /// is near zero. When the user rotates the phone, only `arYawDeg` changes while
-    /// `trueNorth` is constant — we detect this and skip the update.
-    private func applyNorthCorrection(trueNorth: Double, frame: ARFrame, alpha: Double = 0.15, cameraForwardOnly: Bool = false) {
-        let arYawDeg = Double(-frame.camera.eulerAngles.y) * 180.0 / .pi
-        var sample = trueNorth - arYawDeg
-        while sample >  180 { sample -= 360 }
-        while sample < -180 { sample += 360 }
-
-        // Skip samples where the camera has rotated independently of the airplane.
-        // Δ(arYawDeg) − Δ(gpsTrueTrack) isolates user-induced camera rotation:
-        // it is ~0 for airplane turns (both deltas match) and non-zero when the
-        // user pans the phone sideways. A 5° threshold accommodates GPS track
-        // noise (< 1° at airliner speed) while catching deliberate panning.
-        if northCorrectionSampleCount > 0,
-           let prevYaw = prevNorthCorrectionArYawDeg,
-           let prevTrack = prevNorthCorrectionTrueTrack {
-            var deltaYaw = arYawDeg - prevYaw
-            while deltaYaw >  180 { deltaYaw -= 360 }
-            while deltaYaw < -180 { deltaYaw += 360 }
-            var deltaTrack = trueNorth - prevTrack
-            while deltaTrack >  180 { deltaTrack -= 360 }
-            while deltaTrack < -180 { deltaTrack += 360 }
-            if abs(deltaYaw - deltaTrack) > 5.0 {
-                prevNorthCorrectionArYawDeg = arYawDeg
-                prevNorthCorrectionTrueTrack = trueNorth
-                return
-            }
-        }
-
-        // Self-consistency guard (GPS track path only, cameraForwardOnly: true).
-        // sample = gpsTrueTrack − arYawDeg is valid only when the camera faces the travel
-        // direction. The pan-detection block catches active rotation but misses "camera
-        // held still at a sideways angle": deltaYaw=0, deltaTrack=0 → not caught → bad
-        // sample (alpha 0.25) drifts all nodes to camera-forward within ~4 GPS updates.
-        // Reject if the sample disagrees with the current correction by more than 20°.
-        // NOTE: blocking GPS updates while looking sideways does NOT prevent seeing side
-        // targets — nodes are fixed in ARKit world space and remain at correct bearings.
-        // Skipped on first sample (northCorrectionSampleCount == 0) to allow seeding.
-        if cameraForwardOnly && northCorrectionSampleCount > 0 {
-            var diff = sample - arKitNorthCorrectionDeg
-            while diff >  180 { diff -= 360 }
-            while diff < -180 { diff += 360 }
-            if abs(diff) > 20.0 {
-                return
-            }
-        }
-
-        if northCorrectionSampleCount == 0 {
-            arKitNorthCorrectionDeg = sample
-        } else {
-            arKitNorthCorrectionDeg = alpha * sample + (1 - alpha) * arKitNorthCorrectionDeg
-        }
-        northCorrectionSampleCount += 1
-        prevNorthCorrectionArYawDeg = arYawDeg
-        prevNorthCorrectionTrueTrack = trueNorth
-        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
@@ -1481,26 +1374,24 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
             startARSession()
-            arKitNorthCorrectionDeg = 0
-            northCorrectionSampleCount = 0
-            prevNorthCorrectionArYawDeg = nil
-            prevNorthCorrectionTrueTrack = nil
         }
 
         lastHeadingAccuracy = accuracy
         let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         userHeading = trueNorth
 
-        // Use compass for north-correction only when NOT in airborne GPS-track mode.
-        // In-flight the compass is unreliable inside a metal fuselage; GPS track
-        // (applied in didUpdateLocations above) takes over when speed > 30 kt.
-        // Check ADS-B ownship speed first; fall back to iPhone GPS speed so that
-        // WiFi-only flights (no ADS-B receiver) also suppress compass correction.
-        let ownshipSpeedKt = connectionLogic.ownshipData?.groundSpeed ?? 0
-        let iPhoneSpeedKt  = (locationManager.location?.speed ?? -1) * 1.944  // m/s → kt
-        let usingGPSTrack  = tcasEnabled && (ownshipSpeedKt > 30 || iPhoneSpeedKt > 30)
-        if !usingGPSTrack, accuracy <= 10, let frame = arSceneView.session.currentFrame {
-            applyNorthCorrection(trueNorth: trueNorth, frame: frame)
+        // Magnetic declination = trueHeading − magneticHeading.
+        // CLHeading.trueHeading = magneticHeading + WMM geographic lookup-table declination,
+        // so their difference is the pure geographic declination — camera-orientation
+        // independent and unaffected by in-aircraft EMF (the lookup table is keyed on
+        // device location, not on the raw magnetometer).  This replaces the previous
+        // GPS-track-based correction which was only valid when the camera faced forward.
+        if newHeading.trueHeading >= 0 && newHeading.magneticHeading >= 0 {
+            var decl = newHeading.trueHeading - newHeading.magneticHeading
+            while decl >  180 { decl -= 360 }
+            while decl < -180 { decl += 360 }
+            arKitNorthCorrectionDeg = decl
+            sceneManager?.arKitNorthCorrectionDeg = decl
         }
 
         updateStatusLabel()
