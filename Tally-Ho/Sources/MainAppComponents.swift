@@ -23,23 +23,23 @@ class ARComponentFactory {
     static let minARRadius: Float = 5.0
 
     /// Base ring radius for normal traffic (metres in AR space).
-    static let aircraftRingRadius: Float    = 3.0
+    static let aircraftRingRadius: Float    = 3.6
     /// Ring radius for TA threats — slightly larger so they stand out.
-    static let aircraftRingRadiusTA: Float  = 3.8
+    static let aircraftRingRadiusTA: Float  = 4.6
     /// Ring radius for RA threats — even larger, impossible to miss.
-    static let aircraftRingRadiusRA: Float  = 4.6
+    static let aircraftRingRadiusRA: Float  = 5.5
 
-    static let aircraftRingThickness: Float   = 0.35   // normal ring stroke half-width
-    static let aircraftRingThicknessTA: Float = 0.55   // TA — noticeably thicker
-    static let aircraftRingThicknessRA: Float = 0.75   // RA — boldest
+    static let aircraftRingThickness: Float   = 0.42   // normal ring stroke half-width
+    static let aircraftRingThicknessTA: Float = 0.66   // TA — noticeably thicker
+    static let aircraftRingThicknessRA: Float = 0.90   // RA — boldest
 
     /// Airport cone dimensions (metres in AR space).
-    static let coneHeight: CGFloat = 8.0
-    static let coneBaseRadius: CGFloat = 2.0
+    static let coneHeight: CGFloat = 9.6
+    static let coneBaseRadius: CGFloat = 2.4
 
     /// Label font size (1 scene-unit ≈ 1 m).
-    static let labelFontSize: CGFloat        = 1.5
-    static let labelFontSizeAirport: CGFloat = 1.6
+    static let labelFontSize: CGFloat        = 1.8
+    static let labelFontSizeAirport: CGFloat = 1.9
 
     /// Ring geometry params (radius + thickness) per TCAS level.
     static func ringParams(for level: TCASAlertLevel) -> (radius: Float, thickness: Float) {
@@ -215,7 +215,7 @@ class ARComponentFactory {
     /// Uniform scale factor for aircraft/airport marker container nodes.
     /// 1.0 at 0 NM, ~0.74 at 10 NM, ~0.36 at 50 NM, floored at 0.3.
     /// Stored in node userData["distanceScale"] so applySelectedAppearance can
-    /// compose it with the selection multiplier (1.55×) on selection change.
+    /// override it with exactly 1.0 when the node is selected.
     static func markerDistanceScale(_ distanceNM: Double) -> Float {
         Float(max(0.3, 1.0 / (1.0 + 0.035 * distanceNM)))
     }
@@ -352,7 +352,7 @@ class ARComponentFactory {
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
         let distScale = (container.value(forKey: "distanceScale") as? NSNumber)?.floatValue ?? 1.0
-        let finalScale = distScale * (selected ? 1.55 : 1.0)
+        let finalScale: Float = selected ? 1.0 : distScale
         container.scale = SCNVector3(finalScale, finalScale, finalScale)
         container.enumerateChildNodes { node, _ in
             guard node.name != "label" else { return }
@@ -600,15 +600,14 @@ class ARComponentFactory {
         }
 
         // Update distance-based scale at 4 Hz so it stays current as the aircraft moves.
-        // applySelectedAppearance also reads "distanceScale" on selection change — both
-        // paths compose the distance factor with the selection multiplier (1.55×).
+        // The selected node is always rendered at scale 1.0; all others use the distance factor.
         let distScale = markerDistanceScale(distanceNM)
         node.setValue(NSNumber(value: distScale), forKey: "distanceScale")
         let isSelected = selectedNodeID == aircraft.id
-        let selMult: Float = isSelected ? 1.55 : 1.0
+        let s: Float = isSelected ? 1.0 : distScale
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
-        node.scale = SCNVector3(distScale * selMult, distScale * selMult, distScale * selMult)
+        node.scale = SCNVector3(s, s, s)
         SCNTransaction.commit()
 
         // Update rendering order at 4 Hz so depth sorting stays correct as aircraft move.
