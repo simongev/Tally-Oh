@@ -601,9 +601,10 @@ class ARComponentFactory {
 
         // Update distance-based scale at 4 Hz so it stays current as the aircraft moves.
         // The selected node is always rendered at scale 1.0; all others use the distance factor.
+        // NOTE: selectedNodeID stores the full node name ("aircraft_<id>"), not the bare aircraft id.
         let distScale = markerDistanceScale(distanceNM)
         node.setValue(NSNumber(value: distScale), forKey: "distanceScale")
-        let isSelected = selectedNodeID == aircraft.id
+        let isSelected = selectedNodeID == "aircraft_\(aircraft.id)"
         let s: Float = isSelected ? 1.0 : distScale
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
@@ -795,10 +796,11 @@ class ARSceneManager {
     /// reducing the effective position staleness from ≤250 ms (4 Hz) to ≈0 ms.
     /// At 500 kt this eliminates ≈62 m of positional error per 4 Hz interval,
     /// preventing the bearing drift/snap cycle visible when panning the phone.
-    /// Capped at 2 s to guard against a stale fix (GPS loss or app backgrounding).
+    /// Capped at 5 s to cover brief GPS outages that are common inside aircraft
+    /// fuselages (engine/avionics interference can break lock for 2–4 s).
     private func deadReckonedUserLocation() -> CLLocationCoordinate2D {
         let elapsed = Date().timeIntervalSince(liveUserLocationTimestamp)
-        guard liveUserSpeedKt > 5.0, elapsed > 0, elapsed < 2.0 else {
+        guard liveUserSpeedKt > 5.0, elapsed > 0, elapsed < 5.0 else {
             return liveUserLocation
         }
         let (predCoord, _) = CalculationsLogic.predictPosition(
@@ -1073,9 +1075,10 @@ class ARSceneManager {
                     }
                 }
                 // Update distance-based scale at 4 Hz so it shrinks as the user moves away.
+                // NOTE: selectedNodeID stores the full node name ("airport_<icao>"), not the bare ICAO.
                 let distScale = ARComponentFactory.markerDistanceScale(distNM)
                 existing.setValue(NSNumber(value: distScale), forKey: "distanceScale")
-                let isSelected = selectedNodeID == airport.icao
+                let isSelected = selectedNodeID == "airport_\(airport.icao)"
                 let selMult: Float = isSelected ? 1.55 : 1.0
                 SCNTransaction.begin()
                 SCNTransaction.disableActions = true
