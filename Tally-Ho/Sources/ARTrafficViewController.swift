@@ -1370,7 +1370,13 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         let accuracy = newHeading.headingAccuracy
 
-        if lastHeadingAccuracy >= 0
+        // Only restart ARKit when on the ground. In flight, compass accuracy commonly
+        // degrades due to aircraft magnetic interference and can bounce around the 20°
+        // threshold, triggering repeated ARKit world resets that disrupt AR tracking.
+        // Since target positions are recalculated every frame from GPS relative to the
+        // camera, a session restart doesn't improve accuracy — it only causes disruption.
+        if !tcasEnabled
+            && lastHeadingAccuracy >= 0
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
             startARSession()
