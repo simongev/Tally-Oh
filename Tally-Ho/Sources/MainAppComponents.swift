@@ -763,8 +763,7 @@ class ARSceneManager {
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
             if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
-            let extraLookahead = ac.source == .internet ? CalculationsLogic.internetApiLatencySeconds : 0.0
-            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: extraLookahead)
+            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
@@ -890,8 +889,7 @@ class ARSceneManager {
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
 
-            let extraLookahead = ac.source == .internet ? CalculationsLogic.internetApiLatencySeconds : 0.0
-            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: extraLookahead)
+            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
