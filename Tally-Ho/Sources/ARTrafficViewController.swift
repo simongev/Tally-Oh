@@ -1423,7 +1423,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
                 let horizMag = sqrt(lz.x * lz.x + lz.z * lz.z)
                 if horizMag > 0.2 {
                     let cameraARKitBearingRad = atan2(-lz.x, lz.z)
-                    var cameraARKitBearing = cameraARKitBearingRad * (180.0 / .pi)
+                    var cameraARKitBearing = Double(cameraARKitBearingRad) * (180.0 / .pi)
                     if cameraARKitBearing < 0 { cameraARKitBearing += 360 }
 
                     // CLHeading.magneticHeading (.portrait orientation) = magnetic bearing
