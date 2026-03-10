@@ -23,10 +23,6 @@ class CalculationsLogic {
     /// WGS84 ellipsoid semi-minor axis (polar radius, metres).
     static let earthRadiusPolar: Double = 6_356_752.3142
 
-    /// Extra lookahead (seconds) applied to internet-sourced aircraft positions
-    /// to compensate for adsb.lol API's inherent data age (~5–15 s in practice).
-    static let internetApiLatencySeconds: Double = 8.0
-
     /// Approximate WGS84 Earth radius at a given geodetic latitude (radians).
     /// Uses the parametric (geocentric) formula; error < 0.1% across all latitudes.
     static func earthRadius(at latitudeRadians: Double) -> Double {

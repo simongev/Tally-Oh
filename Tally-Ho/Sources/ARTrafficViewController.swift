@@ -187,7 +187,6 @@ class ARTrafficViewController: UIViewController {
     private var baroBaselineSet = false
 
     private var updateTimer: Timer?
-
     private var arZoomFOV: CGFloat = 60
     private var pinchStartFOV: CGFloat = 60
     private var cancellables = Set<AnyCancellable>()
@@ -1419,66 +1418,11 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // device location, not on the raw magnetometer).  This replaces the previous
         // GPS-track-based correction which was only valid when the camera faced forward.
         if newHeading.trueHeading >= 0 && newHeading.magneticHeading >= 0 {
-            // Step 1: geographic declination (WMM lookup — camera-orientation independent,
-            // stable, unaffected by magnetic interference).
             var decl = newHeading.trueHeading - newHeading.magneticHeading
             while decl >  180 { decl -= 360 }
             while decl < -180 { decl += 360 }
-
-            // Step 2: measure ARKit's actual north alignment error.
-            // ARKit establishes its world −Z axis at session start using its own
-            // sensor fusion. If the compass was slightly miscalibrated at that moment
-            // (normal; typical error 2–8°), the world north is off by that amount and
-            // the declination-only correction leaves a constant azimuthal offset on
-            // every target.
-            //
-            // We measure the error by comparing:
-            //   • Camera's forward bearing in ARKit world space  (where ARKit thinks it points)
-            //   • Camera's magnetic bearing from CLHeading        (where the compass says it points)
-            // The difference is the ARKit north calibration error.
-            //
-            // Camera faces −Z in local space. Its local Z axis in world space is
-            // simd_float4x4.columns.2. Forward bearing in ARKit world (east=+X, north=−Z):
-            //   bearing = atan2(−columns.2.x, columns.2.z)
-            var alignmentError: Double = 0
-            if accuracy <= 15, let pov = arSceneView.pointOfView {
-                let t  = simd_float4x4(pov.worldTransform)
-                let lz = t.columns.2   // camera local Z axis expressed in world space
-                // Horizontal magnitude: near zero when device points almost straight up/down
-                // (pitch > ~79°). Bearing is unreliable in that case — skip the correction.
-                let horizMag = sqrt(lz.x * lz.x + lz.z * lz.z)
-                if horizMag > 0.2 {
-                    let cameraARKitBearingRad = atan2(-lz.x, lz.z)
-                    var cameraARKitBearing = Double(cameraARKitBearingRad) * (180.0 / .pi)
-                    if cameraARKitBearing < 0 { cameraARKitBearing += 360 }
-
-                    // CLHeading.magneticHeading (.portrait orientation) = magnetic bearing
-                    // of the device top = the camera direction projected onto horizontal.
-                    var err = cameraARKitBearing - newHeading.magneticHeading
-                    while err >  180 { err -= 360 }
-                    while err < -180 { err += 360 }
-
-                    // Reject implausibly large errors (> 30°): momentary outlier from a
-                    // rapid rotation or brief compass transient. Use pure declination instead.
-                    if abs(err) < 30 { alignmentError = err }
-                }
-            }
-
-            // Total correction = geographic declination + ARKit calibration offset.
-            var newCorrection = decl + alignmentError
-            while newCorrection >  180 { newCorrection -= 360 }
-            while newCorrection < -180 { newCorrection += 360 }
-
-            // Low-pass filter (α = 0.2) smooths frame-to-frame noise in the alignment
-            // component without adding meaningful lag. Seed directly on the first callback
-            // so there is no slow-convergence warmup at app launch.
-            let isFirstReading = (lastHeadingAccuracy < 0)
-            if isFirstReading {
-                arKitNorthCorrectionDeg = newCorrection
-            } else {
-                arKitNorthCorrectionDeg = 0.2 * newCorrection + 0.8 * arKitNorthCorrectionDeg
-            }
-            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+            arKitNorthCorrectionDeg = decl
+            sceneManager?.arKitNorthCorrectionDeg = decl
         }
 
         updateStatusLabel()
