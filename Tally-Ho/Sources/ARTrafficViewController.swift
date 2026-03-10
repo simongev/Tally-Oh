@@ -718,7 +718,7 @@ class ARTrafficViewController: UIViewController {
         case .changed:
             let newFOV = pinchStartFOV / gesture.scale
             arZoomFOV = max(20, min(80, newFOV))
-            camera.fieldOfView = Float(arZoomFOV)
+            camera.fieldOfView = CGFloat(arZoomFOV)
         default:
             break
         }
