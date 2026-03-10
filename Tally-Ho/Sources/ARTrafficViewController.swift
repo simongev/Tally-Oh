@@ -187,6 +187,9 @@ class ARTrafficViewController: UIViewController {
     private var baroBaselineSet = false
 
     private var updateTimer: Timer?
+
+    private var arZoomFOV: CGFloat = 60
+    private var pinchStartFOV: CGFloat = 60
     private var cancellables = Set<AnyCancellable>()
 
     private var lastAirportFilterLocation: CLLocationCoordinate2D?
@@ -498,6 +501,9 @@ class ARTrafficViewController: UIViewController {
     private func setupGestures() {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         arSceneView.addGestureRecognizer(tap)
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        arSceneView.addGestureRecognizer(pinch)
     }
 
     // MARK: - Airport Loading
@@ -565,6 +571,10 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        if let cam = arSceneView.pointOfView?.camera {
+            arZoomFOV = CGFloat(cam.fieldOfView)
+            pinchStartFOV = arZoomFOV
+        }
     }
 
     // MARK: - Actions
@@ -696,6 +706,22 @@ class ARTrafficViewController: UIViewController {
 
     @objc private func closeMetar() {
         hideMetarPanel()
+    }
+
+    // MARK: - Zoom
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard let camera = arSceneView.pointOfView?.camera else { return }
+        switch gesture.state {
+        case .began:
+            pinchStartFOV = arZoomFOV
+        case .changed:
+            let newFOV = pinchStartFOV / gesture.scale
+            arZoomFOV = max(20, min(80, newFOV))
+            camera.fieldOfView = Float(arZoomFOV)
+        default:
+            break
+        }
     }
 
     // MARK: - Hit Testing / Selection
