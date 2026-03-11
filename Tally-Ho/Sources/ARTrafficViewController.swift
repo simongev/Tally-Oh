@@ -149,9 +149,24 @@ class ARTrafficViewController: UIViewController {
 
     private var metarPanelView: UIView!
     private var metarLabel: UILabel!
+    private var metarAgeLabel: UILabel!
     private var metarCloseButton: UIButton!
     private var metarSelectedICAO: String?
     private var metarFetchTask: URLSessionDataTask?
+    /// Time of the METAR observation (parsed from raw string) or D-ATIS fetch time.
+    private var metarObservationTime: Date?
+
+    // MARK: - Info (status) toggle
+
+    private var infoButton: UIButton!
+
+    // MARK: - D-ATIS
+
+    private struct DATISEntry: Decodable {
+        let airport: String
+        let type: String
+        let datis: String
+    }
 
     // MARK: - Core
 
@@ -302,6 +317,7 @@ class ARTrafficViewController: UIViewController {
         statusLabel.clipsToBounds = true
         statusLabel.textAlignment = .left
         statusLabel.isUserInteractionEnabled = false
+        statusLabel.isHidden = true
         view.addSubview(statusLabel)
 
         // Back button
@@ -368,6 +384,23 @@ class ARTrafficViewController: UIViewController {
             mapButton.heightAnchor.constraint(equalToConstant: 48)
         ])
 
+        // Info button (toggles status label)
+        infoButton = UIButton(type: .system)
+        infoButton.translatesAutoresizingMaskIntoConstraints = false
+        infoButton.setImage(UIImage(systemName: "info.circle.fill"), for: .normal)
+        infoButton.tintColor = .white
+        infoButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        infoButton.layer.cornerRadius = 24
+        infoButton.addTarget(self, action: #selector(infoButtonTapped), for: .touchUpInside)
+        view.addSubview(infoButton)
+
+        NSLayoutConstraint.activate([
+            infoButton.topAnchor.constraint(equalTo: mapButton.bottomAnchor, constant: 8),
+            infoButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            infoButton.widthAnchor.constraint(equalToConstant: 48),
+            infoButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
         // TCAS border overlay
         tcasOverlayView = UIView(frame: view.bounds)
         tcasOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -408,6 +441,13 @@ class ARTrafficViewController: UIViewController {
         metarCloseButton.addTarget(self, action: #selector(closeMetar), for: .touchUpInside)
         metarPanelView.addSubview(metarCloseButton)
 
+        metarAgeLabel = UILabel()
+        metarAgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        metarAgeLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        metarAgeLabel.textColor = .systemGreen
+        metarAgeLabel.textAlignment = .right
+        metarPanelView.addSubview(metarAgeLabel)
+
         NSLayoutConstraint.activate([
             metarPanelView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             metarPanelView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
@@ -418,9 +458,12 @@ class ARTrafficViewController: UIViewController {
             metarCloseButton.widthAnchor.constraint(equalToConstant: 28),
             metarCloseButton.heightAnchor.constraint(equalToConstant: 28),
 
+            metarAgeLabel.centerYAnchor.constraint(equalTo: metarCloseButton.centerYAnchor),
+            metarAgeLabel.trailingAnchor.constraint(equalTo: metarCloseButton.leadingAnchor, constant: -8),
+
             metarLabel.topAnchor.constraint(equalTo: metarPanelView.topAnchor, constant: 10),
             metarLabel.leadingAnchor.constraint(equalTo: metarPanelView.leadingAnchor, constant: 12),
-            metarLabel.trailingAnchor.constraint(equalTo: metarCloseButton.leadingAnchor, constant: -4),
+            metarLabel.trailingAnchor.constraint(equalTo: metarAgeLabel.leadingAnchor, constant: -4),
             metarLabel.bottomAnchor.constraint(equalTo: metarPanelView.bottomAnchor, constant: -10)
         ])
     }
@@ -703,6 +746,10 @@ class ARTrafficViewController: UIViewController {
         hideMetarPanel()
     }
 
+    @objc private func infoButtonTapped() {
+        statusLabel.isHidden.toggle()
+    }
+
     // MARK: - Zoom
 
     @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -777,13 +824,15 @@ class ARTrafficViewController: UIViewController {
         statusLeadingToBack.isActive = active
     }
 
-    // MARK: - METAR Panel
+    // MARK: - METAR / D-ATIS Panel
 
     private func showMetarPanel(for icao: String) {
         metarSelectedICAO = icao
-        metarLabel.text = "METAR \(icao): fetching…"
+        metarObservationTime = nil
+        metarAgeLabel.text = nil
+        metarLabel.text = "\(icao): fetching…"
         metarPanelView.isHidden = false
-        fetchMETAR(for: icao)
+        fetchWeather(for: icao)
     }
 
     private func hideMetarPanel() {
@@ -791,16 +840,57 @@ class ARTrafficViewController: UIViewController {
         metarFetchTask = nil
         metarPanelView.isHidden = true
         metarSelectedICAO = nil
+        metarObservationTime = nil
     }
 
-    private func fetchMETAR(for icao: String) {
+    /// Entry point: tries D-ATIS for US airports (ICAO starts with K), falls back to METAR.
+    private func fetchWeather(for icao: String) {
         metarFetchTask?.cancel()
+        if icao.hasPrefix("K") {
+            fetchDATIS(for: icao)
+        } else {
+            fetchMETAROnly(for: icao)
+        }
+    }
 
-        // Build aviationweather.gov request
+    /// Attempts to retrieve D-ATIS from datis.clowd.io. Falls back to METAR on any failure
+    /// or when no D-ATIS is available for the station.
+    private func fetchDATIS(for icao: String) {
+        guard let url = URL(string: "https://datis.clowd.io/api/\(icao)") else {
+            fetchMETAROnly(for: icao)
+            return
+        }
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let self, self.metarSelectedICAO == icao else { return }
+                if let error = error {
+                    if (error as NSError).code == NSURLErrorCancelled { return }
+                    self.fetchMETAROnly(for: icao)
+                    return
+                }
+                guard let data else { self.fetchMETAROnly(for: icao); return }
+                if let entries = try? JSONDecoder().decode([DATISEntry].self, from: data),
+                   !entries.isEmpty {
+                    let text = entries.map { "D-ATIS \($0.type)\n\($0.datis)" }.joined(separator: "\n\n")
+                    self.metarLabel.text = text
+                    // D-ATIS is always current; use now as the observation time
+                    self.metarObservationTime = Date()
+                } else {
+                    // No D-ATIS at this airport, try METAR
+                    self.fetchMETAROnly(for: icao)
+                }
+            }
+        }
+        metarFetchTask = task
+        task.resume()
+    }
+
+    private func fetchMETAROnly(for icao: String) {
+        metarFetchTask?.cancel()
         let urlStr = "https://aviationweather.gov/api/data/metar?ids=\(icao)&format=raw&hours=2"
         guard let url = URL(string: urlStr) else { return }
 
-        let task = URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             DispatchQueue.main.async {
                 guard let self, self.metarSelectedICAO == icao else { return }
                 if let error = error {
@@ -808,7 +898,7 @@ class ARTrafficViewController: UIViewController {
                     self.metarLabel.text = "METAR \(icao): unavailable"
                     return
                 }
-                guard let data = data,
+                guard let data,
                       let raw = String(data: data, encoding: .utf8)?
                           .trimmingCharacters(in: .whitespacesAndNewlines),
                       !raw.isEmpty else {
@@ -821,10 +911,37 @@ class ARTrafficViewController: UIViewController {
                     .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
                     ?? raw
                 self.metarLabel.text = "METAR\n\(latestMETAR)"
+                self.metarObservationTime = self.parseMetarObservationTime(from: latestMETAR)
             }
         }
         metarFetchTask = task
         task.resume()
+    }
+
+    /// Parses the DDHHMM Z observation time from a raw METAR string and returns it as a Date.
+    /// METAR format: `ICAO DDHHMM Z ...` – the time group is 7 chars ending in Z.
+    private func parseMetarObservationTime(from metar: String) -> Date? {
+        let tokens = metar.trimmingCharacters(in: .whitespaces)
+            .components(separatedBy: .whitespaces)
+        guard let timeToken = tokens.first(where: {
+            $0.count == 7 && $0.hasSuffix("Z") && $0.dropLast().allSatisfy({ $0.isNumber })
+        }) else { return nil }
+        guard let day    = Int(timeToken.prefix(2)),
+              let hour   = Int(timeToken.dropFirst(2).prefix(2)),
+              let minute = Int(timeToken.dropFirst(4).prefix(2)) else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        var comps = cal.dateComponents([.year, .month, .day, .hour, .minute], from: Date())
+        comps.day    = day
+        comps.hour   = hour
+        comps.minute = minute
+        comps.second = 0
+        guard let date = cal.date(from: comps) else { return nil }
+        // If the computed date is in the future the METAR is from last month
+        if date > Date() {
+            return cal.date(byAdding: .month, value: -1, to: date)
+        }
+        return date
     }
 
     // MARK: - Update Loop
@@ -952,8 +1069,21 @@ class ARTrafficViewController: UIViewController {
             updateOffScreenArrow(for: nodeID)
         }
         updateTCASArrows()
-
+        updateMetarAgeLabel()
         updateStatusLabel()
+    }
+
+    private func updateMetarAgeLabel() {
+        guard !metarPanelView.isHidden, let obsTime = metarObservationTime else { return }
+        let ageMin = Int(-obsTime.timeIntervalSinceNow / 60)
+        metarAgeLabel.text = "\(ageMin)m ago"
+        if ageMin >= 80 {
+            metarAgeLabel.textColor = .systemRed
+        } else if ageMin >= 60 {
+            metarAgeLabel.textColor = .systemOrange
+        } else {
+            metarAgeLabel.textColor = .systemGreen
+        }
     }
 
     // MARK: - Off-Screen Arrow
@@ -1278,6 +1408,11 @@ class ARTrafficViewController: UIViewController {
         if adsbCnt > 0 { parts.append("ADS-B:\(adsbCnt)") }
         if netCnt  > 0 { parts.append("Net:\(netCnt)") }
         if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
+        if let lastUpdate = connectionLogic.detectedAircraft.values
+            .max(by: { $0.lastUpdate < $1.lastUpdate })?.lastUpdate {
+            let ageSec = Int(-lastUpdate.timeIntervalSinceNow)
+            trafficLine += "  [\(ageSec)s ago]"
+        }
         lines.append(trafficLine)
 
         lines.append("🛫 Airports loaded: \(airports.count)")
