@@ -187,8 +187,8 @@ class ARTrafficViewController: UIViewController {
     private var baroBaselineSet = false
 
     private var updateTimer: Timer?
-    private var arZoomFOV: CGFloat = 60
-    private var pinchStartFOV: CGFloat = 60
+    private var currentZoomScale: CGFloat = 1.0
+    private var pinchStartScale: CGFloat = 1.0
     private var cancellables = Set<AnyCancellable>()
 
     private var lastAirportFilterLocation: CLLocationCoordinate2D?
@@ -570,10 +570,6 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        if let cam = arSceneView.pointOfView?.camera {
-            arZoomFOV = CGFloat(cam.fieldOfView)
-            pinchStartFOV = arZoomFOV
-        }
     }
 
     // MARK: - Actions
@@ -710,14 +706,13 @@ class ARTrafficViewController: UIViewController {
     // MARK: - Zoom
 
     @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-        guard let camera = arSceneView.pointOfView?.camera else { return }
         switch gesture.state {
         case .began:
-            pinchStartFOV = arZoomFOV
+            pinchStartScale = currentZoomScale
         case .changed:
-            let newFOV = pinchStartFOV / gesture.scale
-            arZoomFOV = max(20, min(80, newFOV))
-            camera.fieldOfView = CGFloat(arZoomFOV)
+            let scale = pinchStartScale * gesture.scale
+            currentZoomScale = max(1.0, min(4.0, scale))
+            arSceneView.transform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
         default:
             break
         }
