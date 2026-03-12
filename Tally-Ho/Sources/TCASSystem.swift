@@ -6,11 +6,12 @@
 //
 //  Alert logic mirrors real TCAS τ (tau) thresholds:
 //    Traffic Advisory  (TA) — convergence to CPA within 180 s AND CPA separation
-//                              is within the TA envelope, OR already inside the
-//                              TA bubble right now.
+//                              is within the TA envelope.
 //    Resolution Advisory (RA) — convergence to CPA within 40 s AND CPA separation
-//                               is within the RA envelope, OR already inside the
-//                               RA bubble right now.
+//                               is within the RA envelope.
+//
+//  Alerts are only raised for converging aircraft (tCPA > 0).
+//  Aircraft that are nearby but diverging or flying parallel do not alert.
 //
 //  IMPORTANT: This system only INDICATES threats.
 //  It does NOT advise the pilot to climb or descend — the pilot must listen to
@@ -24,8 +25,8 @@ import CoreLocation
 
 enum TCASAlertLevel: Int, Comparable {
     case none              = 0
-    case trafficAdvisory   = 1   // TA — converging or within outer envelope
-    case resolutionAdvisory = 2  // RA — converging or within inner envelope
+    case trafficAdvisory    = 1   // TA — converging toward CPA within TA envelope
+    case resolutionAdvisory = 2   // RA — converging toward CPA within RA envelope
 
     static func < (lhs: TCASAlertLevel, rhs: TCASAlertLevel) -> Bool {
         lhs.rawValue < rhs.rawValue
@@ -55,16 +56,6 @@ struct TCASEvaluation {
 /// Evaluates aircraft proximity and convergence, returning TCAS alert levels.
 class TCASSystem {
 
-    // MARK: - Spatial thresholds (current-position bubbles)
-
-    /// Traffic Advisory bubble — already inside → TA
-    static let taBubbleHorizNM: Double = 6.0
-    static let taBubbleVertFt:  Double = 1_200.0
-
-    /// Resolution Advisory bubble — already inside → RA
-    static let raBubbleHorizNM: Double = 1.5
-    static let raBubbleVertFt:  Double = 600.0
-
     // MARK: - CPA separation thresholds (predicted closest approach)
 
     /// If predicted CPA horizontal separation < this, the aircraft counts as converging threat
@@ -78,6 +69,11 @@ class TCASSystem {
 
     static let taTauSeconds: Double = 180.0   // TA: alert if CPA < 3 min away
     static let raTauSeconds: Double  =  40.0  // RA: alert if CPA < 40 s away
+
+    // MARK: - Outer guard range (skip CPA computation for clearly distant traffic)
+
+    static let guardHorizNM: Double = 18.0     // 3× the TA CPA threshold
+    static let guardVertFt:  Double = 3_600.0  // 3× the TA bubble vertical
 
     // MARK: - Evaluation
 
@@ -132,21 +128,13 @@ class TCASSystem {
         userVel: SIMD3<Double>
     ) -> TCASAlertLevel {
 
-        // --- 1. Current-position bubble check (instantaneous separation) ---
+        // Compute instantaneous separation (used for guard range check below)
         let horizNM = CalculationsLogic.distanceInNauticalMiles(
             from: userLocation, to: ac.coordinate)
         let vertFt = abs(ac.altitude - userAltitude)
 
-        if horizNM <= raBubbleHorizNM && vertFt <= raBubbleVertFt {
-            return .resolutionAdvisory
-        }
-        if horizNM <= taBubbleHorizNM && vertFt <= taBubbleVertFt {
-            return .trafficAdvisory
-        }
-
-        // --- 2. CPA prediction — only worth computing if within an outer guard range ---
-        // Use a generous guard (TA bubble * 3) to avoid computing CPA for distant traffic.
-        guard horizNM <= taBubbleHorizNM * 3 && vertFt <= taBubbleVertFt * 3 else {
+        // --- CPA prediction — skip aircraft clearly outside the outer guard range ---
+        guard horizNM <= guardHorizNM && vertFt <= guardVertFt else {
             return .none
         }
 
