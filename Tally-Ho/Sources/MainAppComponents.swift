@@ -275,10 +275,11 @@ class ARComponentFactory {
         // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
         container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
 
-        // Closer aircraft render on top of farther ones.
+        // Rings render above all labels; within each layer, closer beats farther.
         let ro = markerRenderingOrder(distanceNM)
         container.renderingOrder = ro
-        container.enumerateChildNodes { child, _ in child.renderingOrder = ro }
+        ringNode.renderingOrder  = ro + 2000   // ring layer (2000–3000) — above labels
+        labelNode.renderingOrder = ro           // label layer (0–1000)
 
         return container
     }
@@ -405,6 +406,7 @@ class ARComponentFactory {
         container.position = scaledAirportPosition(rawPosition, relativeTo: cameraWorldPosition)
 
         let coneNode = SCNNode(geometry: sharedConeGeometry)
+        coneNode.name = "cone"
         coneNode.eulerAngles.x = .pi
         coneNode.position = SCNVector3(0, Float(coneHeight / 2), 0)
         container.addChildNode(coneNode)
@@ -423,10 +425,11 @@ class ARComponentFactory {
         // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
         container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
 
-        // Closer airports render on top of farther ones.
+        // Cones render above all labels; within each layer, closer beats farther.
         let ro = markerRenderingOrder(distanceNM)
         container.renderingOrder = ro
-        container.enumerateChildNodes { child, _ in child.renderingOrder = ro }
+        coneNode.renderingOrder  = ro + 2000   // cone layer (2000–3000) — above labels
+        labelNode.renderingOrder = ro           // label layer (0–1000)
 
         return container
     }
@@ -614,7 +617,9 @@ class ARComponentFactory {
         // Update rendering order at 4 Hz so depth sorting stays correct as aircraft move.
         let ro = markerRenderingOrder(distanceNM)
         node.renderingOrder = ro
-        node.enumerateChildNodes { child, _ in child.renderingOrder = ro }
+        node.enumerateChildNodes { child, _ in
+            child.renderingOrder = child.name == "ring" ? ro + 2000 : ro
+        }
     }
 }
 
@@ -1088,7 +1093,9 @@ class ARSceneManager {
                 // Update rendering order so closer airports always render on top.
                 let ro = ARComponentFactory.markerRenderingOrder(distNM)
                 existing.renderingOrder = ro
-                existing.enumerateChildNodes { child, _ in child.renderingOrder = ro }
+                existing.enumerateChildNodes { child, _ in
+                    child.renderingOrder = child.name == "cone" ? ro + 2000 : ro
+                }
             } else {
                 let node = ARComponentFactory.createAirportMarker(
                     rawPosition: rawPos,
