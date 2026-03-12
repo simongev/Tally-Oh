@@ -446,6 +446,7 @@ class ARTrafficViewController: UIViewController {
         metarAgeLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
         metarAgeLabel.textColor = .systemGreen
         metarAgeLabel.textAlignment = .right
+        metarAgeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         metarPanelView.addSubview(metarAgeLabel)
 
         NSLayoutConstraint.activate([
