@@ -211,6 +211,7 @@ class ARTrafficViewController: UIViewController {
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
     private var arKitNorthCorrectionDeg: Double = 0
+    private var isFirstHeadingFix: Bool = true
 
     // MARK: - Lifecycle
 
@@ -614,6 +615,10 @@ class ARTrafficViewController: UIViewController {
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
         arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        // After a session reset the ARKit world is re-anchored to the current
+        // compass heading, so apply the next heading fix directly rather than
+        // blending it in from the previous session's smoothed state.
+        isFirstHeadingFix = true
     }
 
     // MARK: - Actions
@@ -1180,6 +1185,18 @@ class ARTrafficViewController: UIViewController {
         offScreenArrowView.show(angle: angle, center: edgePoint)
     }
 
+    /// Exponential moving average for angles, handling the 0°/360° wraparound.
+    /// `alpha` is the weight of the new sample (0 < alpha ≤ 1).
+    private func smoothAngle(current: Double, new: Double, alpha: Double) -> Double {
+        var diff = new - current
+        while diff >  180 { diff -= 360 }
+        while diff < -180 { diff += 360 }
+        var result = current + alpha * diff
+        result = result.truncatingRemainder(dividingBy: 360)
+        if result < 0 { result += 360 }
+        return result
+    }
+
     private func screenEdgePoint(
         projected: CGPoint,
         isBehindCamera: Bool,
@@ -1540,7 +1557,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         lastHeadingAccuracy = accuracy
         let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
-        userHeading = trueNorth
+        // Smooth the displayed heading to eliminate sensor noise that causes the
+        // compass to appear to spin while flying straight and level.  alpha=0.3
+        // gives ~0.3 s response at 10 Hz — responsive to turns, quiet at rest.
+        userHeading = isFirstHeadingFix
+            ? trueNorth
+            : smoothAngle(current: userHeading, new: trueNorth, alpha: 0.3)
 
         // Magnetic declination = trueHeading − magneticHeading.
         // CLHeading.trueHeading = magneticHeading + WMM geographic lookup-table declination,
@@ -1552,9 +1574,17 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             var decl = newHeading.trueHeading - newHeading.magneticHeading
             while decl >  180 { decl -= 360 }
             while decl < -180 { decl += 360 }
-            arKitNorthCorrectionDeg = decl
-            sceneManager?.arKitNorthCorrectionDeg = decl
+            // Smooth the north correction heavily (alpha=0.15, ~0.7 s time constant)
+            // so that magnetometer noise doesn't shift every AR node on each callback.
+            // Geographic declination changes only over tens of miles, so this lag is
+            // imperceptible in practice.
+            arKitNorthCorrectionDeg = isFirstHeadingFix
+                ? decl
+                : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
+            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         }
+
+        isFirstHeadingFix = false
 
         updateStatusLabel()
     }
