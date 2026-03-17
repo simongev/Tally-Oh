@@ -212,6 +212,10 @@ class ARTrafficViewController: UIViewController {
 
     private var arKitNorthCorrectionDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
+    /// Vertical field-of-view captured from the ARKit camera on the first pinch gesture.
+    /// Zero means "not yet captured"; re-set to zero after each session reset so the
+    /// true device FOV is re-read rather than carrying over a previous zoom state.
+    private var baseCameraFOV: CGFloat = 0
 
     // MARK: - Lifecycle
 
@@ -619,6 +623,10 @@ class ARTrafficViewController: UIViewController {
         // compass heading, so apply the next heading fix directly rather than
         // blending it in from the previous session's smoothed state.
         isFirstHeadingFix = true
+        // ARKit resets the camera projection on session restart; re-capture the
+        // base FOV on the next pinch so zoom is always relative to the real device FOV.
+        baseCameraFOV = 0
+        currentZoomScale = 1.0
     }
 
     // MARK: - Actions
@@ -762,10 +770,18 @@ class ARTrafficViewController: UIViewController {
         switch gesture.state {
         case .began:
             pinchStartScale = currentZoomScale
+            // Capture the ARKit camera's natural FOV once, before any zoom is applied.
+            // Using UIView.transform to zoom is unreliable with auto-layout and breaks
+            // projectPoint()-based off-screen arrow math; adjusting the camera FOV
+            // directly is the correct approach — ARKit only owns the camera pose, not
+            // the projection, so fieldOfView persists across frames.
+            if baseCameraFOV == 0 {
+                baseCameraFOV = arSceneView.pointOfView?.camera?.fieldOfView ?? 60
+            }
         case .changed:
             let scale = pinchStartScale * gesture.scale
             currentZoomScale = max(1.0, min(4.0, scale))
-            arSceneView.transform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
+            arSceneView.pointOfView?.camera?.fieldOfView = baseCameraFOV / CGFloat(currentZoomScale)
         default:
             break
         }
