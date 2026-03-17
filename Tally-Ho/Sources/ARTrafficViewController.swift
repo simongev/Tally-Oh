@@ -895,8 +895,10 @@ class ARTrafficViewController: UIViewController {
                    !entries.isEmpty {
                     let text = entries.map { "D-ATIS \($0.type)\n\($0.datis)" }.joined(separator: "\n\n")
                     self.metarLabel.text = text
-                    // D-ATIS is always current; use now as the observation time
-                    self.metarObservationTime = Date()
+                    // Parse the HHMMZ issuance time from the D-ATIS body so the age
+                    // label reflects when the ATIS was *issued*, not when we fetched it.
+                    let rawText = entries.map(\.datis).joined(separator: " ")
+                    self.metarObservationTime = self.parseDATISObservationTime(from: rawText) ?? Date()
                 } else {
                     // No D-ATIS at this airport, try METAR
                     self.fetchMETAROnly(for: icao)
@@ -962,6 +964,31 @@ class ARTrafficViewController: UIViewController {
         // If the computed date is in the future the METAR is from last month
         if date > Date() {
             return cal.date(byAdding: .month, value: -1, to: date)
+        }
+        return date
+    }
+
+    /// Parses the HHMMZ issuance time from a D-ATIS text string and returns it as a Date.
+    /// D-ATIS text contains a 5-character Zulu time token such as "2345Z".
+    /// Falls back to nil if no matching token is found, in which case callers use Date().
+    private func parseDATISObservationTime(from text: String) -> Date? {
+        let tokens = text.uppercased().components(separatedBy: .whitespacesAndNewlines)
+        guard let timeToken = tokens.first(where: {
+            $0.count == 5 && $0.hasSuffix("Z") && $0.dropLast().allSatisfy({ $0.isNumber })
+        }) else { return nil }
+        guard let hour   = Int(timeToken.prefix(2)),
+              let minute = Int(timeToken.dropFirst(2).prefix(2)),
+              hour < 24, minute < 60 else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        var comps = cal.dateComponents([.year, .month, .day], from: Date())
+        comps.hour   = hour
+        comps.minute = minute
+        comps.second = 0
+        guard let date = cal.date(from: comps) else { return nil }
+        // If the time is more than 1 hour in the future the issuance was yesterday UTC
+        if date.timeIntervalSinceNow > 3600 {
+            return cal.date(byAdding: .day, value: -1, to: date)
         }
         return date
     }
