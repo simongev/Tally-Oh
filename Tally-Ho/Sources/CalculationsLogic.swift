@@ -129,16 +129,14 @@ class CalculationsLogic {
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,                        // unused — kept for API compat
-        cameraWorldPosition: SCNVector3 = .init(),  // camera's current position in the AR scene
-        northCorrectionDeg: Double = 0              // ARKit-north vs true-north correction
+        cameraWorldPosition: SCNVector3 = .init()   // camera's current position in the AR scene
     ) -> SCNVector3 {
 
         let horizontalDistanceM = distance(from: userCoord, to: targetCoord)
-        // Apply the measured ARKit world-north correction so that markers track
-        // the live compass rather than the compass reading frozen at session start.
-        let rawBearing = self.bearing(from: userCoord, to: targetCoord)
-        let correctedBearing = (rawBearing - northCorrectionDeg + 360).truncatingRemainder(dividingBy: 360)
-        let bearingRad = correctedBearing.toRadians()
+        // ARKit .gravityAndHeading aligns -Z to geographic (true) north on modern
+        // iOS with location services active, so the raw true bearing maps directly
+        // to the ARKit world coordinate system without any declination correction.
+        let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
 
         // Horizontal offsets in world space (metres)
         let dx = Float(horizontalDistanceM * sin(bearingRad))   // East
@@ -202,8 +200,7 @@ class CalculationsLogic {
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,
-        cameraWorldPosition: SCNVector3 = .init(),
-        northCorrectionDeg: Double = 0
+        cameraWorldPosition: SCNVector3 = .init()
     ) -> SCNVector3 {
         return calculateARPosition(
             targetCoord: airportCoord,
@@ -211,8 +208,7 @@ class CalculationsLogic {
             userCoord: userCoord,
             userAltitude: userAltitude,
             userHeading: userHeading,
-            cameraWorldPosition: cameraWorldPosition,
-            northCorrectionDeg: northCorrectionDeg
+            cameraWorldPosition: cameraWorldPosition
         )
     }
 
