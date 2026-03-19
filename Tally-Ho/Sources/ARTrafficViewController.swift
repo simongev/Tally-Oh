@@ -210,7 +210,6 @@ class ARTrafficViewController: UIViewController {
     private var selectionState: SelectionState = .none
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
-    private var arKitNorthCorrectionDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
     /// Vertical field-of-view captured from the ARKit camera on the first pinch gesture.
     /// Zero means "not yet captured"; re-set to zero after each session reset so the
@@ -256,12 +255,7 @@ class ARTrafficViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
-        // startARSession() resets ARKit world tracking but no longer clears the
-        // north correction (which is the stable geographic declination).  The scene
-        // manager is synced here so nodes placed immediately on re-entry use the
-        // correct bearing offset without waiting for the next heading callback.
         startARSession()
-        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
         // (pausing the AR session, invalidating the timer, stopping the altimeter).
@@ -1178,8 +1172,7 @@ class ARTrafficViewController: UIViewController {
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos,
-                northCorrectionDeg:  arKitNorthCorrectionDeg
+                cameraWorldPosition: cameraPos
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -1422,8 +1415,7 @@ class ARTrafficViewController: UIViewController {
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = String(format: "%+.1f°", arKitNorthCorrectionDeg)
-            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
+            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)", displayAlt, altSource, userHeading, compassAccStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -1606,26 +1598,6 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         userHeading = isFirstHeadingFix
             ? trueNorth
             : smoothAngle(current: userHeading, new: trueNorth, alpha: 0.3)
-
-        // Magnetic declination = trueHeading − magneticHeading.
-        // CLHeading.trueHeading = magneticHeading + WMM geographic lookup-table declination,
-        // so their difference is the pure geographic declination — camera-orientation
-        // independent and unaffected by in-aircraft EMF (the lookup table is keyed on
-        // device location, not on the raw magnetometer).  This replaces the previous
-        // GPS-track-based correction which was only valid when the camera faced forward.
-        if newHeading.trueHeading >= 0 && newHeading.magneticHeading >= 0 {
-            var decl = newHeading.trueHeading - newHeading.magneticHeading
-            while decl >  180 { decl -= 360 }
-            while decl < -180 { decl += 360 }
-            // Smooth the north correction heavily (alpha=0.15, ~0.7 s time constant)
-            // so that magnetometer noise doesn't shift every AR node on each callback.
-            // Geographic declination changes only over tens of miles, so this lag is
-            // imperceptible in practice.
-            arKitNorthCorrectionDeg = isFirstHeadingFix
-                ? decl
-                : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
-            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
-        }
 
         isFirstHeadingFix = false
 
