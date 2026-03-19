@@ -726,8 +726,6 @@ class ARSceneManager {
     /// read on the SceneKit thread at 60 Hz (tickAirportPositions).
     private var tickAirportSnapshot: [(airport: Airport, node: SCNNode)] = []
 
-    var arKitNorthCorrectionDeg: Double = 0
-
     /// When true, only aircraft whose IDs are in raFilterThreatIDs are shown.
     private var raFilterActive: Bool = false
     private var raFilterThreatIDs: Set<String> = []
@@ -763,8 +761,6 @@ class ARSceneManager {
         let nodeSnapshot = tickNodeSnapshot
         nodesLock.unlock()
 
-        let northCorrection = arKitNorthCorrectionDeg
-
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
             if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
@@ -775,8 +771,7 @@ class ARSceneManager {
                 userCoord: userLoc,
                 userAltitude: userAlt,
                 userHeading: 0,
-                cameraWorldPosition: cameraWorldPosition,
-                northCorrectionDeg: northCorrection
+                cameraWorldPosition: cameraWorldPosition
             )
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
             node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -833,7 +828,6 @@ class ARSceneManager {
 
         let userLoc         = deadReckonedUserLocation()
         let userAlt         = liveUserAltitude
-        let northCorrection = arKitNorthCorrectionDeg
 
         for entry in snapshot {
             let rawPos = CalculationsLogic.calculateAirportARPosition(
@@ -842,8 +836,7 @@ class ARSceneManager {
                 userCoord:           userLoc,
                 userAltitude:        userAlt,
                 userHeading:         0,
-                cameraWorldPosition: cameraWorldPosition,
-                northCorrectionDeg:  northCorrection
+                cameraWorldPosition: cameraWorldPosition
             )
             let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
             entry.node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -901,8 +894,7 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition,
-                northCorrectionDeg: arKitNorthCorrectionDeg
+                cameraWorldPosition: cameraWorldPosition
             )
 
             let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
@@ -1041,8 +1033,7 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition,
-                northCorrectionDeg: arKitNorthCorrectionDeg
+                cameraWorldPosition: cameraWorldPosition
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,
