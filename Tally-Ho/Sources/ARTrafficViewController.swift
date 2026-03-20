@@ -132,6 +132,7 @@ class ARTrafficViewController: UIViewController {
 
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
+    private var statusCopyButton: UIButton!
     private var settingsButton: UIButton!
     private var mapButton: UIButton!
     private var backButton: UIButton!
@@ -350,9 +351,24 @@ class ARTrafficViewController: UIViewController {
             equalTo: backButton.trailingAnchor, constant: 8)
         statusLeadingToEdge.isActive = true
 
+        // Copy button — floats to the right of the status label, same row
+        statusCopyButton = UIButton(type: .system)
+        statusCopyButton.translatesAutoresizingMaskIntoConstraints = false
+        statusCopyButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
+        statusCopyButton.tintColor = .white
+        statusCopyButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        statusCopyButton.layer.cornerRadius = 14
+        statusCopyButton.isHidden = true
+        statusCopyButton.addTarget(self, action: #selector(copyStatusLabel), for: .touchUpInside)
+        view.addSubview(statusCopyButton)
+
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68)
+            statusLabel.trailingAnchor.constraint(equalTo: statusCopyButton.leadingAnchor, constant: -6),
+            statusCopyButton.centerYAnchor.constraint(equalTo: statusLabel.topAnchor, constant: 14),
+            statusCopyButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            statusCopyButton.widthAnchor.constraint(equalToConstant: 34),
+            statusCopyButton.heightAnchor.constraint(equalToConstant: 28)
         ])
 
         // Settings button (bottom right)
@@ -762,6 +778,16 @@ class ARTrafficViewController: UIViewController {
 
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
+        statusCopyButton.isHidden = statusLabel.isHidden
+    }
+
+    @objc private func copyStatusLabel() {
+        UIPasteboard.general.string = statusLabel.text
+        // Brief visual feedback
+        statusCopyButton.setImage(UIImage(systemName: "checkmark"), for: .normal)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.statusCopyButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
+        }
     }
 
     // MARK: - Zoom

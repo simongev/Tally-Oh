@@ -80,6 +80,11 @@ class ConnectionLogic: ObservableObject {
     /// Hex dump of the very first raw bytes received (shown in status label)
     var _firstPacketHex  = ""
     var _packetCount     = 0
+    /// How many received packets contain 7E+known MSG_ID anywhere in the raw bytes.
+    /// If these are 0 after many packets, the Sentry isn't sending standard GDL90.
+    var _sigHB  = 0   // packets containing 7E 00
+    var _sigOWN = 0   // packets containing 7E 0A
+    var _sigTR  = 0   // packets containing 7E 14
 
     // MARK: Private — Internet
 
@@ -130,9 +135,12 @@ class ConnectionLogic: ObservableObject {
 
     /// One-line GDL90 diagnostic string shown in the status label while receiving.
     var adsbStats: String {
-        var s = "GDL90 HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed) pkts:\(_packetCount)"
+        // Parsed-frame counters (what the GDL90 parser actually processed)
+        var s = "pkts:\(_packetCount) parsed HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed)"
+        // Raw-byte signature counts (are standard GDL90 byte pairs present at all?)
+        s += " | raw 7E00:\(_sigHB) 7E0A:\(_sigOWN) 7E14:\(_sigTR)"
         if !_firstPacketHex.isEmpty {
-            s += "  first[\(_firstPacketHex)]"
+            s += " | first[\(_firstPacketHex)]"
         }
         return s
     }
@@ -218,11 +226,26 @@ class ConnectionLogic: ObservableObject {
     private func receiveFrom(_ conn: NWConnection) {
         conn.receiveMessage { [weak self] data, _, _, error in
             if let data = data, !data.isEmpty {
-                // Capture raw hex of first packet for on-screen diagnostics
-                if self?._firstPacketHex.isEmpty == true {
-                    self?._firstPacketHex = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: "·")
-                }
+                // Capture raw hex of first packet and scan all packets for GDL90 signatures
                 self?._packetCount += 1
+                if self?._firstPacketHex.isEmpty == true {
+                    let hex = data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: "·")
+                    self?._firstPacketHex = "\(data.count)b \(hex)"
+                }
+                // Scan raw bytes for 7E+MSG_ID pairs to see if standard GDL90 frames
+                // exist anywhere in the packet, independent of the frame parser.
+                var sawHB = false, sawOWN = false, sawTR = false
+                for k in 0 ..< data.count - 1 where data[data.startIndex + k] == 0x7E {
+                    switch data[data.startIndex + k + 1] {
+                    case 0x00: sawHB  = true
+                    case 0x0A: sawOWN = true
+                    case 0x14: sawTR  = true
+                    default: break
+                    }
+                }
+                if sawHB  { self?._sigHB  += 1 }
+                if sawOWN { self?._sigOWN += 1 }
+                if sawTR  { self?._sigTR  += 1 }
                 self?.processGDL90Data(data)
                 DispatchQueue.main.async {
                     self?.lastPacketReceived = Date()
