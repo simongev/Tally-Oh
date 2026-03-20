@@ -234,6 +234,30 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
+    /// GDL90 HDLC byte unstuffing: the spec requires that 0x7E and 0x7D bytes
+    /// inside a frame are escaped on the wire as 0x7D 0x5E and 0x7D 0x5D
+    /// respectively.  Passing raw (stuffed) bytes to the field parser produces
+    /// garbage values for any aircraft whose ICAO address, lat/lon, speed, etc.
+    /// happen to contain those byte values.
+    private func gdl90Unstuff(_ raw: Data.SubSequence) -> Data {
+        var out = Data()
+        out.reserveCapacity(raw.count)
+        var j = raw.startIndex
+        while j < raw.endIndex {
+            let b = raw[j]
+            if b == 0x7D {
+                let next = raw.index(after: j)
+                guard next < raw.endIndex else { break }
+                out.append(raw[next] ^ 0x20)
+                j = raw.index(after: next)
+            } else {
+                out.append(b)
+                j = raw.index(after: j)
+            }
+        }
+        return out
+    }
+
     private func processGDL90Data(_ data: Data) {
         // Scan for 0x7E frame boundaries without copying the Data into [UInt8].
         // Iterating Data directly avoids a heap allocation per UDP packet (which
@@ -244,7 +268,12 @@ class ConnectionLogic: ObservableObject {
             let payloadStart = data.index(after: i)
             guard payloadStart < data.endIndex else { break }
             if let end = data[payloadStart...].firstIndex(of: 0x7E) {
-                handleGDL90Message(data[payloadStart..<end])
+                // Unstuff HDLC escape sequences before handing off to the field
+                // parser.  The frame scanner above correctly finds the closing 0x7E
+                // because byte-stuffing guarantees no raw 0x7E appears inside a
+                // frame, but the field offsets are only valid on unstuffed data.
+                let unstuffed = gdl90Unstuff(data[payloadStart..<end])
+                handleGDL90Message(unstuffed[...])
                 // Per GDL90 spec, consecutive frames share their flag byte:
                 // the closing 0x7E of frame N is also the opening 0x7E of frame N+1.
                 // Set i = end (not end+1) so the next iteration treats this 0x7E

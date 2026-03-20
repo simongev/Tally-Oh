@@ -1035,8 +1035,11 @@ class ARTrafficViewController: UIViewController {
     /// True when the user is airborne on a WiFi-only connection (no ADS-B device).
     /// In this mode the app cannot auto-identify the user's aircraft, so we either
     /// hide all traffic within 2 NM (default) or hide only the chosen callsign.
+    /// NOTE: must be false when an ADS-B receiver is connected (.receiving), even if
+    /// that receiver has no GPS fix yet — ADS-B traffic data never includes the
+    /// user's own aircraft as a traffic target, so no masking zone is needed.
     private var wifiInAir: Bool {
-        tcasEnabled && !usingADSBGPS
+        tcasEnabled && connectionLogic.connectionStatus != .receiving
     }
 
     private func updateVisualization() {
@@ -1403,7 +1406,14 @@ class ARTrafficViewController: UIViewController {
 
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
-        let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
+        let gpsSource: String
+        if usingADSBGPS {
+            gpsSource = "ADS-B GPS"
+        } else if connectionLogic.connectionStatus == .receiving {
+            gpsSource = "iPhone GPS (ADS-B: no fix)"
+        } else {
+            gpsSource = "iPhone GPS"
+        }
         if let loc = displayLoc {
             let gpsAccStr: String
             if lastHorizontalAccuracy < 0 {
