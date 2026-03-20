@@ -286,6 +286,13 @@ class ConnectionLogic: ObservableObject {
                 // as the start of the following frame.
                 i = end
             } else {
+                // No closing 0x7E found — treat the remaining bytes as the last
+                // frame in this UDP datagram.  Many GDL90-over-UDP devices omit
+                // the trailing flag on the final frame in a packet (the datagram
+                // boundary serves as an implicit delimiter).  Without this branch
+                // the last frame — typically a Traffic Report — is silently dropped.
+                let unstuffed = gdl90Unstuff(data[payloadStart...])
+                handleGDL90Message(unstuffed[...])
                 break
             }
         }
