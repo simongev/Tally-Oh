@@ -77,6 +77,9 @@ class ConnectionLogic: ObservableObject {
     var _ownshipCount    = 0
     var _trafficCount    = 0
     var _trafficFailed   = 0
+    /// Hex dump of the very first raw bytes received (shown in status label)
+    var _firstPacketHex  = ""
+    var _packetCount     = 0
 
     // MARK: Private — Internet
 
@@ -127,7 +130,11 @@ class ConnectionLogic: ObservableObject {
 
     /// One-line GDL90 diagnostic string shown in the status label while receiving.
     var adsbStats: String {
-        "GDL90 HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed)"
+        var s = "GDL90 HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed) pkts:\(_packetCount)"
+        if !_firstPacketHex.isEmpty {
+            s += "  first[\(_firstPacketHex)]"
+        }
+        return s
     }
 
     // MARK: Init
@@ -211,6 +218,11 @@ class ConnectionLogic: ObservableObject {
     private func receiveFrom(_ conn: NWConnection) {
         conn.receiveMessage { [weak self] data, _, _, error in
             if let data = data, !data.isEmpty {
+                // Capture raw hex of first packet for on-screen diagnostics
+                if self?._firstPacketHex.isEmpty == true {
+                    self?._firstPacketHex = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: "·")
+                }
+                self?._packetCount += 1
                 self?.processGDL90Data(data)
                 DispatchQueue.main.async {
                     self?.lastPacketReceived = Date()
