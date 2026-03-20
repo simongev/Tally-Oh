@@ -1014,7 +1014,9 @@ class ARTrafficViewController: UIViewController {
     }
 
     private var usingADSBGPS: Bool {
-        connectionLogic.connectionStatus == .receiving && connectionLogic.ownshipData != nil
+        guard connectionLogic.connectionStatus == .receiving,
+              let ownship = connectionLogic.ownshipData else { return false }
+        return ownship.latitude != 0 || ownship.longitude != 0
     }
 
     /// TCAS is only meaningful when airborne. Suppress it below 200 ft to avoid

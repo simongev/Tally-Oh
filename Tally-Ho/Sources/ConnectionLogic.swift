@@ -277,8 +277,7 @@ class ConnectionLogic: ObservableObject {
         func byte(_ offset: Int) -> UInt8 { payload[payload.index(idx, offsetBy: offset)] }
 
         advance(1) // skip message ID
-        advance(1) // status
-        advance(1) // address type
+        advance(1) // traffic alert status (bits 7:4) | address type (bits 3:0) — single combined byte per GDL90 spec
 
         guard remaining() >= 3 else { return nil }
         let icao = String(format: "%02X%02X%02X", byte(0), byte(1), byte(2))
@@ -301,7 +300,7 @@ class ConnectionLogic: ObservableObject {
         let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
         advance(2)
 
-        advance(3) // Misc / NIC / NACp
+        advance(1) // NIC | NACp (byte 13 — single byte; HVel starts at byte 14)
 
         guard remaining() >= 2 else { return nil }
         let hvCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
