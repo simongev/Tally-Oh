@@ -229,8 +229,14 @@ class ConnectionLogic: ObservableObject {
                 // Capture raw hex of first packet and scan all packets for GDL90 signatures
                 self?._packetCount += 1
                 if self?._firstPacketHex.isEmpty == true {
-                    let hex = data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: "·")
-                    self?._firstPacketHex = "\(data.count)b \(hex)"
+                    // Full hex dump of the packet so we can decode the format
+                    let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+                    // Also record which byte positions contain 0x7E (frame boundaries)
+                    let flagPos = (0 ..< data.count)
+                        .filter { data[data.startIndex + $0] == 0x7E }
+                        .map { String($0) }
+                        .joined(separator: ",")
+                    self?._firstPacketHex = "\(data.count)b flags@[\(flagPos)]\n\(hex)"
                 }
                 // Scan raw bytes for 7E+MSG_ID pairs to see if standard GDL90 frames
                 // exist anywhere in the packet, independent of the frame parser.
