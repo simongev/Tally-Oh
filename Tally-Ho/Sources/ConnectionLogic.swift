@@ -72,6 +72,11 @@ class ConnectionLogic: ObservableObject {
     private var lastPacketReceived: Date?
     private var signalWatchdogTimer: Timer?
 
+    // Diagnostic counters (debug builds only)
+    private var _heartbeatCount = 0
+    private var _ownshipCount = 0
+    private var _trafficCount = 0
+
     // MARK: Private — Internet
 
     private let adsbLolClient = ADSBLolClient()
@@ -240,7 +245,11 @@ class ConnectionLogic: ObservableObject {
             guard payloadStart < data.endIndex else { break }
             if let end = data[payloadStart...].firstIndex(of: 0x7E) {
                 handleGDL90Message(data[payloadStart..<end])
-                i = data.index(after: end)
+                // Per GDL90 spec, consecutive frames share their flag byte:
+                // the closing 0x7E of frame N is also the opening 0x7E of frame N+1.
+                // Set i = end (not end+1) so the next iteration treats this 0x7E
+                // as the start of the following frame.
+                i = end
             } else {
                 break
             }
@@ -250,14 +259,28 @@ class ConnectionLogic: ObservableObject {
     private func handleGDL90Message(_ payload: Data.SubSequence) {
         guard let msgType = payload.first else { return }
         switch msgType {
-        case 0x00: break  // Heartbeat
+        case 0x00:        // Heartbeat
+            _heartbeatCount += 1
+            if _heartbeatCount == 1 { print("[GDL90] First heartbeat received") }
         case 0x0A:        // Ownship
+            _ownshipCount += 1
             if let ac = parseTrafficPayload(payload, isOwnship: true) {
+                if _ownshipCount <= 3 {
+                    print("[GDL90] Ownship #\(_ownshipCount): lat=\(ac.latitude) lon=\(ac.longitude) alt=\(ac.altitude)ft")
+                }
                 DispatchQueue.main.async { self.ownshipData = ac }
+            } else {
+                if _ownshipCount <= 3 { print("[GDL90] Ownship parse failed (payload len=\(payload.count))") }
             }
         case 0x14:        // Traffic
+            _trafficCount += 1
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
+                if _trafficCount <= 5 {
+                    print("[GDL90] Traffic #\(_trafficCount): \(ac.callsign) icao=\(ac.id) lat=\(ac.latitude) lon=\(ac.longitude) alt=\(ac.altitude)ft spd=\(ac.groundSpeed)kt")
+                }
                 DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
+            } else {
+                if _trafficCount <= 5 { print("[GDL90] Traffic parse failed (payload len=\(payload.count))") }
             }
         case 0x0B: break  // Ownship geometric alt
         default: break
