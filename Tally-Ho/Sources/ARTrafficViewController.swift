@@ -212,6 +212,10 @@ class ARTrafficViewController: UIViewController {
 
     private var arKitNorthCorrectionDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
+    /// Vertical field-of-view captured from the ARKit camera on the first pinch gesture.
+    /// Zero means "not yet captured"; re-set to zero after each session reset so the
+    /// true device FOV is re-read rather than carrying over a previous zoom state.
+    private var baseCameraFOV: CGFloat = 0
 
     // MARK: - Lifecycle
 
@@ -546,10 +550,8 @@ class ARTrafficViewController: UIViewController {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         arSceneView.addGestureRecognizer(tap)
 
-        // Pinch is added to self.view (not arSceneView) so that ARKit's internal
-        // touch handling cannot swallow the two-finger event before we see it.
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
-        view.addGestureRecognizer(pinch)
+        arSceneView.addGestureRecognizer(pinch)
     }
 
     // MARK: - Airport Loading
@@ -621,7 +623,9 @@ class ARTrafficViewController: UIViewController {
         // compass heading, so apply the next heading fix directly rather than
         // blending it in from the previous session's smoothed state.
         isFirstHeadingFix = true
-        arSceneView.transform = .identity
+        // ARKit resets the camera projection on session restart; re-capture the
+        // base FOV on the next pinch so zoom is always relative to the real device FOV.
+        baseCameraFOV = 0
         currentZoomScale = 1.0
     }
 
@@ -766,15 +770,18 @@ class ARTrafficViewController: UIViewController {
         switch gesture.state {
         case .began:
             pinchStartScale = currentZoomScale
+            // Capture the ARKit camera's natural FOV once, before any zoom is applied.
+            // Using UIView.transform to zoom is unreliable with auto-layout and breaks
+            // projectPoint()-based off-screen arrow math; adjusting the camera FOV
+            // directly is the correct approach — ARKit only owns the camera pose, not
+            // the projection, so fieldOfView persists across frames.
+            if baseCameraFOV == 0 {
+                baseCameraFOV = arSceneView.pointOfView?.camera?.fieldOfView ?? 60
+            }
         case .changed:
             let scale = pinchStartScale * gesture.scale
             currentZoomScale = max(1.0, min(4.0, scale))
-            // Digital zoom: scale the AR view layer in the compositor.
-            // ARKit owns the camera's projectionTransform and resets it every frame,
-            // so adjusting fieldOfView has no effect. A UIView transform scales the
-            // already-rendered Metal content at composite time, which is the only
-            // reliable way to achieve full-scene digital zoom in ARKit.
-            arSceneView.transform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
+            arSceneView.pointOfView?.camera?.fieldOfView = baseCameraFOV / CGFloat(currentZoomScale)
         default:
             break
         }
@@ -962,18 +969,13 @@ class ARTrafficViewController: UIViewController {
     }
 
     /// Parses the HHMMZ issuance time from a D-ATIS text string and returns it as a Date.
-    /// D-ATIS text contains a Zulu time token such as "2345Z" or "2345Z." (with trailing
-    /// punctuation). Falls back to nil if no matching token is found.
+    /// D-ATIS text contains a 5-character Zulu time token such as "2345Z".
+    /// Falls back to nil if no matching token is found, in which case callers use Date().
     private func parseDATISObservationTime(from text: String) -> Date? {
         let tokens = text.uppercased().components(separatedBy: .whitespacesAndNewlines)
-        // Strip trailing punctuation so "2345Z." is treated identically to "2345Z".
-        guard let timeToken = tokens.compactMap({ token -> String? in
-            let cleaned = token.trimmingCharacters(in: .punctuationCharacters)
-            guard cleaned.count == 5,
-                  cleaned.hasSuffix("Z"),
-                  cleaned.dropLast().allSatisfy({ $0.isNumber }) else { return nil }
-            return cleaned
-        }).first else { return nil }
+        guard let timeToken = tokens.first(where: {
+            $0.count == 5 && $0.hasSuffix("Z") && $0.dropLast().allSatisfy({ $0.isNumber })
+        }) else { return nil }
         guard let hour   = Int(timeToken.prefix(2)),
               let minute = Int(timeToken.dropFirst(2).prefix(2)),
               hour < 24, minute < 60 else { return nil }
@@ -1613,11 +1615,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // independent and unaffected by in-aircraft EMF (the lookup table is keyed on
         // device location, not on the raw magnetometer).  This replaces the previous
         // GPS-track-based correction which was only valid when the camera faced forward.
-        //
-        // Only apply while airborne: on the ground the magnetometer is disturbed by
-        // vehicles, buildings, and ground equipment, which would pollute the smoothed
-        // correction value used in flight.
-        if tcasEnabled && newHeading.trueHeading >= 0 && newHeading.magneticHeading >= 0 {
+        if newHeading.trueHeading >= 0 && newHeading.magneticHeading >= 0 {
             var decl = newHeading.trueHeading - newHeading.magneticHeading
             while decl >  180 { decl -= 360 }
             while decl < -180 { decl += 360 }
