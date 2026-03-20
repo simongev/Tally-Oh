@@ -72,10 +72,11 @@ class ConnectionLogic: ObservableObject {
     private var lastPacketReceived: Date?
     private var signalWatchdogTimer: Timer?
 
-    // Diagnostic counters (debug builds only)
-    private var _heartbeatCount = 0
-    private var _ownshipCount = 0
-    private var _trafficCount = 0
+    // Diagnostic counters — read by the status label via adsbStats
+    var _heartbeatCount  = 0
+    var _ownshipCount    = 0
+    var _trafficCount    = 0
+    var _trafficFailed   = 0
 
     // MARK: Private — Internet
 
@@ -123,6 +124,11 @@ class ConnectionLogic: ObservableObject {
     private let aircraftTimeout: TimeInterval = 90.0
     private var cleanupTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
+
+    /// One-line GDL90 diagnostic string shown in the status label while receiving.
+    var adsbStats: String {
+        "GDL90 HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed)"
+    }
 
     // MARK: Init
 
@@ -309,6 +315,7 @@ class ConnectionLogic: ObservableObject {
                 }
                 DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
             } else {
+                _trafficFailed += 1
                 if _trafficCount <= 5 { print("[GDL90] Traffic parse failed (payload len=\(payload.count))") }
             }
         case 0x0B: break  // Ownship geometric alt
@@ -349,7 +356,9 @@ class ConnectionLogic: ObservableObject {
 
         guard remaining() >= 2 else { return nil }
         let altCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
-        let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
+        // 0xFFF means "no barometric altitude info". Use -9999 sentinel so callers
+        // can distinguish "aircraft at sea level" (0 ft) from "altitude unknown".
+        let altitude = altCode == 0xFFF ? -9999.0 : Double(altCode) * 25.0 - 1000.0
         advance(2)
 
         advance(1) // NIC | NACp (byte 13 — single byte; HVel starts at byte 14)

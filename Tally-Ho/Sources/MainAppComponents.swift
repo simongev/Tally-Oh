@@ -319,10 +319,14 @@ class ARComponentFactory {
         }
         parts.append(line1)
         if settings.showAircraftAltitude {
-            // Quantize to nearest 100 ft so the label text (and its texture cache key) only
-            // changes when altitude meaningfully changes, not on every raw ADS-B update.
-            let altQ = Int((aircraft.altitude / 100).rounded()) * 100
-            parts.append("\(altQ) ft")
+            if aircraft.altitude < -9000 {
+                parts.append("alt ?")
+            } else {
+                // Quantize to nearest 100 ft so the label text (and its texture cache key) only
+                // changes when altitude meaningfully changes, not on every raw ADS-B update.
+                let altQ = Int((aircraft.altitude / 100).rounded()) * 100
+                parts.append("\(altQ) ft")
+            }
         }
         if settings.showAircraftSpeed {
             // Quantize to nearest 10 kts.
@@ -885,7 +889,7 @@ class ARSceneManager {
 
         for ac in aircraft {
             // Filter out ground aircraft unless the user has enabled them
-            if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
+            if !settings.showGroundAircraft && ac.altitude > -9000 && ac.altitude <= 50 { continue }
 
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
             guard distNM <= settings.aircraftMaxDistance else { continue }

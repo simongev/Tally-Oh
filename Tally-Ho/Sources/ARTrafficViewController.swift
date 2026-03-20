@@ -1054,7 +1054,9 @@ class ARTrafficViewController: UIViewController {
         let wifiMode = wifiInAir
         let wifiOwnshipCallsign = currentSettings.wifiOwnshipCallsign
         let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
-            guard showGround || ac.altitude > 50 else { return false }
+            // Altitude < -9000 is the "no barometric data" sentinel (GDL90 0xFFF).
+            // Treat those aircraft as potentially airborne rather than filtering them.
+            guard showGround || ac.altitude < -9000 || ac.altitude > 50 else { return false }
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate)
             guard distNM <= maxDist else { return false }
             if wifiMode {
@@ -1396,7 +1398,7 @@ class ARTrafficViewController: UIViewController {
         var lines: [String] = []
 
         switch connectionLogic.connectionStatus {
-        case .receiving:     lines.append("📡 ADS-B: Receiving")
+        case .receiving:     lines.append("📡 ADS-B: Receiving  (\(connectionLogic.adsbStats))")
         case .searching:     lines.append("📡 ADS-B: Searching…")
         case .notAvailable:  lines.append("📡 ADS-B: Unavailable")
         case .disconnected:  lines.append("📡 ADS-B: Off")
