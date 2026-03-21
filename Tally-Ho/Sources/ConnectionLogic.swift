@@ -330,9 +330,9 @@ class ConnectionLogic: ObservableObject {
     /// Parse a de-stuffed GDL90 traffic/ownship payload (last 2 bytes are FCS — included in
     /// count but not interpreted here).  Returns nil if the payload is too short or malformed.
     private func parseTrafficPayload(_ payload: Data, isOwnship: Bool) -> Aircraft? {
-        // Minimum: msg_id(1)+status(1)+addr_type(1)+ICAO(3)+lat(3)+lon(3)+
-        //          alt_misc(2)+NIC(1)+vel(2)+vv(2)+track(1)+emitter(1) = 22 bytes.
-        // Compact 0x25/0x26 frames from the Sentry omit the 8-byte callsign and FCS,
+        // Minimum: msg_id(1)+status_addr(1)+ICAO(3)+lat(3)+lon(3)+
+        //          alt_misc(2)+NIC(1)+vel(2)+vv(2)+track(1)+emitter(1)+FCS(2) = 22 bytes.
+        // Compact 0x25/0x26 frames from the Sentry omit the 8-byte callsign,
         // so 22 bytes is the practical floor; standard 0x14 frames are 30 bytes.
         guard payload.count >= 22 else { return nil }
 
@@ -344,8 +344,7 @@ class ConnectionLogic: ObservableObject {
         func byte(_ offset: Int) -> UInt8 { payload[payload.index(idx, offsetBy: offset)] }
 
         advance(1) // skip message ID
-        advance(1) // status
-        advance(1) // address type
+        advance(1) // status / address type (combined byte in GDL90: alert_status[7:4] | addr_type[3:0])
 
         guard remaining() >= 3 else { return nil }
         let icao = String(format: "%02X%02X%02X", byte(0), byte(1), byte(2))
@@ -354,7 +353,8 @@ class ConnectionLogic: ObservableObject {
         guard remaining() >= 3 else { return nil }
         var latRaw = Int32(byte(0)) << 16 | Int32(byte(1)) << 8 | Int32(byte(2))
         if latRaw & 0x800000 != 0 { latRaw |= Int32(bitPattern: 0xFF000000) }
-        let latitude = Double(latRaw) * (180.0 / 8_388_608.0)
+        // GDL90 latitude: 24-bit signed, range [-90, 90] → LSB = 90/2²³ = 180/2²⁴
+        let latitude = Double(latRaw) * (180.0 / 16_777_216.0)
         advance(3)
 
         guard remaining() >= 3 else { return nil }
@@ -368,12 +368,12 @@ class ConnectionLogic: ObservableObject {
         let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
         advance(2)
 
-        advance(3) // Misc / NIC / NACp
+        advance(1) // NIC / NACp (Misc is in the lower nibble of the alt byte, already consumed)
 
         guard remaining() >= 2 else { return nil }
         let hvCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
         let groundSpeed = hvCode == 0xFFF ? 0.0 : Double(hvCode)
-        advance(1)
+        advance(2)  // consume both bytes of the horiz-vel field
 
         guard remaining() >= 2 else { return nil }
         let vvRaw = (Int16(byte(0) & 0x0F) << 8) | Int16(byte(1))
