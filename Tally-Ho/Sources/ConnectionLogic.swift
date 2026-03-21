@@ -312,6 +312,7 @@ class ConnectionLogic: ObservableObject {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
         case 0x14,   // Standard traffic report
+             0x25,   // ADS-B position (ForeFlight Sentry extension, same structure)
              0x26:   // ADS-R fine position (ForeFlight Sentry extension, same structure)
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async {
@@ -330,10 +331,10 @@ class ConnectionLogic: ObservableObject {
     /// count but not interpreted here).  Returns nil if the payload is too short or malformed.
     private func parseTrafficPayload(_ payload: Data, isOwnship: Bool) -> Aircraft? {
         // Minimum: msg_id(1)+status(1)+addr_type(1)+ICAO(3)+lat(3)+lon(3)+
-        //          alt_misc(2)+NIC(1)+vel(2)+vv(2)+track(1)+emitter(1)+FCS(2) = 23 bytes.
-        // Compact 0x26 frames from the Sentry omit the 8-byte callsign and priority byte,
-        // so 23 bytes is the practical floor; standard 0x14 frames are 30 bytes.
-        guard payload.count >= 23 else { return nil }
+        //          alt_misc(2)+NIC(1)+vel(2)+vv(2)+track(1)+emitter(1) = 22 bytes.
+        // Compact 0x25/0x26 frames from the Sentry omit the 8-byte callsign and FCS,
+        // so 22 bytes is the practical floor; standard 0x14 frames are 30 bytes.
+        guard payload.count >= 22 else { return nil }
 
         // Use an index cursor relative to the slice start.
         var idx = payload.startIndex
