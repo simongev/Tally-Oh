@@ -132,7 +132,7 @@ private final class MapCanvasView: UIView {
         if settings.showAircraft {
             for ac in aircraft {
                 guard settings.passes(callsign: ac.callsign) else { continue }
-                if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
+                if !settings.showGroundAircraft && ac.altitude > -9000 && ac.altitude <= 50 { continue }
                 let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
                 guard distNM <= rangeNM else { continue }
 
@@ -144,7 +144,8 @@ private final class MapCanvasView: UIView {
                     .font: labelFont,
                     .foregroundColor: aircraftColor
                 ]
-                let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
+                let altStr = ac.altitude < -9000 ? "alt ?" : "\(Int(ac.altitude)) ft"
+                let label = "\(ac.callsign)\n\(altStr)"
                 (label as NSString).draw(
                     at: CGPoint(x: pt.x + 9, y: pt.y - 7),
                     withAttributes: attrs)
