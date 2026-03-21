@@ -132,6 +132,7 @@ class ARTrafficViewController: UIViewController {
 
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
+    private var copyStatusButton: UIButton!
     private var settingsButton: UIButton!
     private var mapButton: UIButton!
     private var backButton: UIButton!
@@ -348,6 +349,24 @@ class ARTrafficViewController: UIViewController {
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
             statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68)
+        ])
+
+        // Copy button — bottom-right corner of status label
+        copyStatusButton = UIButton(type: .system)
+        copyStatusButton.translatesAutoresizingMaskIntoConstraints = false
+        copyStatusButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
+        copyStatusButton.tintColor = .white
+        copyStatusButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        copyStatusButton.layer.cornerRadius = 12
+        copyStatusButton.isHidden = true
+        copyStatusButton.addTarget(self, action: #selector(copyStatusTapped), for: .touchUpInside)
+        view.addSubview(copyStatusButton)
+
+        NSLayoutConstraint.activate([
+            copyStatusButton.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor, constant: -4),
+            copyStatusButton.bottomAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: -4),
+            copyStatusButton.widthAnchor.constraint(equalToConstant: 28),
+            copyStatusButton.heightAnchor.constraint(equalToConstant: 28)
         ])
 
         // Settings button (bottom right)
@@ -757,6 +776,15 @@ class ARTrafficViewController: UIViewController {
 
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
+        copyStatusButton.isHidden = statusLabel.isHidden
+    }
+
+    @objc private func copyStatusTapped() {
+        UIPasteboard.general.string = statusLabel.text
+        copyStatusButton.setImage(UIImage(systemName: "checkmark"), for: .normal)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.copyStatusButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
+        }
     }
 
     // MARK: - Zoom
