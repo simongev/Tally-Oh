@@ -197,9 +197,19 @@ class ConnectionLogic: ObservableObject {
 
         listener?.start(queue: adsbQueue)
         DispatchQueue.main.async { self.connectionStatus = .searching }
-        // ForeFlight Sentry registration is started lazily: only if 0x25/0x26 frames
-        // are seen (Sentry in proprietary mode).  Standard GDL90 devices (Stratux, etc.)
-        // and internet-only mode are never affected.
+
+        // Broadcast the ForeFlight registration JSON on port 63093 immediately and
+        // repeat every 5 seconds.  The Sentry listens for this broadcast and, on
+        // receipt, switches from its default proprietary 0x25/0x26 mode to unicast
+        // standard GDL90 (0x0A ownship + 0x14 traffic) back to us on port 4000.
+        // This mirrors exactly what ForeFlight Mobile does — it broadcasts
+        // unconditionally from launch so the Sentry catches it as early as possible.
+        // Non-Sentry devices (Stratux, etc.) don't listen on port 63093, so the
+        // broadcast is harmless to them.  The timer is cancelled once standard GDL90
+        // frames confirm the device has switched (or isn't a Sentry at all).
+        DispatchQueue.main.async {
+            self.startSentryRegistration()
+        }
     }
 
     func stopListening() {
@@ -395,9 +405,8 @@ class ConnectionLogic: ObservableObject {
             } else {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary — trigger registration)
-             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary — trigger registration)
-            DispatchQueue.main.async { self.startSentryRegistration() }
+        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary)
+             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary)
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async {
                     self.detectedAircraft[ac.id] = ac
