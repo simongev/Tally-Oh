@@ -405,16 +405,19 @@ class ConnectionLogic: ObservableObject {
             } else {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary)
-             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary)
-            if let ac = parseTrafficPayload(payload, isOwnship: false) {
-                DispatchQueue.main.async {
-                    self.detectedAircraft[ac.id] = ac
-                    self.adsbDiag.parsedTraffic += 1
-                }
-            } else {
-                DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
-            }
+        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary — format undisclosed)
+             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary — format undisclosed)
+            // These proprietary formats cannot be decoded: the coordinate encoding is
+            // private (confirmed by ForeFlight/uAvionix).  Applying the standard GDL90
+            // parser produces garbage positions that fail the 20 NM distance filter,
+            // yielding a misleading "N aircraft but nothing displayed" situation.
+            //
+            // Seeing these instead of 0x0A/0x14 means the Sentry has not switched to
+            // standard GDL90 mode for us yet — most often because another ForeFlight
+            // client on the same device (or subnet) holds the unicast registration.
+            // The registration broadcast continues every 5 s; if the other client is
+            // closed the Sentry should switch on the next broadcast cycle.
+            break
         case 0x0B: break  // Ownship geometric alt (ignored)
         default: break
         }
