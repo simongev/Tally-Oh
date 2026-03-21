@@ -5,16 +5,19 @@
 //  Handles ADS-B reception from ForeFlight Sentry (and compatible devices)
 //  and internet aircraft data from adsb.lol.
 //
-//  ADS-B note: Sentry BROADCASTS GDL 90 UDP packets to the local network on
-//  port 4000. We must LISTEN on that port — not connect outbound to the device.
-//  A UDP NWConnection to a remote host transitions to .ready immediately
-//  regardless of whether the device is present, giving a false "connected" status.
+//  ADS-B note: the ForeFlight Sentry listens for a registration broadcast that
+//  ForeFlight sends on UDP port 63093 every 5 seconds.  Without this handshake
+//  the Sentry only sends proprietary 0x25/0x26 messages whose format is undocumented.
+//  Once it sees the JSON registration it switches to unicast standard GDL90
+//  (0x0A ownship + 0x14 traffic) back to port 4000 on the registrant's IP.
+//  We replicate that broadcast so the Sentry treats us like ForeFlight Mobile.
 //
 
 import Foundation
 import Network
 import CoreLocation
 import Combine
+import Darwin   // BSD socket APIs for UDP broadcast
 
 // MARK: - Enums
 
@@ -88,6 +91,12 @@ class ConnectionLogic: ObservableObject {
     /// Time of last received GDL90 packet — used to detect signal loss
     private var lastPacketReceived: Date?
     private var signalWatchdogTimer: Timer?
+
+    /// Timer that broadcasts the ForeFlight registration JSON on port 63093 every 5 seconds.
+    /// The Sentry (and compatible devices) listen for this broadcast; on receipt they switch
+    /// from their default proprietary 0x25/0x26 broadcast to unicast standard GDL90
+    /// (0x0A ownship + 0x14 traffic) back to us on port 4000.
+    private var foreflight63093Timer: Timer?
 
     // MARK: Private — Internet
 
@@ -188,9 +197,18 @@ class ConnectionLogic: ObservableObject {
 
         listener?.start(queue: adsbQueue)
         DispatchQueue.main.async { self.connectionStatus = .searching }
+
+        // Start the ForeFlight registration broadcast immediately and repeat every 5 s.
+        // Must run on the main run loop so the timer survives app lifecycle correctly.
+        sendForeFlight63093Registration()
+        foreflight63093Timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.sendForeFlight63093Registration()
+        }
     }
 
     func stopListening() {
+        foreflight63093Timer?.invalidate()
+        foreflight63093Timer = nil
         listener?.cancel()
         listener = nil
         DispatchQueue.main.async {
@@ -250,6 +268,43 @@ class ConnectionLogic: ObservableObject {
                 DispatchQueue.main.async {
                     self.connectionStatus = .searching
                     print("⚠️ ADS-B signal lost")
+                }
+            }
+        }
+    }
+
+    /// Broadcast the ForeFlight registration JSON on UDP port 63093.
+    ///
+    /// The ForeFlight Sentry (and uAvionix Scout) monitor the local network for this
+    /// broadcast.  Per the ForeFlight GDL 90 Extended Specification the message is:
+    ///
+    ///   {"App":"ForeFlight","GDL90":{"port":4000}}
+    ///
+    /// On receipt the Sentry switches from its default proprietary broadcast (message
+    /// types 0x25/0x26, format undisclosed) to unicast standard GDL90 on port 4000
+    /// addressed to us — including 0x0A ownship and 0x14 traffic reports that our
+    /// existing parser can decode correctly.
+    private func sendForeFlight63093Registration() {
+        let json = #"{"App":"ForeFlight","GDL90":{"port":4000}}"#
+        guard let payload = json.data(using: .utf8) else { return }
+
+        // BSD socket: UDP broadcast to 255.255.255.255:63093.
+        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard sock >= 0 else { return }
+        defer { close(sock) }
+
+        var yes: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port   = UInt16(63093).bigEndian
+        addr.sin_addr.s_addr = INADDR_BROADCAST  // 0xFFFFFFFF
+
+        payload.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                    _ = sendto(sock, ptr.baseAddress, ptr.count, 0, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
         }
