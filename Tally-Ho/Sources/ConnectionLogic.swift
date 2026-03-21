@@ -197,13 +197,9 @@ class ConnectionLogic: ObservableObject {
 
         listener?.start(queue: adsbQueue)
         DispatchQueue.main.async { self.connectionStatus = .searching }
-
-        // Start the ForeFlight registration broadcast immediately and repeat every 5 s.
-        // Must run on the main run loop so the timer survives app lifecycle correctly.
-        sendForeFlight63093Registration()
-        foreflight63093Timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.sendForeFlight63093Registration()
-        }
+        // ForeFlight Sentry registration is started lazily: only if 0x25/0x26 frames
+        // are seen (Sentry in proprietary mode).  Standard GDL90 devices (Stratux, etc.)
+        // and internet-only mode are never affected.
     }
 
     func stopListening() {
@@ -284,6 +280,25 @@ class ConnectionLogic: ObservableObject {
     /// types 0x25/0x26, format undisclosed) to unicast standard GDL90 on port 4000
     /// addressed to us — including 0x0A ownship and 0x14 traffic reports that our
     /// existing parser can decode correctly.
+
+    /// Start the Sentry registration broadcast if not already running.
+    /// Must be called on the main thread (timer scheduling).
+    private func startSentryRegistration() {
+        guard foreflight63093Timer == nil else { return }
+        sendForeFlight63093Registration()
+        foreflight63093Timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.sendForeFlight63093Registration()
+        }
+    }
+
+    /// Stop the Sentry registration broadcast.
+    /// Must be called on the main thread.
+    private func stopSentryRegistration() {
+        guard foreflight63093Timer != nil else { return }
+        foreflight63093Timer?.invalidate()
+        foreflight63093Timer = nil
+    }
+
     private func sendForeFlight63093Registration() {
         let json = #"{"App":"ForeFlight","GDL90":{"port":4000}}"#
         guard let payload = json.data(using: .utf8) else { return }
@@ -355,9 +370,13 @@ class ConnectionLogic: ObservableObject {
         DispatchQueue.main.async { self.adsbDiag.rawMsgTypeCounts[msgType, default: 0] += 1 }
 
         switch msgType {
-        case 0x00:   // Heartbeat
-            DispatchQueue.main.async { self.adsbDiag.parsedHeartbeat += 1 }
-        case 0x0A:   // Ownship
+        case 0x00:   // Heartbeat — standard GDL90 device confirmed
+            DispatchQueue.main.async {
+                self.adsbDiag.parsedHeartbeat += 1
+                self.stopSentryRegistration()
+            }
+        case 0x0A:   // Ownship — standard GDL90 device confirmed
+            DispatchQueue.main.async { self.stopSentryRegistration() }
             if let ac = parseTrafficPayload(payload, isOwnship: true) {
                 DispatchQueue.main.async {
                     self.ownshipData = ac
@@ -366,9 +385,19 @@ class ConnectionLogic: ObservableObject {
             } else {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x14,   // Standard traffic report
-             0x25,   // ADS-B position (ForeFlight Sentry extension, same structure)
-             0x26:   // ADS-R fine position (ForeFlight Sentry extension, same structure)
+        case 0x14:   // Standard traffic report — standard GDL90 device confirmed
+            DispatchQueue.main.async { self.stopSentryRegistration() }
+            if let ac = parseTrafficPayload(payload, isOwnship: false) {
+                DispatchQueue.main.async {
+                    self.detectedAircraft[ac.id] = ac
+                    self.adsbDiag.parsedTraffic += 1
+                }
+            } else {
+                DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
+            }
+        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary — trigger registration)
+             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary — trigger registration)
+            DispatchQueue.main.async { self.startSentryRegistration() }
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async {
                     self.detectedAircraft[ac.id] = ac
