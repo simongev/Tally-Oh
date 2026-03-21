@@ -65,8 +65,13 @@ class ConnectionLogic: ObservableObject {
     // MARK: Private — ADS-B listener
 
     private var listener: NWListener?
+    private var listener49002: NWListener?     // secondary port used by some Sentry firmware
     private let adsbQueue = DispatchQueue(label: "com.tallyoh.adsb", qos: .userInitiated)
     private let adsbPort: NWEndpoint.Port = 4000
+
+    /// Sentry's IP — captured from the first incoming connection so we can
+    /// send a registration "hello" back and prompt standard GDL90 output.
+    private var sentryEndpoint: NWEndpoint?
 
     /// Time of last received GDL90 packet — used to detect signal loss
     private var lastPacketReceived: Date?
@@ -85,6 +90,7 @@ class ConnectionLogic: ObservableObject {
     var _sigHB  = 0   // packets containing 7E 00
     var _sigOWN = 0   // packets containing 7E 0A
     var _sigTR  = 0   // packets containing 7E 14
+    var _senderInfo = ""  // remote endpoint of first connection
 
     // MARK: Private — Internet
 
@@ -135,13 +141,9 @@ class ConnectionLogic: ObservableObject {
 
     /// One-line GDL90 diagnostic string shown in the status label while receiving.
     var adsbStats: String {
-        // Parsed-frame counters (what the GDL90 parser actually processed)
-        var s = "pkts:\(_packetCount) parsed HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) fail:\(_trafficFailed)"
-        // Raw-byte signature counts (are standard GDL90 byte pairs present at all?)
-        s += " | raw 7E00:\(_sigHB) 7E0A:\(_sigOWN) 7E14:\(_sigTR)"
-        if !_firstPacketHex.isEmpty {
-            s += " | first[\(_firstPacketHex)]"
-        }
+        var s = "pkts:\(_packetCount) HB:\(_heartbeatCount) OS:\(_ownshipCount) TR:\(_trafficCount) | raw 7E00:\(_sigHB) 7E0A:\(_sigOWN) 7E14:\(_sigTR)"
+        if !_senderInfo.isEmpty { s += " | from:\(_senderInfo)" }
+        if !_firstPacketHex.isEmpty { s += " | first[\(_firstPacketHex)]" }
         return s
     }
 
@@ -166,42 +168,75 @@ class ConnectionLogic: ObservableObject {
     /// Start listening for ADS-B broadcasts. Called once on app launch.
     func startListening() {
         guard listener == nil else { return }
+        startListener(on: 4000, storing: &listener, label: "4000")
+        startListener(on: 49002, storing: &listener49002, label: "49002")
+    }
 
+    private func startListener(on port: UInt16,
+                                storing ref: inout NWListener?,
+                                label: String) {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         do {
-            listener = try NWListener(using: .udp, on: adsbPort)
+            ref = try NWListener(using: .udp, on: nwPort)
         } catch {
-            print("❌ Failed to create ADS-B listener: \(error)")
-            DispatchQueue.main.async { self.connectionStatus = .notAvailable }
+            print("❌ Failed to create ADS-B listener on port \(label): \(error)")
             return
         }
 
-        listener?.newConnectionHandler = { [weak self] conn in
+        ref?.newConnectionHandler = { [weak self] conn in
             conn.start(queue: self?.adsbQueue ?? .global())
+            // Capture the Sentry's endpoint so we can send a registration hello
+            if self?.sentryEndpoint == nil, let ep = conn.endpoint as NWEndpoint? {
+                self?.sentryEndpoint = ep
+                self?.sendRegistrationHello(to: conn)
+                self?._senderInfo = "\(ep)"
+            }
             self?.receiveFrom(conn)
         }
 
-        listener?.stateUpdateHandler = { [weak self] state in
+        ref?.stateUpdateHandler = { [weak self] state in
             DispatchQueue.main.async {
                 switch state {
                 case .ready:
-                    print("📡 ADS-B listener ready on port 4000")
-                    self?.connectionStatus = .searching
+                    print("📡 ADS-B listener ready on port \(label)")
+                    if self?.connectionStatus == .disconnected || self?.connectionStatus == .notAvailable {
+                        self?.connectionStatus = .searching
+                    }
                 case .failed(let err):
-                    print("❌ ADS-B listener failed: \(err)")
-                    self?.connectionStatus = .notAvailable
+                    print("❌ ADS-B listener failed on port \(label): \(err)")
                 default:
                     break
                 }
             }
         }
 
-        listener?.start(queue: adsbQueue)
-        DispatchQueue.main.async { self.connectionStatus = .searching }
+        ref?.start(queue: adsbQueue)
+        DispatchQueue.main.async {
+            if self.connectionStatus == .disconnected { self.connectionStatus = .searching }
+        }
+    }
+
+    /// Send a minimal GDL90 heartbeat back to the Sentry.
+    /// Some devices only start unicasting traffic after they see a UDP
+    /// packet from the client (a "registration hello").
+    private func sendRegistrationHello(to conn: NWConnection) {
+        // Standard GDL90 heartbeat: 7E 00 81 00 00 00 00 00 00 00 7E
+        let heartbeat = Data([0x7E, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E])
+        conn.send(content: heartbeat, completion: .contentProcessed { err in
+            if let err = err {
+                print("⚠️ Registration hello failed: \(err)")
+            } else {
+                print("📤 Registration hello sent to Sentry")
+            }
+        })
     }
 
     func stopListening() {
         listener?.cancel()
         listener = nil
+        listener49002?.cancel()
+        listener49002 = nil
+        sentryEndpoint = nil
         DispatchQueue.main.async {
             self.connectionStatus = .disconnected
             self.detectedAircraft.removeAll()
