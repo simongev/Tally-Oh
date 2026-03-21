@@ -412,12 +412,12 @@ class ConnectionLogic: ObservableObject {
             // parser produces garbage positions that fail the 20 NM distance filter,
             // yielding a misleading "N aircraft but nothing displayed" situation.
             //
-            // Seeing these instead of 0x0A/0x14 means the Sentry has not switched to
-            // standard GDL90 mode for us yet — most often because another ForeFlight
-            // client on the same device (or subnet) holds the unicast registration.
-            // The registration broadcast continues every 5 s; if the other client is
-            // closed the Sentry should switch on the next broadcast cycle.
-            break
+            // Seeing these means the Sentry is in proprietary mode — either it never
+            // received our registration, or it did but another ForeFlight client later
+            // took over and has since closed (reverting the Sentry to broadcast mode).
+            // Re-start the registration broadcast so the Sentry switches back to
+            // standard GDL90 on the next 5-second cycle.
+            DispatchQueue.main.async { self.startSentryRegistration() }
         case 0x0B: break  // Ownship geometric alt (ignored)
         default: break
         }
