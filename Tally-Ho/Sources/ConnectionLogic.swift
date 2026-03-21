@@ -50,6 +50,22 @@ struct Aircraft: Identifiable {
     }
 }
 
+// MARK: - ADSBDiagnostics
+
+struct ADSBDiagnostics {
+    var packetCount: Int = 0
+    var parsedHeartbeat: Int = 0
+    var parsedOwnship: Int = 0
+    var parsedTraffic: Int = 0
+    var parsedFail: Int = 0
+    /// Count of each raw GDL90 message type seen (keyed by msg type byte, e.g. 0x26).
+    var rawMsgTypeCounts: [UInt8: Int] = [:]
+    /// Hex string of the first received UDP packet, for display in the status HUD.
+    var firstPacketHex: String? = nil
+    /// Byte positions of 0x7E frame flags within firstPacketHex.
+    var firstPacketFlagPositions: [Int] = []
+}
+
 // MARK: - ConnectionLogic
 
 class ConnectionLogic: ObservableObject {
@@ -61,6 +77,7 @@ class ConnectionLogic: ObservableObject {
     @Published var ownshipData: Aircraft?           // GPS/altitude from ADS-B ownship report
     @Published var isInternetAvailable: Bool = false
     @Published var internetAircraftCount: Int = 0
+    @Published var adsbDiag = ADSBDiagnostics()
 
     // MARK: Private — ADS-B listener
 
@@ -202,9 +219,18 @@ class ConnectionLogic: ObservableObject {
             if let data = data, !data.isEmpty {
                 self?.processGDL90Data(data)
                 DispatchQueue.main.async {
-                    self?.lastPacketReceived = Date()
-                    if self?.connectionStatus != .receiving {
-                        self?.connectionStatus = .receiving
+                    guard let self else { return }
+                    self.adsbDiag.packetCount += 1
+                    // Capture raw bytes of the very first packet for HUD diagnostics.
+                    if self.adsbDiag.firstPacketHex == nil {
+                        self.adsbDiag.firstPacketHex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+                        self.adsbDiag.firstPacketFlagPositions = data.indices
+                            .filter { data[$0] == 0x7E }
+                            .map { data.distance(from: data.startIndex, to: $0) }
+                    }
+                    self.lastPacketReceived = Date()
+                    if self.connectionStatus != .receiving {
+                        self.connectionStatus = .receiving
                         print("✅ ADS-B signal acquired")
                     }
                 }
@@ -230,16 +256,16 @@ class ConnectionLogic: ObservableObject {
     }
 
     private func processGDL90Data(_ data: Data) {
-        // Scan for 0x7E frame boundaries without copying the Data into [UInt8].
-        // Iterating Data directly avoids a heap allocation per UDP packet (which
-        // arrives up to ~10 times/second from an ADS-B receiver).
+        // Scan for 0x7E frame boundaries, then de-stuff each frame before dispatching.
         var i = data.startIndex
         while i < data.endIndex {
             guard data[i] == 0x7E else { i = data.index(after: i); continue }
             let payloadStart = data.index(after: i)
             guard payloadStart < data.endIndex else { break }
             if let end = data[payloadStart...].firstIndex(of: 0x7E) {
-                handleGDL90Message(data[payloadStart..<end])
+                // GDL90 byte-stuffing: 0x7D 0x5E → 0x7E, 0x7D 0x5D → 0x7D
+                let unstuffed = unstuffGDL90(data[payloadStart..<end])
+                handleGDL90Message(unstuffed)
                 i = data.index(after: end)
             } else {
                 break
@@ -247,27 +273,67 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
-    private func handleGDL90Message(_ payload: Data.SubSequence) {
+    /// Remove GDL90 byte-stuffing escape sequences from a raw frame payload.
+    private func unstuffGDL90(_ payload: Data.SubSequence) -> Data {
+        var result = Data()
+        result.reserveCapacity(payload.count)
+        var i = payload.startIndex
+        while i < payload.endIndex {
+            if payload[i] == 0x7D {
+                let next = payload.index(after: i)
+                if next < payload.endIndex {
+                    result.append(payload[next] ^ 0x20)
+                    i = payload.index(after: next)
+                    continue
+                }
+            }
+            result.append(payload[i])
+            i = payload.index(after: i)
+        }
+        return result
+    }
+
+    private func handleGDL90Message(_ payload: Data) {
         guard let msgType = payload.first else { return }
+
+        // Always track raw message type for diagnostics.
+        DispatchQueue.main.async { self.adsbDiag.rawMsgTypeCounts[msgType, default: 0] += 1 }
+
         switch msgType {
-        case 0x00: break  // Heartbeat
-        case 0x0A:        // Ownship
+        case 0x00:   // Heartbeat
+            DispatchQueue.main.async { self.adsbDiag.parsedHeartbeat += 1 }
+        case 0x0A:   // Ownship
             if let ac = parseTrafficPayload(payload, isOwnship: true) {
-                DispatchQueue.main.async { self.ownshipData = ac }
+                DispatchQueue.main.async {
+                    self.ownshipData = ac
+                    self.adsbDiag.parsedOwnship += 1
+                }
+            } else {
+                DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x14:        // Traffic
+        case 0x14,   // Standard traffic report
+             0x26:   // ADS-R fine position (ForeFlight Sentry extension, same structure)
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
-                DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
+                DispatchQueue.main.async {
+                    self.detectedAircraft[ac.id] = ac
+                    self.adsbDiag.parsedTraffic += 1
+                }
+            } else {
+                DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x0B: break  // Ownship geometric alt
+        case 0x0B: break  // Ownship geometric alt (ignored)
         default: break
         }
     }
 
-    /// Parse a GDL90 traffic/ownship payload. Operates directly on a Data.SubSequence
-    /// so no heap copy is required — the indices are absolute within the original Data.
-    private func parseTrafficPayload(_ payload: Data.SubSequence, isOwnship: Bool) -> Aircraft? {
-        guard payload.count >= 28 else { return nil }
+    /// Parse a de-stuffed GDL90 traffic/ownship payload (last 2 bytes are FCS — included in
+    /// count but not interpreted here).  Returns nil if the payload is too short or malformed.
+    private func parseTrafficPayload(_ payload: Data, isOwnship: Bool) -> Aircraft? {
+        // Minimum: msg_id(1)+status(1)+addr_type(1)+ICAO(3)+lat(3)+lon(3)+
+        //          alt_misc(2)+NIC(1)+vel(2)+vv(2)+track(1)+emitter(1)+FCS(2) = 23 bytes.
+        // Compact 0x26 frames from the Sentry omit the 8-byte callsign and priority byte,
+        // so 23 bytes is the practical floor; standard 0x14 frames are 30 bytes.
+        guard payload.count >= 23 else { return nil }
 
         // Use an index cursor relative to the slice start.
         var idx = payload.startIndex

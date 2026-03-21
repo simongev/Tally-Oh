@@ -1389,7 +1389,25 @@ class ARTrafficViewController: UIViewController {
         var lines: [String] = []
 
         switch connectionLogic.connectionStatus {
-        case .receiving:     lines.append("📡 ADS-B: Receiving")
+        case .receiving:
+            let d = connectionLogic.adsbDiag
+            let parsedStr = "pkts:\(d.packetCount) parsed HB:\(d.parsedHeartbeat) OS:\(d.parsedOwnship) TR:\(d.parsedTraffic) fail:\(d.parsedFail)"
+            let hbCnt = d.rawMsgTypeCounts[0x00] ?? 0
+            let osCnt = d.rawMsgTypeCounts[0x0A] ?? 0
+            let trCnt = d.rawMsgTypeCounts[0x14] ?? 0
+            var rawStr = "raw 7E00:\(hbCnt) 7E0A:\(osCnt) 7E14:\(trCnt)"
+            for (type, count) in d.rawMsgTypeCounts.sorted(by: { $0.key < $1.key })
+                where type != 0x00 && type != 0x0A && type != 0x14 {
+                rawStr += " 7E\(String(format: "%02X", type)):\(count)"
+            }
+            var diagStr = "\(parsedStr) | \(rawStr)"
+            if let hex = d.firstPacketHex {
+                let byteCount = hex.components(separatedBy: " ").count
+                let flagsStr = d.firstPacketFlagPositions.map(String.init).joined(separator: ",")
+                let trimmedHex = hex.count > 120 ? String(hex.prefix(120)) + "…" : hex
+                diagStr += " | first[\(byteCount)b flags@[\(flagsStr)] \(trimmedHex)]"
+            }
+            lines.append("📡 ADS-B: Receiving (\(diagStr))")
         case .searching:     lines.append("📡 ADS-B: Searching…")
         case .notAvailable:  lines.append("📡 ADS-B: Unavailable")
         case .disconnected:  lines.append("📡 ADS-B: Off")
