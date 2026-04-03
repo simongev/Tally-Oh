@@ -1435,7 +1435,10 @@ class ARTrafficViewController: UIViewController {
                 + (d.rawMsgTypeCounts[0x0A] ?? 0)
                 + (d.rawMsgTypeCounts[0x14] ?? 0)
             if sentryPropCnt > 0 && stdTrafficCnt == 0 {
-                lines.append("⚠️ Sentry proprietary mode — close ForeFlight to enable traffic")
+                var sentryLine = "⚠️ Sentry proprietary mode — close ForeFlight to enable traffic"
+                if let ip = d.sentryIPCaptured { sentryLine += " | ip:\(ip)" }
+                if d.registrationSendFail > 0 { sentryLine += " | regFail:\(d.registrationSendFail)" }
+                lines.append(sentryLine)
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
             if let hex = d.firstPacketHex {

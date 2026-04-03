@@ -69,6 +69,11 @@ struct ADSBDiagnostics {
     var firstPacketFlagPositions: [Int] = []
     /// Number of ForeFlight 63093 registration broadcasts/unicasts sent since listening started.
     var registrationsSent: Int = 0
+    /// IP address of the device currently sending us GDL90 packets (captured from NWConnection endpoint).
+    /// nil until first packet received.
+    var sentryIPCaptured: String? = nil
+    /// Number of registration send attempts that failed (NWConnection error or sendto errno).
+    var registrationSendFail: Int = 0
 }
 
 // MARK: - ConnectionLogic
@@ -186,7 +191,10 @@ class ConnectionLogic: ObservableObject {
             // Capture the remote endpoint so we can unicast registration directly to the Sentry.
             if case .hostPort(let host, _) = conn.endpoint {
                 let ipString = "\(host)"
-                DispatchQueue.main.async { self?.sentryIPString = ipString }
+                DispatchQueue.main.async {
+                    self?.sentryIPString = ipString
+                    self?.adsbDiag.sentryIPCaptured = ipString
+                }
             }
             conn.start(queue: self?.adsbQueue ?? .global())
             self?.receiveFrom(conn)
@@ -325,7 +333,41 @@ class ConnectionLogic: ObservableObject {
         let json = #"{"App":"ForeFlight","GDL90":{"port":4000}}"#
         guard let payload = json.data(using: .utf8) else { return }
 
-        // Helper: open a new BSD UDP socket and send to a single destination.
+        // 1. Unicast to the Sentry's known IP via Network framework (NWConnection).
+        //    Using NWConnection ensures the send participates in iOS Local Network Access
+        //    privacy checks and uses the same network path as the listener — more reliable
+        //    than BSD socket on iOS.  The BSD socket broadcast below is a belt-and-suspenders
+        //    fallback.
+        if let ip = sentryIPString {
+            let conn = NWConnection(
+                to: .hostPort(host: NWEndpoint.Host(ip), port: 63093),
+                using: .udp
+            )
+            conn.stateUpdateHandler = { [weak self, weak conn] state in
+                switch state {
+                case .ready:
+                    conn?.send(content: payload, completion: .contentProcessed { [weak self] error in
+                        DispatchQueue.main.async {
+                            if let error = error {
+                                print("⚠️ Sentry reg NWConnection send failed: \(error)")
+                                self?.adsbDiag.registrationSendFail += 1
+                            }
+                        }
+                        conn?.cancel()
+                    })
+                case .failed(let error):
+                    print("⚠️ Sentry reg NWConnection failed: \(error)")
+                    DispatchQueue.main.async { self?.adsbDiag.registrationSendFail += 1 }
+                    conn?.cancel()
+                default: break
+                }
+            }
+            conn.start(queue: adsbQueue)
+        }
+
+        // 2. BSD socket broadcast — subnet-directed + limited broadcast (255.255.255.255).
+        //    Runs unconditionally so the Sentry can be reached even before we've captured its IP.
+
         func sendUDP(to destAddr: in_addr_t, broadcast: Bool) {
             let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
             guard sock >= 0 else { return }
@@ -344,26 +386,15 @@ class ConnectionLogic: ObservableObject {
                         let result = sendto(sock, ptr.baseAddress, ptr.count, 0,
                                             saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                         if result < 0 {
-                            print("⚠️ Sentry reg sendto failed: errno \(errno)")
+                            print("⚠️ Sentry reg sendto errno \(errno)")
+                            DispatchQueue.main.async { self.adsbDiag.registrationSendFail += 1 }
                         }
                     }
                 }
             }
         }
 
-        // 1. Unicast directly to the Sentry's known IP — bypasses broadcast routing issues.
-        //    This is the most reliable path: we know the Sentry is at that address because
-        //    it sent us packets.
-        if let ip = sentryIPString {
-            var inAddr = in_addr()
-            if inet_pton(AF_INET, ip, &inAddr) == 1 {
-                sendUDP(to: inAddr.s_addr, broadcast: false)
-            }
-        }
-
-        // 2. Subnet-directed broadcast from every active broadcast-capable interface
-        //    (e.g. 192.168.1.255 on the Sentry's hotspot).  More reliable than 255.255.255.255
-        //    on embedded devices that ignore limited broadcast.
+        // Subnet-directed broadcast from each active interface.
         var ifap: UnsafeMutablePointer<ifaddrs>? = nil
         if getifaddrs(&ifap) == 0, let ifList = ifap {
             var cursor: UnsafeMutablePointer<ifaddrs>? = ifList
@@ -383,7 +414,7 @@ class ConnectionLogic: ObservableObject {
             freeifaddrs(ifList)
         }
 
-        // 3. Limited broadcast fallback (255.255.255.255).
+        // Limited broadcast fallback (255.255.255.255).
         sendUDP(to: INADDR_BROADCAST, broadcast: true)
 
         DispatchQueue.main.async { self.adsbDiag.registrationsSent += 1 }
