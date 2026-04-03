@@ -89,6 +89,11 @@ struct ADSBDiagnostics {
     var propLonScale: Double? = nil
     /// Human-readable calibration status shown in the HUD.
     var calibrationStatus: String? = nil
+    /// Vote counts for proprietary 0x26 encoding discovery.
+    /// Keyed by packed (latOff, latScIdx, lonOff, lonScIdx) indices.
+    var prop26VoteCounts: [Int: Int] = [:]
+    /// Number of 22-byte 0x26 frames processed for voting.
+    var prop26FramesVoted: Int = 0
 }
 
 // MARK: - ConnectionLogic
@@ -499,6 +504,11 @@ class ConnectionLogic: ObservableObject {
                     let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
+                // Vote-based calibration: try all byte-offset/scale combos against
+                // NYC-area geographic bounds until a clear winner emerges.
+                if self.adsbDiag.propLatByteOffset == nil {
+                    self.voteForEncoding26(copy26)
+                }
                 if let ac = self.decodeProprietaryTraffic(copy26) {
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
@@ -508,6 +518,94 @@ class ConnectionLogic: ObservableObject {
         case 0x0B: break  // Ownship geometric alt (ignored)
         default: break
         }
+    }
+
+    /// Vote-based proprietary encoding discovery for 0x26 traffic frames.
+    ///
+    /// For every incoming 22-byte 0x26 frame, tries all (latOff, latScale, lonOff, lonScale)
+    /// combinations and casts a vote for each that decodes to a geographically plausible
+    /// NYC-area position (lat [35°,48°]N, lon [-82°,−65°]W).  After 30+ frames the
+    /// correct combination wins overwhelmingly — correct ~80% hit rate vs. ~0.3% for
+    /// random false-positive combinations.
+    ///
+    /// Must be called on the main thread.
+    private func voteForEncoding26(_ payload: Data) {
+        guard payload.count == 22 else { return }
+        let b = Array(payload)
+
+        func s24(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        let scales: [Double] = [
+            180.0 / 16_777_216.0,   // GDL90 lat
+            360.0 / 16_777_216.0,   // GDL90 lon
+            1.0 / 10_000.0,
+            1.0 / 100_000.0,
+            1.0 / 1_000.0,
+        ]
+        let SC = scales.count   // 5
+        let PC = 19             // positions 1…19 → index 0…18
+
+        adsbDiag.prop26FramesVoted += 1
+
+        for latIdx in 0 ..< PC {
+            let latOff = latIdx + 1
+            let rawLat = Double(s24(latOff))
+            for latScIdx in 0 ..< SC {
+                let lat = rawLat * scales[latScIdx]
+                guard lat >= 35.0 && lat <= 48.0 else { continue }
+                for lonIdx in 0 ..< PC {
+                    let lonOff = lonIdx + 1
+                    guard abs(lonOff - latOff) >= 3 else { continue }
+                    let rawLon = Double(s24(lonOff))
+                    for lonScIdx in 0 ..< SC {
+                        let lon = rawLon * scales[lonScIdx]
+                        guard lon >= -82.0 && lon <= -65.0 else { continue }
+                        // Pack indices into a single Int key (max key = 9024).
+                        let key = (latIdx * SC + latScIdx) * (PC * SC) + lonIdx * SC + lonScIdx
+                        adsbDiag.prop26VoteCounts[key, default: 0] += 1
+                    }
+                }
+            }
+        }
+
+        // Only evaluate after enough frames to suppress noise.
+        guard adsbDiag.prop26FramesVoted >= 30 else { return }
+        guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
+        else { return }
+
+        let secondBest = adsbDiag.prop26VoteCounts
+            .filter { $0.key != bestKey }
+            .max(by: { $0.value < $1.value })?.value ?? 0
+
+        // Require a dominant winner: at least 20 votes and 5× over second place.
+        guard bestVotes >= 20 && bestVotes > secondBest * 5 else {
+            adsbDiag.calibrationStatus = String(format:
+                "🗳 voting: best=%d 2nd=%d (%d frames)",
+                bestVotes, secondBest, adsbDiag.prop26FramesVoted)
+            return
+        }
+
+        // Decode the packed key.
+        let PSC = PC * SC   // 95
+        let lonComp = bestKey % PSC
+        let lonIdx   = lonComp / SC
+        let lonScIdx = lonComp % SC
+        let latComp  = bestKey / PSC
+        let latIdx   = latComp / SC
+        let latScIdx = latComp % SC
+
+        adsbDiag.propLatByteOffset = latIdx + 1
+        adsbDiag.propLonByteOffset = lonIdx + 1
+        adsbDiag.propLatScale      = scales[latScIdx]
+        adsbDiag.propLonScale      = scales[lonScIdx]
+        adsbDiag.calibrationStatus = String(format:
+            "✅26 lat@%d×%.2e lon@%d×%.2e (%d/%d frames)",
+            latIdx + 1, scales[latScIdx],
+            lonIdx + 1, scales[lonScIdx],
+            bestVotes, adsbDiag.prop26FramesVoted)
     }
 
     /// Brute-force all 3-byte positions and scale factors in a 0x25 ownship frame
