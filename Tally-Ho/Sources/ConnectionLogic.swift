@@ -607,20 +607,35 @@ class ConnectionLogic: ObservableObject {
         guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
         else { return }
 
-        let secondBest = adsbDiag.prop26VoteCounts
-            .filter { $0.key != bestKey }
-            .max(by: { $0.value < $1.value })?.value ?? 0
+        // Collect top-3 vote counts.  A tie between first and second is EXPECTED:
+        // roBit=0 with latIdx=A+1 and roBit=1 with latIdx=A read identical bytes in
+        // the frame, so they always tie.  Both decode to the same aircraft positions.
+        // Guard against noise using THIRD place instead of second.
+        let top3 = Array(adsbDiag.prop26VoteCounts.values.sorted(by: >).prefix(3))
+        let secondVotes = top3.count > 1 ? top3[1] : 0
+        let thirdVotes  = top3.count > 2 ? top3[2] : 0
 
-        guard bestVotes >= 10 && bestVotes > secondBest * 4 else {
+        guard bestVotes >= 10 && bestVotes > thirdVotes * 2 else {
             adsbDiag.calibrationStatus = String(format:
-                "🗳70 voting: best=%d 2nd=%d (%d frames)",
-                bestVotes, secondBest, adsbDiag.prop26FramesVoted)
+                "🗳70 voting: best=%d 2nd=%d 3rd=%d (%d frames)",
+                bestVotes, secondVotes, thirdVotes, adsbDiag.prop26FramesVoted)
             return
         }
 
+        // When the top two are tied (aliased), prefer roBit=1 (ro=2, two-byte header)
+        // — the larger key — as the canonical winner.
+        let winnerKey: Int
+        if bestVotes == secondVotes {
+            winnerKey = adsbDiag.prop26VoteCounts
+                .filter { $0.value == bestVotes }
+                .max(by: { $0.key < $1.key })!.key
+        } else {
+            winnerKey = bestKey
+        }
+
         // Unpack the winning key.
-        let roBitOut = bestKey / innerSpace
-        let inner    = bestKey % innerSpace
+        let roBitOut = winnerKey / innerSpace
+        let inner    = winnerKey % innerSpace
         let lonComp  = inner % PSC;  let lonIdx  = lonComp / SC;  let lonScIdx = lonComp % SC
         let latComp  = inner / PSC;  let latIdx  = latComp / SC;  let latScIdx = latComp % SC
 
