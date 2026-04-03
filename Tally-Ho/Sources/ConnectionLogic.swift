@@ -90,10 +90,13 @@ struct ADSBDiagnostics {
     /// Human-readable calibration status shown in the HUD.
     var calibrationStatus: String? = nil
     /// Vote counts for proprietary 0x26 encoding discovery.
-    /// Keyed by packed (latOff, latScIdx, lonOff, lonScIdx) indices.
+    /// Keyed by packed (roBit, latOff, latScIdx, lonOff, lonScIdx) indices.
     var prop26VoteCounts: [Int: Int] = [:]
-    /// Number of 22-byte 0x26 frames processed for voting.
+    /// Number of 70-byte 0x26 bundle frames processed for voting.
     var prop26FramesVoted: Int = 0
+    /// Byte offset within a 70-byte bundle frame where the first 22-byte sub-record starts
+    /// (1 = 1-byte header, 2 = 2-byte header).  Set once voting converges.
+    var prop70RecordOffset: Int? = nil
 }
 
 // MARK: - ConnectionLogic
@@ -504,12 +507,17 @@ class ConnectionLogic: ObservableObject {
                     let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
-                // Vote-based calibration: try all byte-offset/scale combos against
-                // NYC-area geographic bounds until a clear winner emerges.
-                if self.adsbDiag.propLatByteOffset == nil {
+                // Vote-based calibration on 70-byte bundle frames.
+                if self.adsbDiag.prop70RecordOffset == nil {
                     self.voteForEncoding26(copy26)
                 }
-                if let ac = self.decodeProprietaryTraffic(copy26) {
+                // Decode: bundle path (70-byte) or direct path (GPS-calibrated).
+                if copy26.count == 70, self.adsbDiag.prop70RecordOffset != nil {
+                    for ac in self.decodeProprietaryBundle(copy26) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.parsedTraffic += 1
+                    }
+                } else if let ac = self.decodeProprietaryTraffic(copy26) {
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
                 }
@@ -529,14 +537,20 @@ class ConnectionLogic: ObservableObject {
     /// random false-positive combinations.
     ///
     /// Must be called on the main thread.
+    /// Vote-based proprietary encoding discovery for 70-byte bundle frames.
+    ///
+    /// Each bundle contains 3 × 22-byte sub-records preceded by a 1- or 2-byte
+    /// header.  Tries both header sizes and all byte-offset/scale combinations,
+    /// voting for each that decodes to a plausible North American position
+    /// (lat [30°,55°]N, lon [−100°,−55°]W).
+    ///
+    /// Key insight: standalone 22-byte 0x26 frames carry velocity/identification
+    /// data without lat/lon; the 70-byte bundles hold position reports.
+    ///
+    /// Must be called on the main thread.
     private func voteForEncoding26(_ payload: Data) {
-        guard payload.count == 22 else { return }
+        guard payload.count == 70 else { return }
         let b = Array(payload)
-
-        func s24(_ off: Int) -> Int32 {
-            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
-            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
-        }
 
         let scales: [Double] = [
             180.0 / 16_777_216.0,   // GDL90 lat
@@ -546,33 +560,50 @@ class ConnectionLogic: ObservableObject {
             1.0 / 1_000.0,
         ]
         let SC = scales.count   // 5
-        let PC = 19             // positions 1…19 → index 0…18
+        let PC = 19             // relative offsets 0…18 within a 22-byte sub-record
+
+        func s24at(_ absOff: Int) -> Int32 {
+            let v = Int32(b[absOff]) << 16 | Int32(b[absOff + 1]) << 8 | Int32(b[absOff + 2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
 
         adsbDiag.prop26FramesVoted += 1
 
-        for latIdx in 0 ..< PC {
-            let latOff = latIdx + 1
-            let rawLat = Double(s24(latOff))
-            for latScIdx in 0 ..< SC {
-                let lat = rawLat * scales[latScIdx]
-                guard lat >= 35.0 && lat <= 48.0 else { continue }
-                for lonIdx in 0 ..< PC {
-                    let lonOff = lonIdx + 1
-                    guard abs(lonOff - latOff) >= 3 else { continue }
-                    let rawLon = Double(s24(lonOff))
-                    for lonScIdx in 0 ..< SC {
-                        let lon = rawLon * scales[lonScIdx]
-                        guard lon >= -82.0 && lon <= -65.0 else { continue }
-                        // Pack indices into a single Int key (max key = 9024).
-                        let key = (latIdx * SC + latScIdx) * (PC * SC) + lonIdx * SC + lonScIdx
-                        adsbDiag.prop26VoteCounts[key, default: 0] += 1
+        // innerSpace = number of distinct (latIdx,latScIdx,lonIdx,lonScIdx) keys.
+        let PSC = PC * SC        // 95
+        let innerSpace = PSC * PSC  // 9025
+
+        // Try record start offset 1 (1-byte header) and 2 (2-byte header).
+        for roBit in 0 ..< 2 {
+            let ro = roBit + 1
+            for ri in 0 ..< 3 {
+                let sub = ro + ri * 22
+                guard sub + 21 < b.count else { continue }
+
+                for latIdx in 0 ..< PC {
+                    guard sub + latIdx + 2 < b.count else { continue }
+                    let rawLat = Double(s24at(sub + latIdx))
+                    for latScIdx in 0 ..< SC {
+                        let lat = rawLat * scales[latScIdx]
+                        guard lat >= 30.0 && lat <= 55.0 else { continue }
+                        for lonIdx in 0 ..< PC {
+                            guard abs(lonIdx - latIdx) >= 3 else { continue }
+                            guard sub + lonIdx + 2 < b.count else { continue }
+                            let rawLon = Double(s24at(sub + lonIdx))
+                            for lonScIdx in 0 ..< SC {
+                                let lon = rawLon * scales[lonScIdx]
+                                guard lon >= -100.0 && lon <= -55.0 else { continue }
+                                let inner = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
+                                let key   = roBit * innerSpace + inner
+                                adsbDiag.prop26VoteCounts[key, default: 0] += 1
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Only evaluate after enough frames to suppress noise.
-        guard adsbDiag.prop26FramesVoted >= 30 else { return }
+        guard adsbDiag.prop26FramesVoted >= 20 else { return }
         guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
         else { return }
 
@@ -580,32 +611,69 @@ class ConnectionLogic: ObservableObject {
             .filter { $0.key != bestKey }
             .max(by: { $0.value < $1.value })?.value ?? 0
 
-        // Require a dominant winner: at least 20 votes and 5× over second place.
-        guard bestVotes >= 20 && bestVotes > secondBest * 5 else {
+        guard bestVotes >= 10 && bestVotes > secondBest * 4 else {
             adsbDiag.calibrationStatus = String(format:
-                "🗳 voting: best=%d 2nd=%d (%d frames)",
+                "🗳70 voting: best=%d 2nd=%d (%d frames)",
                 bestVotes, secondBest, adsbDiag.prop26FramesVoted)
             return
         }
 
-        // Decode the packed key.
-        let PSC = PC * SC   // 95
-        let lonComp = bestKey % PSC
-        let lonIdx   = lonComp / SC
-        let lonScIdx = lonComp % SC
-        let latComp  = bestKey / PSC
-        let latIdx   = latComp / SC
-        let latScIdx = latComp % SC
+        // Unpack the winning key.
+        let roBitOut = bestKey / innerSpace
+        let inner    = bestKey % innerSpace
+        let lonComp  = inner % PSC;  let lonIdx  = lonComp / SC;  let lonScIdx = lonComp % SC
+        let latComp  = inner / PSC;  let latIdx  = latComp / SC;  let latScIdx = latComp % SC
 
-        adsbDiag.propLatByteOffset = latIdx + 1
-        adsbDiag.propLonByteOffset = lonIdx + 1
-        adsbDiag.propLatScale      = scales[latScIdx]
-        adsbDiag.propLonScale      = scales[lonScIdx]
-        adsbDiag.calibrationStatus = String(format:
-            "✅26 lat@%d×%.2e lon@%d×%.2e (%d/%d frames)",
-            latIdx + 1, scales[latScIdx],
-            lonIdx + 1, scales[lonScIdx],
+        adsbDiag.prop70RecordOffset = roBitOut + 1
+        adsbDiag.propLatByteOffset  = latIdx
+        adsbDiag.propLonByteOffset  = lonIdx
+        adsbDiag.propLatScale       = scales[latScIdx]
+        adsbDiag.propLonScale       = scales[lonScIdx]
+        adsbDiag.calibrationStatus  = String(format:
+            "✅70 ro=%d lat@%d×%.2e lon@%d×%.2e (%d/%d frames)",
+            roBitOut + 1, latIdx, scales[latScIdx],
+            lonIdx, scales[lonScIdx],
             bestVotes, adsbDiag.prop26FramesVoted)
+    }
+
+    /// Decode three aircraft sub-records from a 70-byte proprietary bundle frame.
+    /// Requires calibration via voteForEncoding26.  Must be called on the main thread.
+    private func decodeProprietaryBundle(_ payload: Data) -> [Aircraft] {
+        guard let ro     = adsbDiag.prop70RecordOffset,
+              let latOff = adsbDiag.propLatByteOffset,
+              let lonOff = adsbDiag.propLonByteOffset,
+              let latSc  = adsbDiag.propLatScale,
+              let lonSc  = adsbDiag.propLonScale,
+              payload.count == 70 else { return [] }
+
+        let b = Array(payload)
+
+        func s24at(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        var result: [Aircraft] = []
+        for ri in 0 ..< 3 {
+            let sub = ro + ri * 22
+            guard sub + max(latOff + 2, lonOff + 2) < b.count else { continue }
+
+            let lat = Double(s24at(sub + latOff)) * latSc
+            let lon = Double(s24at(sub + lonOff)) * lonSc
+
+            guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
+            guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
+            if let loc = currentLocation,
+               abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
+
+            // Use first 3 bytes of sub-record as pseudo-ICAO.
+            let icao = String(format: "P%02X%02X%02X", b[sub], b[sub + 1], b[sub + 2])
+            result.append(Aircraft(id: icao, callsign: icao,
+                                   latitude: lat, longitude: lon,
+                                   altitude: 0, track: 0, groundSpeed: 0, verticalRate: 0,
+                                   lastUpdate: Date(), source: .adsb))
+        }
+        return result
     }
 
     /// Brute-force all 3-byte positions and scale factors in a 0x25 ownship frame
