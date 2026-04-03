@@ -649,6 +649,8 @@ class ConnectionLogic: ObservableObject {
             roBitOut + 1, latIdx, scales[latScIdx],
             lonIdx, scales[lonScIdx],
             bestVotes, adsbDiag.prop26FramesVoted)
+        // Clear any stale entries accumulated before calibration committed.
+        detectedAircraft.removeAll()
     }
 
     /// Decode three aircraft sub-records from a 70-byte proprietary bundle frame.
@@ -681,8 +683,14 @@ class ConnectionLogic: ObservableObject {
             if let loc = currentLocation,
                abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
 
-            // Use first 3 bytes of sub-record as pseudo-ICAO.
-            let icao = String(format: "P%02X%02X%02X", b[sub], b[sub + 1], b[sub + 2])
+            // Pick ICAO from the first 3-byte window that doesn't overlap lat or lon bytes.
+            // lat occupies [latOff, latOff+2], lon occupies [lonOff, lonOff+2].
+            let icaoOff = (0 ..< 20).first { off in
+                (off + 2 < latOff || off > latOff + 2) &&
+                (off + 2 < lonOff || off > lonOff + 2)
+            } ?? 0
+            let icao = String(format: "P%02X%02X%02X",
+                              b[sub + icaoOff], b[sub + icaoOff + 1], b[sub + icaoOff + 2])
             result.append(Aircraft(id: icao, callsign: icao,
                                    latitude: lat, longitude: lon,
                                    altitude: 0, track: 0, groundSpeed: 0, verticalRate: 0,
