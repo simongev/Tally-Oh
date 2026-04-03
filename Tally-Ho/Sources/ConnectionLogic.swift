@@ -67,6 +67,8 @@ struct ADSBDiagnostics {
     var firstPacketHex: String? = nil
     /// Byte positions of 0x7E frame flags within firstPacketHex.
     var firstPacketFlagPositions: [Int] = []
+    /// Number of ForeFlight 63093 registration broadcasts/unicasts sent since listening started.
+    var registrationsSent: Int = 0
 }
 
 // MARK: - ConnectionLogic
@@ -97,6 +99,11 @@ class ConnectionLogic: ObservableObject {
     /// from their default proprietary 0x25/0x26 broadcast to unicast standard GDL90
     /// (0x0A ownship + 0x14 traffic) back to us on port 4000.
     private var foreflight63093Timer: Timer?
+
+    /// IP address (string) of the last device that sent us a GDL90 packet.
+    /// Captured from the NWConnection remote endpoint and used to send the registration
+    /// unicast directly to the Sentry, bypassing any broadcast routing issues.
+    private var sentryIPString: String?
 
     // MARK: Private — Internet
 
@@ -176,6 +183,11 @@ class ConnectionLogic: ObservableObject {
         }
 
         listener?.newConnectionHandler = { [weak self] conn in
+            // Capture the remote endpoint so we can unicast registration directly to the Sentry.
+            if case .hostPort(let host, _) = conn.endpoint {
+                let ipString = "\(host)"
+                DispatchQueue.main.async { self?.sentryIPString = ipString }
+            }
             conn.start(queue: self?.adsbQueue ?? .global())
             self?.receiveFrom(conn)
         }
@@ -313,26 +325,68 @@ class ConnectionLogic: ObservableObject {
         let json = #"{"App":"ForeFlight","GDL90":{"port":4000}}"#
         guard let payload = json.data(using: .utf8) else { return }
 
-        // BSD socket: UDP broadcast to 255.255.255.255:63093.
-        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard sock >= 0 else { return }
-        defer { close(sock) }
-
-        var yes: Int32 = 1
-        setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port   = UInt16(63093).bigEndian
-        addr.sin_addr.s_addr = INADDR_BROADCAST  // 0xFFFFFFFF
-
-        payload.withUnsafeBytes { ptr in
-            withUnsafePointer(to: &addr) { addrPtr in
-                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                    _ = sendto(sock, ptr.baseAddress, ptr.count, 0, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        // Helper: open a new BSD UDP socket and send to a single destination.
+        func sendUDP(to destAddr: in_addr_t, broadcast: Bool) {
+            let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            guard sock >= 0 else { return }
+            defer { close(sock) }
+            if broadcast {
+                var yes: Int32 = 1
+                setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
+            }
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port   = UInt16(63093).bigEndian
+            addr.sin_addr.s_addr = destAddr
+            payload.withUnsafeBytes { ptr in
+                withUnsafePointer(to: &addr) { addrPtr in
+                    addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                        let result = sendto(sock, ptr.baseAddress, ptr.count, 0,
+                                            saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        if result < 0 {
+                            print("⚠️ Sentry reg sendto failed: errno \(errno)")
+                        }
+                    }
                 }
             }
         }
+
+        // 1. Unicast directly to the Sentry's known IP — bypasses broadcast routing issues.
+        //    This is the most reliable path: we know the Sentry is at that address because
+        //    it sent us packets.
+        if let ip = sentryIPString {
+            var inAddr = in_addr()
+            if inet_pton(AF_INET, ip, &inAddr) == 1 {
+                sendUDP(to: inAddr.s_addr, broadcast: false)
+            }
+        }
+
+        // 2. Subnet-directed broadcast from every active broadcast-capable interface
+        //    (e.g. 192.168.1.255 on the Sentry's hotspot).  More reliable than 255.255.255.255
+        //    on embedded devices that ignore limited broadcast.
+        var ifap: UnsafeMutablePointer<ifaddrs>? = nil
+        if getifaddrs(&ifap) == 0, let ifList = ifap {
+            var cursor: UnsafeMutablePointer<ifaddrs>? = ifList
+            while let ifa = cursor {
+                let flags = Int32(ifa.pointee.ifa_flags)
+                if flags & IFF_UP != 0,
+                   flags & IFF_BROADCAST != 0,
+                   ifa.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_INET),
+                   let bcastSA = ifa.pointee.ifa_dstaddr {
+                    let bcastAddr = bcastSA.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                        $0.pointee.sin_addr.s_addr
+                    }
+                    sendUDP(to: bcastAddr, broadcast: true)
+                }
+                cursor = ifa.pointee.ifa_next
+            }
+            freeifaddrs(ifList)
+        }
+
+        // 3. Limited broadcast fallback (255.255.255.255).
+        sendUDP(to: INADDR_BROADCAST, broadcast: true)
+
+        DispatchQueue.main.async { self.adsbDiag.registrationsSent += 1 }
     }
 
     private func processGDL90Data(_ data: Data) {

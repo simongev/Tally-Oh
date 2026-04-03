@@ -1417,7 +1417,8 @@ class ARTrafficViewController: UIViewController {
         switch connectionLogic.connectionStatus {
         case .receiving:
             let d = connectionLogic.adsbDiag
-            let parsedStr = "pkts:\(d.packetCount) parsed HB:\(d.parsedHeartbeat) OS:\(d.parsedOwnship) TR:\(d.parsedTraffic) fail:\(d.parsedFail)"
+            let regSuffix = d.registrationsSent > 0 ? " reg:\(d.registrationsSent)" : ""
+            let parsedStr = "pkts:\(d.packetCount) parsed HB:\(d.parsedHeartbeat) OS:\(d.parsedOwnship) TR:\(d.parsedTraffic) fail:\(d.parsedFail)\(regSuffix)"
             let hbCnt = d.rawMsgTypeCounts[0x00] ?? 0
             let osCnt = d.rawMsgTypeCounts[0x0A] ?? 0
             let trCnt = d.rawMsgTypeCounts[0x14] ?? 0
