@@ -541,8 +541,8 @@ class ConnectionLogic: ObservableObject {
     ///
     /// Each bundle contains 3 × 22-byte sub-records preceded by a 1- or 2-byte
     /// header.  Tries both header sizes and all byte-offset/scale combinations,
-    /// voting for each that decodes to a plausible North American position
-    /// (lat [30°,55°]N, lon [−100°,−55°]W).
+    /// voting for each that decodes to a position near the user's GPS location.
+    /// Uses GPS ±10° bounds when available; falls back to broad North America box.
     ///
     /// Key insight: standalone 22-byte 0x26 frames carry velocity/identification
     /// data without lat/lon; the 70-byte bundles hold position reports.
@@ -551,6 +551,17 @@ class ConnectionLogic: ObservableObject {
     private func voteForEncoding26(_ payload: Data) {
         guard payload.count == 70 else { return }
         let b = Array(payload)
+
+        // Tight GPS-centred bounds reduce noise ~10×.  With ±10° around the user
+        // only ~0.6% of random 24-bit values pass vs 1.7% for the broad NE-US box.
+        let (latMin, latMax, lonMin, lonMax): (Double, Double, Double, Double)
+        if let loc = currentLocation {
+            let pad: Double = 10.0
+            latMin = loc.latitude  - pad;  latMax = loc.latitude  + pad
+            lonMin = loc.longitude - pad;  lonMax = loc.longitude + pad
+        } else {
+            latMin = 25.0; latMax = 55.0; lonMin = -105.0; lonMax = -55.0
+        }
 
         let scales: [Double] = [
             180.0 / 16_777_216.0,   // GDL90 lat
@@ -585,14 +596,14 @@ class ConnectionLogic: ObservableObject {
                     let rawLat = Double(s24at(sub + latIdx))
                     for latScIdx in 0 ..< SC {
                         let lat = rawLat * scales[latScIdx]
-                        guard lat >= 30.0 && lat <= 55.0 else { continue }
+                        guard lat >= latMin && lat <= latMax else { continue }
                         for lonIdx in 0 ..< PC {
                             guard abs(lonIdx - latIdx) >= 3 else { continue }
                             guard sub + lonIdx + 2 < b.count else { continue }
                             let rawLon = Double(s24at(sub + lonIdx))
                             for lonScIdx in 0 ..< SC {
                                 let lon = rawLon * scales[lonScIdx]
-                                guard lon >= -100.0 && lon <= -55.0 else { continue }
+                                guard lon >= lonMin && lon <= lonMax else { continue }
                                 let inner = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
                                 let key   = roBit * innerSpace + inner
                                 adsbDiag.prop26VoteCounts[key, default: 0] += 1
