@@ -1442,7 +1442,14 @@ class ARTrafficViewController: UIViewController {
                     if sorted.isEmpty { return "" }
                     return " | frames: " + sorted.map { "\($0.key)b×\($0.value)" }.joined(separator: " ")
                 }()
-                lines.append("⚠️ Sentry proprietary 0x25/0x26 — ForeFlight/OzRunways only (decoding in progress)\(ipPart)\(sizePart)")
+                lines.append("⚠️ Sentry proprietary 0x25/0x26\(ipPart)\(sizePart)")
+                if let cal = d.calibrationStatus {
+                    lines.append("🔬 \(cal)")
+                }
+                if let hex25 = d.lastMsg25Hex {
+                    let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
+                    lines.append("0x25: \(trimmed)")
+                }
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
             if let hex = d.firstPacketHex {

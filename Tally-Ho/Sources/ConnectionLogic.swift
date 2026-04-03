@@ -75,6 +75,20 @@ struct ADSBDiagnostics {
     /// Histogram of de-stuffed GDL90 frame payload sizes (in bytes), keyed by size.
     /// Helps characterise proprietary frame formats for reverse-engineering.
     var frameSizeCounts: [Int: Int] = [:]
+    /// Most recent 0x25 (ownship) frame hex, updated on every 0x25 arrival.
+    var lastMsg25Hex: String? = nil
+    /// One sample hex string per unique de-stuffed frame size (first seen wins).
+    var sampleFramesBySize: [Int: String] = [:]
+    /// Byte offset into the 0x25 payload where latitude was found by calibration.
+    var propLatByteOffset: Int? = nil
+    /// Byte offset into the 0x25 payload where longitude was found by calibration.
+    var propLonByteOffset: Int? = nil
+    /// Scale factor: rawInt * propLatScale = degrees latitude.
+    var propLatScale: Double? = nil
+    /// Scale factor: rawInt * propLonScale = degrees longitude.
+    var propLonScale: Double? = nil
+    /// Human-readable calibration status shown in the HUD.
+    var calibrationStatus: String? = nil
 }
 
 // MARK: - ConnectionLogic
@@ -462,22 +476,126 @@ class ConnectionLogic: ObservableObject {
             } else {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
             }
-        case 0x25,   // ADS-B position (ForeFlight Sentry proprietary — format undisclosed)
-             0x26:   // ADS-R fine position (ForeFlight Sentry proprietary — format undisclosed)
-            // These proprietary formats cannot be decoded: the coordinate encoding is
-            // private (confirmed by ForeFlight/uAvionix).  Applying the standard GDL90
-            // parser produces garbage positions that fail the 20 NM distance filter,
-            // yielding a misleading "N aircraft but nothing displayed" situation.
-            //
-            // Seeing these means the Sentry is in proprietary mode — either it never
-            // received our registration, or it did but another ForeFlight client later
-            // took over and has since closed (reverting the Sentry to broadcast mode).
-            // Re-start the registration broadcast so the Sentry switches back to
-            // standard GDL90 on the next 5-second cycle.
-            DispatchQueue.main.async { self.startSentryRegistration() }
+        case 0x25:   // Sentry proprietary ownship — contains device GPS position
+            let copy25 = payload
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let hex = copy25.map { String(format: "%02X", $0) }.joined(separator: " ")
+                self.adsbDiag.lastMsg25Hex = hex
+                if self.adsbDiag.sampleFramesBySize[copy25.count] == nil {
+                    self.adsbDiag.sampleFramesBySize[copy25.count] = hex
+                }
+                // Brute-force calibration: discover lat/lon byte layout using known GPS.
+                if let loc = self.currentLocation, self.adsbDiag.propLatByteOffset == nil {
+                    self.calibrateProprietaryEncoding(copy25, userLat: loc.latitude, userLon: loc.longitude)
+                }
+                self.startSentryRegistration()
+            }
+        case 0x26:   // Sentry proprietary traffic
+            let copy26 = payload
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
+                    let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                    self.adsbDiag.sampleFramesBySize[copy26.count] = hex
+                }
+                if let ac = self.decodeProprietaryTraffic(copy26) {
+                    self.detectedAircraft[ac.id] = ac
+                    self.adsbDiag.parsedTraffic += 1
+                }
+                self.startSentryRegistration()
+            }
         case 0x0B: break  // Ownship geometric alt (ignored)
         default: break
         }
+    }
+
+    /// Brute-force all 3-byte positions and scale factors in a 0x25 ownship frame
+    /// to discover the proprietary lat/lon encoding by matching against the user's
+    /// known GPS position. Must be called on the main thread.
+    private func calibrateProprietaryEncoding(_ payload: Data, userLat: Double, userLon: Double) {
+        let b = Array(payload)
+        let n = b.count
+        guard n >= 7 else { return }
+
+        func s24(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        let scales: [Double] = [
+            180.0 / 16_777_216.0,   // standard GDL90 lat
+            360.0 / 16_777_216.0,   // standard GDL90 lon
+            1.0 / 10_000.0,
+            1.0 / 100_000.0,
+        ]
+        let latTol = 1.5   // degrees
+        let lonTol = 2.5   // degrees
+
+        for latOff in 1 ... (n - 3) {
+            for latSc in scales {
+                let lat = Double(s24(latOff)) * latSc
+                guard abs(lat - userLat) <= latTol else { continue }
+                for lonOff in 1 ... (n - 3) {
+                    guard abs(lonOff - latOff) >= 3 else { continue }
+                    for lonSc in scales {
+                        let lon = Double(s24(lonOff)) * lonSc
+                        guard abs(lon - userLon) <= lonTol else { continue }
+                        adsbDiag.propLatByteOffset = latOff
+                        adsbDiag.propLonByteOffset = lonOff
+                        adsbDiag.propLatScale = latSc
+                        adsbDiag.propLonScale = lonSc
+                        adsbDiag.calibrationStatus = String(format:
+                            "✅ lat@%d×%.2e=%.4f° lon@%d×%.2e=%.4f°",
+                            latOff, latSc, lat, lonOff, lonSc, lon)
+                        return
+                    }
+                }
+            }
+        }
+        adsbDiag.calibrationStatus = String(format:
+            "🔍 no match: target [%.4f, %.4f] in %db frame",
+            userLat, userLon, n)
+    }
+
+    /// Decode a 0x26 proprietary traffic frame using calibrated byte offsets.
+    /// Returns nil if not yet calibrated, frame is too small, or position is invalid.
+    /// Must be called on the main thread.
+    private func decodeProprietaryTraffic(_ payload: Data) -> Aircraft? {
+        guard let latOff = adsbDiag.propLatByteOffset,
+              let lonOff = adsbDiag.propLonByteOffset,
+              let latSc  = adsbDiag.propLatScale,
+              let lonSc  = adsbDiag.propLonScale else { return nil }
+
+        let b = Array(payload)
+        let n = b.count
+        guard n > max(latOff + 2, lonOff + 2) else { return nil }
+
+        func s24(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        let lat = Double(s24(latOff)) * latSc
+        let lon = Double(s24(lonOff)) * lonSc
+
+        guard (-90 ... 90).contains(lat), (-180 ... 180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }  // reject near-zero
+
+        // Skip ownship: if position is within 0.1° of user's GPS it's us, not traffic.
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 {
+            return nil
+        }
+
+        let icao = n >= 5
+            ? String(format: "P%02X%02X%02X", b[2], b[3], b[4])
+            : String(format: "P%02X%02d", b[1], n)
+
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 0, track: 0, groundSpeed: 0, verticalRate: 0,
+                        lastUpdate: Date(), source: .adsb)
     }
 
     /// Parse a de-stuffed GDL90 traffic/ownship payload (last 2 bytes are FCS — included in
