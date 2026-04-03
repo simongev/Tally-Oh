@@ -1427,18 +1427,22 @@ class ARTrafficViewController: UIViewController {
                 where type != 0x00 && type != 0x0A && type != 0x14 {
                 rawStr += " 7E\(String(format: "%02X", type)):\(count)"
             }
-            // Warn when the Sentry is locked in proprietary mode (0x25/0x26 only).
-            // This typically means another ForeFlight client on the same device holds
-            // the unicast registration — close ForeFlight to let this app take over.
+            // The Sentry always sends proprietary msg types 0x25/0x26 — there is no
+            // standard GDL90 mode.  ForeFlight and OzRunways have a licensed decoder;
+            // we are reverse-engineering the format.  Show frame-size histogram to
+            // help characterise the protocol layout.
             let sentryPropCnt = (d.rawMsgTypeCounts[0x25] ?? 0) + (d.rawMsgTypeCounts[0x26] ?? 0)
             let stdTrafficCnt = (d.rawMsgTypeCounts[0x00] ?? 0)
                 + (d.rawMsgTypeCounts[0x0A] ?? 0)
                 + (d.rawMsgTypeCounts[0x14] ?? 0)
             if sentryPropCnt > 0 && stdTrafficCnt == 0 {
-                var sentryLine = "⚠️ Sentry proprietary mode — close ForeFlight to enable traffic"
-                if let ip = d.sentryIPCaptured { sentryLine += " | ip:\(ip)" }
-                if d.registrationSendFail > 0 { sentryLine += " | regFail:\(d.registrationSendFail)" }
-                lines.append(sentryLine)
+                let ipPart = d.sentryIPCaptured.map { " | ip:\($0)" } ?? ""
+                let sizePart: String = {
+                    let sorted = d.frameSizeCounts.sorted { $0.key < $1.key }
+                    if sorted.isEmpty { return "" }
+                    return " | frames: " + sorted.map { "\($0.key)b×\($0.value)" }.joined(separator: " ")
+                }()
+                lines.append("⚠️ Sentry proprietary 0x25/0x26 — ForeFlight/OzRunways only (decoding in progress)\(ipPart)\(sizePart)")
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
             if let hex = d.firstPacketHex {

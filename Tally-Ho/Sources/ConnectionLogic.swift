@@ -67,13 +67,14 @@ struct ADSBDiagnostics {
     var firstPacketHex: String? = nil
     /// Byte positions of 0x7E frame flags within firstPacketHex.
     var firstPacketFlagPositions: [Int] = []
-    /// Number of ForeFlight 63093 registration broadcasts/unicasts sent since listening started.
+    /// Number of ForeFlight 63093 registration broadcasts sent since listening started.
     var registrationsSent: Int = 0
     /// IP address of the device currently sending us GDL90 packets (captured from NWConnection endpoint).
     /// nil until first packet received.
     var sentryIPCaptured: String? = nil
-    /// Number of registration send attempts that failed (NWConnection error or sendto errno).
-    var registrationSendFail: Int = 0
+    /// Histogram of de-stuffed GDL90 frame payload sizes (in bytes), keyed by size.
+    /// Helps characterise proprietary frame formats for reverse-engineering.
+    var frameSizeCounts: [Int: Int] = [:]
 }
 
 // MARK: - ConnectionLogic
@@ -333,49 +334,22 @@ class ConnectionLogic: ObservableObject {
         let json = #"{"App":"ForeFlight","GDL90":{"port":4000}}"#
         guard let payload = json.data(using: .utf8) else { return }
 
-        // 1. Unicast to the Sentry's known IP via Network framework (NWConnection).
-        //    Using NWConnection ensures the send participates in iOS Local Network Access
-        //    privacy checks and uses the same network path as the listener — more reliable
-        //    than BSD socket on iOS.  The BSD socket broadcast below is a belt-and-suspenders
-        //    fallback.
-        if let ip = sentryIPString {
-            let conn = NWConnection(
-                to: .hostPort(host: NWEndpoint.Host(ip), port: 63093),
-                using: .udp
-            )
-            conn.stateUpdateHandler = { [weak self, weak conn] state in
-                switch state {
-                case .ready:
-                    conn?.send(content: payload, completion: .contentProcessed { [weak self] error in
-                        DispatchQueue.main.async {
-                            if let error = error {
-                                print("⚠️ Sentry reg NWConnection send failed: \(error)")
-                                self?.adsbDiag.registrationSendFail += 1
-                            }
-                        }
-                        conn?.cancel()
-                    })
-                case .failed(let error):
-                    print("⚠️ Sentry reg NWConnection failed: \(error)")
-                    DispatchQueue.main.async { self?.adsbDiag.registrationSendFail += 1 }
-                    conn?.cancel()
-                default: break
-                }
-            }
-            conn.start(queue: adsbQueue)
-        }
+        // Research shows the Sentry does NOT listen on port 63093 for unicast —
+        // 63093 is the port ForeFlight uses to broadcast its own presence to standard
+        // GDL90 hardware (Garmin, Stratus), not a mode-switch port for the Sentry.
+        // The Sentry always sends proprietary 0x25/0x26 regardless of registration.
+        //
+        // We still send the broadcast because it may cause the Sentry to switch from
+        // broad­cast delivery to unicast delivery (same 0x25/0x26 content, lower overhead).
+        // NWConnection unicast to sentryIP:63093 is intentionally omitted because the
+        // Sentry's port 63093 is closed — it produces ICMP unreachable for every attempt.
 
-        // 2. BSD socket broadcast — subnet-directed + limited broadcast (255.255.255.255).
-        //    Runs unconditionally so the Sentry can be reached even before we've captured its IP.
-
-        func sendUDP(to destAddr: in_addr_t, broadcast: Bool) {
+        func sendBroadcast(to destAddr: in_addr_t) {
             let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
             guard sock >= 0 else { return }
             defer { close(sock) }
-            if broadcast {
-                var yes: Int32 = 1
-                setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
-            }
+            var yes: Int32 = 1
+            setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, socklen_t(MemoryLayout<Int32>.size))
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
             addr.sin_port   = UInt16(63093).bigEndian
@@ -383,18 +357,14 @@ class ConnectionLogic: ObservableObject {
             payload.withUnsafeBytes { ptr in
                 withUnsafePointer(to: &addr) { addrPtr in
                     addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                        let result = sendto(sock, ptr.baseAddress, ptr.count, 0,
-                                            saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-                        if result < 0 {
-                            print("⚠️ Sentry reg sendto errno \(errno)")
-                            DispatchQueue.main.async { self.adsbDiag.registrationSendFail += 1 }
-                        }
+                        _ = sendto(sock, ptr.baseAddress, ptr.count, 0,
+                                   saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                     }
                 }
             }
         }
 
-        // Subnet-directed broadcast from each active interface.
+        // Subnet-directed broadcast from each active interface, then limited broadcast.
         var ifap: UnsafeMutablePointer<ifaddrs>? = nil
         if getifaddrs(&ifap) == 0, let ifList = ifap {
             var cursor: UnsafeMutablePointer<ifaddrs>? = ifList
@@ -407,15 +377,13 @@ class ConnectionLogic: ObservableObject {
                     let bcastAddr = bcastSA.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
                         $0.pointee.sin_addr.s_addr
                     }
-                    sendUDP(to: bcastAddr, broadcast: true)
+                    sendBroadcast(to: bcastAddr)
                 }
                 cursor = ifa.pointee.ifa_next
             }
             freeifaddrs(ifList)
         }
-
-        // Limited broadcast fallback (255.255.255.255).
-        sendUDP(to: INADDR_BROADCAST, broadcast: true)
+        sendBroadcast(to: INADDR_BROADCAST)
 
         DispatchQueue.main.async { self.adsbDiag.registrationsSent += 1 }
     }
@@ -461,8 +429,12 @@ class ConnectionLogic: ObservableObject {
     private func handleGDL90Message(_ payload: Data) {
         guard let msgType = payload.first else { return }
 
-        // Always track raw message type for diagnostics.
-        DispatchQueue.main.async { self.adsbDiag.rawMsgTypeCounts[msgType, default: 0] += 1 }
+        // Always track raw message type and frame size for diagnostics.
+        let frameSize = payload.count
+        DispatchQueue.main.async {
+            self.adsbDiag.rawMsgTypeCounts[msgType, default: 0] += 1
+            self.adsbDiag.frameSizeCounts[frameSize, default: 0] += 1
+        }
 
         switch msgType {
         case 0x00:   // Heartbeat — standard GDL90 device confirmed
