@@ -684,11 +684,12 @@ class ConnectionLogic: ObservableObject {
                abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
 
             // Pick ICAO from the first 3-byte window that doesn't overlap lat or lon bytes.
-            // lat occupies [latOff, latOff+2], lon occupies [lonOff, lonOff+2].
-            let icaoOff = (0 ..< 20).first { off in
-                (off + 2 < latOff || off > latOff + 2) &&
-                (off + 2 < lonOff || off > lonOff + 2)
-            } ?? 0
+            var icaoOff = 0
+            for off in 0 ..< 20 {
+                let noLat = off + 2 < latOff || off > latOff + 2
+                let noLon = off + 2 < lonOff || off > lonOff + 2
+                if noLat && noLon { icaoOff = off; break }
+            }
             let icao = String(format: "P%02X%02X%02X",
                               b[sub + icaoOff], b[sub + icaoOff + 1], b[sub + icaoOff + 2])
             result.append(Aircraft(id: icao, callsign: icao,
