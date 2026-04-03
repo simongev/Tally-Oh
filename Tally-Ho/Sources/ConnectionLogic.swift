@@ -703,9 +703,19 @@ class ConnectionLogic: ObservableObject {
             }
             let icao = String(format: "P%02X%02X%02X",
                               b[sub + icaoOff], b[sub + icaoOff + 1], b[sub + icaoOff + 2])
+            // Attempt GDL90 altitude decode from the two bytes after lat+lon (offset 6
+            // when latOff=0/lonOff=3). Raw 12-bit value × 25 − 1000 ft.  If the result
+            // is implausible fall back to 10 000 ft so AR dots appear above the user.
+            let altOff = max(latOff, lonOff) + 3
+            var altFt: Double = 10_000
+            if sub + altOff + 1 < b.count {
+                let raw12 = (Int(b[sub + altOff]) << 4) | (Int(b[sub + altOff + 1]) >> 4)
+                let decoded = Double(raw12) * 25.0 - 1000.0
+                if decoded >= -1000 && decoded <= 50_000 { altFt = decoded }
+            }
             result.append(Aircraft(id: icao, callsign: icao,
                                    latitude: lat, longitude: lon,
-                                   altitude: 0, track: 0, groundSpeed: 0, verticalRate: 0,
+                                   altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
                                    lastUpdate: Date(), source: .adsb))
         }
         return result
