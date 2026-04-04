@@ -552,11 +552,13 @@ class ConnectionLogic: ObservableObject {
         guard payload.count == 70 else { return }
         let b = Array(payload)
 
-        // Tight GPS-centred bounds reduce noise ~10×.  With ±10° around the user
-        // only ~0.6% of random 24-bit values pass vs 1.7% for the broad NE-US box.
+        // ±3° ≈ 200 mi window — comfortably covers full ADS-B range.
+        // With per-scale probability ~0.056% of a random 3-byte value landing in range,
+        // the chance that ALL 3 sub-records pass by coincidence is ~1.8e-10 per frame
+        // per candidate, eliminating false-positive ties entirely.
         let (latMin, latMax, lonMin, lonMax): (Double, Double, Double, Double)
         if let loc = currentLocation {
-            let pad: Double = 10.0
+            let pad: Double = 3.0
             latMin = loc.latitude  - pad;  latMax = loc.latitude  + pad
             lonMin = loc.longitude - pad;  lonMax = loc.longitude + pad
         } else {
@@ -584,30 +586,30 @@ class ConnectionLogic: ObservableObject {
         let PSC = PC * SC        // 95
         let innerSpace = PSC * PSC  // 9025
 
-        // Try record start offset 1 (1-byte header) and 2 (2-byte header).
+        // Vote only when ALL 3 sub-records decode to in-bounds lat/lon.
+        // This raises the bar from P≈1% (per sub-record) to P≈1.8e-10 (all three),
+        // eliminating the three-way tie caused by per-sub-record independent voting.
         for roBit in 0 ..< 2 {
             let ro = roBit + 1
-            for ri in 0 ..< 3 {
-                let sub = ro + ri * 22
-                guard sub + 21 < b.count else { continue }
-
-                for latIdx in 0 ..< PC {
-                    guard sub + latIdx + 2 < b.count else { continue }
-                    let rawLat = Double(s24at(sub + latIdx))
-                    for latScIdx in 0 ..< SC {
-                        let lat = rawLat * scales[latScIdx]
-                        guard lat >= latMin && lat <= latMax else { continue }
-                        for lonIdx in 0 ..< PC {
-                            guard abs(lonIdx - latIdx) >= 3 else { continue }
-                            guard sub + lonIdx + 2 < b.count else { continue }
-                            let rawLon = Double(s24at(sub + lonIdx))
-                            for lonScIdx in 0 ..< SC {
-                                let lon = rawLon * scales[lonScIdx]
-                                guard lon >= lonMin && lon <= lonMax else { continue }
-                                let inner = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
-                                let key   = roBit * innerSpace + inner
-                                adsbDiag.prop26VoteCounts[key, default: 0] += 1
+            for latIdx in 0 ..< PC {
+                for latScIdx in 0 ..< SC {
+                    for lonIdx in 0 ..< PC {
+                        guard abs(lonIdx - latIdx) >= 3 else { continue }
+                        let hiIdx = max(latIdx, lonIdx)
+                        for lonScIdx in 0 ..< SC {
+                            var allPass = true
+                            for ri in 0 ..< 3 {
+                                let sub = ro + ri * 22
+                                guard sub + hiIdx + 2 < b.count else { allPass = false; break }
+                                let lat = Double(s24at(sub + latIdx)) * scales[latScIdx]
+                                guard lat >= latMin && lat <= latMax else { allPass = false; break }
+                                let lon = Double(s24at(sub + lonIdx)) * scales[lonScIdx]
+                                guard lon >= lonMin && lon <= lonMax else { allPass = false; break }
                             }
+                            guard allPass else { continue }
+                            let inner = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
+                            let key   = roBit * innerSpace + inner
+                            adsbDiag.prop26VoteCounts[key, default: 0] += 1
                         }
                     }
                 }
@@ -618,10 +620,8 @@ class ConnectionLogic: ObservableObject {
         guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
         else { return }
 
-        // Collect top-3 vote counts.  A tie between first and second is EXPECTED:
-        // roBit=0 with latIdx=A+1 and roBit=1 with latIdx=A read identical bytes in
-        // the frame, so they always tie.  Both decode to the same aircraft positions.
-        // Guard against noise using THIRD place instead of second.
+        // A tie between 1st and 2nd is still expected (roBit=0/latIdx=A+1 vs roBit=1/latIdx=A
+        // read the same bytes).  3rd-place is the true noise reference.
         let top3 = Array(adsbDiag.prop26VoteCounts.values.sorted(by: >).prefix(3))
         let secondVotes = top3.count > 1 ? top3[1] : 0
         let thirdVotes  = top3.count > 2 ? top3[2] : 0
