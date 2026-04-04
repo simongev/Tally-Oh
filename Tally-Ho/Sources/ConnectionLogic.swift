@@ -503,8 +503,12 @@ class ConnectionLogic: ObservableObject {
             let copy26 = payload
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
-                    let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                // Always refresh the 70-byte sample (most-recent wins) so the HUD
+                // always shows a current frame that can be correlated with ForeFlight.
+                if copy26.count == 70 {
+                    self.adsbDiag.sampleFramesBySize[70] = hex
+                } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
                 // Vote-based calibration on 70-byte bundle frames.
