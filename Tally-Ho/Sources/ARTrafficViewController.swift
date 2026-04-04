@@ -1450,8 +1450,11 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
-                // Full 70-byte bundle frame (two rows, 35 bytes each) — screenshot
-                // this alongside a ForeFlight aircraft tap to identify the encoding.
+                // Most-recent 22-byte frame (one aircraft) and 70-byte bundle frame.
+                // Screenshot alongside a ForeFlight aircraft tap to identify encoding.
+                if let hex22 = d.sampleFramesBySize[22] {
+                    lines.append("0x26[22b] " + hex22)
+                }
                 if let hex70 = d.sampleFramesBySize[70] {
                     let bytes = hex70.components(separatedBy: " ")
                     lines.append("0x26[70b] " + bytes.prefix(35).joined(separator: " "))

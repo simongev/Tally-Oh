@@ -504,20 +504,31 @@ class ConnectionLogic: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
-                // Always refresh the 70-byte sample (most-recent wins) so the HUD
-                // always shows a current frame that can be correlated with ForeFlight.
-                if copy26.count == 70 {
-                    self.adsbDiag.sampleFramesBySize[70] = hex
+                // Always refresh the 70-byte and 22-byte samples (most-recent wins).
+                if copy26.count == 70 || copy26.count == 22 {
+                    self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
-                // Vote-based calibration on 70-byte bundle frames.
+                // Vote-based calibration: try both 70-byte bundles and 22-byte single-aircraft frames.
                 if self.adsbDiag.prop70RecordOffset == nil {
-                    self.voteForEncoding26(copy26)
+                    if copy26.count == 22 {
+                        self.voteForEncoding22(copy26)
+                    } else {
+                        self.voteForEncoding26(copy26)
+                    }
                 }
-                // Decode: bundle path (70-byte) or direct path (GPS-calibrated).
-                if copy26.count == 70, self.adsbDiag.prop70RecordOffset != nil {
+                // Decode once calibration has committed.
+                let ro = self.adsbDiag.prop70RecordOffset
+                if copy26.count == 70, ro != nil, ro != 0 {
+                    // 70-byte bundle path (3 aircraft sub-records).
                     for ac in self.decodeProprietaryBundle(copy26) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.parsedTraffic += 1
+                    }
+                } else if copy26.count == 22, ro == 0 {
+                    // 22-byte single-aircraft frame path.
+                    if let ac = self.decodeProprietarySingle(copy26) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
                     }
@@ -668,6 +679,98 @@ class ConnectionLogic: ObservableObject {
         detectedAircraft.removeAll()
     }
 
+    /// Vote-based encoding discovery for 22-byte single-aircraft 0x26 frames.
+    ///
+    /// The most common Sentry frame size (22 bytes = 1 msg type + 19 data + 2 CRC) likely
+    /// carries one aircraft's position per frame.  We try all (latOff, lonOff, scale)
+    /// combinations and vote for any that decode to a position within ±3° of the user's GPS.
+    /// One vote per frame — with 80+ frames all showing the same aircraft near the user,
+    /// the true layout will score far above any false candidate.
+    private func voteForEncoding22(_ payload: Data) {
+        guard payload.count == 22 else { return }
+        guard let loc = currentLocation else { return }
+
+        let b  = Array(payload)
+        let pad: Double = 3.0
+        let latMin = loc.latitude  - pad,  latMax = loc.latitude  + pad
+        let lonMin = loc.longitude - pad,  lonMax = loc.longitude + pad
+
+        let scales: [Double] = [
+            180.0 / 16_777_216.0,
+            360.0 / 16_777_216.0,
+            1.0 / 10_000.0,
+            1.0 / 100_000.0,
+            1.0 / 1_000.0,
+        ]
+        let SC = scales.count
+        let PC = 19   // usable offsets 1…19 within the 22-byte frame (skip type byte 0 and last 2 CRC)
+
+        func s24at(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        adsbDiag.prop26FramesVoted += 1   // reuse counter for display
+
+        for latIdx in 1 ..< PC {
+            guard latIdx + 2 < b.count - 2 else { continue }
+            let rawLat = Double(s24at(latIdx))
+            for latScIdx in 0 ..< SC {
+                let lat = rawLat * scales[latScIdx]
+                guard lat >= latMin && lat <= latMax else { continue }
+                for lonIdx in 1 ..< PC {
+                    guard abs(lonIdx - latIdx) >= 3 else { continue }
+                    guard lonIdx + 2 < b.count - 2 else { continue }
+                    let rawLon = Double(s24at(lonIdx))
+                    for lonScIdx in 0 ..< SC {
+                        let lon = rawLon * scales[lonScIdx]
+                        guard lon >= lonMin && lon <= lonMax else { continue }
+                        // Key: roBit=2 signals "22-byte single-frame" path.
+                        let PSC   = PC * SC
+                        let inner = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
+                        let key   = 2 * PSC * PSC + inner
+                        adsbDiag.prop26VoteCounts[key, default: 0] += 1
+                    }
+                }
+            }
+        }
+
+        guard adsbDiag.prop26FramesVoted >= 20 else { return }
+        guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
+        else { return }
+
+        let top3 = Array(adsbDiag.prop26VoteCounts.values.sorted(by: >).prefix(3))
+        let thirdVotes = top3.count > 2 ? top3[2] : 0
+
+        guard bestVotes >= 10 && bestVotes > thirdVotes * 2 else {
+            let second = top3.count > 1 ? top3[1] : 0
+            adsbDiag.calibrationStatus = String(format:
+                "🗳22 voting: best=%d 2nd=%d 3rd=%d (%d frames)",
+                bestVotes, second, thirdVotes, adsbDiag.prop26FramesVoted)
+            return
+        }
+
+        // Converged — decode the key back to (latIdx, latScIdx, lonIdx, lonScIdx).
+        let PSC   = PC * SC
+        let inner = bestKey % (PSC * PSC)
+        let latIdx  = (inner / PSC) / SC
+        let latScIdx = (inner / PSC) % SC
+        let lonIdx   = (inner % PSC) / SC
+        let lonScIdx = (inner % PSC) % SC
+
+        // Commit calibration using the same fields as the 70-byte path.
+        adsbDiag.prop70RecordOffset = 0    // 0 = 22-byte single-frame mode
+        adsbDiag.propLatByteOffset  = latIdx
+        adsbDiag.propLonByteOffset  = lonIdx
+        adsbDiag.propLatScale       = scales[latScIdx]
+        adsbDiag.propLonScale       = scales[lonScIdx]
+        adsbDiag.calibrationStatus  = String(format:
+            "✅22 lat@%d×%.2e lon@%d×%.2e (%d/%d frames)",
+            latIdx, scales[latScIdx], lonIdx, scales[lonScIdx],
+            bestVotes, adsbDiag.prop26FramesVoted)
+        detectedAircraft.removeAll()
+    }
+
     /// Decode three aircraft sub-records from a 70-byte proprietary bundle frame.
     /// Requires calibration via voteForEncoding26.  Must be called on the main thread.
     private func decodeProprietaryBundle(_ payload: Data) -> [Aircraft] {
@@ -771,6 +874,39 @@ class ConnectionLogic: ObservableObject {
         adsbDiag.calibrationStatus = String(format:
             "🔍 no match: target [%.4f, %.4f] in %db frame",
             userLat, userLon, n)
+    }
+
+    /// Decode a single-aircraft 22-byte 0x26 frame using calibration from voteForEncoding22.
+    /// prop70RecordOffset == 0 signals this mode.
+    private func decodeProprietarySingle(_ payload: Data) -> Aircraft? {
+        guard payload.count == 22,
+              let latOff = adsbDiag.propLatByteOffset,
+              let lonOff = adsbDiag.propLonByteOffset,
+              let latSc  = adsbDiag.propLatScale,
+              let lonSc  = adsbDiag.propLonScale else { return nil }
+        let b = Array(payload)
+        func s24at(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        guard latOff + 2 < b.count, lonOff + 2 < b.count else { return nil }
+        let lat = Double(s24at(latOff)) * latSc
+        let lon = Double(s24at(lonOff)) * lonSc
+        guard lat >= -90 && lat <= 90, lon >= -180 && lon <= 180 else { return nil }
+        // Build a unique ICAO-style ID from the first 3 non-type bytes.
+        let icao = String(format: "S%02X%02X%02X", b[1], b[2], b[3])
+        // Try GDL90 altitude from the two bytes after the lon field.
+        let altOff = max(latOff, lonOff) + 3
+        var altFt: Double = 10_000
+        if altOff + 1 < b.count {
+            let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
+            let dec = Double(raw12) * 25.0 - 1000.0
+            if dec >= -1000 && dec <= 50_000 { altFt = dec }
+        }
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
+                        lastUpdate: Date(), source: .adsb)
     }
 
     /// Decode a 0x26 proprietary traffic frame using calibrated byte offsets.
