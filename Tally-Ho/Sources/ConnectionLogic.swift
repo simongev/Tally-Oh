@@ -97,6 +97,13 @@ struct ADSBDiagnostics {
     /// Byte offset within a 70-byte bundle frame where the first 22-byte sub-record starts
     /// (1 = 1-byte header, 2 = 2-byte header).  Set once voting converges.
     var prop70RecordOffset: Int? = nil
+
+    // MARK: Multi-frame correlation capture
+    /// Ring buffer of the last 8 distinct 22-byte 0x26 frames (hex strings), newest first.
+    /// Used for side-by-side comparison with ForeFlight to identify encoding.
+    var recent22bFrames: [String] = []
+    /// Attempt log from the ICAO-derived XOR decoding attempt.
+    var icaoXorStatus: String? = nil
 }
 
 // MARK: - ConnectionLogic
@@ -510,6 +517,56 @@ class ConnectionLogic: ObservableObject {
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
+
+                // Maintain ring buffer of recent unique 22-byte frames (for correlation).
+                if copy26.count == 22 {
+                    if self.adsbDiag.recent22bFrames.first != hex {
+                        self.adsbDiag.recent22bFrames.insert(hex, at: 0)
+                        if self.adsbDiag.recent22bFrames.count > 8 {
+                            self.adsbDiag.recent22bFrames.removeLast()
+                        }
+                    }
+                    // Hypothesis: ICAO is stored at bytes 16-18 (plaintext).
+                    // XOR key = ICAO[0] XOR ICAO[2].  Decrypt, then read:
+                    //   lat @ bytes 13-15, lon @ bytes 19-21 with scale 180/2^23.
+                    let b = Array(copy26)
+                    if b.count == 22 {
+                        let icao0 = b[16], icao1 = b[17], icao2 = b[18]
+                        let icao = (Int(icao0) << 16) | (Int(icao1) << 8) | Int(icao2)
+                        let xorKey = icao0 ^ icao2
+                        let dec = b.map { $0 ^ xorKey }
+                        func s24d(_ i: Int) -> Int32 {
+                            let v = Int32(dec[i]) << 16 | Int32(dec[i+1]) << 8 | Int32(dec[i+2])
+                            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+                        }
+                        let scale: Double = 180.0 / 8_388_608.0
+                        let lat = Double(s24d(13)) * scale
+                        let lon = Double(s24d(19)) * scale
+                        let icaoStr = String(format: "%06X", icao)
+                        if lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
+                            && (abs(lat) > 1 || abs(lon) > 1) {
+                            self.adsbDiag.icaoXorStatus = String(format:
+                                "🔑ICAO=%@ key=0x%02X lat=%.4f lon=%.4f",
+                                icaoStr, xorKey, lat, lon)
+                            // If coordinates are plausible, inject as detected aircraft.
+                            if let loc = self.currentLocation,
+                               abs(lat - loc.latitude) < 5, abs(lon - loc.longitude) < 5 {
+                                let ac = Aircraft(id: "X\(icaoStr)", callsign: icaoStr,
+                                                  latitude: lat, longitude: lon,
+                                                  altitude: 10_000, track: 0,
+                                                  groundSpeed: 0, verticalRate: 0,
+                                                  lastUpdate: Date(), source: .adsb)
+                                self.detectedAircraft[ac.id] = ac
+                                self.adsbDiag.parsedTraffic += 1
+                            }
+                        } else {
+                            self.adsbDiag.icaoXorStatus = String(format:
+                                "🔑ICAO=%@ key=0x%02X → invalid (%.1f,%.1f)",
+                                icaoStr, xorKey, lat, lon)
+                        }
+                    }
+                }
+
                 // Vote-based calibration: try both 70-byte bundles and 22-byte single-aircraft frames.
                 if self.adsbDiag.prop70RecordOffset == nil {
                     if copy26.count == 22 {

@@ -1450,16 +1450,31 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
-                // Most-recent 22-byte frame (one aircraft) and 70-byte bundle frame.
-                // Screenshot alongside a ForeFlight aircraft tap to identify encoding.
-                if let hex22 = d.sampleFramesBySize[22] {
-                    lines.append("0x26[22b] " + hex22)
+                // ICAO-derived XOR decode status.
+                if let xorStatus = d.icaoXorStatus {
+                    lines.append(xorStatus)
+                }
+                // Ring buffer of recent 22-byte frames for ForeFlight correlation.
+                // Screenshot both apps simultaneously: each frame here = one aircraft in ForeFlight.
+                // Bytes 16-18 = candidate ICAO, XOR key = B16 XOR B18.
+                for (i, frameHex) in d.recent22bFrames.prefix(4).enumerated() {
+                    let parts = frameHex.components(separatedBy: " ")
+                    // Highlight bytes 13-15 (lat?), 16-18 (ICAO?), 19-21 (lon?)
+                    let annotated = parts.enumerated().map { (idx, h) -> String in
+                        switch idx {
+                        case 13, 14, 15: return "[\(h)]"
+                        case 16, 17, 18: return "<\(h)>"
+                        case 19, 20, 21: return "{\(h)}"
+                        default: return h
+                        }
+                    }.joined(separator: " ")
+                    lines.append("F\(i+1): \(annotated)")
                 }
                 if let hex70 = d.sampleFramesBySize[70] {
                     let bytes = hex70.components(separatedBy: " ")
-                    lines.append("0x26[70b] " + bytes.prefix(35).joined(separator: " "))
+                    lines.append("70b: " + bytes.prefix(35).joined(separator: " "))
                     let rest = Array(bytes.dropFirst(35))
-                    if !rest.isEmpty { lines.append("         " + rest.joined(separator: " ")) }
+                    if !rest.isEmpty { lines.append("     " + rest.joined(separator: " ")) }
                 }
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
