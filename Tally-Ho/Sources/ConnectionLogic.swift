@@ -762,9 +762,14 @@ class ConnectionLogic: ObservableObject {
         let top3 = Array(adsbDiag.prop22bVoteCounts.values.sorted(by: >).prefix(3))
         let thirdVotes = top3.count > 2 ? top3[2] : 0
 
-        // Threshold: 6 votes is statistically unambiguous with separated 22-byte dict
-        // (P(false-positive ≥ 6) ≈ 0.002% across all 10,000 candidates).
-        guard bestVotes >= 6 && bestVotes > thirdVotes * 2 else {
+        // Threshold: ≥6 absolute votes AND winner leads 3rd by ≥3.
+        // The ×2 multiplier was too strict: aliased byte-offset candidates
+        // (sharing 2 of 3 bytes with the true field) legitimately score ~90%
+        // as many votes as the winner, so best/3rd ratios stay near 1.5×.
+        // An absolute gap of 3 is safe: random noise peaks at ~1 vote
+        // (494 × 0.056% = 0.28 expected), so a gap of 3 is ~10σ above noise.
+        // This still blocks the 7=7=7 deadlock (gap = 0 < 3).
+        guard bestVotes >= 6 && (bestVotes - thirdVotes) >= 3 else {
             let second = top3.count > 1 ? top3[1] : 0
             adsbDiag.calibrationStatus = String(format:
                 "🗳22 voting: best=%d 2nd=%d 3rd=%d (%d frames)",
