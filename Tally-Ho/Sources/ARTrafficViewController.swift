@@ -1562,7 +1562,7 @@ class ARTrafficViewController: UIViewController {
         }
         lines.append(trafficLine)
 
-        // Show decoded positions of the closest ADS-B aircraft for ForeFlight cross-check.
+        // Show decoded positions of all ADS-B aircraft (sorted by distance) for ForeFlight cross-check.
         if let userLoc = activeLocation {
             let nearby = connectionLogic.detectedAircraft.values
                 .filter { $0.source == .adsb }
@@ -1572,7 +1572,6 @@ class ARTrafficViewController: UIViewController {
                     return (ac, sqrt(dlat*dlat + dlon*dlon) * 60)  // nm
                 }
                 .sorted { $0.1 < $1.1 }
-                .prefix(3)
             for (ac, distNM) in nearby {
                 lines.append(String(format: "  %@ %.4f° %.4f° %.0fft %.0fnm",
                                     ac.callsign, ac.latitude, ac.longitude, ac.altitude, distNM))
