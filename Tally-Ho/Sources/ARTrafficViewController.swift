@@ -1450,23 +1450,16 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
-                // ICAO-derived XOR decode status.
-                if let xorStatus = d.icaoXorStatus {
-                    lines.append(xorStatus)
-                }
                 // Ring buffer of recent 22-byte frames for ForeFlight correlation.
-                // Screenshot both apps simultaneously: each frame here = one aircraft in ForeFlight.
-                // Bytes 16-18 = candidate ICAO, XOR key = B16 XOR B18.
+                // [..] = lat field, {..} = lon field per voting result.
+                let latOff = d.propLatByteOffset
+                let lonOff = d.propLonByteOffset
                 for (i, frameHex) in d.recent22bFrames.prefix(4).enumerated() {
                     let parts = frameHex.components(separatedBy: " ")
-                    // Highlight bytes 13-15 (lat?), 16-18 (ICAO?), 19-21 (lon?)
                     let annotated = parts.enumerated().map { (idx, h) -> String in
-                        switch idx {
-                        case 13, 14, 15: return "[\(h)]"
-                        case 16, 17, 18: return "<\(h)>"
-                        case 19, 20, 21: return "{\(h)}"
-                        default: return h
-                        }
+                        if let lo = latOff, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
+                        if let lo = lonOff, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
+                        return h
                     }.joined(separator: " ")
                     lines.append("F\(i+1): \(annotated)")
                 }
@@ -1568,6 +1561,23 @@ class ARTrafficViewController: UIViewController {
             trafficLine += "  [\(ageSec)s ago]"
         }
         lines.append(trafficLine)
+
+        // Show decoded positions of the closest ADS-B aircraft for ForeFlight cross-check.
+        if let userLoc = activeLocation {
+            let nearby = connectionLogic.detectedAircraft.values
+                .filter { $0.source == .adsb }
+                .map { ac -> (Aircraft, Double) in
+                    let dlat = ac.latitude  - userLoc.latitude
+                    let dlon = (ac.longitude - userLoc.longitude) * cos(userLoc.latitude * .pi / 180)
+                    return (ac, sqrt(dlat*dlat + dlon*dlon) * 60)  // nm
+                }
+                .sorted { $0.1 < $1.1 }
+                .prefix(3)
+            for (ac, distNM) in nearby {
+                lines.append(String(format: "  %@ %.4f° %.4f° %.0fft %.0fnm",
+                                    ac.callsign, ac.latitude, ac.longitude, ac.altitude, distNM))
+            }
+        }
 
         lines.append("🛫 Airports loaded: \(airports.count)")
 

@@ -102,8 +102,6 @@ struct ADSBDiagnostics {
     /// Ring buffer of the last 8 distinct 22-byte 0x26 frames (hex strings), newest first.
     /// Used for side-by-side comparison with ForeFlight to identify encoding.
     var recent22bFrames: [String] = []
-    /// Attempt log from the ICAO-derived XOR decoding attempt.
-    var icaoXorStatus: String? = nil
 }
 
 // MARK: - ConnectionLogic
@@ -526,45 +524,6 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.recent22bFrames.removeLast()
                         }
                     }
-                    // Hypothesis: ICAO is stored at bytes 16-18 (plaintext).
-                    // XOR key = ICAO[0] XOR ICAO[2].  Decrypt, then read:
-                    //   lat @ bytes 13-15, lon @ bytes 19-21 with scale 180/2^23.
-                    let b = Array(copy26)
-                    if b.count == 22 {
-                        let icao0 = b[16], icao1 = b[17], icao2 = b[18]
-                        let icao = (Int(icao0) << 16) | (Int(icao1) << 8) | Int(icao2)
-                        let xorKey = icao0 ^ icao2
-                        let dec = b.map { $0 ^ xorKey }
-                        func s24d(_ i: Int) -> Int32 {
-                            let v = Int32(dec[i]) << 16 | Int32(dec[i+1]) << 8 | Int32(dec[i+2])
-                            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
-                        }
-                        let scale: Double = 180.0 / 8_388_608.0
-                        let lat = Double(s24d(13)) * scale
-                        let lon = Double(s24d(19)) * scale
-                        let icaoStr = String(format: "%06X", icao)
-                        if lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
-                            && (abs(lat) > 1 || abs(lon) > 1) {
-                            self.adsbDiag.icaoXorStatus = String(format:
-                                "🔑ICAO=%@ key=0x%02X lat=%.4f lon=%.4f",
-                                icaoStr, xorKey, lat, lon)
-                            // If coordinates are plausible, inject as detected aircraft.
-                            if let loc = self.currentLocation,
-                               abs(lat - loc.latitude) < 5, abs(lon - loc.longitude) < 5 {
-                                let ac = Aircraft(id: "X\(icaoStr)", callsign: icaoStr,
-                                                  latitude: lat, longitude: lon,
-                                                  altitude: 10_000, track: 0,
-                                                  groundSpeed: 0, verticalRate: 0,
-                                                  lastUpdate: Date(), source: .adsb)
-                                self.detectedAircraft[ac.id] = ac
-                                self.adsbDiag.parsedTraffic += 1
-                            }
-                        } else {
-                            self.adsbDiag.icaoXorStatus = String(format:
-                                "🔑ICAO=%@ key=0x%02X → invalid (%.1f,%.1f)",
-                                icaoStr, xorKey, lat, lon)
-                        }
-                    }
                 }
 
                 // Vote-based calibration: try both 70-byte bundles and 22-byte single-aircraft frames.
@@ -950,6 +909,11 @@ class ConnectionLogic: ObservableObject {
         let lat = Double(s24at(latOff)) * latSc
         let lon = Double(s24at(lonOff)) * lonSc
         guard lat >= -90 && lat <= 90, lon >= -180 && lon <= 180 else { return nil }
+        // Reject positions >5° from user. Only ~3% of 22-byte frames are true position
+        // frames; the rest carry velocity/identity data whose random bytes accidentally pass
+        // the ±90/±180 range check, flooding detectedAircraft with phantom aircraft worldwide.
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
         // Build a unique ICAO-style ID from the first 3 non-type bytes.
         let icao = String(format: "S%02X%02X%02X", b[1], b[2], b[3])
         // Try GDL90 altitude from the two bytes after the lon field.
@@ -989,6 +953,10 @@ class ConnectionLogic: ObservableObject {
 
         guard (-90 ... 90).contains(lat), (-180 ... 180).contains(lon) else { return nil }
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }  // reject near-zero
+
+        // Reject positions >5° from user (same phantom-elimination logic as decodeProprietarySingle).
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
 
         // Skip ownship: if position is within 0.1° of user's GPS it's us, not traffic.
         if let loc = currentLocation,
