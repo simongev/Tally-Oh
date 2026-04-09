@@ -1446,6 +1446,9 @@ class ARTrafficViewController: UIViewController {
                 if let cal = d.calibrationStatus {
                     lines.append("🔬 \(cal)")
                 }
+                if !d.prop70VotingStatus.isEmpty {
+                    lines.append("🗳 \(d.prop70VotingStatus)")
+                }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
@@ -1562,10 +1565,9 @@ class ARTrafficViewController: UIViewController {
         }
         lines.append(trafficLine)
 
-        // Show decoded positions of all ADS-B aircraft (sorted by distance) for ForeFlight cross-check.
+        // Show decoded positions of all aircraft (sorted by distance) for ForeFlight cross-check.
         if let userLoc = activeLocation {
             let nearby = connectionLogic.detectedAircraft.values
-                .filter { $0.source == .adsb }
                 .map { ac -> (Aircraft, Double) in
                     let dlat = ac.latitude  - userLoc.latitude
                     let dlon = (ac.longitude - userLoc.longitude) * cos(userLoc.latitude * .pi / 180)
@@ -1573,8 +1575,9 @@ class ARTrafficViewController: UIViewController {
                 }
                 .sorted { $0.1 < $1.1 }
             for (ac, distNM) in nearby {
-                lines.append(String(format: "  %@ %.4f° %.4f° %.0fft %.0fnm",
-                                    ac.callsign, ac.latitude, ac.longitude, ac.altitude, distNM))
+                let srcTag = ac.source == .internet ? "🌐" : "📡"
+                lines.append(String(format: "  %@%@ %.4f° %.4f° %.0fft %.0fnm",
+                                    srcTag, ac.callsign, ac.latitude, ac.longitude, ac.altitude, distNM))
             }
         }
 
