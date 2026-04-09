@@ -532,18 +532,21 @@ class ConnectionLogic: ObservableObject {
                     }
                 }
 
-                // Vote-based calibration: try both 70-byte bundles and 22-byte single-aircraft frames.
-                if self.adsbDiag.prop70RecordOffset == nil {
-                    if copy26.count == 22 {
-                        self.voteForEncoding22(copy26)
-                    } else {
-                        self.voteForEncoding26(copy26)
-                    }
+                // Vote-based calibration: 22b and 70b run independently so either can win.
+                // 22b votes only while uncalibrated (ro == nil).
+                // 70b votes while uncalibrated OR while in 22b-only mode (ro == 0), so that
+                // if 22b converges first the 70b path can still win on a later frame burst.
+                if self.adsbDiag.prop70RecordOffset == nil && copy26.count == 22 {
+                    self.voteForEncoding22(copy26)
+                }
+                if (self.adsbDiag.prop70RecordOffset == nil ||
+                    self.adsbDiag.prop70RecordOffset == 0) && copy26.count == 70 {
+                    self.voteForEncoding26(copy26)
                 }
                 // Decode once calibration has committed.
                 let ro = self.adsbDiag.prop70RecordOffset
-                if copy26.count == 70, ro != nil, ro != 0 {
-                    // 70-byte bundle path (3 aircraft sub-records).
+                if copy26.count == 70, let ro, ro != 0 {
+                    // 70-byte bundle path (2 aircraft sub-records).
                     for ac in self.decodeProprietaryBundle(copy26) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
@@ -623,9 +626,11 @@ class ConnectionLogic: ObservableObject {
         let PSC = PC * SC        // 95
         let innerSpace = PSC * PSC  // 9025
 
-        // Vote only when ALL 3 sub-records decode to in-bounds lat/lon.
-        // This raises the bar from P≈1% (per sub-record) to P≈1.8e-10 (all three),
-        // eliminating the three-way tie caused by per-sub-record independent voting.
+        // Vote only when BOTH active sub-records decode to in-bounds lat/lon.
+        // The 70b frame has 2 aircraft records (bytes ro..ro+43) followed by an 18-byte
+        // constant device-metadata block (bytes ~50-67) that is NOT an aircraft record.
+        // Requiring all 3 records meant the constant block always failed the lat/lon check,
+        // so zero votes were ever cast and calibration could never converge.
         for roBit in 0 ..< 2 {
             let ro = roBit + 1
             for latIdx in 0 ..< PC {
@@ -635,7 +640,7 @@ class ConnectionLogic: ObservableObject {
                         let hiIdx = max(latIdx, lonIdx)
                         for lonScIdx in 0 ..< SC {
                             var allPass = true
-                            for ri in 0 ..< 3 {
+                            for ri in 0 ..< 2 {
                                 let sub = ro + ri * 22
                                 guard sub + hiIdx + 2 < b.count else { allPass = false; break }
                                 let lat = Double(s24at(sub + latIdx)) * scales[latScIdx]
@@ -814,7 +819,7 @@ class ConnectionLogic: ObservableObject {
         }
 
         var result: [Aircraft] = []
-        for ri in 0 ..< 3 {
+        for ri in 0 ..< 2 {   // 70b frames carry 2 aircraft records; bytes ~50-67 are device metadata
             let sub = ro + ri * 22
             guard sub + max(latOff + 2, lonOff + 2) < b.count else { continue }
 
@@ -977,9 +982,17 @@ class ConnectionLogic: ObservableObject {
             ? String(format: "P%02X%02X%02X", b[2], b[3], b[4])
             : String(format: "P%02X%02d", b[1], n)
 
+        // Try GDL90 altitude from the two bytes after the lon field (same logic as decodeProprietarySingle).
+        let altOff = max(latOff, lonOff) + 3
+        var altFt: Double = 10_000
+        if altOff + 1 < n {
+            let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
+            let dec = Double(raw12) * 25.0 - 1000.0
+            if dec >= -1000 && dec <= 50_000 { altFt = dec }
+        }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
-                        altitude: 0, track: 0, groundSpeed: 0, verticalRate: 0,
+                        altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
                         lastUpdate: Date(), source: .adsb)
     }
 
