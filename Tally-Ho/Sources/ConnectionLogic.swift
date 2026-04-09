@@ -625,11 +625,12 @@ class ConnectionLogic: ObservableObject {
 
         adsbDiag.prop26FramesVoted += 1
 
-        // 70b frame layout: [0-1] header, [2-17] sub0, [18-33] sub1, [34-49] sub2,
+        // 70b frame layout: [0-1] header, [2-17] sub0, [18-33] sub1, [34-49] unknown block,
         // [50-67] constant device metadata, [68-69] CRC.  2 + 3×16 + 18 + 2 = 70 ✓
-        // ro is fixed at 2 (start of first sub-record).  Each sub-record is 16 bytes,
-        // so valid field offsets within a sub-record are 0..12 (need +2 for s24).
-        // PC=13 so latIdx/lonIdx range 0..12.
+        // Only sub0 and sub1 reliably carry aircraft lat/lon.  The block at bytes 34-49
+        // appears to be ICAO/status data (not position), so requiring all 3 sub-records
+        // to decode to valid lat/lon always fails → vote dict stays empty → no status.
+        // Use 2 sub-records (sub0 + sub1) with stride=16 and fixed ro=2.
         let ro  = 2
         let PSC = PC * SC   // 13 × 5 = 65
 
@@ -640,7 +641,7 @@ class ConnectionLogic: ObservableObject {
                     let hiIdx = max(latIdx, lonIdx)
                     for lonScIdx in 0 ..< SC {
                         var allPass = true
-                        for ri in 0 ..< 3 {
+                        for ri in 0 ..< 2 {   // sub0 (bytes 2-17) and sub1 (bytes 18-33) only
                             let sub = ro + ri * 16
                             guard sub + hiIdx + 2 < b.count else { allPass = false; break }
                             let lat = Double(s24at(sub + latIdx)) * scales[latScIdx]
@@ -657,8 +658,13 @@ class ConnectionLogic: ObservableObject {
         }
 
         guard adsbDiag.prop26FramesVoted >= 20 else { return }
-        guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value })
-        else { return }
+
+        guard let (bestKey, bestVotes) = adsbDiag.prop26VoteCounts.max(by: { $0.value < $1.value }) else {
+            adsbDiag.prop70VotingStatus = String(format:
+                "🗳70 0 votes after %d fr (filter too strict?)",
+                adsbDiag.prop26FramesVoted)
+            return
+        }
 
         let top3 = Array(adsbDiag.prop26VoteCounts.values.sorted(by: >).prefix(3))
         let secondVotes = top3.count > 1 ? top3[1] : 0
@@ -802,7 +808,7 @@ class ConnectionLogic: ObservableObject {
         }
 
         var result: [Aircraft] = []
-        for ri in 0 ..< 3 {   // 70b frames carry 3 aircraft sub-records of 16 bytes each
+        for ri in 0 ..< 2 {   // sub0 (bytes 2-17) and sub1 (bytes 18-33) carry aircraft positions
             let sub = ro + ri * 16
             guard sub + max(latOff + 2, lonOff + 2) < b.count else { continue }
 
