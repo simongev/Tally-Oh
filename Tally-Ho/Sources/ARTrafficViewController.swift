@@ -364,7 +364,7 @@ class ARTrafficViewController: UIViewController {
 
         NSLayoutConstraint.activate([
             copyStatusButton.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor, constant: -4),
-            copyStatusButton.bottomAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: -4),
+            copyStatusButton.topAnchor.constraint(equalTo: statusLabel.topAnchor, constant: 4),
             copyStatusButton.widthAnchor.constraint(equalToConstant: 28),
             copyStatusButton.heightAnchor.constraint(equalToConstant: 28)
         ])
