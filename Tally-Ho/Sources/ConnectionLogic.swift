@@ -626,32 +626,31 @@ class ConnectionLogic: ObservableObject {
         adsbDiag.prop26FramesVoted += 1
 
         // 70b frame layout: [0-1] header, [2-17] sub0, [18-33] sub1, [34-49] unknown block,
-        // [50-67] constant device metadata, [68-69] CRC.  2 + 3×16 + 18 + 2 = 70 ✓
-        // Only sub0 and sub1 reliably carry aircraft lat/lon.  The block at bytes 34-49
-        // appears to be ICAO/status data (not position), so requiring all 3 sub-records
-        // to decode to valid lat/lon always fails → vote dict stays empty → no status.
-        // Use 2 sub-records (sub0 + sub1) with stride=16 and fixed ro=2.
+        // [50-67] constant device metadata, [68-69] CRC.
+        // Vote with OR logic: each sub-record independently contributes a vote when its
+        // own lat+lon bytes decode to a position near the user.  AND logic (requiring both)
+        // always scores 0 because when one sub-record contains a distant or absent aircraft
+        // it blocks the other.  Expected noise ≈ 920×0.12% ≈ 1 vote per candidate;
+        // true encoding accumulates ~920 votes in 460 frames → converges after ~10 frames.
         let ro  = 2
         let PSC = PC * SC   // 13 × 5 = 65
 
-        for latIdx in 0 ..< PC {
-            for latScIdx in 0 ..< SC {
-                for lonIdx in 0 ..< PC {
-                    guard abs(lonIdx - latIdx) >= 3 else { continue }
-                    let hiIdx = max(latIdx, lonIdx)
-                    for lonScIdx in 0 ..< SC {
-                        var allPass = true
-                        for ri in 0 ..< 2 {   // sub0 (bytes 2-17) and sub1 (bytes 18-33) only
-                            let sub = ro + ri * 16
-                            guard sub + hiIdx + 2 < b.count else { allPass = false; break }
-                            let lat = Double(s24at(sub + latIdx)) * scales[latScIdx]
-                            guard lat >= latMin && lat <= latMax else { allPass = false; break }
+        for ri in 0 ..< 2 {   // sub0 (bytes 2-17) and sub1 (bytes 18-33) independently
+            let sub = ro + ri * 16
+            for latIdx in 0 ..< PC {
+                for latScIdx in 0 ..< SC {
+                    let lat = Double(s24at(sub + latIdx)) * scales[latScIdx]
+                    guard lat >= latMin && lat <= latMax else { continue }
+                    for lonIdx in 0 ..< PC {
+                        guard abs(lonIdx - latIdx) >= 3 else { continue }
+                        let hiIdx = max(latIdx, lonIdx)
+                        guard sub + hiIdx + 2 < b.count else { continue }
+                        for lonScIdx in 0 ..< SC {
                             let lon = Double(s24at(sub + lonIdx)) * scales[lonScIdx]
-                            guard lon >= lonMin && lon <= lonMax else { allPass = false; break }
+                            guard lon >= lonMin && lon <= lonMax else { continue }
+                            let key = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
+                            adsbDiag.prop26VoteCounts[key, default: 0] += 1
                         }
-                        guard allPass else { continue }
-                        let key = (latIdx * SC + latScIdx) * PSC + lonIdx * SC + lonScIdx
-                        adsbDiag.prop26VoteCounts[key, default: 0] += 1
                     }
                 }
             }
