@@ -106,6 +106,8 @@ struct ADSBDiagnostics {
     /// In-progress 70b voting status — kept separate so it doesn't overwrite a
     /// converged ✅22 result in calibrationStatus.
     var prop70VotingStatus: String = ""
+    /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
+    var prop70ScanResult: String = ""
 
     // MARK: Multi-frame correlation capture
     /// Ring buffer of the last 8 distinct 22-byte 0x26 frames (hex strings), newest first.
@@ -676,11 +678,50 @@ class ConnectionLogic: ObservableObject {
         let diagLat = Double(s24at(ro + latIdx)) * scales[latScIdx]
         let diagLon = Double(s24at(ro + lonIdx)) * scales[lonScIdx]
 
+        // Distance from best-candidate decoded position to user GPS.
+        // Values >15° mean the winner is from random noise, not a real aircraft.
+        let userLat = currentLocation?.latitude  ?? 40.0
+        let userLon = currentLocation?.longitude ?? -74.0
+        let dDeg = max(abs(diagLat - userLat), abs(diagLon - userLon))
+
+        // Cross-correlation: every 10 frames scan all 3-byte windows in the 70b variable
+        // region (bytes 2-49) against every detected Sentry aircraft's lat & lon.
+        // "∅/N" = N known aircraft checked, none found → strong evidence the 70b frame
+        // does NOT use the same linear-scaled 3-byte encoding as the 22b frames.
+        // "🎯callsign@(latOff×scIdx)/(lonOff×scIdx)" = found and offset reported.
+        if adsbDiag.prop26FramesVoted % 10 == 0 && adsbDiag.prop26FramesVoted >= 50 {
+            var found = ""
+            let adsbAircraft = detectedAircraft.values.filter { $0.source == .adsb }
+            outer: for ac in adsbAircraft {
+                for latOff in 2 ..< 47 {
+                    guard latOff + 2 <= b.count - 3 else { break }
+                    let latRaw = Double(s24at(latOff))
+                    for (li, lsc) in scales.enumerated() {
+                        guard abs(latRaw * lsc - ac.latitude) < 0.2 else { continue }
+                        for lonOff in 2 ..< 47 {
+                            guard abs(lonOff - latOff) >= 3, lonOff + 2 <= b.count - 3 else { continue }
+                            let lonRaw = Double(s24at(lonOff))
+                            for (ni, nsc) in scales.enumerated() {
+                                guard abs(lonRaw * nsc - ac.longitude) < 0.5 else { continue }
+                                found = "🎯\(ac.callsign)@(\(latOff)×\(li))/(\(lonOff)×\(ni))"
+                                break outer
+                            }
+                        }
+                    }
+                }
+            }
+            adsbDiag.prop70ScanResult = found.isEmpty
+                ? (adsbAircraft.isEmpty ? "" : "∅/\(adsbAircraft.count)ac")
+                : found
+        }
+
         guard bestVotes >= 8 && (bestVotes - thirdVotes) >= 2 else {
+            let noiseTag = dDeg > 15.0 ? "⚡" : ""
             adsbDiag.prop70VotingStatus = String(format:
-                "🗳70 best=%d 3rd=%d (%d fr) lat@%d×%.2e lon@%d×%.2e→(%.2f,%.2f)",
+                "🗳70 %@(%.1f,%.1f)Δ%.0f° best=%d 3rd=%d (%d fr) %@",
+                noiseTag, diagLat, diagLon, dDeg,
                 bestVotes, thirdVotes, adsbDiag.prop26FramesVoted,
-                latIdx, scales[latScIdx], lonIdx, scales[lonScIdx], diagLat, diagLon)
+                adsbDiag.prop70ScanResult)
             return
         }
 
