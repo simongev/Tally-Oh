@@ -280,6 +280,10 @@ class ConnectionLogic: ObservableObject {
             self.connectionStatus = .disconnected
             self.detectedAircraft.removeAll()
             self.ownshipData = nil
+            // Reset all calibration and vote state so a reconnect starts clean.
+            // Without this, stale vote counts survive into the next session and can
+            // cause early false convergence (e.g. ICAO-as-lat at offset 2).
+            self.adsbDiag = ADSBDiagnostics()
         }
     }
 
@@ -686,9 +690,10 @@ class ConnectionLogic: ObservableObject {
 
         // Cross-correlation: every 10 frames scan all 3-byte windows in the 70b variable
         // region (bytes 2-49) against every detected Sentry aircraft's lat & lon.
-        // "∅/N" = N known aircraft checked, none found → strong evidence the 70b frame
-        // does NOT use the same linear-scaled 3-byte encoding as the 22b frames.
-        // "🎯callsign@(latOff×scIdx)/(lonOff×scIdx)" = found and offset reported.
+        // Tolerances: ±0.05° lat, ±0.1° lon (tight enough to give <1 false positive per
+        // 2000 scans with 3 aircraft; ±0.2°/±0.5° gave ~1 false pos per scan → noise).
+        // "∅/N" = N aircraft checked, none found → 70b frame is NOT a simple 3-byte bundle.
+        // "🎯callsign lat@off=DDD.DD lon@off=DDD.DD" = confirmed hit with decoded values.
         if adsbDiag.prop26FramesVoted % 10 == 0 && adsbDiag.prop26FramesVoted >= 50 {
             var found = ""
             let adsbAircraft = detectedAircraft.values.filter { $0.source == .adsb }
@@ -696,14 +701,17 @@ class ConnectionLogic: ObservableObject {
                 for latOff in 2 ..< 47 {
                     guard latOff + 2 <= b.count - 3 else { break }
                     let latRaw = Double(s24at(latOff))
-                    for (li, lsc) in scales.enumerated() {
-                        guard abs(latRaw * lsc - ac.latitude) < 0.2 else { continue }
+                    for (_, lsc) in scales.enumerated() {
+                        let decodedLat = latRaw * lsc
+                        guard abs(decodedLat - ac.latitude) < 0.05 else { continue }
                         for lonOff in 2 ..< 47 {
                             guard abs(lonOff - latOff) >= 3, lonOff + 2 <= b.count - 3 else { continue }
                             let lonRaw = Double(s24at(lonOff))
-                            for (ni, nsc) in scales.enumerated() {
-                                guard abs(lonRaw * nsc - ac.longitude) < 0.5 else { continue }
-                                found = "🎯\(ac.callsign)@(\(latOff)×\(li))/(\(lonOff)×\(ni))"
+                            for (_, nsc) in scales.enumerated() {
+                                let decodedLon = lonRaw * nsc
+                                guard abs(decodedLon - ac.longitude) < 0.1 else { continue }
+                                found = String(format: "🎯%@ lat@%d=%.2f lon@%d=%.2f",
+                                               ac.callsign, latOff, decodedLat, lonOff, decodedLon)
                                 break outer
                             }
                         }
@@ -764,7 +772,14 @@ class ConnectionLogic: ObservableObject {
             1.0 / 1_000.0,
         ]
         let SC = scales.count
-        let PC = 19   // usable offsets 1…19 within the 22-byte frame (skip type byte 0 and last 2 CRC)
+        // PC = 19 covers all byte positions in the 22b frame.
+        // latStart/lonStart = 5: skip bytes 0 (type), 1 (status), 2-4 (ICAO address).
+        // Bytes 2-4 with GDL90-lat scale accidentally produce plausible latitudes for any
+        // aircraft whose ICAO starts with 0x38-0x45 (e.g. ICAO 378E26 decodes to 39.06°N),
+        // causing the voting to converge on lat@2 and emit phantom ICAO-derived aircraft.
+        let PC = 19
+        let latStart = 5
+        let lonStart = 5
 
         func s24at(_ i: Int) -> Int32 {
             let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
@@ -774,13 +789,13 @@ class ConnectionLogic: ObservableObject {
         adsbDiag.prop22bFramesVoted += 1
 
         let PSC = PC * SC
-        for latIdx in 1 ..< PC {
+        for latIdx in latStart ..< PC {
             guard latIdx + 2 < b.count - 2 else { continue }
             let rawLat = Double(s24at(latIdx))
             for latScIdx in 0 ..< SC {
                 let lat = rawLat * scales[latScIdx]
                 guard lat >= latMin && lat <= latMax else { continue }
-                for lonIdx in 1 ..< PC {
+                for lonIdx in lonStart ..< PC {
                     guard abs(lonIdx - latIdx) >= 3 else { continue }
                     guard lonIdx + 2 < b.count - 2 else { continue }
                     let rawLon = Double(s24at(lonIdx))
