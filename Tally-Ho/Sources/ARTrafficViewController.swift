@@ -1446,6 +1446,22 @@ class ARTrafficViewController: UIViewController {
                 if let cal = d.calibrationStatus {
                     lines.append("🔬 \(cal)")
                 }
+                if !d.capturedPositionFrameHex.isEmpty {
+                    // Annotate captured position frame with [lat] and {lon} brackets so the
+                    // encoding is visually obvious.
+                    let latOff2 = d.propLatByteOffset
+                    let lonOff2 = d.propLonByteOffset
+                    let parts2 = d.capturedPositionFrameHex.components(separatedBy: " ")
+                    // First token is the callsign; annotate remainder (byte tokens).
+                    let callsign2 = parts2.first ?? ""
+                    let byteTokens = Array(parts2.dropFirst())
+                    let annotated2 = byteTokens.enumerated().map { (idx, h) -> String in
+                        if let lo = latOff2, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
+                        if let lo = lonOff2, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
+                        return h
+                    }.joined(separator: " ")
+                    lines.append("✅22b \(callsign2) \(annotated2)")
+                }
                 if !d.prop70VotingStatus.isEmpty {
                     lines.append("🗳 \(d.prop70VotingStatus)")
                 }

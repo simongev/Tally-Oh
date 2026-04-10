@@ -113,6 +113,9 @@ struct ADSBDiagnostics {
     /// Ring buffer of the last 8 distinct 22-byte 0x26 frames (hex strings), newest first.
     /// Used for side-by-side comparison with ForeFlight to identify encoding.
     var recent22bFrames: [String] = []
+    /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
+    /// decoded an aircraft position. Lets us verify which bytes actually encode lat/lon.
+    var capturedPositionFrameHex: String = ""
 }
 
 // MARK: - ConnectionLogic
@@ -565,6 +568,10 @@ class ConnectionLogic: ObservableObject {
                     if let ac = self.decodeProprietarySingle(copy26) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
+                        // Capture the raw frame bytes so we can visually verify which bytes
+                        // encode the decoded lat/lon (confirms or refutes voting result).
+                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                        self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
                     }
                 } else if let ac = self.decodeProprietaryTraffic(copy26) {
                     self.detectedAircraft[ac.id] = ac
