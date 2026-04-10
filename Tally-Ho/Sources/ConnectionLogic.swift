@@ -669,15 +669,20 @@ class ConnectionLogic: ObservableObject {
         let secondVotes = top3.count > 1 ? top3[1] : 0
         let thirdVotes  = top3.count > 2 ? top3[2] : 0
 
-        guard bestVotes >= 10 && bestVotes > thirdVotes * 2 else {
-            adsbDiag.prop70VotingStatus = String(format:
-                "🗳70 best=%d 2nd=%d 3rd=%d (%d fr)",
-                bestVotes, secondVotes, thirdVotes, adsbDiag.prop26FramesVoted)
-            return
-        }
-
         let lonComp  = bestKey % PSC;  let lonIdx  = lonComp / SC;  let lonScIdx = lonComp % SC
         let latComp  = bestKey / PSC;  let latIdx  = latComp / SC;  let latScIdx = latComp % SC
+
+        // Decode sub0 with best candidate for diagnostic display even before convergence.
+        let diagLat = Double(s24at(ro + latIdx)) * scales[latScIdx]
+        let diagLon = Double(s24at(ro + lonIdx)) * scales[lonScIdx]
+
+        guard bestVotes >= 8 && (bestVotes - thirdVotes) >= 2 else {
+            adsbDiag.prop70VotingStatus = String(format:
+                "🗳70 best=%d 3rd=%d (%d fr) lat@%d×%.2e lon@%d×%.2e→(%.2f,%.2f)",
+                bestVotes, thirdVotes, adsbDiag.prop26FramesVoted,
+                latIdx, scales[latScIdx], lonIdx, scales[lonScIdx], diagLat, diagLon)
+            return
+        }
 
         adsbDiag.prop70RecordOffset = ro
         adsbDiag.propLatByteOffset  = latIdx
