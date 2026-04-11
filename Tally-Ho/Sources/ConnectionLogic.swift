@@ -121,6 +121,9 @@ struct ADSBDiagnostics {
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
     /// decoded an aircraft position. Lets us verify which bytes actually encode lat/lon.
     var capturedPositionFrameHex: String = ""
+    /// The raw bytes (space-separated hex) of the most recent 47b frame that successfully
+    /// decoded an aircraft position via decodeProprietaryTraffic.
+    var captured47bFrameHex: String = ""
 }
 
 // MARK: - ConnectionLogic
@@ -585,6 +588,10 @@ class ConnectionLogic: ObservableObject {
                     // lon@5 produce random positions that flood detectedAircraft with phantoms.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
+                    if copy26.count == 47 {
+                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                        self.adsbDiag.captured47bFrameHex = "\(ac.callsign): \(hex)"
+                    }
                 }
                 self.startSentryRegistration()
             }
@@ -1043,8 +1050,11 @@ class ConnectionLogic: ObservableObject {
             return nil
         }
 
-        let icao = n >= 5
-            ? String(format: "P%02X%02X%02X", b[2], b[3], b[4])
+        // Use bytes [1-3] for ICAO, consistent with decodeProprietarySingle.
+        // b[1] == 0x00 for TIS-B pseudo-addresses (same as 22b frames);
+        // b[4] is a flags byte, not part of the ICAO.
+        let icao = n >= 4
+            ? String(format: "P%02X%02X%02X", b[1], b[2], b[3])
             : String(format: "P%02X%02d", b[1], n)
 
         // Try GDL90 altitude from the two bytes after the lon field (same logic as decodeProprietarySingle).

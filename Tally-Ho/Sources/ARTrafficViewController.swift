@@ -1462,6 +1462,22 @@ class ARTrafficViewController: UIViewController {
                     }.joined(separator: " ")
                     lines.append("✅22b \(callsign2) \(annotated2)")
                 }
+                if !d.captured47bFrameHex.isEmpty {
+                    let latOff47 = d.propLatByteOffset
+                    let lonOff47 = d.propLonByteOffset
+                    let parts47 = d.captured47bFrameHex.components(separatedBy: " ")
+                    let callsign47 = parts47.first ?? ""
+                    let byteTokens47 = Array(parts47.dropFirst())
+                    let annotated47 = byteTokens47.enumerated().map { (idx, h) -> String in
+                        if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
+                        if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
+                        return h
+                    }.joined(separator: " ")
+                    // 47b is long — split at byte 24 to keep lines readable.
+                    let toks = annotated47.components(separatedBy: " ")
+                    lines.append("✅47b \(callsign47) " + toks.prefix(24).joined(separator: " "))
+                    if toks.count > 24 { lines.append("      " + Array(toks.dropFirst(24)).joined(separator: " ")) }
+                }
                 if !d.prop70VotingStatus.isEmpty {
                     lines.append("🗳 \(d.prop70VotingStatus)")
                 }
