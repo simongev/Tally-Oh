@@ -1481,6 +1481,9 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70VotingStatus.isEmpty {
                     lines.append("🗳 \(d.prop70VotingStatus)")
                 }
+                if !d.prop70ConfirmedHit.isEmpty {
+                    lines.append("🏆 \(d.prop70ConfirmedHit)")
+                }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
@@ -1519,6 +1522,12 @@ class ARTrafficViewController: UIViewController {
                     lines.append("47b: " + toks47.prefix(28).joined(separator: " "))
                     let rest47 = Array(toks47.dropFirst(28))
                     if !rest47.isEmpty { lines.append("     " + rest47.joined(separator: " ")) }
+                }
+                if let hex56 = d.sampleFramesBySize[56] {
+                    let bytes = hex56.components(separatedBy: " ")
+                    lines.append("56b: " + bytes.prefix(28).joined(separator: " "))
+                    let rest = Array(bytes.dropFirst(28))
+                    if !rest.isEmpty { lines.append("     " + rest.joined(separator: " ")) }
                 }
                 if let hex70 = d.sampleFramesBySize[70] {
                     let bytes = hex70.components(separatedBy: " ")

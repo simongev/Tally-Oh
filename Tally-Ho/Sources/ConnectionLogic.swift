@@ -119,7 +119,11 @@ struct ADSBDiagnostics {
     /// converged ✅22 result in calibrationStatus.
     var prop70VotingStatus: String = ""
     /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
+    /// Overwritten every scan window; see prop70ConfirmedHit for the persistent best result.
     var prop70ScanResult: String = ""
+    /// Best cross-correlation hit seen so far, with scale — never cleared once set.
+    /// Lets us track the best evidence across scan windows even when the aircraft ages out.
+    var prop70ConfirmedHit: String = ""
 
     // MARK: Multi-frame correlation capture
     /// Ring buffer of the last 4 distinct 22-byte 0x26 frames (hex strings), newest first.
@@ -754,8 +758,8 @@ class ConnectionLogic: ObservableObject {
                             for nsc in scales {
                                 let decLon = lonBE * nsc
                                 guard abs(decLon - ac.longitude) < 0.1 else { continue }
-                                found = String(format: "🎯BE %@ lat@%d=%.2f lon@%d=%.2f",
-                                               ac.callsign, latOff, decLat, lonOff, decLon)
+                                found = String(format: "🎯BE %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
+                                               ac.callsign, latOff, lsc, decLat, lonOff, nsc, decLon)
                                 break outer
                             }
                         }
@@ -766,8 +770,8 @@ class ConnectionLogic: ObservableObject {
                             for nsc in scales {
                                 let decLon = lonLE * nsc
                                 guard abs(decLon - ac.longitude) < 0.1 else { continue }
-                                found = String(format: "🎯LE %@ lat@%d=%.2f lon@%d=%.2f",
-                                               ac.callsign, latOff, decLat, lonOff, decLon)
+                                found = String(format: "🎯LE %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
+                                               ac.callsign, latOff, lsc, decLat, lonOff, nsc, decLon)
                                 break outer
                             }
                         }
@@ -777,6 +781,10 @@ class ConnectionLogic: ObservableObject {
             adsbDiag.prop70ScanResult = found.isEmpty
                 ? (allAircraft.isEmpty ? "" : "∅/\(allAircraft.count)ac")
                 : found
+            // Persist the best hit across scan windows (survives aircraft aging out).
+            if !found.isEmpty {
+                adsbDiag.prop70ConfirmedHit = found
+            }
         }
 
         guard bestVotes >= 8 && (bestVotes - thirdVotes) >= 2 else {
