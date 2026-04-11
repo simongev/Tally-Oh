@@ -716,7 +716,9 @@ class ConnectionLogic: ObservableObject {
         // "🎯callsign lat@off=DDD.DD lon@off=DDD.DD" = confirmed hit with decoded values.
         if adsbDiag.prop26FramesVoted % 10 == 0 && adsbDiag.prop26FramesVoted >= 50 {
             var found = ""
-            let adsbAircraft = detectedAircraft.values.filter { $0.source == .adsb }
+            // Include ALL aircraft (Sentry + Internet) for cross-correlation.
+            // With TR:0 Sentry gives 0 reference points; Internet provides ~60.
+            let adsbAircraft = Array(detectedAircraft.values)
             outer: for ac in adsbAircraft {
                 for latOff in 2 ..< 47 {
                     guard latOff + 2 <= b.count - 3 else { break }
