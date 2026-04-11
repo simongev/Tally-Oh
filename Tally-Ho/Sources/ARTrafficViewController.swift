@@ -1482,6 +1482,23 @@ class ARTrafficViewController: UIViewController {
                     }.joined(separator: " ")
                     lines.append("F\(i+1): \(annotated)")
                 }
+                if let hex47 = d.sampleFramesBySize[47] {
+                    // Annotate [lat] and {lon} positions so we can verify the 47b layout.
+                    // Also mark bytes 1-3 with (ICAO) since that's what decodeProprietaryTraffic uses.
+                    let latOff47 = d.propLatByteOffset
+                    let lonOff47 = d.propLonByteOffset
+                    let parts47 = hex47.components(separatedBy: " ")
+                    let annotated47 = parts47.enumerated().map { (idx, h) -> String in
+                        if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
+                        if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
+                        if idx >= 2 && idx <= 4 { return "(\(h))" }   // ICAO candidate (b[2-4])
+                        return h
+                    }.joined(separator: " ")
+                    let toks47 = annotated47.components(separatedBy: " ")
+                    lines.append("47b: " + toks47.prefix(28).joined(separator: " "))
+                    let rest47 = Array(toks47.dropFirst(28))
+                    if !rest47.isEmpty { lines.append("     " + rest47.joined(separator: " ")) }
+                }
                 if let hex70 = d.sampleFramesBySize[70] {
                     let bytes = hex70.components(separatedBy: " ")
                     lines.append("70b: " + bytes.prefix(35).joined(separator: " "))

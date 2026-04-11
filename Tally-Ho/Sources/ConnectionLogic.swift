@@ -578,7 +578,11 @@ class ConnectionLogic: ObservableObject {
                         let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                         self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
                     }
-                } else if let ac = self.decodeProprietaryTraffic(copy26) {
+                } else if copy26.count != 70,
+                          let ac = self.decodeProprietaryTraffic(copy26) {
+                    // Non-22b, non-70b frames (e.g. 47b extended records).
+                    // 70b is excluded: its encoding is still unknown and its bytes at lat@15,
+                    // lon@5 produce random positions that flood detectedAircraft with phantoms.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
                 }
