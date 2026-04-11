@@ -79,16 +79,20 @@ struct ADSBDiagnostics {
     var lastMsg25Hex: String? = nil
     /// One sample hex string per unique de-stuffed frame size (first seen wins).
     var sampleFramesBySize: [Int: String] = [:]
-    /// Byte offset into the 0x25 payload where latitude was found by calibration.
-    var propLatByteOffset: Int? = nil
-    /// Byte offset into the 0x25 payload where longitude was found by calibration.
-    var propLonByteOffset: Int? = nil
+    // MARK: Confirmed 22b frame layout (reverse-engineered, validated against captured frames)
+    // Layout: [0x26][ICAO 3b][flags][LON 3b][unk 7b][LAT 3b][ALT 2b][CRC 2b]
+    // Both lat and lon use scale 180/2^24 (= 1.07e-05°/LSB).
+    // Altitude: top 12 bits of big-endian uint16 at byte 18: (raw12 × 25) − 1000 ft.
+    /// Byte offset into the 0x26 payload where latitude was found.
+    var propLatByteOffset: Int? = 15
+    /// Byte offset into the 0x26 payload where longitude was found.
+    var propLonByteOffset: Int? = 5
     /// Scale factor: rawInt * propLatScale = degrees latitude.
-    var propLatScale: Double? = nil
+    var propLatScale: Double? = 180.0 / 16_777_216.0
     /// Scale factor: rawInt * propLonScale = degrees longitude.
-    var propLonScale: Double? = nil
+    var propLonScale: Double? = 180.0 / 16_777_216.0
     /// Human-readable calibration status shown in the HUD.
-    var calibrationStatus: String? = nil
+    var calibrationStatus: String? = "✅22 lat@15×1.07e-05 lon@5×1.07e-05 (hardcoded)"
     /// Vote counts for proprietary 0x26 encoding discovery.
     /// Keyed by packed (roBit, latOff, latScIdx, lonOff, lonScIdx) indices.
     var prop26VoteCounts: [Int: Int] = [:]
@@ -101,8 +105,9 @@ struct ADSBDiagnostics {
     /// Number of 22-byte 0x26 frames processed for voting.
     var prop22bFramesVoted: Int = 0
     /// Byte offset within a 70-byte bundle frame where the first sub-record starts.
-    /// 0 = 22-byte single-frame mode; >0 = bundle mode. Set once voting converges.
-    var prop70RecordOffset: Int? = nil
+    /// 0 = 22-byte single-frame mode; >0 = bundle mode.
+    /// Pre-set to 0 so the 22b decode path is active from the very first frame.
+    var prop70RecordOffset: Int? = 0
     /// In-progress 70b voting status — kept separate so it doesn't overwrite a
     /// converged ✅22 result in calibrationStatus.
     var prop70VotingStatus: String = ""
