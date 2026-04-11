@@ -132,6 +132,7 @@ class ARTrafficViewController: UIViewController {
 
     private var arSceneView: ARSCNView!
     private var statusLabel: UILabel!
+    private var hudScrollView: UIScrollView!
     private var copyStatusButton: UIButton!
     private var settingsButton: UIButton!
     private var mapButton: UIButton!
@@ -308,18 +309,37 @@ class ARTrafficViewController: UIViewController {
         offScreenArrowView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(offScreenArrowView)
 
+        // Scroll view — caps the HUD to the safe area so it never overflows off-screen.
+        hudScrollView = UIScrollView()
+        hudScrollView.translatesAutoresizingMaskIntoConstraints = false
+        hudScrollView.layer.cornerRadius = 8
+        hudScrollView.clipsToBounds = true
+        hudScrollView.isHidden = true
+        hudScrollView.showsVerticalScrollIndicator = true
+        hudScrollView.showsHorizontalScrollIndicator = false
+        view.addSubview(hudScrollView)
+
         statusLabel = UILabel()
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.65)
         statusLabel.textColor = .white
         statusLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         statusLabel.numberOfLines = 0
-        statusLabel.layer.cornerRadius = 8
-        statusLabel.clipsToBounds = true
         statusLabel.textAlignment = .left
         statusLabel.isUserInteractionEnabled = false
-        statusLabel.isHidden = true
-        view.addSubview(statusLabel)
+        hudScrollView.addSubview(statusLabel)
+
+        // Pin label to scroll content area; fix its width to the scroll frame so
+        // it wraps horizontally rather than expanding sideways.
+        let contentGuide = hudScrollView.contentLayoutGuide
+        let frameGuide   = hudScrollView.frameLayoutGuide
+        NSLayoutConstraint.activate([
+            statusLabel.topAnchor.constraint(equalTo: contentGuide.topAnchor),
+            statusLabel.leadingAnchor.constraint(equalTo: contentGuide.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: contentGuide.trailingAnchor),
+            statusLabel.bottomAnchor.constraint(equalTo: contentGuide.bottomAnchor),
+            statusLabel.widthAnchor.constraint(equalTo: frameGuide.widthAnchor),
+        ])
 
         // Back button
         backButton = UIButton(type: .system)
@@ -340,18 +360,20 @@ class ARTrafficViewController: UIViewController {
             backButton.heightAnchor.constraint(equalToConstant: 48)
         ])
 
-        statusLeadingToEdge = statusLabel.leadingAnchor.constraint(
+        statusLeadingToEdge = hudScrollView.leadingAnchor.constraint(
             equalTo: view.leadingAnchor, constant: 12)
-        statusLeadingToBack = statusLabel.leadingAnchor.constraint(
+        statusLeadingToBack = hudScrollView.leadingAnchor.constraint(
             equalTo: backButton.trailingAnchor, constant: 8)
         statusLeadingToEdge.isActive = true
 
         NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68)
+            hudScrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            hudScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68),
+            // Cap height so the HUD never runs off the bottom of the safe area.
+            hudScrollView.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
         ])
 
-        // Copy button — bottom-right corner of status label
+        // Copy button — top-right corner of the scroll view frame (not the content).
         copyStatusButton = UIButton(type: .system)
         copyStatusButton.translatesAutoresizingMaskIntoConstraints = false
         copyStatusButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
@@ -363,8 +385,8 @@ class ARTrafficViewController: UIViewController {
         view.addSubview(copyStatusButton)
 
         NSLayoutConstraint.activate([
-            copyStatusButton.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor, constant: -4),
-            copyStatusButton.topAnchor.constraint(equalTo: statusLabel.topAnchor, constant: 4),
+            copyStatusButton.trailingAnchor.constraint(equalTo: hudScrollView.trailingAnchor, constant: -4),
+            copyStatusButton.topAnchor.constraint(equalTo: hudScrollView.topAnchor, constant: 4),
             copyStatusButton.widthAnchor.constraint(equalToConstant: 28),
             copyStatusButton.heightAnchor.constraint(equalToConstant: 28)
         ])
@@ -775,13 +797,18 @@ class ARTrafficViewController: UIViewController {
     }
 
     @objc private func infoButtonTapped() {
-        statusLabel.isHidden.toggle()
-        copyStatusButton.isHidden = statusLabel.isHidden
+        hudScrollView.isHidden.toggle()
+        copyStatusButton.isHidden = hudScrollView.isHidden
     }
 
     @objc private func copyStatusTapped() {
-        UIPasteboard.general.string = statusLabel.text
+        // Change icon immediately so the tap feels instant.
         copyStatusButton.setImage(UIImage(systemName: "checkmark"), for: .normal)
+        // Pasteboard write can stall the main thread briefly; push it to a background queue.
+        let text = statusLabel.text ?? ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            UIPasteboard.general.string = text
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.copyStatusButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
         }
