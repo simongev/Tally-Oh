@@ -104,10 +104,17 @@ struct ADSBDiagnostics {
     var prop22bVoteCounts: [Int: Int] = [:]
     /// Number of 22-byte 0x26 frames processed for voting.
     var prop22bFramesVoted: Int = 0
-    /// Byte offset within a 70-byte bundle frame where the first sub-record starts.
-    /// 0 = 22-byte single-frame mode; >0 = bundle mode.
-    /// Pre-set to 0 so the 22b decode path is active from the very first frame.
+    /// DEPRECATED dispatch sentinel — kept for legacy code paths.  No longer drives decode.
     var prop70RecordOffset: Int? = 0
+    /// Sub-record byte offset within a 70b bundle (set by voteForEncoding26 on convergence).
+    /// nil = 70b bundle not yet calibrated.  Non-nil activates decodeProprietaryBundle.
+    var prop70SubRecordOffset: Int? = nil
+    /// Calibration values for 70b bundle sub-records (separate from confirmed 22b values).
+    /// Only written by voteForEncoding26; never overwrite the hardcoded 22b offsets.
+    var prop70LatByteOffset: Int = 0
+    var prop70LonByteOffset: Int = 0
+    var prop70LatScale: Double = 0
+    var prop70LonScale: Double = 0
     /// In-progress 70b voting status — kept separate so it doesn't overwrite a
     /// converged ✅22 result in calibrationStatus.
     var prop70VotingStatus: String = ""
@@ -552,40 +559,30 @@ class ConnectionLogic: ObservableObject {
                     }
                 }
 
-                // Vote-based calibration: 22b and 70b run independently so either can win.
-                // 22b votes only while uncalibrated (ro == nil).
-                // 70b votes while uncalibrated OR while in 22b-only mode (ro == 0), so that
-                // if 22b converges first the 70b path can still win on a later frame burst.
-                if self.adsbDiag.prop70RecordOffset == nil && copy26.count == 22 {
-                    self.voteForEncoding22(copy26)
-                }
-                if (self.adsbDiag.prop70RecordOffset == nil ||
-                    self.adsbDiag.prop70RecordOffset == 0) && copy26.count == 70 {
+                // 70b voting runs until prop70SubRecordOffset is set (bundle calibrated).
+                // 22b voting is permanently disabled — layout confirmed and hardcoded.
+                if self.adsbDiag.prop70SubRecordOffset == nil && copy26.count == 70 {
                     self.voteForEncoding26(copy26)
                 }
-                // Decode once calibration has committed.
-                let ro = self.adsbDiag.prop70RecordOffset
-                if copy26.count == 70, let ro, ro != 0 {
-                    // 70-byte bundle path (2 aircraft sub-records).
+                // 22b: always use hardcoded single-aircraft decoder (independent of 70b state).
+                if copy26.count == 22 {
+                    if let ac = self.decodeProprietarySingle(copy26) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.parsedTraffic += 1
+                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
+                        self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
+                    }
+                } else if copy26.count == 70,
+                          self.adsbDiag.prop70SubRecordOffset != nil {
+                    // 70b bundle path — active once voteForEncoding26 converges.
                     for ac in self.decodeProprietaryBundle(copy26) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
                     }
-                } else if copy26.count == 22, ro == 0 {
-                    // 22-byte single-aircraft frame path.
-                    if let ac = self.decodeProprietarySingle(copy26) {
-                        self.detectedAircraft[ac.id] = ac
-                        self.adsbDiag.parsedTraffic += 1
-                        // Capture the raw frame bytes so we can visually verify which bytes
-                        // encode the decoded lat/lon (confirms or refutes voting result).
-                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
-                        self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
-                    }
                 } else if copy26.count != 70,
+                          copy26.count != 22,
                           let ac = self.decodeProprietaryTraffic(copy26) {
-                    // Non-22b, non-70b frames (e.g. 47b extended records).
-                    // 70b is excluded: its encoding is still unknown and its bytes at lat@15,
-                    // lon@5 produce random positions that flood detectedAircraft with phantoms.
+                    // Extended frames (e.g. 47b): use hardcoded lat@15/lon@5 offsets.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
                     if copy26.count == 47 {
@@ -756,19 +753,18 @@ class ConnectionLogic: ObservableObject {
             return
         }
 
-        adsbDiag.prop70RecordOffset = ro
-        adsbDiag.propLatByteOffset  = latIdx
-        adsbDiag.propLonByteOffset  = lonIdx
-        adsbDiag.propLatScale       = scales[latScIdx]
-        adsbDiag.propLonScale       = scales[lonScIdx]
-        adsbDiag.calibrationStatus  = String(format:
+        // Write 70b-specific calibration to its own fields — never touch the confirmed
+        // 22b values (propLatByteOffset / propLonByteOffset / calibrationStatus).
+        adsbDiag.prop70SubRecordOffset = ro
+        adsbDiag.prop70LatByteOffset   = latIdx
+        adsbDiag.prop70LonByteOffset   = lonIdx
+        adsbDiag.prop70LatScale        = scales[latScIdx]
+        adsbDiag.prop70LonScale        = scales[lonScIdx]
+        adsbDiag.prop70VotingStatus    = String(format:
             "✅70 ro=%d lat@%d×%.2e lon@%d×%.2e (%d/%d fr)",
             ro, latIdx, scales[latScIdx],
             lonIdx, scales[lonScIdx],
             bestVotes, adsbDiag.prop26FramesVoted)
-        adsbDiag.prop70VotingStatus = ""
-        // Clear any stale entries accumulated before calibration committed.
-        detectedAircraft.removeAll()
     }
 
     /// Vote-based encoding discovery for 22-byte single-aircraft 0x26 frames.
@@ -876,12 +872,13 @@ class ConnectionLogic: ObservableObject {
     /// Decode three aircraft sub-records from a 70-byte proprietary bundle frame.
     /// Requires calibration via voteForEncoding26.  Must be called on the main thread.
     private func decodeProprietaryBundle(_ payload: Data) -> [Aircraft] {
-        guard let ro     = adsbDiag.prop70RecordOffset,
-              let latOff = adsbDiag.propLatByteOffset,
-              let lonOff = adsbDiag.propLonByteOffset,
-              let latSc  = adsbDiag.propLatScale,
-              let lonSc  = adsbDiag.propLonScale,
+        guard let ro = adsbDiag.prop70SubRecordOffset,
               payload.count == 70 else { return [] }
+        let latOff = adsbDiag.prop70LatByteOffset
+        let lonOff = adsbDiag.prop70LonByteOffset
+        let latSc  = adsbDiag.prop70LatScale
+        let lonSc  = adsbDiag.prop70LonScale
+        guard latSc != 0, lonSc != 0 else { return [] }
 
         let b = Array(payload)
 
@@ -900,6 +897,10 @@ class ConnectionLogic: ObservableObject {
 
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
+            // Reject positions more than 5° from user — prevents phantom aircraft from
+            // random bytes passing the range check (same filter as decodeProprietarySingle).
+            if let loc = currentLocation,
+               abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { continue }
             if let loc = currentLocation,
                abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
 
