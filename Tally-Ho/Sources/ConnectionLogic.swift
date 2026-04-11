@@ -718,22 +718,66 @@ class ConnectionLogic: ObservableObject {
             var found = ""
             // Include ALL aircraft (Sentry + Internet) for cross-correlation.
             // With TR:0 Sentry gives 0 reference points; Internet provides ~60.
-            let adsbAircraft = Array(detectedAircraft.values)
-            outer: for ac in adsbAircraft {
+            let allAircraft = Array(detectedAircraft.values)
+            let userLat2 = currentLocation?.latitude  ?? 40.0
+            let userLon2 = currentLocation?.longitude ?? -74.0
+
+            // Little-endian signed 24-bit read.
+            func s24le(_ off: Int) -> Double {
+                let v = Int32(b[off]) | Int32(b[off+1]) << 8 | Int32(b[off+2]) << 16
+                return Double(v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v)
+            }
+            // Signed 16-bit read (big-endian).
+            func s16at(_ off: Int) -> Double {
+                let v = Int16(bitPattern: UInt16(b[off]) << 8 | UInt16(b[off+1]))
+                return Double(v)
+            }
+
+            // 1) Big-endian signed 24-bit at every scale (original approach).
+            // 2) Little-endian signed 24-bit at every scale.
+            // 3) 2-byte delta from user GPS: value = (ac.lat - userLat) at 1/10000 and 1/100 scales.
+            outer: for ac in allAircraft {
+                let dLat = ac.latitude  - userLat2
+                let dLon = ac.longitude - userLon2
                 for latOff in 2 ..< 47 {
                     guard latOff + 2 <= b.count - 3 else { break }
-                    let latRaw = Double(s24at(latOff))
-                    for (_, lsc) in scales.enumerated() {
-                        let decodedLat = latRaw * lsc
-                        guard abs(decodedLat - ac.latitude) < 0.05 else { continue }
-                        for lonOff in 2 ..< 47 {
-                            guard abs(lonOff - latOff) >= 3, lonOff + 2 <= b.count - 3 else { continue }
-                            let lonRaw = Double(s24at(lonOff))
-                            for (_, nsc) in scales.enumerated() {
-                                let decodedLon = lonRaw * nsc
-                                guard abs(decodedLon - ac.longitude) < 0.1 else { continue }
-                                found = String(format: "🎯%@ lat@%d=%.2f lon@%d=%.2f",
-                                               ac.callsign, latOff, decodedLat, lonOff, decodedLon)
+                    let latBE = Double(s24at(latOff))
+                    let latLE = s24le(latOff)
+                    let lat16 = s16at(latOff)   // 2-byte big-endian
+                    for lonOff in 2 ..< 47 {
+                        guard abs(lonOff - latOff) >= 2, lonOff + 2 <= b.count - 3 else { continue }
+                        let lonBE = Double(s24at(lonOff))
+                        let lonLE = s24le(lonOff)
+                        let lon16 = s16at(lonOff)
+                        // 3-byte big-endian at all scales
+                        for lsc in scales {
+                            let decLat = latBE * lsc
+                            guard abs(decLat - ac.latitude) < 0.05 else { continue }
+                            for nsc in scales {
+                                let decLon = lonBE * nsc
+                                guard abs(decLon - ac.longitude) < 0.1 else { continue }
+                                found = String(format: "🎯BE %@ lat@%d=%.2f lon@%d=%.2f",
+                                               ac.callsign, latOff, decLat, lonOff, decLon)
+                                break outer
+                            }
+                        }
+                        // 3-byte little-endian at all scales
+                        for lsc in scales {
+                            let decLat = latLE * lsc
+                            guard abs(decLat - ac.latitude) < 0.05 else { continue }
+                            for nsc in scales {
+                                let decLon = lonLE * nsc
+                                guard abs(decLon - ac.longitude) < 0.1 else { continue }
+                                found = String(format: "🎯LE %@ lat@%d=%.2f lon@%d=%.2f",
+                                               ac.callsign, latOff, decLat, lonOff, decLon)
+                                break outer
+                            }
+                        }
+                        // 2-byte delta from GPS at 1/10000 and 1/100 °/LSB
+                        for dsc in [1.0/10_000.0, 1.0/100.0] {
+                            if abs(lat16 * dsc - dLat) < 0.05 && abs(lon16 * dsc - dLon) < 0.1 {
+                                found = String(format: "🎯ΔGPS %@ dlat@%d lon@%d sc=%.0e",
+                                               ac.callsign, latOff, lonOff, dsc)
                                 break outer
                             }
                         }
@@ -741,7 +785,7 @@ class ConnectionLogic: ObservableObject {
                 }
             }
             adsbDiag.prop70ScanResult = found.isEmpty
-                ? (adsbAircraft.isEmpty ? "" : "∅/\(adsbAircraft.count)ac")
+                ? (allAircraft.isEmpty ? "" : "∅/\(allAircraft.count)ac")
                 : found
         }
 

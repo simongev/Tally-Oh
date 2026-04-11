@@ -1485,6 +1485,9 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
+                if let hex20 = d.sampleFramesBySize[20] {
+                    lines.append("20b: \(hex20)")
+                }
                 // Ring buffer of recent 22-byte frames for ForeFlight correlation.
                 // [..] = lat field, {..} = lon field per voting result.
                 let latOff = d.propLatByteOffset
@@ -1507,7 +1510,7 @@ class ARTrafficViewController: UIViewController {
                     let annotated47 = parts47.enumerated().map { (idx, h) -> String in
                         if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
                         if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        if idx >= 2 && idx <= 4 { return "(\(h))" }   // ICAO candidate (b[2-4])
+                        if idx >= 1 && idx <= 3 { return "(\(h))" }   // ICAO at b[1-3]
                         return h
                     }.joined(separator: " ")
                     let toks47 = annotated47.components(separatedBy: " ")
