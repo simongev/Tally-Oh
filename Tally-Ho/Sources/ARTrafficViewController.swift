@@ -1485,8 +1485,10 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
-                if let hex20 = d.sampleFramesBySize[20] {
-                    lines.append("20b: \(hex20)")
+                // 20b ring buffer: show up to 2 recent frames for cross-session comparison.
+                // We want to see if ICAO/bytes vary between frames, identifying position fields.
+                for (i, f20) in d.recent20bFrames.prefix(2).enumerated() {
+                    lines.append("G\(i+1): \(f20)")
                 }
                 // Ring buffer of recent 22-byte frames for ForeFlight correlation.
                 // [..] = lat field, {..} = lon field per voting result.

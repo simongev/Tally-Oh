@@ -122,9 +122,10 @@ struct ADSBDiagnostics {
     var prop70ScanResult: String = ""
 
     // MARK: Multi-frame correlation capture
-    /// Ring buffer of the last 8 distinct 22-byte 0x26 frames (hex strings), newest first.
-    /// Used for side-by-side comparison with ForeFlight to identify encoding.
+    /// Ring buffer of the last 4 distinct 22-byte 0x26 frames (hex strings), newest first.
     var recent22bFrames: [String] = []
+    /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
+    var recent20bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
     /// decoded an aircraft position. Lets us verify which bytes actually encode lat/lon.
     var capturedPositionFrameHex: String = ""
@@ -542,19 +543,27 @@ class ConnectionLogic: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
-                // Always refresh the 70-byte and 22-byte samples (most-recent wins).
-                if copy26.count == 70 || copy26.count == 22 {
+                // Always refresh 70b, 22b, and 20b samples (most-recent wins).
+                // Other sizes: first-seen only (not enough variety to benefit from refresh).
+                if copy26.count == 70 || copy26.count == 22 || copy26.count == 20 {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 }
 
-                // Maintain ring buffer of recent unique 22-byte frames (for correlation).
+                // Ring buffers of recent unique frames for cross-session comparison.
                 if copy26.count == 22 {
                     if self.adsbDiag.recent22bFrames.first != hex {
                         self.adsbDiag.recent22bFrames.insert(hex, at: 0)
-                        if self.adsbDiag.recent22bFrames.count > 8 {
+                        if self.adsbDiag.recent22bFrames.count > 4 {
                             self.adsbDiag.recent22bFrames.removeLast()
+                        }
+                    }
+                } else if copy26.count == 20 {
+                    if self.adsbDiag.recent20bFrames.first != hex {
+                        self.adsbDiag.recent20bFrames.insert(hex, at: 0)
+                        if self.adsbDiag.recent20bFrames.count > 4 {
+                            self.adsbDiag.recent20bFrames.removeLast()
                         }
                     }
                 }
@@ -719,36 +728,25 @@ class ConnectionLogic: ObservableObject {
             // Include ALL aircraft (Sentry + Internet) for cross-correlation.
             // With TR:0 Sentry gives 0 reference points; Internet provides ~60.
             let allAircraft = Array(detectedAircraft.values)
-            let userLat2 = currentLocation?.latitude  ?? 40.0
-            let userLon2 = currentLocation?.longitude ?? -74.0
 
             // Little-endian signed 24-bit read.
             func s24le(_ off: Int) -> Double {
                 let v = Int32(b[off]) | Int32(b[off+1]) << 8 | Int32(b[off+2]) << 16
                 return Double(v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v)
             }
-            // Signed 16-bit read (big-endian).
-            func s16at(_ off: Int) -> Double {
-                let v = Int16(bitPattern: UInt16(b[off]) << 8 | UInt16(b[off+1]))
-                return Double(v)
-            }
 
-            // 1) Big-endian signed 24-bit at every scale (original approach).
-            // 2) Little-endian signed 24-bit at every scale.
-            // 3) 2-byte delta from user GPS: value = (ac.lat - userLat) at 1/10000 and 1/100 scales.
+            // 3-byte big-endian signed at every scale; then little-endian at every scale.
+            // 2-byte delta scans were removed: with ~4000 offset pairs × 2 scales × N aircraft
+            // the expected false-positive rate exceeds 1 per scan, making results meaningless.
             outer: for ac in allAircraft {
-                let dLat = ac.latitude  - userLat2
-                let dLon = ac.longitude - userLon2
                 for latOff in 2 ..< 47 {
                     guard latOff + 2 <= b.count - 3 else { break }
                     let latBE = Double(s24at(latOff))
                     let latLE = s24le(latOff)
-                    let lat16 = s16at(latOff)   // 2-byte big-endian
                     for lonOff in 2 ..< 47 {
-                        guard abs(lonOff - latOff) >= 2, lonOff + 2 <= b.count - 3 else { continue }
+                        guard abs(lonOff - latOff) >= 3, lonOff + 2 <= b.count - 3 else { continue }
                         let lonBE = Double(s24at(lonOff))
                         let lonLE = s24le(lonOff)
-                        let lon16 = s16at(lonOff)
                         // 3-byte big-endian at all scales
                         for lsc in scales {
                             let decLat = latBE * lsc
@@ -770,14 +768,6 @@ class ConnectionLogic: ObservableObject {
                                 guard abs(decLon - ac.longitude) < 0.1 else { continue }
                                 found = String(format: "🎯LE %@ lat@%d=%.2f lon@%d=%.2f",
                                                ac.callsign, latOff, decLat, lonOff, decLon)
-                                break outer
-                            }
-                        }
-                        // 2-byte delta from GPS at 1/10000 and 1/100 °/LSB
-                        for dsc in [1.0/10_000.0, 1.0/100.0] {
-                            if abs(lat16 * dsc - dLat) < 0.05 && abs(lon16 * dsc - dLon) < 0.1 {
-                                found = String(format: "🎯ΔGPS %@ dlat@%d lon@%d sc=%.0e",
-                                               ac.callsign, latOff, lonOff, dsc)
                                 break outer
                             }
                         }
