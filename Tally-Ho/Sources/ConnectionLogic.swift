@@ -119,10 +119,11 @@ struct ADSBDiagnostics {
     /// converged ✅22 result in calibrationStatus.
     var prop70VotingStatus: String = ""
     /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
-    /// Overwritten every scan window; see prop70ConfirmedHit for the persistent best result.
     var prop70ScanResult: String = ""
-    /// Best cross-correlation hit seen so far, with scale — never cleared once set.
-    /// Lets us track the best evidence across scan windows even when the aircraft ages out.
+    /// Vote counts for cross-correlation candidates across scan windows.
+    /// Key: "BE/LE,latOff,lonOff,lscIdx,nscIdx"  Value: number of scan windows that hit this key.
+    var prop70XcorrVotes: [String: Int] = [:]
+    /// Confirmed hit — only set when a single (latOff,lonOff,scale) key accumulates 3+ votes.
     var prop70ConfirmedHit: String = ""
 
     // MARK: Multi-frame correlation capture
@@ -728,9 +729,7 @@ class ConnectionLogic: ObservableObject {
         // "∅/N" = N aircraft checked, none found → 70b frame is NOT a simple 3-byte bundle.
         // "🎯callsign lat@off=DDD.DD lon@off=DDD.DD" = confirmed hit with decoded values.
         if adsbDiag.prop26FramesVoted % 10 == 0 && adsbDiag.prop26FramesVoted >= 50 {
-            var found = ""
-            // Include ALL aircraft (Sentry + Internet) for cross-correlation.
-            // With TR:0 Sentry gives 0 reference points; Internet provides ~60.
+            // Include ALL aircraft (Sentry + Internet) as reference points.
             let allAircraft = Array(detectedAircraft.values)
 
             // Little-endian signed 24-bit read.
@@ -739,10 +738,14 @@ class ConnectionLogic: ObservableObject {
                 return Double(v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v)
             }
 
-            // 3-byte big-endian signed at every scale; then little-endian at every scale.
-            // 2-byte delta scans were removed: with ~4000 offset pairs × 2 scales × N aircraft
-            // the expected false-positive rate exceeds 1 per scan, making results meaningless.
-            outer: for ac in allAircraft {
+            // Vote-accumulating cross-correlation.
+            // With 100+ Internet aircraft, ~33 false positives per scan window are expected.
+            // A true hit at a specific (latOff, lonOff, scale) key will accumulate votes across
+            // multiple consecutive scan windows; a random FP won't hit the same key repeatedly.
+            // Only promote to prop70ConfirmedHit after 3+ votes on the same key.
+            var bestHit: (key: String, votes: Int, display: String)? = nil
+
+            outerXcorr: for ac in allAircraft {
                 for latOff in 2 ..< 47 {
                     guard latOff + 2 <= b.count - 3 else { break }
                     let latBE = Double(s24at(latOff))
@@ -751,39 +754,49 @@ class ConnectionLogic: ObservableObject {
                         guard abs(lonOff - latOff) >= 3, lonOff + 2 <= b.count - 3 else { continue }
                         let lonBE = Double(s24at(lonOff))
                         let lonLE = s24le(lonOff)
-                        // 3-byte big-endian at all scales
-                        for lsc in scales {
-                            let decLat = latBE * lsc
-                            guard abs(decLat - ac.latitude) < 0.05 else { continue }
-                            for nsc in scales {
-                                let decLon = lonBE * nsc
-                                guard abs(decLon - ac.longitude) < 0.1 else { continue }
-                                found = String(format: "🎯BE %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
-                                               ac.callsign, latOff, lsc, decLat, lonOff, nsc, decLon)
-                                break outer
+                        for (lscIdx, lsc) in scales.enumerated() {
+                            // big-endian lat check
+                            let decLatBE = latBE * lsc
+                            if abs(decLatBE - ac.latitude) < 0.05 {
+                                for (nscIdx, nsc) in scales.enumerated() {
+                                    let decLonBE = lonBE * nsc
+                                    guard abs(decLonBE - ac.longitude) < 0.1 else { continue }
+                                    let key = "BE,\(latOff),\(lonOff),\(lscIdx),\(nscIdx)"
+                                    adsbDiag.prop70XcorrVotes[key, default: 0] += 1
+                                    let v = adsbDiag.prop70XcorrVotes[key]!
+                                    let disp = String(format: "🎯BE×%d %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
+                                                      v, ac.callsign, latOff, lsc, decLatBE, lonOff, nsc, decLonBE)
+                                    if bestHit == nil || v > bestHit!.votes { bestHit = (key, v, disp) }
+                                    if v >= 3 { break outerXcorr }
+                                }
                             }
-                        }
-                        // 3-byte little-endian at all scales
-                        for lsc in scales {
-                            let decLat = latLE * lsc
-                            guard abs(decLat - ac.latitude) < 0.05 else { continue }
-                            for nsc in scales {
-                                let decLon = lonLE * nsc
-                                guard abs(decLon - ac.longitude) < 0.1 else { continue }
-                                found = String(format: "🎯LE %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
-                                               ac.callsign, latOff, lsc, decLat, lonOff, nsc, decLon)
-                                break outer
+                            // little-endian lat check
+                            let decLatLE = latLE * lsc
+                            if abs(decLatLE - ac.latitude) < 0.05 {
+                                for (nscIdx, nsc) in scales.enumerated() {
+                                    let decLonLE = lonLE * nsc
+                                    guard abs(decLonLE - ac.longitude) < 0.1 else { continue }
+                                    let key = "LE,\(latOff),\(lonOff),\(lscIdx),\(nscIdx)"
+                                    adsbDiag.prop70XcorrVotes[key, default: 0] += 1
+                                    let v = adsbDiag.prop70XcorrVotes[key]!
+                                    let disp = String(format: "🎯LE×%d %@ lat@%d(%.2e)=%.2f lon@%d(%.2e)=%.2f",
+                                                      v, ac.callsign, latOff, lsc, decLatLE, lonOff, nsc, decLonLE)
+                                    if bestHit == nil || v > bestHit!.votes { bestHit = (key, v, disp) }
+                                    if v >= 3 { break outerXcorr }
+                                }
                             }
                         }
                     }
                 }
             }
-            adsbDiag.prop70ScanResult = found.isEmpty
-                ? (allAircraft.isEmpty ? "" : "∅/\(allAircraft.count)ac")
-                : found
-            // Persist the best hit across scan windows (survives aircraft aging out).
-            if !found.isEmpty {
-                adsbDiag.prop70ConfirmedHit = found
+
+            if let best = bestHit {
+                adsbDiag.prop70ScanResult = best.display
+                if best.votes >= 3 && adsbDiag.prop70ConfirmedHit.isEmpty {
+                    adsbDiag.prop70ConfirmedHit = best.display
+                }
+            } else {
+                adsbDiag.prop70ScanResult = allAircraft.isEmpty ? "" : "∅/\(allAircraft.count)ac"
             }
         }
 
