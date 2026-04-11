@@ -125,6 +125,9 @@ struct ADSBDiagnostics {
     var prop70XcorrVotes: [String: Int] = [:]
     /// Confirmed hit — only set when a single (latOff,lonOff,scale) key accumulates 3+ votes.
     var prop70ConfirmedHit: String = ""
+    /// Real-time decode of 70b frame at hypothesis offsets (lat@3 LE, lon@38 LE, scale 360/2^24).
+    /// Updated on every 70b frame arrival.  Shows 3 candidate slots with nearest aircraft match.
+    var prop70HypothesisResult: String = ""
 
     // MARK: Multi-frame correlation capture
     /// Ring buffer of the last 4 distinct 22-byte 0x26 frames (hex strings), newest first.
@@ -663,6 +666,12 @@ class ConnectionLogic: ObservableObject {
             return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
         }
 
+        // Little-endian signed 24-bit read (used for xcorr and hypothesis decode).
+        func s24le(_ off: Int) -> Double {
+            let v = Int32(b[off]) | Int32(b[off+1]) << 8 | Int32(b[off+2]) << 16
+            return Double(v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v)
+        }
+
         adsbDiag.prop26FramesVoted += 1
 
         // 70b frame layout: [0-1] header, [2-17] sub0, [18-33] sub1, [34-49] unknown block,
@@ -732,12 +741,6 @@ class ConnectionLogic: ObservableObject {
             // Include ALL aircraft (Sentry + Internet) as reference points.
             let allAircraft = Array(detectedAircraft.values)
 
-            // Little-endian signed 24-bit read.
-            func s24le(_ off: Int) -> Double {
-                let v = Int32(b[off]) | Int32(b[off+1]) << 8 | Int32(b[off+2]) << 16
-                return Double(v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v)
-            }
-
             // Vote-accumulating cross-correlation.
             // With 100+ Internet aircraft, ~33 false positives per scan window are expected.
             // A true hit at a specific (latOff, lonOff, scale) key will accumulate votes across
@@ -798,6 +801,45 @@ class ConnectionLogic: ObservableObject {
             } else {
                 adsbDiag.prop70ScanResult = allAircraft.isEmpty ? "" : "∅/\(allAircraft.count)ac"
             }
+        }
+
+        // Build 180: Real-time hypothesis decode at confirmed-candidate offsets.
+        // 🎯LE×2 hit identified: lat@3 LE, lon@38 LE, scale 360/2^24 (2.15e-05°/LSB).
+        // Hypothesis: the 70b variable region packs lat fields together (b[3,6,9…])
+        // and lon fields together (b[38,41,44…]) — all lats first, then all lons.
+        // Show 3 candidate aircraft slots (stride 3 between each).
+        // Each slot shows decoded lat/lon and nearest aircraft within 5°.
+        do {
+            let hypScale = 360.0 / 16_777_216.0   // 2.15e-05 — confirmed LE scale
+            let latBases = [3, 6, 9]
+            let lonBases = [38, 41, 44]
+            let userLat  = currentLocation?.latitude  ?? 40.0
+            let userLon  = currentLocation?.longitude ?? -74.0
+            var parts: [String] = []
+            for slot in 0 ..< 3 {
+                let lOff = latBases[slot]
+                let nOff = lonBases[slot]
+                guard nOff + 2 < b.count else { continue }
+                let hypLat = s24le(lOff) * hypScale
+                let hypLon = s24le(nOff) * hypScale
+                // Find nearest aircraft within 5° of decoded position.
+                let nearest = detectedAircraft.values.min(by: {
+                    max(abs($0.latitude - hypLat), abs($0.longitude - hypLon)) <
+                    max(abs($1.latitude - hypLat), abs($1.longitude - hypLon))
+                })
+                let tag: String
+                if let n = nearest,
+                   abs(n.latitude - hypLat) < 2.0,
+                   abs(n.longitude - hypLon) < 2.0 {
+                    tag = n.callsign
+                } else if abs(hypLat - userLat) < 10.0 && abs(hypLon - userLon) < 10.0 {
+                    tag = "?"
+                } else {
+                    tag = "∅"
+                }
+                parts.append(String(format: "S%d %.2f/%.2f(%@)", slot, hypLat, hypLon, tag))
+            }
+            adsbDiag.prop70HypothesisResult = parts.joined(separator: " ")
         }
 
         guard bestVotes >= 8 && (bestVotes - thirdVotes) >= 2 else {
