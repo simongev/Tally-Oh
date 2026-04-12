@@ -315,8 +315,19 @@ class ConnectionLogic: ObservableObject {
     }
 
     func updateLocation(_ location: CLLocationCoordinate2D, altitudeFeet: Double = 0) {
+        let firstFix = currentLocation == nil
         currentLocation = location
         currentAltitudeFeet = altitudeFeet
+        // On first GPS fix, evict ghost ADS-B aircraft that were decoded before the
+        // geographic filter could apply (currentLocation was nil at decode time).
+        // This cleans up worldwide phantom aircraft that appear during GPS cold-start.
+        if firstFix {
+            detectedAircraft = detectedAircraft.filter { _, ac in
+                ac.source == .internet ||
+                (abs(ac.latitude  - location.latitude)  <= 5.0 &&
+                 abs(ac.longitude - location.longitude) <= 5.0)
+            }
+        }
         // Kick off internet fetching now that we have a location.
         // Check both the published flag AND the live path status so we don't
         // miss the window where NWPathMonitor hasn't fired its first callback yet.
