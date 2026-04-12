@@ -1588,7 +1588,19 @@ class ARTrafficViewController: UIViewController {
         case .disconnected:  lines.append("📡 ADS-B: Off")
         }
 
-        lines.append(connectionLogic.isInternetAvailable ? "🌐 Internet: Online" : "🌐 Internet: Offline")
+        // When internet is offline, cached internet aircraft may still be in the dict
+        // (they age out via 90s cleanup).  Show the cached count so the user knows xcorr
+        // still has reference aircraft to work with.
+        if connectionLogic.isInternetAvailable {
+            lines.append("🌐 Internet: Online")
+        } else {
+            let cachedNet = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
+            if cachedNet > 0 {
+                lines.append("🌐 Internet: Offline (\(cachedNet) cached)")
+            } else {
+                lines.append("🌐 Internet: Offline")
+            }
+        }
 
         let displayLoc = activeLocation
         let displayAlt = activeAltitude

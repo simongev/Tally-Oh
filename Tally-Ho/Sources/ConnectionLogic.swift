@@ -1297,9 +1297,12 @@ class ConnectionLogic: ObservableObject {
     private func stopInternetFetching() {
         internetFetchTimer?.invalidate()
         internetFetchTimer = nil
+        // Do NOT evict internet aircraft immediately — they remain in detectedAircraft and
+        // age out via the 90-second cleanup timer.  This gives the 70b cross-correlation
+        // ~90 seconds of cached reference aircraft after switching to Sentry WiFi (which
+        // has no internet), enabling xcorr to run against recently-seen traffic.
         DispatchQueue.main.async {
-            self.detectedAircraft = self.detectedAircraft.filter { $0.value.source == .adsb }
-            self.internetAircraftCount = 0
+            self.internetAircraftCount = 0   // signal: live feed is down, but aircraft may still be cached
         }
     }
 
