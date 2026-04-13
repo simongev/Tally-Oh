@@ -142,6 +142,29 @@ struct ADSBDiagnostics {
     /// The raw bytes (space-separated hex) of the most recent 47b frame that successfully
     /// decoded an aircraft position via decodeProprietaryTraffic.
     var captured47bFrameHex: String = ""
+
+    // MARK: - Undecoded frame xcorr (21b / 43b / 47b)
+
+    /// Confirmed encoding for a previously-undecoded frame size.
+    struct UndecodedHit {
+        let isLE: Bool
+        let latOff: Int
+        let lonOff: Int
+        let scale: Double
+        let votes: Int
+        var display: String {
+            "\(isLE ? "LE" : "BE") lat@\(latOff) lon@\(lonOff) sc=\(String(format: "%.2e", scale)) ×\(votes)"
+        }
+    }
+
+    /// Accumulated xcorr vote counts for 21b/43b/47b frames.
+    /// Key format: "\(size)b LE|BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)"
+    var undecodedXcorrVotes: [String: Int] = [:]
+    /// Current best xcorr candidate — shown in HUD while scanning.
+    var undecodedXcorrResult: String = ""
+    /// Confirmed encoding per frame size (key = payload byte count).
+    /// Set once ≥8 votes accumulate for one candidate; drives direct decode thereafter.
+    var undecodedHits: [Int: UndecodedHit] = [:]
 }
 
 // MARK: - ConnectionLogic
@@ -564,9 +587,10 @@ class ConnectionLogic: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
-                // Always refresh 70b, 22b, and 20b samples (most-recent wins).
-                // Other sizes: first-seen only (not enough variety to benefit from refresh).
-                if copy26.count == 70 || copy26.count == 22 || copy26.count == 20 {
+                // Always refresh high-interest frame sizes so HUD stays current.
+                // Other sizes: first-seen only.
+                let alwaysRefreshSizes: Set<Int> = [70, 22, 20, 21, 43, 47]
+                if alwaysRefreshSizes.contains(copy26.count) {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
@@ -604,16 +628,22 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
                     }
-                } else if copy26.count != 70,
-                          copy26.count != 22,
+                } else if [21, 43, 47].contains(copy26.count) {
+                    // xcorr-based decode for undecoded frame sizes.
+                    // Once a hit is confirmed, decode directly; otherwise accumulate votes.
+                    if let hit = self.adsbDiag.undecodedHits[copy26.count] {
+                        if let ac = self.decodeWithHit(copy26, hit: hit) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.parsedTraffic += 1
+                        }
+                    } else {
+                        self.scanUndecodedFrame(copy26)
+                    }
+                } else if copy26.count != 70, copy26.count != 22,
                           let ac = self.decodeProprietaryTraffic(copy26) {
-                    // Extended frames (e.g. 47b): use hardcoded lat@15/lon@5 offsets.
+                    // Other frame sizes: attempt with 22b-calibrated offsets.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
-                    if copy26.count == 47 {
-                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
-                        self.adsbDiag.captured47bFrameHex = "\(ac.callsign): \(hex)"
-                    }
                 }
                 self.startSentryRegistration()
             }
@@ -1021,6 +1051,150 @@ class ConnectionLogic: ObservableObject {
                                    lastUpdate: Date(), source: .adsb))
         }
         return result
+    }
+
+    /// Cross-correlation scan for undecoded frame sizes (21b / 43b / 47b).
+    ///
+    /// Tries all (endian, latOff, lonOff, scale) combinations and votes for each
+    /// that decodes to a position near the user's GPS (±0.3°) or a known aircraft
+    /// (±0.15°).  After ≥8 votes on one candidate the hit is confirmed and stored
+    /// in `adsbDiag.undecodedHits[n]` so subsequent frames are decoded directly
+    /// without re-running the full scan.
+    ///
+    /// Must be called on the main thread.
+    private func scanUndecodedFrame(_ payload: Data) {
+        let n = payload.count
+        let b = Array(payload)
+        let scales: [Double] = [
+            1.0 / 100_000.0,       // LE 1e-5 (confirmed for 70b)
+            180.0 / 16_777_216.0,  // GDL90 lat scale
+            360.0 / 16_777_216.0,  // GDL90 lon scale
+        ]
+
+        // Build reference set: GPS with ±0.3° tolerance, known aircraft with ±0.15°.
+        struct Ref { let lat, lon, tol: Double }
+        var refs: [Ref] = []
+        if let loc = currentLocation {
+            refs.append(Ref(lat: loc.latitude, lon: loc.longitude, tol: 0.3))
+        }
+        for ac in detectedAircraft.values {
+            refs.append(Ref(lat: ac.latitude, lon: ac.longitude, tol: 0.15))
+        }
+        guard !refs.isEmpty else { return }
+
+        let maxOff = n - 3
+        guard maxOff >= 3 else { return }
+
+        func s24le(_ i: Int) -> Double {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+            let s = v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            return Double(s)
+        }
+        func s24be(_ i: Int) -> Double {
+            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+            let s = v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            return Double(s)
+        }
+
+        let sizePrefix = "\(n)b "
+
+        for latOff in 0...maxOff {
+            for lonOff in 0...maxOff {
+                guard abs(lonOff - latOff) >= 3 else { continue }
+                for (scIdx, sc) in scales.enumerated() {
+                    // LE
+                    let latLE = s24le(latOff) * sc
+                    let lonLE = s24le(lonOff) * sc
+                    if (-90...90).contains(latLE), (-180...180).contains(lonLE),
+                       abs(latLE) > 1 || abs(lonLE) > 1 {
+                        for ref in refs where
+                            abs(latLE - ref.lat) <= ref.tol &&
+                            abs(lonLE - ref.lon) <= ref.tol {
+                            adsbDiag.undecodedXcorrVotes[
+                                "\(sizePrefix)LE lat@\(latOff) lon@\(lonOff) sc\(scIdx)",
+                                default: 0] += 1
+                        }
+                    }
+                    // BE
+                    let latBE = s24be(latOff) * sc
+                    let lonBE = s24be(lonOff) * sc
+                    if (-90...90).contains(latBE), (-180...180).contains(lonBE),
+                       abs(latBE) > 1 || abs(lonBE) > 1 {
+                        for ref in refs where
+                            abs(latBE - ref.lat) <= ref.tol &&
+                            abs(lonBE - ref.lon) <= ref.tol {
+                            adsbDiag.undecodedXcorrVotes[
+                                "\(sizePrefix)BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)",
+                                default: 0] += 1
+                        }
+                    }
+                }
+            }
+        }
+
+        // Evaluate convergence for this specific frame size.
+        let sizeVotes = adsbDiag.undecodedXcorrVotes.filter { $0.key.hasPrefix(sizePrefix) }
+        guard let (bestKey, bestVotes) = sizeVotes.max(by: { $0.value < $1.value }) else { return }
+        let top3 = Array(sizeVotes.values.sorted(by: >).prefix(3))
+        let thirdVotes = top3.count > 2 ? top3[2] : 0
+
+        adsbDiag.undecodedXcorrResult = "🔍\(bestKey) ×\(bestVotes)/\(thirdVotes)"
+
+        // Confirm at ≥8 votes with winner leading 3rd by ≥3.
+        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 3 else { return }
+
+        // Parse the winning key: "\(n)b LE|BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)"
+        let parts = bestKey.components(separatedBy: " ")
+        guard parts.count == 5,
+              let isLE = (parts[1] == "LE" ? true : parts[1] == "BE" ? false : nil),
+              parts[2].hasPrefix("lat@"), parts[3].hasPrefix("lon@"),
+              let latOff = Int(parts[2].dropFirst(4)),
+              let lonOff = Int(parts[3].dropFirst(4)),
+              parts[4].hasPrefix("sc"),
+              let scIdx = Int(parts[4].dropFirst(2)),
+              scIdx < scales.count else { return }
+
+        adsbDiag.undecodedHits[n] = ADSBDiagnostics.UndecodedHit(
+            isLE: isLE, latOff: latOff, lonOff: lonOff,
+            scale: scales[scIdx], votes: bestVotes)
+        adsbDiag.undecodedXcorrResult = "✅\(bestKey) ×\(bestVotes)"
+    }
+
+    /// Decode a payload using a confirmed xcorr hit.
+    /// Must be called on the main thread.
+    private func decodeWithHit(_ payload: Data, hit: ADSBDiagnostics.UndecodedHit) -> Aircraft? {
+        let b = Array(payload)
+        let n = b.count
+        guard hit.latOff + 2 < n, hit.lonOff + 2 < n else { return nil }
+
+        func s24(_ i: Int) -> Int32 {
+            if hit.isLE {
+                let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+                return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            } else {
+                let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+                return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            }
+        }
+
+        let lat = Double(s24(hit.latOff)) * hit.scale
+        let lon = Double(s24(hit.lonOff)) * hit.scale
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { return nil }
+
+        // Tentative ICAO from b[1-3]; prefixed with 'U' + frame size to avoid
+        // collisions with 22b ('S') and 70b ('T') aircraft.
+        let icao = n >= 4
+            ? String(format: "U%d%02X%02X%02X", n, b[1], b[2], b[3])
+            : String(format: "U%d%02X", n, b[1])
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                        lastUpdate: Date(), source: .adsb)
     }
 
     /// Brute-force all 3-byte positions and scale factors in a 0x25 ownship frame

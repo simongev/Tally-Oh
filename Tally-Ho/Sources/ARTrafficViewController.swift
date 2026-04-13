@@ -1495,6 +1495,13 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
+                // Xcorr scan progress for 21b / 43b / 47b undecoded frames.
+                if !d.undecodedXcorrResult.isEmpty {
+                    lines.append(d.undecodedXcorrResult)
+                }
+                for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
+                    lines.append("✅\(size)b \(hit.display)")
+                }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
@@ -1517,22 +1524,44 @@ class ARTrafficViewController: UIViewController {
                     }.joined(separator: " ")
                     lines.append("F\(i+1): \(annotated)")
                 }
+                if let hex43 = d.sampleFramesBySize[43] {
+                    let hit43 = d.undecodedHits[43]
+                    let parts43 = hex43.components(separatedBy: " ")
+                    let annotated43 = parts43.enumerated().map { (idx, h) -> String in
+                        if let hit = hit43, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
+                        if let hit = hit43, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
+                        return h
+                    }.joined(separator: " ")
+                    let toks43 = annotated43.components(separatedBy: " ")
+                    lines.append("43b: " + toks43.prefix(22).joined(separator: " "))
+                    let rest43 = Array(toks43.dropFirst(22))
+                    if !rest43.isEmpty { lines.append("     " + rest43.joined(separator: " ")) }
+                }
                 if let hex47 = d.sampleFramesBySize[47] {
-                    // Annotate [lat] and {lon} positions so we can verify the 47b layout.
-                    // Also mark bytes 1-3 with (ICAO) since that's what decodeProprietaryTraffic uses.
-                    let latOff47 = d.propLatByteOffset
-                    let lonOff47 = d.propLonByteOffset
+                    // Prefer xcorr-confirmed offsets for 47b; fall back to 22b calibration.
+                    let hit47 = d.undecodedHits[47]
+                    let latOff47 = hit47.map { $0.latOff } ?? d.propLatByteOffset
+                    let lonOff47 = hit47.map { $0.lonOff } ?? d.propLonByteOffset
                     let parts47 = hex47.components(separatedBy: " ")
                     let annotated47 = parts47.enumerated().map { (idx, h) -> String in
                         if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
                         if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        if idx >= 1 && idx <= 3 { return "(\(h))" }   // ICAO at b[1-3]
                         return h
                     }.joined(separator: " ")
                     let toks47 = annotated47.components(separatedBy: " ")
                     lines.append("47b: " + toks47.prefix(28).joined(separator: " "))
                     let rest47 = Array(toks47.dropFirst(28))
                     if !rest47.isEmpty { lines.append("     " + rest47.joined(separator: " ")) }
+                }
+                if let hex21 = d.sampleFramesBySize[21] {
+                    let hit21 = d.undecodedHits[21]
+                    let parts21 = hex21.components(separatedBy: " ")
+                    let annotated21 = parts21.enumerated().map { (idx, h) -> String in
+                        if let hit = hit21, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
+                        if let hit = hit21, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
+                        return h
+                    }.joined(separator: " ")
+                    lines.append("21b: " + annotated21)
                 }
                 if let hex56 = d.sampleFramesBySize[56] {
                     let bytes = hex56.components(separatedBy: " ")
@@ -1554,13 +1583,9 @@ class ARTrafficViewController: UIViewController {
                     let rest70 = Array(annotated70.dropFirst(35))
                     if !rest70.isEmpty { lines.append("     " + rest70.joined(separator: " ")) }
                 }
-                // 28b and 21b frames — possibly contain nearby traffic that ForeFlight sees.
-                // Displayed raw (no annotation yet) so we can identify the encoding.
+                // 28b = 0x25 ownship frame — shown raw for reference.
                 if let hex28 = d.sampleFramesBySize[28] {
                     lines.append("28b: \(hex28)")
-                }
-                if let hex21 = d.sampleFramesBySize[21] {
-                    lines.append("21b: \(hex21)")
                 }
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
