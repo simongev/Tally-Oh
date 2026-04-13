@@ -115,9 +115,8 @@ struct ADSBDiagnostics {
     var prop70LonByteOffset: Int = 0
     var prop70LatScale: Double = 0
     var prop70LonScale: Double = 0
-    /// In-progress 70b voting status — kept separate so it doesn't overwrite a
-    /// converged ✅22 result in calibrationStatus.
-    var prop70VotingStatus: String = ""
+    /// 70b bundle calibration status shown in HUD (hardcoded since Build 185).
+    var prop70VotingStatus: String = "HARDCODED LE 1e-5 lat@11/lon@46"
     /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
     var prop70ScanResult: String = ""
     /// Vote counts for cross-correlation candidates across scan windows.
@@ -125,8 +124,7 @@ struct ADSBDiagnostics {
     var prop70XcorrVotes: [String: Int] = [:]
     /// Confirmed hit — only set when a single (latOff,lonOff,scale) key accumulates 3+ votes.
     var prop70ConfirmedHit: String = ""
-    /// Real-time decode of 70b frame at hypothesis offsets (lat@3 LE, lon@38 LE, scale 360/2^24).
-    /// Updated on every 70b frame arrival.  Shows 3 candidate slots with nearest aircraft match.
+    /// Hypothesis decode result (unused since Build 185 — encoding confirmed).
     var prop70HypothesisResult: String = ""
 
     // MARK: Multi-frame correlation capture
@@ -587,12 +585,8 @@ class ConnectionLogic: ObservableObject {
                     }
                 }
 
-                // 70b voting runs until prop70SubRecordOffset is set (bundle calibrated).
-                // 22b voting is permanently disabled — layout confirmed and hardcoded.
-                if self.adsbDiag.prop70SubRecordOffset == nil && copy26.count == 70 {
-                    self.voteForEncoding26(copy26)
-                }
-                // 22b: always use hardcoded single-aircraft decoder (independent of 70b state).
+                // 70b voting removed — encoding confirmed and hardcoded (Build 185).
+                // 22b: always use hardcoded single-aircraft decoder.
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26) {
                         self.detectedAircraft[ac.id] = ac
@@ -600,9 +594,8 @@ class ConnectionLogic: ObservableObject {
                         let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                         self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
                     }
-                } else if copy26.count == 70,
-                          self.adsbDiag.prop70SubRecordOffset != nil {
-                    // 70b bundle path — active once voteForEncoding26 converges.
+                } else if copy26.count == 70 {
+                    // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3).
                     for ac in self.decodeProprietaryBundle(copy26) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
@@ -979,63 +972,48 @@ class ConnectionLogic: ObservableObject {
         detectedAircraft.removeAll()
     }
 
-    /// Decode three aircraft sub-records from a 70-byte proprietary bundle frame.
-    /// Requires calibration via voteForEncoding26.  Must be called on the main thread.
+    /// Decode aircraft from a 70-byte proprietary bundle frame.
+    /// Encoding confirmed via ×3 xcorr hit (Build 185):
+    ///   - LE 24-bit signed, scale 1/100,000 (1.0e-05 °/LSB)
+    ///   - Slot 0: lat@3,  lon@38  (tentative ×2)
+    ///   - Slot 1: lat@11, lon@46  (confirmed ×3 — NKS832/RPA5643 hits)
+    /// Both slots use a 35-byte lat→lon separation (46-11 = 38-3 = 35).
+    /// Must be called on the main thread.
     private func decodeProprietaryBundle(_ payload: Data) -> [Aircraft] {
-        guard let ro = adsbDiag.prop70SubRecordOffset,
-              payload.count == 70 else { return [] }
-        let latOff = adsbDiag.prop70LatByteOffset
-        let lonOff = adsbDiag.prop70LonByteOffset
-        let latSc  = adsbDiag.prop70LatScale
-        let lonSc  = adsbDiag.prop70LonScale
-        guard latSc != 0, lonSc != 0 else { return [] }
-
+        guard payload.count == 70 else { return [] }
         let b = Array(payload)
+        let scale = 1.0 / 100_000.0
 
-        func s24at(_ off: Int) -> Int32 {
-            let v = Int32(b[off]) << 16 | Int32(b[off + 1]) << 8 | Int32(b[off + 2])
+        // LE 24-bit signed: byte[off] = LSB, byte[off+1] = MID, byte[off+2] = MSB
+        func s24le(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) | Int32(b[off + 1]) << 8 | Int32(b[off + 2]) << 16
             return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
         }
 
-        var result: [Aircraft] = []
-        for ri in 0 ..< 2 {   // sub0 (bytes 2-17) and sub1 (bytes 18-33) carry aircraft positions
-            let sub = ro + ri * 16
-            guard sub + max(latOff + 2, lonOff + 2) < b.count else { continue }
+        // Slot 0 lat@3/lon@38 (tentative), Slot 1 lat@11/lon@46 (confirmed ×3)
+        let slots: [(latOff: Int, lonOff: Int, id: String)] = [
+            (3,  38, "T70A"),
+            (11, 46, "T70B"),
+        ]
 
-            let lat = Double(s24at(sub + latOff)) * latSc
-            let lon = Double(s24at(sub + lonOff)) * lonSc
+        var result: [Aircraft] = []
+        for slot in slots {
+            guard slot.lonOff + 2 < b.count else { continue }
+            let lat = Double(s24le(slot.latOff)) * scale
+            let lon = Double(s24le(slot.lonOff)) * scale
 
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
-            // Reject positions more than 5° from user — prevents phantom aircraft from
-            // random bytes passing the range check (same filter as decodeProprietarySingle).
+            // Reject positions more than 5° from user — prevents phantom aircraft.
             if let loc = currentLocation,
                abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { continue }
+            // Reject positions identical to user (own-ship echo).
             if let loc = currentLocation,
                abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
 
-            // Pick ICAO from the first 3-byte window that doesn't overlap lat or lon bytes.
-            var icaoOff = 0
-            for off in 0 ..< 20 {
-                let noLat = off + 2 < latOff || off > latOff + 2
-                let noLon = off + 2 < lonOff || off > lonOff + 2
-                if noLat && noLon { icaoOff = off; break }
-            }
-            let icao = String(format: "P%02X%02X%02X",
-                              b[sub + icaoOff], b[sub + icaoOff + 1], b[sub + icaoOff + 2])
-            // Attempt GDL90 altitude decode from the two bytes after lat+lon (offset 6
-            // when latOff=0/lonOff=3). Raw 12-bit value × 25 − 1000 ft.  If the result
-            // is implausible fall back to 10 000 ft so AR dots appear above the user.
-            let altOff = max(latOff, lonOff) + 3
-            var altFt: Double = 10_000
-            if sub + altOff + 1 < b.count {
-                let raw12 = (Int(b[sub + altOff]) << 4) | (Int(b[sub + altOff + 1]) >> 4)
-                let decoded = Double(raw12) * 25.0 - 1000.0
-                if decoded >= -1000 && decoded <= 50_000 { altFt = decoded }
-            }
-            result.append(Aircraft(id: icao, callsign: icao,
+            result.append(Aircraft(id: slot.id, callsign: slot.id,
                                    latitude: lat, longitude: lon,
-                                   altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
+                                   altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
                                    lastUpdate: Date(), source: .adsb))
         }
         return result

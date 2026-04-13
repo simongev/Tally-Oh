@@ -1490,13 +1490,10 @@ class ARTrafficViewController: UIViewController {
                     if toks.count > 24 { lines.append("      " + Array(toks.dropFirst(24)).joined(separator: " ")) }
                 }
                 if !d.prop70VotingStatus.isEmpty {
-                    lines.append("🗳 \(d.prop70VotingStatus)")
+                    lines.append("✅70b \(d.prop70VotingStatus)")
                 }
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
-                }
-                if !d.prop70HypothesisResult.isEmpty {
-                    lines.append("🔍 \(d.prop70HypothesisResult)")
                 }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
