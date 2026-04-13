@@ -130,6 +130,10 @@ struct ADSBDiagnostics {
     // MARK: Multi-frame correlation capture
     /// Ring buffer of the last 4 distinct 22-byte 0x26 frames (hex strings), newest first.
     var recent22bFrames: [String] = []
+    /// Last internet fetch result: nil=never, "" = success, non-empty = error message.
+    var lastInternetFetchStatus: String? = nil
+    /// Aircraft count from last successful internet fetch (for HUD display).
+    var lastInternetFetchCount: Int = 0
     /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
     var recent20bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
@@ -1295,11 +1299,14 @@ class ConnectionLogic: ObservableObject {
             switch result {
             case .success(let aircraft):
                 self?.consecutiveInternetFailures = 0
+                DispatchQueue.main.async { self?.adsbDiag.lastInternetFetchStatus = "" }
                 self?.mergeInternetAircraft(aircraft)
             case .failure(let err):
-                print("⚠️ adsb.lol fetch failed: \(err.localizedDescription)")
+                let msg = err.localizedDescription
+                print("⚠️ adsb.lol fetch failed: \(msg)")
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    self.adsbDiag.lastInternetFetchStatus = msg
                     self.consecutiveInternetFailures += 1
                     if self.consecutiveInternetFailures >= self.maxInternetFailuresBeforeOffline {
                         // Treat the path as having no real internet (e.g. Sentry WiFi hotspot).
@@ -1381,7 +1388,9 @@ class ConnectionLogic: ObservableObject {
                     var merged = self.detectedAircraft
                     for (id, ac) in updates { merged[id] = ac }
                     self.detectedAircraft = merged
-                    self.internetAircraftCount = merged.values.filter { $0.source == .internet }.count
+                    let netCount = merged.values.filter { $0.source == .internet }.count
+                    self.internetAircraftCount = netCount
+                    self.adsbDiag.lastInternetFetchCount = netCount
                 }
             }
         }

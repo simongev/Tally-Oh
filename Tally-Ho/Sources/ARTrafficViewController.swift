@@ -1541,8 +1541,7 @@ class ARTrafficViewController: UIViewController {
                     if !rest.isEmpty { lines.append("     " + rest.joined(separator: " ")) }
                 }
                 if let hex70 = d.sampleFramesBySize[70] {
-                    // Annotate hypothesis bytes: [lat] at b[3-5], {lon} at b[38-40].
-                    // Adjacent slots: [lat1] at b[6-8], {lon1} at b[41-43]; [lat2] at b[9-11], {lon2} at b[44-46].
+                    // Annotate confirmed slots: [lat] at b[3-5,9-11], {lon} at b[38-40,44-46].
                     let latRanges  = [3...5, 6...8, 9...11]
                     let lonRanges  = [38...40, 41...43, 44...46]
                     let bytes70 = hex70.components(separatedBy: " ")
@@ -1554,6 +1553,14 @@ class ARTrafficViewController: UIViewController {
                     lines.append("70b: " + annotated70.prefix(35).joined(separator: " "))
                     let rest70 = Array(annotated70.dropFirst(35))
                     if !rest70.isEmpty { lines.append("     " + rest70.joined(separator: " ")) }
+                }
+                // 28b and 21b frames — possibly contain nearby traffic that ForeFlight sees.
+                // Displayed raw (no annotation yet) so we can identify the encoding.
+                if let hex28 = d.sampleFramesBySize[28] {
+                    lines.append("28b: \(hex28)")
+                }
+                if let hex21 = d.sampleFramesBySize[21] {
+                    lines.append("21b: \(hex21)")
                 }
             }
             var diagStr = "\(parsedStr) | \(rawStr)"
@@ -1573,7 +1580,16 @@ class ARTrafficViewController: UIViewController {
         // (they age out via 90s cleanup).  Show the cached count so the user knows xcorr
         // still has reference aircraft to work with.
         if connectionLogic.isInternetAvailable {
-            lines.append("🌐 Internet: Online")
+            let d2 = connectionLogic.adsbDiag
+            if let status = d2.lastInternetFetchStatus {
+                if status.isEmpty {
+                    lines.append("🌐 Internet: Online (\(d2.lastInternetFetchCount)ac)")
+                } else {
+                    lines.append("🌐 Internet: Online ⚠️ \(status)")
+                }
+            } else {
+                lines.append("🌐 Internet: Online (fetching…)")
+            }
         } else {
             let cachedNet = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
             if cachedNet > 0 {
