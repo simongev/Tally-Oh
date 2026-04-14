@@ -1495,9 +1495,8 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
-                // Xcorr scan progress for 21b / 43b / 47b undecoded frames.
-                // One result line per size (scanning and confirmed).
-                for size in [21, 43, 47] {
+                // Xcorr scan for 21b / 43b frames (rare, unknown purpose).
+                for size in [21, 43] {
                     if let result = d.undecodedXcorrResults[size] {
                         lines.append(result)
                     } else if d.frameSizeCounts[size] != nil {
@@ -1506,6 +1505,10 @@ class ARTrafficViewController: UIViewController {
                 }
                 for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
                     lines.append("✅\(size)b \(hit.display)")
+                }
+                // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
+                if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {
+                    lines.append("47b×\(cnt47) = 0x25×\(cnt25) (ownship ext)")
                 }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25

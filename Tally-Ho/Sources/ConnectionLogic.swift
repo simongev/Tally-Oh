@@ -634,14 +634,16 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.parsedTraffic += 1
                     }
                 } else if [21, 43, 47].contains(copy26.count) {
-                    // xcorr-based decode for undecoded frame sizes.
-                    // Once a hit is confirmed, decode directly; otherwise accumulate votes.
-                    if let hit = self.adsbDiag.undecodedHits[copy26.count] {
+                    // 47b frames are paired 1:1 with 0x25 ownship frames — they appear to
+                    // carry extended device data, not traffic positions.  Skip xcorr for 47b.
+                    // 21b and 43b are rare, unknown, and worth scanning.
+                    let shouldScan = copy26.count != 47
+                    if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit) {
                             self.detectedAircraft[ac.id] = ac
                             self.adsbDiag.parsedTraffic += 1
                         }
-                    } else {
+                    } else if shouldScan {
                         self.scanUndecodedFrame(copy26)
                     }
                 } else if copy26.count != 70, copy26.count != 22,
@@ -1048,7 +1050,7 @@ class ConnectionLogic: ObservableObject {
                abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { continue }
             // Reject positions identical to user (own-ship echo).
             if let loc = currentLocation,
-               abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { continue }
+               abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
 
             result.append(Aircraft(id: slot.id, callsign: slot.id,
                                    latitude: lat, longitude: lon,
@@ -1075,6 +1077,8 @@ class ConnectionLogic: ObservableObject {
     /// Must be called on the main thread.
     private func scanUndecodedFrame(_ payload: Data) {
         let n = payload.count
+        // 47b frames are paired with 0x25 ownship (count always matches) — skip.
+        guard n != 47 else { return }
         let b = Array(payload)
 
         // lat and lon are tried with all combinations of these scales.
@@ -1214,7 +1218,7 @@ class ConnectionLogic: ObservableObject {
         if let loc = currentLocation,
            abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
         if let loc = currentLocation,
-           abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 { return nil }
+           abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { return nil }
 
         // Tentative ICAO from b[1-3]; prefixed with 'U' + frame size to avoid
         // collisions with 22b ('S') and 70b ('T') aircraft.
@@ -1343,7 +1347,7 @@ class ConnectionLogic: ObservableObject {
 
         // Skip ownship: if position is within 0.1° of user's GPS it's us, not traffic.
         if let loc = currentLocation,
-           abs(lat - loc.latitude) < 0.1 && abs(lon - loc.longitude) < 0.1 {
+           abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 {
             return nil
         }
 
