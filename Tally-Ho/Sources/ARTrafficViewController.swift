@@ -1496,8 +1496,13 @@ class ARTrafficViewController: UIViewController {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
                 // Xcorr scan progress for 21b / 43b / 47b undecoded frames.
-                if !d.undecodedXcorrResult.isEmpty {
-                    lines.append(d.undecodedXcorrResult)
+                // One result line per size (scanning and confirmed).
+                for size in [21, 43, 47] {
+                    if let result = d.undecodedXcorrResults[size] {
+                        lines.append(result)
+                    } else if d.frameSizeCounts[size] != nil {
+                        lines.append("🔍\(size)b scanning…")
+                    }
                 }
                 for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
                     lines.append("✅\(size)b \(hit.display)")

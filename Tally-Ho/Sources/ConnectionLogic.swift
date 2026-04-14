@@ -150,18 +150,23 @@ struct ADSBDiagnostics {
         let isLE: Bool
         let latOff: Int
         let lonOff: Int
-        let scale: Double
+        let latScale: Double   // scale applied to the lat field
+        let lonScale: Double   // scale applied to the lon field (may differ from latScale)
         let votes: Int
         var display: String {
-            "\(isLE ? "LE" : "BE") lat@\(latOff) lon@\(lonOff) sc=\(String(format: "%.2e", scale)) ×\(votes)"
+            let latSc = String(format: "%.2e", latScale)
+            let lonSc = String(format: "%.2e", lonScale)
+            let sc = latScale == lonScale ? "sc=\(latSc)" : "latSc=\(latSc) lonSc=\(lonSc)"
+            return "\(isLE ? "LE" : "BE") lat@\(latOff) lon@\(lonOff) \(sc) ×\(votes)"
         }
     }
 
     /// Accumulated xcorr vote counts for 21b/43b/47b frames.
-    /// Key format: "\(size)b LE|BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)"
+    /// Key format: "\(size)b LE|BE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)"
+    /// where lsi/msi index into [1e-5, 180/2^24, 360/2^24].
     var undecodedXcorrVotes: [String: Int] = [:]
-    /// Current best xcorr candidate — shown in HUD while scanning.
-    var undecodedXcorrResult: String = ""
+    /// Current best xcorr candidate per frame size (key = byte count).
+    var undecodedXcorrResults: [Int: String] = [:]
     /// Confirmed encoding per frame size (key = payload byte count).
     /// Set once ≥8 votes accumulate for one candidate; drives direct decode thereafter.
     var undecodedHits: [Int: UndecodedHit] = [:]
@@ -1055,30 +1060,41 @@ class ConnectionLogic: ObservableObject {
 
     /// Cross-correlation scan for undecoded frame sizes (21b / 43b / 47b).
     ///
-    /// Tries all (endian, latOff, lonOff, scale) combinations and votes for each
-    /// that decodes to a position near the user's GPS (±0.3°) or a known aircraft
-    /// (±0.15°).  After ≥8 votes on one candidate the hit is confirmed and stored
-    /// in `adsbDiag.undecodedHits[n]` so subsequent frames are decoded directly
-    /// without re-running the full scan.
+    /// Tries all (endian, latOff, latScale, lonOff, lonScale) combinations.
+    /// Lat and lon may use DIFFERENT scales, covering standard GDL90 layout
+    /// (lat: 180/2^24, lon: 360/2^24) as well as the proprietary 1e-5 format.
+    ///
+    /// References used (tightest wins):
+    ///   • Internet aircraft (from adsb.lol) — ±0.10° lat, ±0.15° lon
+    ///   • User GPS                          — ±0.20° lat, ±0.20° lon
+    ///   • Other decoded ADS-B aircraft      — ±0.15° lat, ±0.15° lon
+    ///
+    /// Confirms once one candidate reaches ≥8 votes AND leads 3rd by ≥4.
+    /// Per-size results stored in adsbDiag.undecodedXcorrResults[n].
     ///
     /// Must be called on the main thread.
     private func scanUndecodedFrame(_ payload: Data) {
         let n = payload.count
         let b = Array(payload)
-        let scales: [Double] = [
-            1.0 / 100_000.0,       // LE 1e-5 (confirmed for 70b)
-            180.0 / 16_777_216.0,  // GDL90 lat scale
-            360.0 / 16_777_216.0,  // GDL90 lon scale
-        ]
 
-        // Build reference set: GPS with ±0.3° tolerance, known aircraft with ±0.15°.
-        struct Ref { let lat, lon, tol: Double }
+        // lat and lon are tried with all combinations of these scales.
+        let scales: [Double] = [
+            1.0 / 100_000.0,       // LE 1e-5 (confirmed for 70b/22b)
+            180.0 / 16_777_216.0,  // GDL90 lat  (180°/2^24)
+            360.0 / 16_777_216.0,  // GDL90 lon  (360°/2^24)
+        ]
+        let nsc = scales.count
+
+        // Reference set.  Separate lat/lon tolerances let internet aircraft act as
+        // tight anchors (they are accurate to ~0.01°) while GPS is a fallback.
+        struct Ref { let lat, lon, latTol, lonTol: Double }
         var refs: [Ref] = []
         if let loc = currentLocation {
-            refs.append(Ref(lat: loc.latitude, lon: loc.longitude, tol: 0.3))
+            refs.append(Ref(lat: loc.latitude,  lon: loc.longitude,  latTol: 0.20, lonTol: 0.20))
         }
         for ac in detectedAircraft.values {
-            refs.append(Ref(lat: ac.latitude, lon: ac.longitude, tol: 0.15))
+            let (lt, ln): (Double, Double) = ac.source == .internet ? (0.10, 0.15) : (0.15, 0.15)
+            refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: lt, lonTol: ln))
         }
         guard !refs.isEmpty else { return }
 
@@ -1101,31 +1117,40 @@ class ConnectionLogic: ObservableObject {
         for latOff in 0...maxOff {
             for lonOff in 0...maxOff {
                 guard abs(lonOff - latOff) >= 3 else { continue }
-                for (scIdx, sc) in scales.enumerated() {
-                    // LE
-                    let latLE = s24le(latOff) * sc
-                    let lonLE = s24le(lonOff) * sc
-                    if (-90...90).contains(latLE), (-180...180).contains(lonLE),
-                       abs(latLE) > 1 || abs(lonLE) > 1 {
-                        for ref in refs where
-                            abs(latLE - ref.lat) <= ref.tol &&
-                            abs(lonLE - ref.lon) <= ref.tol {
-                            adsbDiag.undecodedXcorrVotes[
-                                "\(sizePrefix)LE lat@\(latOff) lon@\(lonOff) sc\(scIdx)",
-                                default: 0] += 1
+                let rawLE_lat = s24le(latOff)
+                let rawBE_lat = s24be(latOff)
+                let rawLE_lon = s24le(lonOff)
+                let rawBE_lon = s24be(lonOff)
+                for lsi in 0..<nsc {
+                    let latSc = scales[lsi]
+                    let latLE = rawLE_lat * latSc
+                    let latBE = rawBE_lat * latSc
+                    guard (-90...90).contains(latLE) || (-90...90).contains(latBE) else { continue }
+                    for msi in 0..<nsc {
+                        let lonSc = scales[msi]
+                        let lonLE = rawLE_lon * lonSc
+                        let lonBE = rawBE_lon * lonSc
+                        // LE
+                        if (-90...90).contains(latLE), (-180...180).contains(lonLE),
+                           abs(latLE) > 1 || abs(lonLE) > 1 {
+                            for ref in refs where
+                                abs(latLE - ref.lat) <= ref.latTol &&
+                                abs(lonLE - ref.lon) <= ref.lonTol {
+                                adsbDiag.undecodedXcorrVotes[
+                                    "\(sizePrefix)LE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)",
+                                    default: 0] += 1
+                            }
                         }
-                    }
-                    // BE
-                    let latBE = s24be(latOff) * sc
-                    let lonBE = s24be(lonOff) * sc
-                    if (-90...90).contains(latBE), (-180...180).contains(lonBE),
-                       abs(latBE) > 1 || abs(lonBE) > 1 {
-                        for ref in refs where
-                            abs(latBE - ref.lat) <= ref.tol &&
-                            abs(lonBE - ref.lon) <= ref.tol {
-                            adsbDiag.undecodedXcorrVotes[
-                                "\(sizePrefix)BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)",
-                                default: 0] += 1
+                        // BE
+                        if (-90...90).contains(latBE), (-180...180).contains(lonBE),
+                           abs(latBE) > 1 || abs(lonBE) > 1 {
+                            for ref in refs where
+                                abs(latBE - ref.lat) <= ref.latTol &&
+                                abs(lonBE - ref.lon) <= ref.lonTol {
+                                adsbDiag.undecodedXcorrVotes[
+                                    "\(sizePrefix)BE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)",
+                                    default: 0] += 1
+                            }
                         }
                     }
                 }
@@ -1138,26 +1163,31 @@ class ConnectionLogic: ObservableObject {
         let top3 = Array(sizeVotes.values.sorted(by: >).prefix(3))
         let thirdVotes = top3.count > 2 ? top3[2] : 0
 
-        adsbDiag.undecodedXcorrResult = "🔍\(bestKey) ×\(bestVotes)/\(thirdVotes)"
+        // Store per-size result for HUD.
+        adsbDiag.undecodedXcorrResults[n] = "🔍\(bestKey) ×\(bestVotes)/\(thirdVotes)"
 
-        // Confirm at ≥8 votes with winner leading 3rd by ≥3.
-        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 3 else { return }
+        // Confirm at ≥8 votes with winner leading 3rd by ≥4.
+        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 4 else { return }
 
-        // Parse the winning key: "\(n)b LE|BE lat@\(latOff) lon@\(lonOff) sc\(scIdx)"
+        // Parse the winning key: "\(n)b LE|BE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)"
+        // e.g. "47b LE lat@5s1 lon@8s2"
         let parts = bestKey.components(separatedBy: " ")
-        guard parts.count == 5,
-              let isLE = (parts[1] == "LE" ? true : parts[1] == "BE" ? false : nil),
-              parts[2].hasPrefix("lat@"), parts[3].hasPrefix("lon@"),
-              let latOff = Int(parts[2].dropFirst(4)),
-              let lonOff = Int(parts[3].dropFirst(4)),
-              parts[4].hasPrefix("sc"),
-              let scIdx = Int(parts[4].dropFirst(2)),
-              scIdx < scales.count else { return }
+        guard parts.count == 4,
+              let isLE = (parts[1] == "LE" ? true : parts[1] == "BE" ? false : nil)
+        else { return }
+        let latStr = String(parts[2].dropFirst(4))  // "5s1"
+        let lonStr = String(parts[3].dropFirst(4))  // "8s2"
+        let latParts = latStr.components(separatedBy: "s")
+        let lonParts = lonStr.components(separatedBy: "s")
+        guard latParts.count == 2, lonParts.count == 2,
+              let latOff = Int(latParts[0]), let lsi = Int(latParts[1]),
+              let lonOff = Int(lonParts[0]), let msi = Int(lonParts[1]),
+              lsi < nsc, msi < nsc else { return }
 
         adsbDiag.undecodedHits[n] = ADSBDiagnostics.UndecodedHit(
             isLE: isLE, latOff: latOff, lonOff: lonOff,
-            scale: scales[scIdx], votes: bestVotes)
-        adsbDiag.undecodedXcorrResult = "✅\(bestKey) ×\(bestVotes)"
+            latScale: scales[lsi], lonScale: scales[msi], votes: bestVotes)
+        adsbDiag.undecodedXcorrResults[n] = "✅\(bestKey) ×\(bestVotes)"
     }
 
     /// Decode a payload using a confirmed xcorr hit.
@@ -1177,8 +1207,8 @@ class ConnectionLogic: ObservableObject {
             }
         }
 
-        let lat = Double(s24(hit.latOff)) * hit.scale
-        let lon = Double(s24(hit.lonOff)) * hit.scale
+        let lat = Double(s24(hit.latOff)) * hit.latScale
+        let lon = Double(s24(hit.lonOff)) * hit.lonScale
         guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
         if let loc = currentLocation,
