@@ -1495,8 +1495,8 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
-                // Xcorr scan for 21b / 43b frames (rare, unknown purpose).
-                for size in [21, 43] {
+                // Xcorr scan for 20b (likely nearby traffic), 21b / 43b (rare, paired).
+                for size in [20, 21, 43] {
                     if let result = d.undecodedXcorrResults[size] {
                         lines.append(result)
                     } else if d.frameSizeCounts[size] != nil {

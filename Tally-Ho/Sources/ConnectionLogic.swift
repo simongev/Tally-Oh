@@ -633,10 +633,11 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.parsedTraffic += 1
                     }
-                } else if [21, 43, 47].contains(copy26.count) {
-                    // 47b frames are paired 1:1 with 0x25 ownship frames — they appear to
-                    // carry extended device data, not traffic positions.  Skip xcorr for 47b.
-                    // 21b and 43b are rare, unknown, and worth scanning.
+                } else if [20, 21, 43, 47].contains(copy26.count) {
+                    // 47b: paired 1:1 with 0x25 ownship — skip xcorr.
+                    // 20b: abundant (~270/session), xcorr likely to converge quickly on
+                    //      nearby traffic that the 22b offsets can't decode correctly.
+                    // 21b/43b: rare and paired — xcorr running but may never converge.
                     let shouldScan = copy26.count != 47
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit) {
@@ -646,9 +647,9 @@ class ConnectionLogic: ObservableObject {
                     } else if shouldScan {
                         self.scanUndecodedFrame(copy26)
                     }
-                } else if copy26.count != 70, copy26.count != 22,
+                } else if ![70, 22, 20, 21, 43, 47].contains(copy26.count),
                           let ac = self.decodeProprietaryTraffic(copy26) {
-                    // Other frame sizes: attempt with 22b-calibrated offsets.
+                    // Catch-all for other frame sizes: try 22b-calibrated offsets.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.parsedTraffic += 1
                 }
