@@ -170,6 +170,10 @@ struct ADSBDiagnostics {
     /// Confirmed encoding per frame size (key = payload byte count).
     /// Set once ≥8 votes accumulate for one candidate; drives direct decode thereafter.
     var undecodedHits: [Int: UndecodedHit] = [:]
+    /// Deduplicate xcorr inputs per frame size: each unique byte sequence votes only
+    /// once, preventing a high-frequency static frame (e.g. the G1 device-ID frame)
+    /// from drowning the signal with thousands of identical votes.
+    var xcorrSeenFrames: [Int: Set<String>] = [:]
 }
 
 // MARK: - ConnectionLogic
@@ -645,7 +649,15 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.parsedTraffic += 1
                         }
                     } else if shouldScan {
-                        self.scanUndecodedFrame(copy26)
+                        // Deduplicate xcorr inputs: each unique byte sequence votes once only.
+                        // The static G1 device-ID frame repeats hundreds of times per session;
+                        // without deduplication its false votes would swamp the real signal.
+                        let n = copy26.count
+                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[n]?.contains(hex) ?? false
+                        if !alreadySeen {
+                            self.adsbDiag.xcorrSeenFrames[n, default: []].insert(hex)
+                            self.scanUndecodedFrame(copy26)
+                        }
                     }
                 } else if ![70, 22, 20, 21, 43, 47].contains(copy26.count),
                           let ac = self.decodeProprietaryTraffic(copy26) {

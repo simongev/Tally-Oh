@@ -1500,7 +1500,8 @@ class ARTrafficViewController: UIViewController {
                     if let result = d.undecodedXcorrResults[size] {
                         lines.append(result)
                     } else if d.frameSizeCounts[size] != nil {
-                        lines.append("🔍\(size)b scanning…")
+                        let unique = d.xcorrSeenFrames[size]?.count ?? 0
+                        lines.append("🔍\(size)b scanning… (\(unique) uniq)")
                     }
                 }
                 for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
