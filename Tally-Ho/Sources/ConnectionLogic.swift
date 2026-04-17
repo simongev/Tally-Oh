@@ -606,7 +606,7 @@ class ConnectionLogic: ObservableObject {
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                 // Always refresh high-interest frame sizes so HUD stays current.
                 // Other sizes: first-seen only.
-                let alwaysRefreshSizes: Set<Int> = [70, 22, 20, 21, 43, 47]
+                let alwaysRefreshSizes: Set<Int> = [70, 22, 20, 21, 43, 47, 56]
                 if alwaysRefreshSizes.contains(copy26.count) {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
@@ -647,14 +647,15 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
                     }
-                } else if [20, 21, 43, 47].contains(copy26.count) {
+                } else if [20, 21, 43, 47, 56].contains(copy26.count) {
                     // 47b: paired 1:1 with 0x25 ownship — skip xcorr.
                     // 20b: xcorr across two sessions converged on different offsets/endianness
                     //      each time (LE lat@14 lon@11 in one session, BE lat@14 lon@17 in the
                     //      next). This inconsistency rules out fixed-offset position data — 20b
                     //      frames are device status or ownship auxiliary, not traffic. Skip xcorr.
-                    // 21b/43b: rare and paired — xcorr running but may never converge.
-                    let shouldScan = copy26.count == 21 || copy26.count == 43
+                    // 21b/43b: rare paired device-status frames; xcorr running.
+                    // 56b: first appeared as ×2, jumped to ×31 — could be traffic; add to xcorr.
+                    let shouldScan = copy26.count == 21 || copy26.count == 43 || copy26.count == 56
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit) {
                             self.detectedAircraft[ac.id] = ac
@@ -663,8 +664,6 @@ class ConnectionLogic: ObservableObject {
                         }
                     } else if shouldScan {
                         // Deduplicate xcorr inputs: each unique byte sequence votes once only.
-                        // The static G1 device-ID frame repeats hundreds of times per session;
-                        // without deduplication its false votes would swamp the real signal.
                         let n = copy26.count
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[n]?.contains(hex) ?? false
                         if !alreadySeen {
@@ -672,7 +671,7 @@ class ConnectionLogic: ObservableObject {
                             self.scanUndecodedFrame(copy26)
                         }
                     }
-                } else if ![70, 22, 20, 21, 43, 47].contains(copy26.count),
+                } else if ![70, 22, 20, 21, 43, 47, 56].contains(copy26.count),
                           let ac = self.decodeProprietaryTraffic(copy26) {
                     // Catch-all for other frame sizes: try 22b-calibrated offsets.
                     self.detectedAircraft[ac.id] = ac
@@ -1219,6 +1218,10 @@ class ConnectionLogic: ObservableObject {
             isLE: isLE, latOff: latOff, lonOff: lonOff,
             latScale: scales[lsi], lonScale: scales[msi], votes: bestVotes)
         adsbDiag.undecodedXcorrResults[n] = "✅\(bestKey) ×\(bestVotes)"
+        // Immediately decode the triggering frame so xcorrDecodedSamples is
+        // populated right away — without this, the HUD position annotation only
+        // appears after the NEXT frame of this size arrives.
+        _ = decodeWithHit(payload, hit: adsbDiag.undecodedHits[n]!)
     }
 
     /// Decode a payload using a confirmed xcorr hit.

@@ -1500,9 +1500,9 @@ class ARTrafficViewController: UIViewController {
                 if let cnt20 = d.frameSizeCounts[20] {
                     lines.append("20b×\(cnt20) (aux/ownship, not traffic)")
                 }
-                // Xcorr scan for 21b and 43b only.
+                // Xcorr scan for 21b, 43b, and 56b.
                 let xcorrConvergedSizes = Set(d.undecodedHits.keys)
-                for size in [21, 43] {
+                for size in [21, 43, 56] {
                     if xcorrConvergedSizes.contains(size) {
                         if let hit = d.undecodedHits[size] {
                             lines.append("✅\(size)b \(hit.display)")
@@ -1601,10 +1601,17 @@ class ARTrafficViewController: UIViewController {
                     lines.append("21b: " + annotated21)
                 }
                 if let hex56 = d.sampleFramesBySize[56] {
-                    let bytes = hex56.components(separatedBy: " ")
-                    lines.append("56b: " + bytes.prefix(28).joined(separator: " "))
-                    let rest = Array(bytes.dropFirst(28))
-                    if !rest.isEmpty { lines.append("     " + rest.joined(separator: " ")) }
+                    let hit56 = d.undecodedHits[56]
+                    let parts56 = hex56.components(separatedBy: " ")
+                    let ann56 = parts56.enumerated().map { (idx, h) -> String in
+                        if let hit = hit56, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
+                        if let hit = hit56, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
+                        return h
+                    }.joined(separator: " ")
+                    let toks56 = ann56.components(separatedBy: " ")
+                    lines.append("56b: " + toks56.prefix(28).joined(separator: " "))
+                    let rest56 = Array(toks56.dropFirst(28))
+                    if !rest56.isEmpty { lines.append("     " + rest56.joined(separator: " ")) }
                 }
                 if let hex70 = d.sampleFramesBySize[70] {
                     // Annotate confirmed slots: [lat] at b[3-5,9-11], {lon} at b[38-40,44-46].
