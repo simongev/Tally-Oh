@@ -1495,17 +1495,26 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
-                // Xcorr scan for 20b (likely nearby traffic), 21b / 43b (rare, paired).
+                // Xcorr scan for 20b, 21b, 43b.
+                // undecodedHits shows the expanded form once converged; while scanning
+                // show the compact vote status from undecodedXcorrResults.
+                let xcorrConvergedSizes = Set(d.undecodedHits.keys)
                 for size in [20, 21, 43] {
-                    if let result = d.undecodedXcorrResults[size] {
+                    if xcorrConvergedSizes.contains(size) {
+                        // Converged — show expanded hit (avoids duplicate with xcorrResults).
+                        if let hit = d.undecodedHits[size] {
+                            lines.append("✅\(size)b \(hit.display)")
+                            if let s = d.xcorrDecodedSamples[size] {
+                                let tag = s.nearGPS ? "(~ownship)" : "(~traffic)"
+                                lines.append(String(format: "  →%.4f° %.4f° %@", s.lat, s.lon, tag))
+                            }
+                        }
+                    } else if let result = d.undecodedXcorrResults[size] {
                         lines.append(result)
                     } else if d.frameSizeCounts[size] != nil {
                         let unique = d.xcorrSeenFrames[size]?.count ?? 0
                         lines.append("🔍\(size)b scanning… (\(unique) uniq)")
                     }
-                }
-                for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
-                    lines.append("✅\(size)b \(hit.display)")
                 }
                 // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {

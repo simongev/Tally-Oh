@@ -174,6 +174,10 @@ struct ADSBDiagnostics {
     /// once, preventing a high-frequency static frame (e.g. the G1 device-ID frame)
     /// from drowning the signal with thousands of identical votes.
     var xcorrSeenFrames: [Int: Set<String>] = [:]
+    /// Last decoded lat/lon from decodeWithHit (before ownship/range rejection).
+    /// Lets us verify whether xcorr-converged frames encode ownship or traffic.
+    struct XcorrDecodedSample { let lat: Double; let lon: Double; let nearGPS: Bool }
+    var xcorrDecodedSamples: [Int: XcorrDecodedSample] = [:]
 }
 
 // MARK: - ConnectionLogic
@@ -1226,6 +1230,13 @@ class ConnectionLogic: ObservableObject {
 
         let lat = Double(s24(hit.latOff)) * hit.latScale
         let lon = Double(s24(hit.lonOff)) * hit.lonScale
+        // Sample the raw decoded position before any rejection, so HUD can show
+        // whether xcorr-converged frames encode ownship or actual traffic.
+        if let loc = currentLocation {
+            let nearGPS = abs(lat - loc.latitude) < 0.5 && abs(lon - loc.longitude) < 0.5
+            adsbDiag.xcorrDecodedSamples[n] = ADSBDiagnostics.XcorrDecodedSample(
+                lat: lat, lon: lon, nearGPS: nearGPS)
+        }
         guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
         if let loc = currentLocation,
