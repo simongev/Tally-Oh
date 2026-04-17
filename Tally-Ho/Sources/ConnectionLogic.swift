@@ -178,6 +178,9 @@ struct ADSBDiagnostics {
     /// Lets us verify whether xcorr-converged frames encode ownship or traffic.
     struct XcorrDecodedSample { let lat: Double; let lon: Double; let nearGPS: Bool }
     var xcorrDecodedSamples: [Int: XcorrDecodedSample] = [:]
+    /// All unique ADS-B aircraft IDs decoded during this session (never cleared).
+    /// Current count shown as "seen:N" in HUD alongside the live aircraft count.
+    var uniqueAircraftSeen: Set<String> = []
 }
 
 // MARK: - ConnectionLogic
@@ -575,6 +578,7 @@ class ConnectionLogic: ObservableObject {
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async {
                     self.detectedAircraft[ac.id] = ac
+                    self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                     self.adsbDiag.parsedTraffic += 1
                 }
             } else {
@@ -631,6 +635,7 @@ class ConnectionLogic: ObservableObject {
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26) {
                         self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
                         let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                         self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
@@ -639,17 +644,21 @@ class ConnectionLogic: ObservableObject {
                     // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3).
                     for ac in self.decodeProprietaryBundle(copy26) {
                         self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
                     }
                 } else if [20, 21, 43, 47].contains(copy26.count) {
                     // 47b: paired 1:1 with 0x25 ownship — skip xcorr.
-                    // 20b: abundant (~270/session), xcorr likely to converge quickly on
-                    //      nearby traffic that the 22b offsets can't decode correctly.
+                    // 20b: xcorr across two sessions converged on different offsets/endianness
+                    //      each time (LE lat@14 lon@11 in one session, BE lat@14 lon@17 in the
+                    //      next). This inconsistency rules out fixed-offset position data — 20b
+                    //      frames are device status or ownship auxiliary, not traffic. Skip xcorr.
                     // 21b/43b: rare and paired — xcorr running but may never converge.
-                    let shouldScan = copy26.count != 47
+                    let shouldScan = copy26.count == 21 || copy26.count == 43
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit) {
                             self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                             self.adsbDiag.parsedTraffic += 1
                         }
                     } else if shouldScan {
@@ -667,6 +676,7 @@ class ConnectionLogic: ObservableObject {
                           let ac = self.decodeProprietaryTraffic(copy26) {
                     // Catch-all for other frame sizes: try 22b-calibrated offsets.
                     self.detectedAircraft[ac.id] = ac
+                    self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                     self.adsbDiag.parsedTraffic += 1
                 }
                 self.startSentryRegistration()

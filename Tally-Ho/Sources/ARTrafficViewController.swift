@@ -1495,13 +1495,15 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
-                // Xcorr scan for 20b, 21b, 43b.
-                // undecodedHits shows the expanded form once converged; while scanning
-                // show the compact vote status from undecodedXcorrResults.
+                // 20b: xcorr produced inconsistent offsets across sessions — ruled out as
+                // position data; shown as auxiliary/ownship frame, no xcorr scanning.
+                if let cnt20 = d.frameSizeCounts[20] {
+                    lines.append("20b×\(cnt20) (aux/ownship, not traffic)")
+                }
+                // Xcorr scan for 21b and 43b only.
                 let xcorrConvergedSizes = Set(d.undecodedHits.keys)
-                for size in [20, 21, 43] {
+                for size in [21, 43] {
                     if xcorrConvergedSizes.contains(size) {
-                        // Converged — show expanded hit (avoids duplicate with xcorrResults).
                         if let hit = d.undecodedHits[size] {
                             lines.append("✅\(size)b \(hit.display)")
                             if let s = d.xcorrDecodedSamples[size] {
@@ -1726,7 +1728,11 @@ class ARTrafficViewController: UIViewController {
         let netCnt  = connectionLogic.internetAircraftCount
         var trafficLine = "🛩 Aircraft: \(total)"
         var parts: [String] = []
-        if adsbCnt > 0 { parts.append("ADS-B:\(adsbCnt)") }
+        if adsbCnt > 0 {
+            let seen = connectionLogic.adsbDiag.uniqueAircraftSeen.count
+            let seenSuffix = seen > adsbCnt ? " seen:\(seen)" : ""
+            parts.append("ADS-B:\(adsbCnt)\(seenSuffix)")
+        }
         if netCnt  > 0 { parts.append("Net:\(netCnt)") }
         if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
         if let lastUpdate = connectionLogic.detectedAircraft.values
