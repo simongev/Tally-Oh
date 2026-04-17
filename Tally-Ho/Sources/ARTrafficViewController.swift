@@ -1511,10 +1511,20 @@ class ARTrafficViewController: UIViewController {
                     lines.append("47b×\(cnt47) = 0x25×\(cnt25) (ownship ext)")
                 }
                 // Show 21b/43b counts alongside 0x25 to check for ownship pairing.
-                for sz in [21, 43] {
-                    if let cntSz = d.frameSizeCounts[sz], let cnt25 = d.rawMsgTypeCounts[0x25] {
-                        let hint = cnt25 > 0 && abs(cntSz - cnt25) <= max(1, cnt25 / 10) ? " (ownship?)" : ""
-                        lines.append("\(sz)b×\(cntSz) 0x25×\(cnt25)\(hint)")
+                // When 21b count == 43b count they always arrive together — a paired
+                // device-status message, not individual traffic frames.
+                let cnt21 = d.frameSizeCounts[21]
+                let cnt43 = d.frameSizeCounts[43]
+                let cnt25 = d.rawMsgTypeCounts[0x25]
+                if let c21 = cnt21, let c43 = cnt43, c21 == c43 {
+                    let hint = cnt25.map { " 0x25×\($0)" } ?? ""
+                    lines.append("21b=43b×\(c21)\(hint) (paired, not traffic)")
+                } else {
+                    for (sz, cntSz) in [(21, cnt21), (43, cnt43)] {
+                        if let c = cntSz, let c25 = cnt25 {
+                            let ownship = c25 > 0 && abs(c - c25) <= max(1, c25 / 10)
+                            lines.append("\(sz)b×\(c) 0x25×\(c25)\(ownship ? " (ownship?)" : "")")
+                        }
                     }
                 }
                 if let hex25 = d.lastMsg25Hex {

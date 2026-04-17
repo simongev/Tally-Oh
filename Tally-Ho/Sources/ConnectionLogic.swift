@@ -1303,18 +1303,15 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
         // Build a unique ICAO-style ID from the first 3 non-type bytes.
         let icao = String(format: "S%02X%02X%02X", b[1], b[2], b[3])
-        // Try GDL90 altitude (12-bit packed) at two candidate offsets:
-        //   primary  = after the later  coordinate field (confirmed for many frames)
-        //   secondary = after the earlier coordinate field (fallback for frames where
-        //               the primary offset falls in a non-altitude region)
-        let altOff1 = max(latOff, lonOff) + 3   // primary:   after the later  coord field
-        let altOff2 = min(latOff, lonOff) + 3   // secondary: after the earlier coord field
+        // Try GDL90 altitude (12-bit packed) from the two bytes immediately after the
+        // later coordinate field.  Only one offset is tried — a secondary fallback at
+        // the earlier coordinate field produced spurious sub-zero altitudes (Build 190).
+        let altOff = max(latOff, lonOff) + 3
         var altFt: Double = 10_000
-        for altOff in [altOff1, altOff2] {
-            guard altOff + 1 < b.count else { continue }
+        if altOff + 1 < b.count {
             let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
             let dec = Double(raw12) * 25.0 - 1000.0
-            if dec >= -1000 && dec <= 50_000 { altFt = dec; break }
+            if dec >= -1000 && dec <= 50_000 { altFt = dec }
         }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
@@ -1363,15 +1360,13 @@ class ConnectionLogic: ObservableObject {
             ? String(format: "P%02X%02X%02X", b[1], b[2], b[3])
             : String(format: "P%02X%02d", b[1], n)
 
-        // Try GDL90 altitude (12-bit packed) at two candidate offsets (same logic as decodeProprietarySingle).
-        let altOff1 = max(latOff, lonOff) + 3
-        let altOff2 = min(latOff, lonOff) + 3
+        // Try GDL90 altitude (12-bit packed) from the two bytes after the later coord field.
+        let altOff = max(latOff, lonOff) + 3
         var altFt: Double = 10_000
-        for altOff in [altOff1, altOff2] {
-            guard altOff + 1 < n else { continue }
+        if altOff + 1 < n {
             let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
             let dec = Double(raw12) * 25.0 - 1000.0
-            if dec >= -1000 && dec <= 50_000 { altFt = dec; break }
+            if dec >= -1000 && dec <= 50_000 { altFt = dec }
         }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
