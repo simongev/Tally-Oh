@@ -1500,9 +1500,9 @@ class ARTrafficViewController: UIViewController {
                 if let cnt20 = d.frameSizeCounts[20] {
                     lines.append("20b×\(cnt20) (aux/ownship, not traffic)")
                 }
-                // Xcorr scan for 21b, 43b, and 56b.
+                // Xcorr scan for 56b only (21b/43b ruled out as device-status).
                 let xcorrConvergedSizes = Set(d.undecodedHits.keys)
-                for size in [21, 43, 56] {
+                for size in [56] {
                     if xcorrConvergedSizes.contains(size) {
                         if let hit = d.undecodedHits[size] {
                             lines.append("✅\(size)b \(hit.display)")

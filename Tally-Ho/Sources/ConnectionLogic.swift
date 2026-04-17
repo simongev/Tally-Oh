@@ -653,9 +653,11 @@ class ConnectionLogic: ObservableObject {
                     //      each time (LE lat@14 lon@11 in one session, BE lat@14 lon@17 in the
                     //      next). This inconsistency rules out fixed-offset position data — 20b
                     //      frames are device status or ownship auxiliary, not traffic. Skip xcorr.
-                    // 21b/43b: rare paired device-status frames; xcorr running.
-                    // 56b: first appeared as ×2, jumped to ×31 — could be traffic; add to xcorr.
-                    let shouldScan = copy26.count == 21 || copy26.count == 43 || copy26.count == 56
+                    // 21b/43b: always appear at equal counts (paired device-status). xcorr on 43b
+                    //      converged to Antarctica (-66°/-89°) one session and different offsets
+                    //      the next — same false-positive instability as 20b. Skip xcorr for both.
+                    // 56b: count varies dramatically (×2 then ×31) — likely traffic. xcorr active.
+                    let shouldScan = copy26.count == 56
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit) {
                             self.detectedAircraft[ac.id] = ac
@@ -1073,7 +1075,7 @@ class ConnectionLogic: ObservableObject {
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
             // Reject positions more than 5° from user — prevents phantom aircraft.
             if let loc = currentLocation,
-               abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { continue }
+               abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
             // Reject positions identical to user (own-ship echo).
             if let loc = currentLocation,
                abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
@@ -1253,7 +1255,7 @@ class ConnectionLogic: ObservableObject {
         guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
         if let loc = currentLocation,
-           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
         if let loc = currentLocation,
            abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { return nil }
 
@@ -1337,7 +1339,7 @@ class ConnectionLogic: ObservableObject {
         // frames; the rest carry velocity/identity data whose random bytes accidentally pass
         // the ±90/±180 range check, flooding detectedAircraft with phantom aircraft worldwide.
         if let loc = currentLocation,
-           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
         // Build a unique ICAO-style ID from the first 3 non-type bytes.
         let icao = String(format: "S%02X%02X%02X", b[1], b[2], b[3])
         // Try GDL90 altitude (12-bit packed) from the two bytes immediately after the
@@ -1382,7 +1384,7 @@ class ConnectionLogic: ObservableObject {
 
         // Reject positions >5° from user (same phantom-elimination logic as decodeProprietarySingle).
         if let loc = currentLocation,
-           abs(lat - loc.latitude) > 5 || abs(lon - loc.longitude) > 5 { return nil }
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
 
         // Skip ownship: if position is within 0.1° of user's GPS it's us, not traffic.
         if let loc = currentLocation,
