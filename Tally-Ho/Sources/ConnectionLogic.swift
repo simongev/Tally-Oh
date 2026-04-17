@@ -577,9 +577,11 @@ class ConnectionLogic: ObservableObject {
             DispatchQueue.main.async { self.stopSentryRegistration() }
             if let ac = parseTrafficPayload(payload, isOwnship: false) {
                 DispatchQueue.main.async {
-                    self.detectedAircraft[ac.id] = ac
-                    self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
-                    self.adsbDiag.parsedTraffic += 1
+                    if self.isPhysicallyReceivable(ac) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                    }
                 }
             } else {
                 DispatchQueue.main.async { self.adsbDiag.parsedFail += 1 }
@@ -633,7 +635,7 @@ class ConnectionLogic: ObservableObject {
                 // 70b voting removed — encoding confirmed and hardcoded (Build 185).
                 // 22b: always use hardcoded single-aircraft decoder.
                 if copy26.count == 22 {
-                    if let ac = self.decodeProprietarySingle(copy26) {
+                    if let ac = self.decodeProprietarySingle(copy26), self.isPhysicallyReceivable(ac) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
@@ -643,6 +645,7 @@ class ConnectionLogic: ObservableObject {
                 } else if copy26.count == 70 {
                     // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3).
                     for ac in self.decodeProprietaryBundle(copy26) {
+                        guard self.isPhysicallyReceivable(ac) else { continue }
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
@@ -659,7 +662,7 @@ class ConnectionLogic: ObservableObject {
                     // 56b: count varies dramatically (×2 then ×31) — likely traffic. xcorr active.
                     let shouldScan = copy26.count == 56
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
-                        if let ac = self.decodeWithHit(copy26, hit: hit) {
+                        if let ac = self.decodeWithHit(copy26, hit: hit), self.isPhysicallyReceivable(ac) {
                             self.detectedAircraft[ac.id] = ac
                             self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                             self.adsbDiag.parsedTraffic += 1
@@ -674,7 +677,8 @@ class ConnectionLogic: ObservableObject {
                         }
                     }
                 } else if ![70, 22, 20, 21, 43, 47, 56].contains(copy26.count),
-                          let ac = self.decodeProprietaryTraffic(copy26) {
+                          let ac = self.decodeProprietaryTraffic(copy26),
+                          self.isPhysicallyReceivable(ac) {
                     // Catch-all for other frame sizes: try 22b-calibrated offsets.
                     self.detectedAircraft[ac.id] = ac
                     self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
@@ -1316,6 +1320,21 @@ class ConnectionLogic: ObservableObject {
         adsbDiag.calibrationStatus = String(format:
             "🔍 no match: target [%.4f, %.4f] in %db frame",
             userLat, userLon, n)
+    }
+
+    /// RF line-of-sight range check.  Returns false if the aircraft is geometrically
+    /// unreachable given its altitude and the user's GPS altitude.
+    /// physAlt: use 40000 ft for fallback-altitude aircraft (decoded as <15000 ft) so
+    /// the check is conservative rather than rejecting real en-route traffic.
+    private func isPhysicallyReceivable(_ ac: Aircraft) -> Bool {
+        guard let loc = currentLocation else { return true }
+        let userAltFt = max(currentAltitudeFeet, 0.0)
+        let physAltFt: Double = ac.altitude < 15_000 ? 40_000.0 : ac.altitude
+        let maxRangeNm = (1.23 * sqrt(physAltFt) + 1.23 * sqrt(userAltFt)) * 1.5
+        let dlat = ac.latitude  - loc.latitude
+        let dlon = (ac.longitude - loc.longitude) * cos(loc.latitude * .pi / 180.0)
+        let distNm = sqrt(dlat * dlat + dlon * dlon) * 60.0
+        return distNm <= maxRangeNm
     }
 
     /// Decode a single-aircraft 22-byte 0x26 frame using calibration from voteForEncoding22.
