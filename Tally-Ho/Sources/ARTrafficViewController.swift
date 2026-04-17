@@ -1510,6 +1510,13 @@ class ARTrafficViewController: UIViewController {
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {
                     lines.append("47b×\(cnt47) = 0x25×\(cnt25) (ownship ext)")
                 }
+                // Show 21b/43b counts alongside 0x25 to check for ownship pairing.
+                for sz in [21, 43] {
+                    if let cntSz = d.frameSizeCounts[sz], let cnt25 = d.rawMsgTypeCounts[0x25] {
+                        let hint = cnt25 > 0 && abs(cntSz - cnt25) <= max(1, cnt25 / 10) ? " (ownship?)" : ""
+                        lines.append("\(sz)b×\(cntSz) 0x25×\(cnt25)\(hint)")
+                    }
+                }
                 if let hex25 = d.lastMsg25Hex {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
@@ -1720,8 +1727,11 @@ class ARTrafficViewController: UIViewController {
                 .sorted { $0.1 < $1.1 }
             for (ac, distNM) in nearby {
                 let srcTag = ac.source == .internet ? "🌐" : "📡"
-                lines.append(String(format: "  %@%@ %.4f° %.4f° %.0fft %.0fnm",
-                                    srcTag, ac.callsign, ac.latitude, ac.longitude, ac.altitude, distNM))
+                // ~ prefix flags ADS-B aircraft whose altitude is the 10000ft fallback
+                // (decode failed — actual altitude unknown).
+                let altPrefix = (ac.source == .adsb && ac.altitude == 10_000) ? "~" : ""
+                lines.append(String(format: "  %@%@ %.4f° %.4f° %@%.0fft %.0fnm",
+                                    srcTag, ac.callsign, ac.latitude, ac.longitude, altPrefix, ac.altitude, distNM))
             }
         }
 
