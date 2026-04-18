@@ -1077,16 +1077,25 @@ class ConnectionLogic: ObservableObject {
 
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
-            // Reject positions more than 5° from user — prevents phantom aircraft.
+            // Reject positions more than 10° from user — prevents phantom aircraft.
             if let loc = currentLocation,
                abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
             // Reject positions identical to user (own-ship echo).
             if let loc = currentLocation,
                abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
 
+            // GDL90 12-bit altitude packed at bytes immediately after the later coordinate.
+            let altOff = max(slot.latOff, slot.lonOff) + 3
+            var altFt: Double = 10_000
+            if altOff + 1 < b.count {
+                let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
+                let dec = Double(raw12) * 25.0 - 1000.0
+                if dec >= -1_000 && dec <= 50_000 { altFt = dec }
+            }
+
             result.append(Aircraft(id: slot.id, callsign: slot.id,
                                    latitude: lat, longitude: lon,
-                                   altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                                   altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
                                    lastUpdate: Date(), source: .adsb))
         }
         return result
