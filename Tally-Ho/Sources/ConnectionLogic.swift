@@ -1063,9 +1063,10 @@ class ConnectionLogic: ObservableObject {
             return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
         }
 
-        // Slot 0 lat@3/lon@38 (tentative), Slot 1 lat@11/lon@46 (confirmed ×3)
+        // Slot 0 lat@3/lon@38 was removed: lon bytes 38-40 are a fixed protocol field
+        // that always decode to -80.17°W regardless of actual aircraft position.
+        // Slot 1 lat@11/lon@46 confirmed ×3 (NKS832/RPA5643 hits).
         let slots: [(latOff: Int, lonOff: Int, id: String)] = [
-            (3,  38, "T70A"),
             (11, 46, "T70B"),
         ]
 
@@ -1339,7 +1340,7 @@ class ConnectionLogic: ObservableObject {
         guard let loc = currentLocation else { return true }
         let userAltFt = max(currentAltitudeFeet, 0.0)
         let physAltFt: Double = (ac.altitude == 10_000) ? 40_000.0 : max(ac.altitude, 1_000.0)
-        let maxRangeNm = (1.23 * sqrt(physAltFt) + 1.23 * sqrt(userAltFt)) * 1.5
+        let maxRangeNm = (1.23 * sqrt(physAltFt) + 1.23 * sqrt(userAltFt)) * 1.2
         let dlat = ac.latitude  - loc.latitude
         let dlon = (ac.longitude - loc.longitude) * cos(loc.latitude * .pi / 180.0)
         let distNm = sqrt(dlat * dlat + dlon * dlon) * 60.0
