@@ -1495,28 +1495,21 @@ class ARTrafficViewController: UIViewController {
                 if !d.prop70ConfirmedHit.isEmpty {
                     lines.append("🏆 \(d.prop70ConfirmedHit)")
                 }
+                // 560b = 8×70b bundle decoded with same LE 1e-5 encoding.
+                if let cnt560 = d.frameSizeCounts[560] {
+                    let ok = d.prop560DecodeCount
+                    lines.append(ok > 0 ? "✅560b×\(cnt560) (\(ok) w/traffic)" : "⏳560b×\(cnt560) (0 decoded)")
+                }
                 // 20b: xcorr produced inconsistent offsets across sessions — ruled out as
                 // position data; shown as auxiliary/ownship frame, no xcorr scanning.
                 if let cnt20 = d.frameSizeCounts[20] {
                     lines.append("20b×\(cnt20) (aux/ownship, not traffic)")
                 }
-                // Xcorr scan for 56b only (21b/43b ruled out as device-status).
-                let xcorrConvergedSizes = Set(d.undecodedHits.keys)
-                for size in [56] {
-                    if xcorrConvergedSizes.contains(size) {
-                        if let hit = d.undecodedHits[size] {
-                            lines.append("✅\(size)b \(hit.display)")
-                            if let s = d.xcorrDecodedSamples[size] {
-                                let tag = s.nearGPS ? "(~ownship)" : "(~traffic)"
-                                lines.append(String(format: "  →%.4f° %.4f° %@", s.lat, s.lon, tag))
-                            }
-                        }
-                    } else if let result = d.undecodedXcorrResults[size] {
-                        lines.append(result)
-                    } else if d.frameSizeCounts[size] != nil {
-                        let unique = d.xcorrSeenFrames[size]?.count ?? 0
-                        lines.append("🔍\(size)b scanning… (\(unique) uniq)")
-                    }
+                // 56b xcorr stopped: converged to different offsets in each in-flight session
+                // (session1: BE lat@6, session2: BE lat@0) — same instability as confirmed
+                // false-positives 20b/43b → not fixed-offset position data.
+                if let cnt56 = d.frameSizeCounts[56] {
+                    lines.append("56b×\(cnt56) (xcorr stopped)")
                 }
                 // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {

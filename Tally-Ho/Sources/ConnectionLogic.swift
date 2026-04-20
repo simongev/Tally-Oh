@@ -181,6 +181,8 @@ struct ADSBDiagnostics {
     /// All unique ADS-B aircraft IDs decoded during this session (never cleared).
     /// Current count shown as "seen:N" in HUD alongside the live aircraft count.
     var uniqueAircraftSeen: Set<String> = []
+    /// Count of 560b frames that produced ≥1 decoded aircraft (for HUD display).
+    var prop560DecodeCount: Int = 0
 }
 
 // MARK: - ConnectionLogic
@@ -650,6 +652,18 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
                     }
+                } else if copy26.count == 560 {
+                    // 560b = 8×70b bundle — same LE 1e-5 encoding per sub-record.
+                    let decoded560 = self.decodeProprietaryBundle560(copy26)
+                    var added = 0
+                    for ac in decoded560 {
+                        guard self.isPhysicallyReceivable(ac) else { continue }
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                        added += 1
+                    }
+                    if added > 0 { self.adsbDiag.prop560DecodeCount += 1 }
                 } else if [20, 21, 43, 47, 56].contains(copy26.count) {
                     // 47b: paired 1:1 with 0x25 ownship — skip xcorr.
                     // 20b: xcorr across two sessions converged on different offsets/endianness
@@ -659,8 +673,9 @@ class ConnectionLogic: ObservableObject {
                     // 21b/43b: always appear at equal counts (paired device-status). xcorr on 43b
                     //      converged to Antarctica (-66°/-89°) one session and different offsets
                     //      the next — same false-positive instability as 20b. Skip xcorr for both.
-                    // 56b: count varies dramatically (×2 then ×31) — likely traffic. xcorr active.
-                    let shouldScan = copy26.count == 56
+                    // 56b: xcorr stopped — converged to different offsets in each in-flight session
+                    //      (session1: BE lat@6, session2: BE lat@0). Same instability as 20b/43b.
+                    let shouldScan = false
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit), self.isPhysicallyReceivable(ac) {
                             self.detectedAircraft[ac.id] = ac
@@ -668,7 +683,6 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.parsedTraffic += 1
                         }
                     } else if shouldScan {
-                        // Deduplicate xcorr inputs: each unique byte sequence votes once only.
                         let n = copy26.count
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[n]?.contains(hex) ?? false
                         if !alreadySeen {
@@ -676,7 +690,7 @@ class ConnectionLogic: ObservableObject {
                             self.scanUndecodedFrame(copy26)
                         }
                     }
-                } else if ![70, 22, 20, 21, 43, 47, 56].contains(copy26.count),
+                } else if ![70, 22, 20, 21, 43, 47, 56, 560].contains(copy26.count),
                           let ac = self.decodeProprietaryTraffic(copy26),
                           self.isPhysicallyReceivable(ac) {
                     // Catch-all for other frame sizes: try 22b-calibrated offsets.
@@ -1095,6 +1109,57 @@ class ConnectionLogic: ObservableObject {
             }
 
             result.append(Aircraft(id: slot.id, callsign: slot.id,
+                                   latitude: lat, longitude: lon,
+                                   altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
+                                   lastUpdate: Date(), source: .adsb))
+        }
+        return result
+    }
+
+    /// Decode a 560-byte proprietary bundle as 8 × 70b sub-records.
+    ///
+    /// 560 = 8 × 70 exactly.  Each sub-record uses the same LE 1e-5 encoding confirmed
+    /// for standalone 70b bundles: lat@(base+11), lon@(base+46), alt@(base+49).
+    /// ICAO ID comes from bytes base+1,2,3 (same position as in 22b single-aircraft frames).
+    private func decodeProprietaryBundle560(_ payload: Data) -> [Aircraft] {
+        guard payload.count == 560 else { return [] }
+        let b = Array(payload)
+        let scale = 1.0 / 100_000.0
+
+        func s24le(_ off: Int) -> Int32 {
+            let v = Int32(b[off]) | Int32(b[off + 1]) << 8 | Int32(b[off + 2]) << 16
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+
+        var result: [Aircraft] = []
+        for i in 0..<8 {
+            let base = i * 70
+            let latOff = base + 11
+            let lonOff = base + 46
+            guard lonOff + 2 < b.count else { continue }
+
+            let lat = Double(s24le(latOff)) * scale
+            let lon = Double(s24le(lonOff)) * scale
+
+            guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
+            guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
+            if let loc = currentLocation,
+               abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
+            if let loc = currentLocation,
+               abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
+
+            let icaoHex = String(format: "%02X%02X%02X", b[base + 1], b[base + 2], b[base + 3])
+            let acId = icaoHex == "000000" ? "B560_\(i)" : icaoHex
+
+            let altOff = base + 49  // max(latOff-base, lonOff-base) + 3 = 46+3 = 49
+            var altFt: Double = 10_000
+            if altOff + 1 < b.count {
+                let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
+                let dec = Double(raw12) * 25.0 - 1000.0
+                if dec >= -1_000 && dec <= 50_000 { altFt = dec }
+            }
+
+            result.append(Aircraft(id: acId, callsign: acId,
                                    latitude: lat, longitude: lon,
                                    altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
                                    lastUpdate: Date(), source: .adsb))
