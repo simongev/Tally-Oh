@@ -1729,12 +1729,27 @@ class ARTrafficViewController: UIViewController {
         let total   = connectionLogic.detectedAircraft.count
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
+
+        // Count ADS-B aircraft confirmed by a nearby internet aircraft (within 0.1° ≈ 6nm).
+        // Matching by position rather than ICAO because the 560b ICAO bytes are unverified.
+        let internetPositions = connectionLogic.detectedAircraft.values
+            .filter { $0.source == .internet }
+            .map { ($0.latitude, $0.longitude) }
+        let confirmedCnt = connectionLogic.detectedAircraft.values
+            .filter { ac in
+                guard ac.source == .adsb else { return false }
+                return internetPositions.contains { (iLat, iLon) in
+                    abs(iLat - ac.latitude) < 0.1 && abs(iLon - ac.longitude) < 0.1
+                }
+            }.count
+
         var trafficLine = "🛩 Aircraft: \(total)"
         var parts: [String] = []
         if adsbCnt > 0 {
             let seen = connectionLogic.adsbDiag.uniqueAircraftSeen.count
             let seenSuffix = seen > adsbCnt ? " seen:\(seen)" : ""
-            parts.append("ADS-B:\(adsbCnt)\(seenSuffix)")
+            let confSuffix = confirmedCnt > 0 ? " ✅\(confirmedCnt)" : ""
+            parts.append("ADS-B:\(adsbCnt)\(confSuffix)\(seenSuffix)")
         }
         if netCnt  > 0 { parts.append("Net:\(netCnt)") }
         if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
@@ -1755,7 +1770,16 @@ class ARTrafficViewController: UIViewController {
                 }
                 .sorted { $0.1 < $1.1 }
             for (ac, distNM) in nearby {
-                let srcTag = ac.source == .internet ? "🌐" : "📡"
+                let srcTag: String
+                if ac.source == .internet {
+                    srcTag = "🌐"
+                } else if internetPositions.contains(where: { (iLat, iLon) in
+                    abs(iLat - ac.latitude) < 0.1 && abs(iLon - ac.longitude) < 0.1
+                }) {
+                    srcTag = "✅"
+                } else {
+                    srcTag = "📡"
+                }
                 // ~ prefix flags ADS-B aircraft whose altitude is the 10000ft fallback
                 // (decode failed — actual altitude unknown).
                 let altPrefix = (ac.source == .adsb && ac.altitude == 10_000) ? "~" : ""
