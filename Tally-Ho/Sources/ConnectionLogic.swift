@@ -658,8 +658,28 @@ class ConnectionLogic: ObservableObject {
                     var added = 0
                     for ac in decoded560 {
                         guard self.isPhysicallyReceivable(ac) else { continue }
-                        self.detectedAircraft[ac.id] = ac
-                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        // Bytes 1-3 of each sub-record are not a stable ICAO —
+                        // the same aircraft appears in different sub-record slots
+                        // across frames with different byte values.  Look for an
+                        // existing ADS-B aircraft within 0.02° (≈1 nm) and reuse
+                        // its ID to prevent duplicate entries for the same aircraft.
+                        let stableId: String
+                        if let existingKey = self.detectedAircraft.first(where: { _, ex in
+                            ex.source == .adsb &&
+                            abs(ex.latitude  - ac.latitude)  < 0.02 &&
+                            abs(ex.longitude - ac.longitude) < 0.02
+                        })?.key {
+                            stableId = existingKey
+                        } else {
+                            stableId = ac.id
+                        }
+                        let stableAc = Aircraft(id: stableId, callsign: stableId,
+                                                latitude: ac.latitude, longitude: ac.longitude,
+                                                altitude: ac.altitude, track: 0, groundSpeed: 0,
+                                                verticalRate: 0, lastUpdate: ac.lastUpdate,
+                                                source: .adsb)
+                        self.detectedAircraft[stableId] = stableAc
+                        self.adsbDiag.uniqueAircraftSeen.insert(stableId)
                         self.adsbDiag.parsedTraffic += 1
                         added += 1
                     }
