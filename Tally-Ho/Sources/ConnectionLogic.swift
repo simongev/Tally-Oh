@@ -248,10 +248,10 @@ class ConnectionLogic: ObservableObject {
         internetQueryRadius = max(10, distanceNM * 1.25)
     }
 
-    /// Hard cap on total internet aircraft stored.  Only 200 nodes can ever be
-    /// rendered, and the closest 200 by distance are chosen, so storing more than
-    /// ~100 provides no visual benefit while inflating the dictionary copied every tick.
-    private let maxInternetAircraft = 100
+    /// Hard cap on total internet aircraft stored.  When Sentry ADS-B is receiving,
+    /// the query radius grows to 200 nm to cover the same range as ADS-B traffic,
+    /// so the cap also grows to accommodate the larger area.
+    private var maxInternetAircraft: Int { connectionStatus == .receiving ? 300 : 100 }
     /// Timestamp of the most recent internet fetch request — used to compute
     /// dynamic extrapolation latency in the dead-reckoning position predictor.
     private(set) var lastInternetFetchTime: Date?
@@ -1670,10 +1670,11 @@ class ConnectionLogic: ObservableObject {
     private func fetchInternetData() {
         guard let loc = currentLocation else { return }
         lastInternetFetchTime = Date()
+        let effectiveRadius = connectionStatus == .receiving ? max(internetQueryRadius, 200.0) : internetQueryRadius
         adsbLolClient.fetchAircraft(
             latitude: loc.latitude,
             longitude: loc.longitude,
-            radiusNM: internetQueryRadius
+            radiusNM: effectiveRadius
         ) { [weak self] result in
             switch result {
             case .success(let aircraft):
