@@ -1686,6 +1686,9 @@ class ARTrafficViewController: UIViewController {
             }
             let corrStr = String(format: "%+.1f°", arKitNorthCorrectionDeg)
             lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
+        } else if lastHorizontalAccuracy > 0 {
+            // Rough fix — spatial filter active but AR positioning not yet usable.
+            lines.append(String(format: "📍 GPS: ±%.0fm (filter only, AR pending)", lastHorizontalAccuracy))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -1803,6 +1806,16 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
 
         let hAcc = loc.horizontalAccuracy
+        // Without A-GPS (flight mode, no cellular), cold-start accuracy is typically
+        // 200–2000 m — well above the 30 m AR threshold — for the first few minutes.
+        // The spatial filter (±10°) only needs ~100 km precision, so seed ConnectionLogic
+        // with any sub-2 km fix before the AR accuracy guard runs.  This breaks the
+        // chicken-and-egg deadlock where tcasEnabled requires altitude which requires
+        // a GPS fix that requires tcasEnabled.
+        if hAcc > 0 && hAcc < 2000 && userLocation == nil {
+            connectionLogic.updateLocation(loc.coordinate,
+                                           altitudeFeet: loc.altitude * CalculationsLogic.metersToFeet)
+        }
         // Inside an aircraft fuselage the GPS signal is attenuated; accuracy
         // typically degrades to 30–150 m, which would make the strict ground
         // threshold (30 m) reject every fix.  In flight (tcasEnabled = altitude
