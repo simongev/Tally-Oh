@@ -1115,9 +1115,10 @@ class ConnectionLogic: ObservableObject {
             // Reject positions more than 10° from user — prevents phantom aircraft.
             if let loc = currentLocation,
                abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
-            // Reject positions identical to user (own-ship echo).
+            // Reject ownship echo.
             if let loc = currentLocation,
-               abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
+               abs(lat - loc.latitude) < ownshipRejectionRadius &&
+               abs(lon - loc.longitude) < ownshipRejectionRadius { continue }
 
             // GDL90 12-bit altitude packed at bytes immediately after the later coordinate.
             let altOff = max(slot.latOff, slot.lonOff) + 3
@@ -1165,8 +1166,10 @@ class ConnectionLogic: ObservableObject {
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
             if let loc = currentLocation,
                abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
+            // Reject ownship echo.
             if let loc = currentLocation,
-               abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { continue }
+               abs(lat - loc.latitude) < ownshipRejectionRadius &&
+               abs(lon - loc.longitude) < ownshipRejectionRadius { continue }
 
             let icaoHex = String(format: "%02X%02X%02X", b[base + 1], b[base + 2], b[base + 3])
             let acId = icaoHex == "000000" ? "B560_\(i)" : icaoHex
@@ -1355,8 +1358,10 @@ class ConnectionLogic: ObservableObject {
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
         if let loc = currentLocation,
            abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        // Reject ownship echo.
         if let loc = currentLocation,
-           abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 { return nil }
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
 
         // Tentative ICAO from b[1-3]; prefixed with 'U' + frame size to avoid
         // collisions with 22b ('S') and 70b ('T') aircraft.
@@ -1432,6 +1437,14 @@ class ConnectionLogic: ObservableObject {
         return distNm <= maxRangeNm
     }
 
+    /// Ownship echo rejection radius in degrees.
+    /// In flight the aircraft transponder GPS can disagree with the iPhone GPS by
+    /// up to ~3 nm (different receivers, timing offset).  On the ground keep the
+    /// radius tight (≈0.6 nm) so nearby taxiing aircraft are not suppressed.
+    private var ownshipRejectionRadius: Double {
+        currentAltitudeFeet > 5_000 ? 0.05 : 0.01
+    }
+
     /// Decode a single-aircraft 22-byte 0x26 frame using calibration from voteForEncoding22.
     /// prop70RecordOffset == 0 signals this mode.
     private func decodeProprietarySingle(_ payload: Data) -> Aircraft? {
@@ -1454,6 +1467,10 @@ class ConnectionLogic: ObservableObject {
         // the ±90/±180 range check, flooding detectedAircraft with phantom aircraft worldwide.
         if let loc = currentLocation,
            abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        // Reject ownship echo (transponder GPS can differ from iPhone GPS by up to ~3 nm).
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         // Build a unique ICAO-style ID from the first 3 non-type bytes.
         let icao = String(format: "S%02X%02X%02X", b[1], b[2], b[3])
         // Try GDL90 altitude (12-bit packed) from the two bytes immediately after the
@@ -1500,11 +1517,10 @@ class ConnectionLogic: ObservableObject {
         if let loc = currentLocation,
            abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
 
-        // Skip ownship: if position is within 0.1° of user's GPS it's us, not traffic.
+        // Skip ownship echo.
         if let loc = currentLocation,
-           abs(lat - loc.latitude) < 0.01 && abs(lon - loc.longitude) < 0.01 {
-            return nil
-        }
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
 
         // Use bytes [1-3] for ICAO, consistent with decodeProprietarySingle.
         // b[1] == 0x00 for TIS-B pseudo-addresses (same as 22b frames);
