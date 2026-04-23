@@ -1500,16 +1500,14 @@ class ARTrafficViewController: UIViewController {
                     let ok = d.prop560DecodeCount
                     lines.append(ok > 0 ? "✅560b×\(cnt560) (\(ok) w/traffic)" : "⏳560b×\(cnt560) (0 decoded)")
                 }
-                // 20b: xcorr produced inconsistent offsets across sessions — ruled out as
-                // position data; shown as auxiliary/ownship frame, no xcorr scanning.
+                // 20b: ground-only device status, never appears in flight. Just count.
                 if let cnt20 = d.frameSizeCounts[20] {
-                    lines.append("20b×\(cnt20) (aux/ownship, not traffic)")
+                    lines.append("20b×\(cnt20) (ground device status)")
                 }
-                // 56b xcorr stopped: converged to different offsets in each in-flight session
-                // (session1: BE lat@6, session2: BE lat@0) — same instability as confirmed
-                // false-positives 20b/43b → not fixed-offset position data.
+                // 56b: dominant in-flight frame — xcorr re-enabled (Build 211).
                 if let cnt56 = d.frameSizeCounts[56] {
-                    lines.append("56b×\(cnt56) (xcorr stopped)")
+                    let xcorr56 = d.undecodedXcorrResults[56] ?? "🔍scanning…"
+                    lines.append("56b×\(cnt56) \(xcorr56)")
                 }
                 // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {
@@ -1540,9 +1538,6 @@ class ARTrafficViewController: UIViewController {
                 // can compare directly to the ForeFlight aircraft list.
                 for (i, f20) in d.recent20bFrames.prefix(2).enumerated() {
                     lines.append("G\(i+1): \(f20)")
-                    let hypo = decode20bHypotheses(hex: f20,
-                                                   hit: d.undecodedHits[20])
-                    if !hypo.isEmpty { lines.append("    \(hypo)") }
                 }
                 // Ring buffer of recent 22-byte frames for ForeFlight correlation.
                 // [..] = lat field, {..} = lon field per voting result.
@@ -1798,30 +1793,6 @@ class ARTrafficViewController: UIViewController {
         statusLabel.text = newText
     }
 
-    /// Decodes a 20-byte frame hex string under the Build 210 lat@14 LE 1e-5
-    /// hypothesis for lon@11 and lon@17. Returns a compact summary so the user
-    /// can compare directly to the ForeFlight aircraft list.
-    private func decode20bHypotheses(hex: String,
-                                     hit: ADSBDiagnostics.UndecodedHit?) -> String {
-        let bytes = hex.components(separatedBy: " ").compactMap { UInt8($0, radix: 16) }
-        guard bytes.count == 20 else { return "" }
-        let scale = 1.0 / 100_000.0
-        func s24le(_ i: Int) -> Double {
-            let v = Int32(bytes[i]) | Int32(bytes[i+1]) << 8 | Int32(bytes[i+2]) << 16
-            let s = v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
-            return Double(s)
-        }
-        let lat = s24le(14) * scale
-        var parts: [String] = []
-        for lonOff in [11, 17] {
-            let lon = s24le(lonOff) * scale
-            let match = connectionLogic.matchLabelForPosition(lat: lat, lon: lon)
-            let locked = (hit?.latOff == 14 && hit?.lonOff == lonOff) ? "🔒" : ""
-            parts.append(String(format: "L%d=(%.3f,%.3f)%@%@",
-                                lonOff, lat, lon, match, locked))
-        }
-        return parts.joined(separator: " ")
-    }
 }
 
 // MARK: - ARSCNViewDelegate
