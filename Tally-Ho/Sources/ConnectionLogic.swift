@@ -685,17 +685,13 @@ class ConnectionLogic: ObservableObject {
                     }
                     if added > 0 { self.adsbDiag.prop560DecodeCount += 1 }
                 } else if [20, 21, 43, 47, 56].contains(copy26.count) {
-                    // 47b: paired 1:1 with 0x25 ownship — skip xcorr.
-                    // 20b: xcorr across two sessions converged on different offsets/endianness
-                    //      each time (LE lat@14 lon@11 in one session, BE lat@14 lon@17 in the
-                    //      next). This inconsistency rules out fixed-offset position data — 20b
-                    //      frames are device status or ownship auxiliary, not traffic. Skip xcorr.
-                    // 21b/43b: always appear at equal counts (paired device-status). xcorr on 43b
-                    //      converged to Antarctica (-66°/-89°) one session and different offsets
-                    //      the next — same false-positive instability as 20b. Skip xcorr for both.
-                    // 56b: xcorr stopped — converged to different offsets in each in-flight session
-                    //      (session1: BE lat@6, session2: BE lat@0). Same instability as 20b/43b.
-                    let shouldScan = false
+                    // 47b/21b/43b/56b: confirmed not traffic — skip xcorr.
+                    // 20b: re-enabled. Both prior sessions independently found lat@14; the
+                    //      conflicting lon offsets (lon@11 vs lon@17) came from different
+                    //      close-aircraft sets present in each session, not a format inconsistency.
+                    //      With 200+ internet aircraft as reference anchors, xcorr will converge
+                    //      reliably the next time the Sentry receives close-range traffic.
+                    let shouldScan = copy26.count == 20
                     if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
                         if let ac = self.decodeWithHit(copy26, hit: hit), self.isPhysicallyReceivable(ac) {
                             self.detectedAircraft[ac.id] = ac
