@@ -1536,10 +1536,13 @@ class ARTrafficViewController: UIViewController {
                     let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
                     lines.append("0x25: \(trimmed)")
                 }
-                // 20b ring buffer: show up to 2 recent frames for cross-session comparison.
-                // We want to see if ICAO/bytes vary between frames, identifying position fields.
+                // 20b ring buffer: hex + both lon-offset hypotheses so the user
+                // can compare directly to the ForeFlight aircraft list.
                 for (i, f20) in d.recent20bFrames.prefix(2).enumerated() {
                     lines.append("G\(i+1): \(f20)")
+                    let hypo = decode20bHypotheses(hex: f20,
+                                                   hit: d.undecodedHits[20])
+                    if !hypo.isEmpty { lines.append("    \(hypo)") }
                 }
                 // Ring buffer of recent 22-byte frames for ForeFlight correlation.
                 // [..] = lat field, {..} = lon field per voting result.
@@ -1793,6 +1796,31 @@ class ARTrafficViewController: UIViewController {
         let newText = lines.map { "  \($0)  " }.joined(separator: "\n")
         guard newText != statusLabel.text else { return }
         statusLabel.text = newText
+    }
+
+    /// Decodes a 20-byte frame hex string under the Build 210 lat@14 LE 1e-5
+    /// hypothesis for lon@11 and lon@17. Returns a compact summary so the user
+    /// can compare directly to the ForeFlight aircraft list.
+    private func decode20bHypotheses(hex: String,
+                                     hit: ADSBDiagnostics.UndecodedHit?) -> String {
+        let bytes = hex.components(separatedBy: " ").compactMap { UInt8($0, radix: 16) }
+        guard bytes.count == 20 else { return "" }
+        let scale = 1.0 / 100_000.0
+        func s24le(_ i: Int) -> Double {
+            let v = Int32(bytes[i]) | Int32(bytes[i+1]) << 8 | Int32(bytes[i+2]) << 16
+            let s = v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            return Double(s)
+        }
+        let lat = s24le(14) * scale
+        var parts: [String] = []
+        for lonOff in [11, 17] {
+            let lon = s24le(lonOff) * scale
+            let match = connectionLogic.matchLabelForPosition(lat: lat, lon: lon)
+            let locked = (hit?.latOff == 14 && hit?.lonOff == lonOff) ? "🔒" : ""
+            parts.append(String(format: "L%d=(%.3f,%.3f)%@%@",
+                                lonOff, lat, lon, match, locked))
+        }
+        return parts.joined(separator: " ")
     }
 }
 

@@ -1329,6 +1329,22 @@ class ConnectionLogic: ObservableObject {
         _ = decodeWithHit(payload, hit: adsbDiag.undecodedHits[n]!)
     }
 
+    /// Returns a HUD label for a hypothesized (lat, lon): "[net]" if within 0.10°
+    /// of an internet aircraft, "[adsb]" if within an ADS-B aircraft, "[own]" if
+    /// within the ownship rejection radius of GPS, "" if no match.
+    /// Must be called on the main thread.
+    func matchLabelForPosition(lat: Double, lon: Double) -> String {
+        if let loc = currentLocation,
+           abs(lat - loc.latitude)  < ownshipRejectionRadius,
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return "[own]" }
+        for ac in detectedAircraft.values {
+            guard abs(lat - ac.latitude)  <= 0.10,
+                  abs(lon - ac.longitude) <= 0.10 else { continue }
+            return ac.source == .internet ? "[net]" : "[adsb]"
+        }
+        return ""
+    }
+
     /// For 20-byte 0x26 frames: lat@14 is confirmed from 2 independent sessions.
     /// Tries lon@11 then lon@17 (the two observed lon offsets) using LE 1e-5 scale.
     /// Validates each decoded position against internet aircraft (≤0.10°).  First
