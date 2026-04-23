@@ -686,24 +686,29 @@ class ConnectionLogic: ObservableObject {
                     if added > 0 { self.adsbDiag.prop560DecodeCount += 1 }
                 } else if [20, 21, 43, 47, 56].contains(copy26.count) {
                     // 47b/21b/43b/56b: confirmed not traffic — skip xcorr.
-                    // 20b: re-enabled. Both prior sessions independently found lat@14; the
-                    //      conflicting lon offsets (lon@11 vs lon@17) came from different
-                    //      close-aircraft sets present in each session, not a format inconsistency.
-                    //      With 200+ internet aircraft as reference anchors, xcorr will converge
-                    //      reliably the next time the Sentry receives close-range traffic.
-                    let shouldScan = copy26.count == 20
-                    if let hit = shouldScan ? self.adsbDiag.undecodedHits[copy26.count] : nil {
-                        if let ac = self.decodeWithHit(copy26, hit: hit), self.isPhysicallyReceivable(ac) {
+                    // 20b: lat@14 LE 1e-5 confirmed from 2 independent sessions.
+                    //      Try lon@11 and lon@17 (both observed) immediately, validate
+                    //      against internet aircraft, and lock on first match — no xcorr
+                    //      convergence delay.  Fall through to xcorr if no internet match.
+                    if copy26.count == 20 {
+                        if let hit = self.adsbDiag.undecodedHits[20] {
+                            if let ac = self.decodeWithHit(copy26, hit: hit),
+                               self.isPhysicallyReceivable(ac) {
+                                self.detectedAircraft[ac.id] = ac
+                                self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                                self.adsbDiag.parsedTraffic += 1
+                            }
+                        } else if let ac = self.tryLock20b(copy26),
+                                  self.isPhysicallyReceivable(ac) {
                             self.detectedAircraft[ac.id] = ac
                             self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                             self.adsbDiag.parsedTraffic += 1
-                        }
-                    } else if shouldScan {
-                        let n = copy26.count
-                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[n]?.contains(hex) ?? false
-                        if !alreadySeen {
-                            self.adsbDiag.xcorrSeenFrames[n, default: []].insert(hex)
-                            self.scanUndecodedFrame(copy26)
+                        } else {
+                            let alreadySeen = self.adsbDiag.xcorrSeenFrames[20]?.contains(hex) ?? false
+                            if !alreadySeen {
+                                self.adsbDiag.xcorrSeenFrames[20, default: []].insert(hex)
+                                self.scanUndecodedFrame(copy26)
+                            }
                         }
                     }
                 } else if ![70, 22, 20, 21, 43, 47, 56, 560].contains(copy26.count),
@@ -1322,6 +1327,55 @@ class ConnectionLogic: ObservableObject {
         // populated right away — without this, the HUD position annotation only
         // appears after the NEXT frame of this size arrives.
         _ = decodeWithHit(payload, hit: adsbDiag.undecodedHits[n]!)
+    }
+
+    /// For 20-byte 0x26 frames: lat@14 is confirmed from 2 independent sessions.
+    /// Tries lon@11 then lon@17 (the two observed lon offsets) using LE 1e-5 scale.
+    /// Validates each decoded position against internet aircraft (≤0.10°).  First
+    /// match locks undecodedHits[20] and returns the aircraft — zero xcorr delay.
+    /// Returns nil if no internet aircraft validates either candidate.
+    /// Must be called on the main thread.
+    private func tryLock20b(_ payload: Data) -> Aircraft? {
+        let scale = 1.0 / 100_000.0
+        let b = Array(payload)
+        guard b.count == 20 else { return nil }
+
+        func s24le(_ i: Int) -> Double {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+            let s = v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+            return Double(s)
+        }
+
+        let lat = s24le(14) * scale
+        guard (-90...90).contains(lat), abs(lat) > 1 else { return nil }
+        guard let loc = currentLocation, abs(lat - loc.latitude) <= 10 else { return nil }
+
+        for lonOff in [11, 17] {
+            let lon = s24le(lonOff) * scale
+            guard (-180...180).contains(lon), abs(lon) > 1 else { continue }
+            guard abs(lon - loc.longitude) <= 10 else { continue }
+            if abs(lat - loc.latitude) < ownshipRejectionRadius &&
+               abs(lon - loc.longitude) < ownshipRejectionRadius { continue }
+
+            let validated = detectedAircraft.values.contains {
+                $0.source == .internet &&
+                abs(lat - $0.latitude)  <= 0.10 &&
+                abs(lon - $0.longitude) <= 0.10
+            }
+            guard validated else { continue }
+
+            adsbDiag.undecodedHits[20] = ADSBDiagnostics.UndecodedHit(
+                isLE: true, latOff: 14, lonOff: lonOff,
+                latScale: scale, lonScale: scale, votes: 99)
+            adsbDiag.undecodedXcorrResults[20] = "✅20b LE lat@14 lon@\(lonOff) ×internet"
+
+            let icao = String(format: "U20%02X%02X%02X", b[1], b[2], b[3])
+            return Aircraft(id: icao, callsign: icao,
+                            latitude: lat, longitude: lon,
+                            altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                            lastUpdate: Date(), source: .adsb)
+        }
+        return nil
     }
 
     /// Decode a payload using a confirmed xcorr hit.
