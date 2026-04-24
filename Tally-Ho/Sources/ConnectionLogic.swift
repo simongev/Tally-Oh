@@ -635,14 +635,28 @@ class ConnectionLogic: ObservableObject {
                 }
 
                 // 70b voting removed — encoding confirmed and hardcoded (Build 185).
-                // 22b: always use hardcoded single-aircraft decoder.
+                // 22b: hardcoded single-aircraft decoder first.
+                // Frames that fail (decode outside ±10° of user) go through xcorr
+                // to find an alternative 22b sub-type format (Build 212).
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26), self.isPhysicallyReceivable(ac) {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
-                        let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                         self.adsbDiag.capturedPositionFrameHex = "\(ac.callsign): \(hex)"
+                    } else if let hit = self.adsbDiag.undecodedHits[22] {
+                        if let ac = self.decodeWithHit(copy26, hit: hit),
+                           self.isPhysicallyReceivable(ac) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                            self.adsbDiag.parsedTraffic += 1
+                        }
+                    } else {
+                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
+                        if !alreadySeen {
+                            self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)
+                            self.scanUndecodedFrame(copy26)
+                        }
                     }
                 } else if copy26.count == 70 {
                     // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3).
