@@ -1234,11 +1234,13 @@ class ConnectionLogic: ObservableObject {
         ]
         let nsc = scales.count
 
-        // Reference set.  Internet aircraft are tight anchors (±0.10°/0.15°, accurate to ~0.01°).
-        // ADS-B decoded aircraft (22b/70b) are slightly looser (±0.15°).
-        // Ownship GPS is the fallback anchor: tight (±0.20°) when internet is live so it doesn't
-        // dominate; wide (±1.50°, ≈90nm) when no internet is available (e.g. in-flight) so that
-        // traffic at 20-80nm can still accumulate votes and xcorr can converge.
+        // Reference set.
+        // With internet: ownship ±0.20° + all aircraft refs (internet ±0.10°, ADS-B ±0.15°).
+        //   Many tight anchors → fast convergence from ground sessions.
+        // Without internet (in-flight): ONLY ownship ±1.50° (≈90nm).
+        //   Dropping 100+ ADS-B refs reduces false-positive surface from ~0.03% to ~0.014%
+        //   per frame, keeping noise well below 1 vote while the true format accumulates
+        //   hundreds of votes from aircraft within 90nm.
         struct Ref { let lat, lon, latTol, lonTol: Double }
         var refs: [Ref] = []
         let hasInternet = detectedAircraft.values.contains { $0.source == .internet }
@@ -1246,9 +1248,11 @@ class ConnectionLogic: ObservableObject {
             let ownTol: Double = hasInternet ? 0.20 : 1.50
             refs.append(Ref(lat: loc.latitude, lon: loc.longitude, latTol: ownTol, lonTol: ownTol))
         }
-        for ac in detectedAircraft.values {
-            let (lt, ln): (Double, Double) = ac.source == .internet ? (0.10, 0.15) : (0.15, 0.15)
-            refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: lt, lonTol: ln))
+        if hasInternet {
+            for ac in detectedAircraft.values {
+                let (lt, ln): (Double, Double) = ac.source == .internet ? (0.10, 0.15) : (0.15, 0.15)
+                refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: lt, lonTol: ln))
+            }
         }
         guard !refs.isEmpty else { return }
 
