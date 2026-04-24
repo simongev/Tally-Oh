@@ -93,7 +93,7 @@ struct ADSBDiagnostics {
     var propLonScale: Double? = 180.0 / 16_777_216.0
     /// Human-readable calibration status shown in the HUD.
     var calibrationStatus: String? = "✅22 lat@15×1.07e-05 lon@5×1.07e-05 (hardcoded)"
-    var calibrationV2Status: String? = "✅22v2 lat@4×1.00e-05 lon@9×1.07e-05 (hardcoded)"
+    var calibrationV2Status: String? = "✅22v2 LE lat@2×1.00e-05 lon@5×1.07e-05 (hardcoded)"
     /// Vote counts for proprietary 0x26 encoding discovery.
     /// Keyed by packed (roBit, latOff, latScIdx, lonOff, lonScIdx) indices.
     var prop26VoteCounts: [Int: Int] = [:]
@@ -637,7 +637,7 @@ class ConnectionLogic: ObservableObject {
 
                 // 70b voting removed — encoding confirmed and hardcoded (Build 185).
                 // 22b: two hardcoded formats. v1=BE lat@15 lon@5 180/2^24 (far traffic).
-                //      v2=BE lat@4 1e-5 lon@9 180/2^24 (confirmed xcorr ×11, Build 212).
+                //      v2=LE lat@2 1e-5 lon@5 180/2^24 (confirmed xcorr ×26, Build 212).
                 //      Frames failing both go through xcorr for any future unknown format.
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26), self.isPhysicallyReceivable(ac) {
@@ -1504,18 +1504,17 @@ class ConnectionLogic: ObservableObject {
                         lastUpdate: Date(), source: .adsb)
     }
 
-    /// Hardcoded 22b sub-type v2: BE lat@4 scale 1e-5, lon@9 scale 180/2^24.
-    /// Confirmed via xcorr ×11 (Build 212). Handles 22b frames that fail the primary
-    /// hardcoded decoder (BE lat@15 lon@5 scale 180/2^24).
+    /// Hardcoded 22b sub-type v2: LE lat@2 scale 1e-5, lon@5 scale 180/2^24.
+    /// Confirmed via xcorr ×26 (Build 212 session 2). Supersedes BE lat@4/lon@9 ×11.
     private func decode22bV2(_ payload: Data) -> Aircraft? {
         guard payload.count == 22 else { return nil }
         let b = Array(payload)
-        func s24be(_ i: Int) -> Int32 {
-            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+        func s24le(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
             return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
         }
-        let lat = Double(s24be(4)) * (1.0 / 100_000.0)
-        let lon = Double(s24be(9)) * (180.0 / 16_777_216.0)
+        let lat = Double(s24le(2)) * (1.0 / 100_000.0)
+        let lon = Double(s24le(5)) * (180.0 / 16_777_216.0)
         guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
         guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
         if let loc = currentLocation,
