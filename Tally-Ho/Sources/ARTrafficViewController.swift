@@ -1457,8 +1457,8 @@ class ARTrafficViewController: UIViewController {
                 if let cal = d.calibrationStatus {
                     lines.append("🔬 \(cal)")
                 }
-                if let xcorr22 = d.undecodedXcorrResults[22] {
-                    lines.append("🔬22b-v2: \(xcorr22)")
+                if let cal2 = d.calibrationV2Status {
+                    lines.append("🔬 \(cal2)")
                 }
                 if !d.capturedPositionFrameHex.isEmpty {
                     // Annotate captured position frame with [lat] and {lon} brackets so the
