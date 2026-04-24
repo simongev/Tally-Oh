@@ -1234,12 +1234,17 @@ class ConnectionLogic: ObservableObject {
         ]
         let nsc = scales.count
 
-        // Reference set.  Separate lat/lon tolerances let internet aircraft act as
-        // tight anchors (they are accurate to ~0.01°) while GPS is a fallback.
+        // Reference set.  Internet aircraft are tight anchors (±0.10°/0.15°, accurate to ~0.01°).
+        // ADS-B decoded aircraft (22b/70b) are slightly looser (±0.15°).
+        // Ownship GPS is the fallback anchor: tight (±0.20°) when internet is live so it doesn't
+        // dominate; wide (±1.50°, ≈90nm) when no internet is available (e.g. in-flight) so that
+        // traffic at 20-80nm can still accumulate votes and xcorr can converge.
         struct Ref { let lat, lon, latTol, lonTol: Double }
         var refs: [Ref] = []
+        let hasInternet = detectedAircraft.values.contains { $0.source == .internet }
         if let loc = currentLocation {
-            refs.append(Ref(lat: loc.latitude,  lon: loc.longitude,  latTol: 0.20, lonTol: 0.20))
+            let ownTol: Double = hasInternet ? 0.20 : 1.50
+            refs.append(Ref(lat: loc.latitude, lon: loc.longitude, latTol: ownTol, lonTol: ownTol))
         }
         for ac in detectedAircraft.values {
             let (lt, ln): (Double, Double) = ac.source == .internet ? (0.10, 0.15) : (0.15, 0.15)
