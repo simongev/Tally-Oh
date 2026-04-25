@@ -1243,7 +1243,7 @@ class ConnectionLogic: ObservableObject {
         //   hundreds of votes from aircraft within 90nm.
         struct Ref { let lat, lon, latTol, lonTol: Double }
         var refs: [Ref] = []
-        let hasInternet = detectedAircraft.values.contains { $0.source == .internet }
+        let hasInternet = internetAircraftCount > 0
         if let loc = currentLocation {
             let ownTol: Double = hasInternet ? 0.20 : 1.50
             refs.append(Ref(lat: loc.latitude, lon: loc.longitude, latTol: ownTol, lonTol: ownTol))
