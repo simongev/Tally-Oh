@@ -1255,6 +1255,9 @@ class ConnectionLogic: ObservableObject {
             }
         }
         guard !refs.isEmpty else { return }
+        // Once a hit is confirmed for this frame size, xcorr has done its job.
+        // Stop scanning so the ✅ display is preserved and the hit is never overwritten.
+        guard adsbDiag.undecodedHits[n] == nil else { return }
 
         let maxOff = n - 3
         guard maxOff >= 3 else { return }
