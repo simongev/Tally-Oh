@@ -1512,6 +1512,9 @@ class ARTrafficViewController: UIViewController {
                     let xcorr56 = d.undecodedXcorrResults[56] ?? "🔍scanning…"
                     lines.append("56b×\(cnt56) \(xcorr56)")
                 }
+                if !d.prop56bStatus.isEmpty {
+                    lines.append("✅56b \(d.prop56bStatus)")
+                }
                 // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {
                     lines.append("47b×\(cnt47) = 0x25×\(cnt25) (ownship ext)")

@@ -118,6 +118,8 @@ struct ADSBDiagnostics {
     var prop70LonScale: Double = 0
     /// 70b bundle calibration status shown in HUD (hardcoded since Build 185).
     var prop70VotingStatus: String = "HARDCODED LE 1e-5 lat@11/lon@46"
+    /// 56b experimental hardcoded status shown in HUD (Build 220). Empty until first decode fires.
+    var prop56bStatus: String = ""
     /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
     var prop70ScanResult: String = ""
     /// Vote counts for cross-correlation candidates across scan windows.
@@ -699,14 +701,21 @@ class ConnectionLogic: ObservableObject {
                 } else if [20, 21, 43, 47, 56].contains(copy26.count) {
                     // 20b: ground-only device status (never appears in flight). Skip.
                     // 47b/21b/43b: confirmed not traffic. Skip.
-                    // 56b: dominant in-flight frame (500+/session). Re-enabled xcorr.
-                    //      Previous "inconsistent offsets" was a false alarm — xcorr
-                    //      converged on different aircraft in different sessions, not
-                    //      different formats. With decoded aircraft as reference anchors
-                    //      (±0.15°) xcorr will converge on the correct lat/lon offsets.
+                    // 56b: dominant in-flight frame (500+/session).
+                    // Decode priority: (1) hardcoded experimental, (2) xcorr hit, (3) xcorr scan.
                     if copy26.count == 56 {
                         var decoded56 = false
-                        if let hit = self.adsbDiag.undecodedHits[56] {
+                        // (1) Experimental hardcoded format: LE lat@52×1.07e-5 lon@18×1.00e-5.
+                        if let ac = self.decode56bHardcoded(copy26),
+                           self.isPhysicallyReceivable(ac) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                            self.adsbDiag.parsedTraffic += 1
+                            self.adsbDiag.prop56bStatus = "HARDCODED LE lat@52×1.07e-05 lon@18×1.00e-05"
+                            decoded56 = true
+                        }
+                        // (2) xcorr confirmed hit (if present).
+                        if !decoded56, let hit = self.adsbDiag.undecodedHits[56] {
                             if let ac = self.decodeWithHit(copy26, hit: hit),
                                self.isPhysicallyReceivable(ac) {
                                 self.detectedAircraft[ac.id] = ac
@@ -715,8 +724,7 @@ class ConnectionLogic: ObservableObject {
                                 decoded56 = true
                             }
                         }
-                        // If no hit yet, or hit produced invalid position (false convergence):
-                        // run xcorr on new unique frames so the true format can still converge.
+                        // (3) xcorr scan for new unique frames so format can still be validated.
                         if !decoded56 {
                             let alreadySeen = self.adsbDiag.xcorrSeenFrames[56]?.contains(hex) ?? false
                             if !alreadySeen {
@@ -1539,6 +1547,31 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) < ownshipRejectionRadius &&
            abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         let icao = String(format: "V%02X%02X%02X", b[1], b[2], b[3])
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                        lastUpdate: Date(), source: .adsb)
+    }
+
+    /// Experimental hardcoded 56b decoder: LE lat@52 ×(180/2²⁴), lon@18 ×1e-5.
+    /// Candidate from 4 consecutive cruise HUDs at ×10/9 (Build 218). W-prefix IDs.
+    private func decode56bHardcoded(_ payload: Data) -> Aircraft? {
+        let b = Array(payload)
+        guard b.count == 56 else { return nil }
+        func s24le(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        let lat = Double(s24le(52)) * (180.0 / 16_777_216.0)
+        let lon = Double(s24le(18)) * (1.0 / 100_000.0)
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
+        let icao = String(format: "W%02X%02X%02X", b[1], b[2], b[3])
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
                         altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
