@@ -1235,12 +1235,14 @@ class ConnectionLogic: ObservableObject {
         let nsc = scales.count
 
         // Reference set.
-        // With internet: ownship ±0.20° + all aircraft refs (internet ±0.10°, ADS-B ±0.15°).
-        //   Many tight anchors → fast convergence from ground sessions.
-        // Without internet (in-flight): ONLY ownship ±1.50° (≈90nm).
-        //   Dropping 100+ ADS-B refs reduces false-positive surface from ~0.03% to ~0.014%
-        //   per frame, keeping noise well below 1 vote while the true format accumulates
-        //   hundreds of votes from aircraft within 90nm.
+        // Internet aircraft (±0.10°/0.15°) used only when live feed is active.
+        // ADS-B decoded aircraft (±0.15°) used ALWAYS, even offline. Their diverse
+        //   positions break the systematic adjacent-offset correlation that keeps
+        //   the ownship-only xcorr gap at ≤2: with 30-50 refs spanning 20+° lon,
+        //   competing offset candidates can't match all refs, growing the gap to 20+.
+        // Ownship (±1.50°) catches 56b aircraft not in the ADS-B list.
+        // Expected noise: ~3.4 votes/candidate (ownship 2.2 + ADS-B refs 1.2).
+        // Expected signal: 20-50 votes (ADS-B ref matches + ownship-only aircraft).
         struct Ref { let lat, lon, latTol, lonTol: Double }
         var refs: [Ref] = []
         let hasInternet = internetAircraftCount > 0
@@ -1248,10 +1250,12 @@ class ConnectionLogic: ObservableObject {
             let ownTol: Double = hasInternet ? 0.20 : 1.50
             refs.append(Ref(lat: loc.latitude, lon: loc.longitude, latTol: ownTol, lonTol: ownTol))
         }
+        for ac in detectedAircraft.values where ac.source == .adsb {
+            refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: 0.15, lonTol: 0.15))
+        }
         if hasInternet {
-            for ac in detectedAircraft.values {
-                let (lt, ln): (Double, Double) = ac.source == .internet ? (0.10, 0.15) : (0.15, 0.15)
-                refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: lt, lonTol: ln))
+            for ac in detectedAircraft.values where ac.source == .internet {
+                refs.append(Ref(lat: ac.latitude, lon: ac.longitude, latTol: 0.10, lonTol: 0.15))
             }
         }
         guard !refs.isEmpty else { return }
