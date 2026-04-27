@@ -1514,6 +1514,11 @@ class ARTrafficViewController: UIViewController {
                 }
                 if !d.prop56bStatus.isEmpty {
                     lines.append("✅56b \(d.prop56bStatus)")
+                    if !d.prop56bLastDecodedHex.isEmpty {
+                        let toks = d.prop56bLastDecodedHex.components(separatedBy: " ")
+                        lines.append("  W: " + toks.prefix(28).joined(separator: " "))
+                        if toks.count > 28 { lines.append("     " + Array(toks.dropFirst(28)).joined(separator: " ")) }
+                    }
                 }
                 // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
                 if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {

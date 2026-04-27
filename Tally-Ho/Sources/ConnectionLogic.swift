@@ -120,6 +120,8 @@ struct ADSBDiagnostics {
     var prop70VotingStatus: String = "HARDCODED LE 1e-5 lat@11/lon@46"
     /// 56b experimental hardcoded status shown in HUD (Build 220). Empty until first decode fires.
     var prop56bStatus: String = ""
+    /// Raw hex of last successfully-decoded W frame, for ICAO hunting (Build 222).
+    var prop56bLastDecodedHex: String = ""
     /// Cached result of last cross-correlation scan of 70b bytes against detected aircraft.
     var prop70ScanResult: String = ""
     /// Vote counts for cross-correlation candidates across scan windows.
@@ -717,6 +719,13 @@ class ConnectionLogic: ObservableObject {
                                 : ""
                             let netNote = netTag.isEmpty ? "" : " \(netTag)"
                             self.adsbDiag.prop56bStatus = "HARDCODED LE lat@52×1.07e-05 lon@18×1.00e-05 (W×\(wCount))\(netNote)"
+                            // Log raw bytes with <XX> marking 0xA0-0xAF bytes (US ICAO range).
+                            let b = Array(copy26)
+                            let hexParts = b.enumerated().map { (i, byte) -> String in
+                                let h = String(format: "%02X", byte)
+                                return (byte >= 0xA0 && byte <= 0xAF) ? "<\(h)>" : h
+                            }
+                            self.adsbDiag.prop56bLastDecodedHex = hexParts.joined(separator: " ")
                             decoded56 = true
                         }
                         // (2) xcorr confirmed hit (if present).
