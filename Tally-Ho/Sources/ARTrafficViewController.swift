@@ -1449,6 +1449,8 @@ class ARTrafficViewController: UIViewController {
         var lines: [String] = []
         let d = connectionLogic.adsbDiag
 
+        if !logSavedNote.isEmpty { lines.append(logSavedNote) }
+
         // Source
         switch connectionLogic.connectionStatus {
         case .receiving:
@@ -1598,8 +1600,6 @@ class ARTrafficViewController: UIViewController {
         }
 
         lines.append("🛫 Airports: \(airports.count)")
-
-        if !logSavedNote.isEmpty { lines.append(logSavedNote) }
 
         let newText = lines.map { "  \($0)  " }.joined(separator: "\n")
         guard newText != statusLabel.text else { return }
