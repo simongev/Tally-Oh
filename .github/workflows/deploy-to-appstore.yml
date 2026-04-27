@@ -1,6 +1,9 @@
 name: Deploy to App Store
 
 on:
+  push:
+    branches:
+      - claude/fix-foreflight-sentry-display-oexPM
   workflow_dispatch:
 
 jobs:
@@ -104,6 +107,12 @@ jobs:
             -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
             -exportPath $RUNNER_TEMP/export
 
+      - name: Read build number
+        id: build_info
+        run: |
+          BUILD=$(xcodebuild -project "Tally-Ho.xcodeproj" -scheme "Tally-Ho" -showBuildSettings 2>/dev/null | awk '/CURRENT_PROJECT_VERSION/{print $3; exit}')
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+
       - name: Upload to App Store Connect
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -113,9 +122,25 @@ jobs:
             -f $RUNNER_TEMP/export/*.ipa \
             -t ios \
             --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
+            --apiIssuer "$ASC_ISSUER_ID" \
+            --output-format xml 2>&1 | tee /tmp/altool_output.txt
+          # altool exits non-zero on failure; the tee above preserves output for the next step
+          grep -q "success" /tmp/altool_output.txt || (cat /tmp/altool_output.txt && exit 1)
+
+      - name: Notify on commit
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD: ${{ steps.build_info.outputs.build }}
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            BODY="✅ Build $BUILD uploaded to App Store Connect. It will appear in TestFlight once Apple finishes processing (usually 5–15 min)."
+          else
+            BODY="❌ Build $BUILD failed to upload. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+          fi
+          gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments \
+            -f body="$BODY"
 
       - name: Clean up keychain
         if: always()
         run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
-        # $RUNNER_TEMP/app-signing.keychain-db
