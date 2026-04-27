@@ -118,14 +118,12 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
+          set -o pipefail
           xcrun altool --upload-app \
             -f $RUNNER_TEMP/export/*.ipa \
             -t ios \
             --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID" \
-            --output-format xml 2>&1 | tee /tmp/altool_output.txt
-          # altool exits non-zero on failure; the tee above preserves output for the next step
-          grep -q "success" /tmp/altool_output.txt || (cat /tmp/altool_output.txt && exit 1)
+            --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee /tmp/altool_output.txt
 
       - name: Notify on commit
         if: always()
