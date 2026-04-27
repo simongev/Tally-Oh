@@ -805,7 +805,7 @@ class ARTrafficViewController: UIViewController {
         } else {
             try? data.write(to: url)
         }
-        logSavedNote = "📝 Log saved — Files > TallyOh > tally-hud-log.txt"
+        logSavedNote = "📝 Log saved [\(reason)] — Files > TallyOh > tally-hud-log.txt"
     }
 
     @objc private func copyStatusTapped() {
@@ -1616,10 +1616,10 @@ class ARTrafficViewController: UIViewController {
                 if let hex = d.sampleFramesBySize[n] { frames.append("\(n)b: \(hex)") }
                 appendToHUDLog(reason: "xcorr \(n)b lock", rawFrames: frames)
             }
-            // Ground correlation: 56b frames arriving while internet aircraft are visible.
-            // Fires once per session — gives raw bytes + known positions for offline decode.
+            // Ground correlation: fires once we have ≥20 56b frames and internet aircraft.
+            // Waiting for 20 frames (~20s) avoids firing on the very first connection burst.
             let netCount = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
-            if d.frameSizeCounts[56] != nil && netCount > 0
+            if (d.frameSizeCounts[56] ?? 0) >= 20 && netCount >= 3
                 && capturedEventKeys.insert("56b_ground_corr").inserted {
                 var frames: [String] = []
                 if let hex = d.sampleFramesBySize[56] { frames.append("56b: \(hex)") }
