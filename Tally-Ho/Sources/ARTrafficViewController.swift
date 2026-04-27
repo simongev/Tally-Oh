@@ -795,6 +795,26 @@ class ARTrafficViewController: UIViewController {
         if !rawFrames.isEmpty {
             entry += "\n--- raw frames ---\n" + rawFrames.joined(separator: "\n") + "\n"
         }
+
+        let d = connectionLogic.adsbDiag
+        var cal: [String] = []
+        if let s = d.calibrationStatus   { cal.append(s) }
+        if let s = d.calibrationV2Status { cal.append(s) }
+        if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
+           let latS = d.propLatScale,    let lonS = d.propLonScale {
+            cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
+        }
+        for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
+            cal.append("\(size)b xcorr: \(hit.display)")
+        }
+        for (size, hex) in d.sampleFramesBySize.sorted(by: { $0.key < $1.key })
+            where rawFrames.allSatisfy({ !$0.hasPrefix("\(size)b:") }) {
+            cal.append("\(size)b sample: \(hex)")
+        }
+        if !cal.isEmpty {
+            entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"
+        }
+
         guard let data = entry.data(using: .utf8) else { return }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let url  = docs.appendingPathComponent("tally-hud-log.txt")
