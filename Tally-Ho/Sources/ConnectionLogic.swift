@@ -711,7 +711,12 @@ class ConnectionLogic: ObservableObject {
                             self.detectedAircraft[ac.id] = ac
                             self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                             self.adsbDiag.parsedTraffic += 1
-                            self.adsbDiag.prop56bStatus = "HARDCODED LE lat@52×1.07e-05 lon@18×1.00e-05"
+                            let wCount = self.adsbDiag.uniqueAircraftSeen.filter { $0.hasPrefix("W") }.count
+                            let netTag = self.internetAircraftCount > 0
+                                ? self.matchLabelForPosition(lat: ac.latitude, lon: ac.longitude)
+                                : ""
+                            let netNote = netTag.isEmpty ? "" : " \(netTag)"
+                            self.adsbDiag.prop56bStatus = "HARDCODED LE lat@52×1.07e-05 lon@18×1.00e-05 (W×\(wCount))\(netNote)"
                             decoded56 = true
                         }
                         // (2) xcorr confirmed hit (if present).
@@ -1551,6 +1556,23 @@ class ConnectionLogic: ObservableObject {
                         latitude: lat, longitude: lon,
                         altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
                         lastUpdate: Date(), source: .adsb)
+    }
+
+    /// Internet-match label for a decoded (lat,lon): "[net]" within ±0.10° of an internet
+    /// aircraft, "[adsb]" within ±0.15° of an ADS-B aircraft, "" otherwise. Call on main.
+    func matchLabelForPosition(lat: Double, lon: Double) -> String {
+        for ac in detectedAircraft.values {
+            if ac.source == .internet,
+               abs(lat - ac.latitude) <= 0.10,
+               abs(lon - ac.longitude) <= 0.10 { return "[net:\(ac.callsign)]" }
+        }
+        for ac in detectedAircraft.values {
+            if ac.source == .adsb,
+               !ac.id.hasPrefix("W"),
+               abs(lat - ac.latitude) <= 0.15,
+               abs(lon - ac.longitude) <= 0.15 { return "[adsb:\(ac.id)]" }
+        }
+        return ""
     }
 
     /// Experimental hardcoded 56b decoder: LE lat@52 ×(180/2²⁴), lon@18 ×1e-5.
