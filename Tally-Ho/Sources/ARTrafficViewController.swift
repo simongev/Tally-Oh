@@ -789,9 +789,12 @@ class ARTrafficViewController: UIViewController {
         copyStatusButton.isHidden = statusLabel.isHidden
     }
 
-    private func appendToHUDLog(reason: String) {
+    private func appendToHUDLog(reason: String, rawFrames: [String] = []) {
         let ts = ISO8601DateFormatter().string(from: Date())
-        let entry = "\n=== \(ts) [\(reason)] ===\n\(statusLabel.text ?? "")\n"
+        var entry = "\n=== \(ts) [\(reason)] ===\n\(statusLabel.text ?? "")\n"
+        if !rawFrames.isEmpty {
+            entry += "\n--- raw frames ---\n" + rawFrames.joined(separator: "\n") + "\n"
+        }
         guard let data = entry.data(using: .utf8) else { return }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let url  = docs.appendingPathComponent("tally-hud-log.txt")
@@ -1602,13 +1605,26 @@ class ARTrafficViewController: UIViewController {
         guard newText != statusLabel.text else { return }
         statusLabel.text = newText
 
-        // Auto-capture on first W decode or any new xcorr convergence
+        // Auto-capture triggers
         if connectionLogic.connectionStatus == .receiving {
             if !d.prop56bLastDecodedHex.isEmpty && capturedEventKeys.insert("w56_first").inserted {
-                appendToHUDLog(reason: "First W56 decode")
+                appendToHUDLog(reason: "First W56 decode",
+                               rawFrames: [d.prop56bLastDecodedHex])
             }
             for (n, _) in d.undecodedHits where capturedEventKeys.insert("xcorr_\(n)b").inserted {
-                appendToHUDLog(reason: "xcorr \(n)b lock")
+                var frames: [String] = []
+                if let hex = d.sampleFramesBySize[n] { frames.append("\(n)b: \(hex)") }
+                appendToHUDLog(reason: "xcorr \(n)b lock", rawFrames: frames)
+            }
+            // Ground correlation: 56b frames arriving while internet aircraft are visible.
+            // Fires once per session — gives raw bytes + known positions for offline decode.
+            let netCount = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
+            if d.frameSizeCounts[56] != nil && netCount > 0
+                && capturedEventKeys.insert("56b_ground_corr").inserted {
+                var frames: [String] = []
+                if let hex = d.sampleFramesBySize[56] { frames.append("56b: \(hex)") }
+                if !d.prop56bLastDecodedHex.isEmpty { frames.append("56b(W): \(d.prop56bLastDecodedHex)") }
+                appendToHUDLog(reason: "56b+internet ground correlation", rawFrames: frames)
             }
         }
     }
