@@ -800,6 +800,7 @@ class ARTrafficViewController: UIViewController {
         var cal: [String] = []
         if let s = d.calibrationStatus   { cal.append(s) }
         if let s = d.calibrationV2Status { cal.append(s) }
+        if let s = d.calibrationV3Status { cal.append(s) }
         if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
            let latS = d.propLatScale,    let lonS = d.propLonScale {
             cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
@@ -1562,6 +1563,7 @@ class ARTrafficViewController: UIViewController {
             var decoders: [String] = []
             if d.calibrationStatus  != nil { decoders.append("22b") }
             if d.calibrationV2Status != nil { decoders.append("22v2") }
+            if d.calibrationV3Status != nil { decoders.append("22v3") }
             if d.frameSizeCounts[70]  != nil || d.frameSizeCounts[560] != nil { decoders.append("70b") }
             if d.prop560DecodeCount > 0 { decoders.append("560b") }
             let wCount = d.uniqueAircraftSeen.filter { $0.hasPrefix("W") }.count

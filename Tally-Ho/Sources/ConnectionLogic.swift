@@ -94,6 +94,8 @@ struct ADSBDiagnostics {
     /// Human-readable calibration status shown in the HUD.
     var calibrationStatus: String? = "✅22 lat@15×1.07e-05 lon@5×1.07e-05 (hardcoded)"
     var calibrationV2Status: String? = "✅22v2 LE lat@2×1.00e-05 lon@5×1.07e-05 (hardcoded)"
+    /// Set when decode22bV3 (BE lat@10/lon@6 ×1e-5) successfully produces an aircraft.
+    var calibrationV3Status: String? = nil
     /// Vote counts for proprietary 0x26 encoding discovery.
     /// Keyed by packed (roBit, latOff, latScIdx, lonOff, lonScIdx) indices.
     var prop26VoteCounts: [Int: Int] = [:]
@@ -653,6 +655,16 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
+                    } else if let ac = self.decode22bV3(copy26), self.isPhysicallyReceivable(ac) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                        if self.adsbDiag.calibrationV3Status == nil {
+                            let netTag = self.internetAircraftCount > 0
+                                ? self.matchLabelForPosition(lat: ac.latitude, lon: ac.longitude)
+                                : ""
+                            self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5 \(netTag)"
+                        }
                     } else {
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
                         if !alreadySeen {
@@ -1561,6 +1573,31 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) < ownshipRejectionRadius &&
            abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         let icao = String(format: "V%02X%02X%02X", b[1], b[2], b[3])
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                        lastUpdate: Date(), source: .adsb)
+    }
+
+    /// 22b sub-type v3: BE lat@10 ×1e-5, lon@6 ×1e-5.
+    /// Inferred from single-frame xcorr match (RPA4574 Δlat=0.030° Δlon=0.060°, Build 235).
+    private func decode22bV3(_ payload: Data) -> Aircraft? {
+        guard payload.count == 22 else { return nil }
+        let b = Array(payload)
+        func s24be(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        let lat = Double(s24be(10)) * (1.0 / 100_000.0)
+        let lon = Double(s24be(6))  * (1.0 / 100_000.0)
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
+        let icao = String(format: "X%02X%02X%02X", b[1], b[2], b[3])
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
                         altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
