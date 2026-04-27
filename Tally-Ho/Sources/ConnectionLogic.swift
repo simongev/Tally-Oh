@@ -656,14 +656,16 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
                     } else if let ac = self.decode22bV3(copy26), self.isPhysicallyReceivable(ac) {
+                        // Capture internet-match label before adding to detectedAircraft
+                        // to avoid a circular self-match in matchLabelForPosition.
+                        let v3Tag: String? = self.adsbDiag.calibrationV3Status == nil
+                            ? self.matchLabelForPosition(lat: ac.latitude, lon: ac.longitude)
+                            : nil
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
-                        if self.adsbDiag.calibrationV3Status == nil {
-                            let netTag = self.internetAircraftCount > 0
-                                ? self.matchLabelForPosition(lat: ac.latitude, lon: ac.longitude)
-                                : ""
-                            self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5 \(netTag)"
+                        if let tag = v3Tag {
+                            self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
                     } else {
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
