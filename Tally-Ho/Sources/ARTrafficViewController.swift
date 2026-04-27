@@ -798,14 +798,18 @@ class ARTrafficViewController: UIViewController {
         guard let data = entry.data(using: .utf8) else { return }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let url  = docs.appendingPathComponent("tally-hud-log.txt")
+        var writeOK = false
         if let handle = try? FileHandle(forWritingTo: url) {
             handle.seekToEndOfFile()
             handle.write(data)
             try? handle.close()
-        } else {
-            try? data.write(to: url)
+            writeOK = true
+        } else if (try? data.write(to: url)) != nil {
+            writeOK = true
         }
-        logSavedNote = "📝 Log saved [\(reason)] — Files > TallyOh > tally-hud-log.txt"
+        logSavedNote = writeOK
+            ? "📝 Log saved [\(reason)] — Files > TallyOh > tally-hud-log.txt"
+            : "⚠️ Log write failed [\(reason)]"
     }
 
     @objc private func copyStatusTapped() {
