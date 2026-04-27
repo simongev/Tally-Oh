@@ -146,6 +146,10 @@ class ARTrafficViewController: UIViewController {
     private var tcasOverlayView: UIView!
     private var lastAppliedTCASLevel: TCASAlertLevel = .none
 
+    // MARK: - Auto-log
+    private var capturedEventKeys = Set<String>()
+    private var logSavedNote: String = ""
+
     // MARK: - METAR Panel
 
     private var metarPanelView: UIView!
@@ -783,6 +787,22 @@ class ARTrafficViewController: UIViewController {
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
         copyStatusButton.isHidden = statusLabel.isHidden
+    }
+
+    private func appendToHUDLog(reason: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let entry = "\n=== \(ts) [\(reason)] ===\n\(statusLabel.text ?? "")\n"
+        guard let data = entry.data(using: .utf8) else { return }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url  = docs.appendingPathComponent("tally-hud-log.txt")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+        logSavedNote = "📝 Log saved — Files > TallyOh > tally-hud-log.txt"
     }
 
     @objc private func copyStatusTapped() {
@@ -1424,265 +1444,46 @@ class ARTrafficViewController: UIViewController {
 
     private func updateStatusLabel() {
         var lines: [String] = []
+        let d = connectionLogic.adsbDiag
 
+        // Source
         switch connectionLogic.connectionStatus {
         case .receiving:
-            let d = connectionLogic.adsbDiag
-            let regSuffix = d.registrationsSent > 0 ? " reg:\(d.registrationsSent)" : ""
-            let parsedStr = "pkts:\(d.packetCount) parsed HB:\(d.parsedHeartbeat) OS:\(d.parsedOwnship) TR:\(d.parsedTraffic) fail:\(d.parsedFail)\(regSuffix)"
-            let hbCnt = d.rawMsgTypeCounts[0x00] ?? 0
-            let osCnt = d.rawMsgTypeCounts[0x0A] ?? 0
-            let trCnt = d.rawMsgTypeCounts[0x14] ?? 0
-            var rawStr = "raw 7E00:\(hbCnt) 7E0A:\(osCnt) 7E14:\(trCnt)"
-            for (type, count) in d.rawMsgTypeCounts.sorted(by: { $0.key < $1.key })
-                where type != 0x00 && type != 0x0A && type != 0x14 {
-                rawStr += " 7E\(String(format: "%02X", type)):\(count)"
-            }
-            // The Sentry always sends proprietary msg types 0x25/0x26 — there is no
-            // standard GDL90 mode.  ForeFlight and OzRunways have a licensed decoder;
-            // we are reverse-engineering the format.  Show frame-size histogram to
-            // help characterise the protocol layout.
-            let sentryPropCnt = (d.rawMsgTypeCounts[0x25] ?? 0) + (d.rawMsgTypeCounts[0x26] ?? 0)
-            let stdTrafficCnt = (d.rawMsgTypeCounts[0x00] ?? 0)
-                + (d.rawMsgTypeCounts[0x0A] ?? 0)
-                + (d.rawMsgTypeCounts[0x14] ?? 0)
-            if sentryPropCnt > 0 && stdTrafficCnt == 0 {
-                let ipPart = d.sentryIPCaptured.map { " | ip:\($0)" } ?? ""
-                let sizePart: String = {
-                    let sorted = d.frameSizeCounts.sorted { $0.key < $1.key }
-                    if sorted.isEmpty { return "" }
-                    return " | frames: " + sorted.map { "\($0.key)b×\($0.value)" }.joined(separator: " ")
-                }()
-                lines.append("⚠️ Sentry proprietary 0x25/0x26\(ipPart)\(sizePart)")
-                if let cal = d.calibrationStatus {
-                    lines.append("🔬 \(cal)")
-                }
-                if let cal2 = d.calibrationV2Status {
-                    lines.append("🔬 \(cal2)")
-                }
-                if !d.capturedPositionFrameHex.isEmpty {
-                    // Annotate captured position frame with [lat] and {lon} brackets so the
-                    // encoding is visually obvious.
-                    let latOff2 = d.propLatByteOffset
-                    let lonOff2 = d.propLonByteOffset
-                    let parts2 = d.capturedPositionFrameHex.components(separatedBy: " ")
-                    // First token is the callsign; annotate remainder (byte tokens).
-                    let callsign2 = parts2.first ?? ""
-                    let byteTokens = Array(parts2.dropFirst())
-                    let annotated2 = byteTokens.enumerated().map { (idx, h) -> String in
-                        if let lo = latOff2, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
-                        if let lo = lonOff2, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    lines.append("✅22b \(callsign2) \(annotated2)")
-                }
-                if !d.captured47bFrameHex.isEmpty {
-                    let latOff47 = d.propLatByteOffset
-                    let lonOff47 = d.propLonByteOffset
-                    let parts47 = d.captured47bFrameHex.components(separatedBy: " ")
-                    let callsign47 = parts47.first ?? ""
-                    let byteTokens47 = Array(parts47.dropFirst())
-                    let annotated47 = byteTokens47.enumerated().map { (idx, h) -> String in
-                        if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
-                        if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    // 47b is long — split at byte 24 to keep lines readable.
-                    let toks = annotated47.components(separatedBy: " ")
-                    lines.append("✅47b \(callsign47) " + toks.prefix(24).joined(separator: " "))
-                    if toks.count > 24 { lines.append("      " + Array(toks.dropFirst(24)).joined(separator: " ")) }
-                }
-                if !d.prop70VotingStatus.isEmpty {
-                    lines.append("✅70b \(d.prop70VotingStatus)")
-                }
-                if !d.prop70ConfirmedHit.isEmpty {
-                    lines.append("🏆 \(d.prop70ConfirmedHit)")
-                }
-                // 560b = 8×70b bundle decoded with same LE 1e-5 encoding.
-                if let cnt560 = d.frameSizeCounts[560] {
-                    let ok = d.prop560DecodeCount
-                    lines.append(ok > 0 ? "✅560b×\(cnt560) (\(ok) w/traffic)" : "⏳560b×\(cnt560) (0 decoded)")
-                }
-                // 20b: ground-only device status, never appears in flight. Just count.
-                if let cnt20 = d.frameSizeCounts[20] {
-                    lines.append("20b×\(cnt20) (ground device status)")
-                }
-                // 56b: dominant in-flight frame — xcorr re-enabled (Build 211).
-                if let cnt56 = d.frameSizeCounts[56] {
-                    let xcorr56 = d.undecodedXcorrResults[56] ?? "🔍scanning…"
-                    lines.append("56b×\(cnt56) \(xcorr56)")
-                }
-                if !d.prop56bStatus.isEmpty {
-                    lines.append("✅56b \(d.prop56bStatus)")
-                    if !d.prop56bLastDecodedHex.isEmpty {
-                        let toks = d.prop56bLastDecodedHex.components(separatedBy: " ")
-                        lines.append("  W: " + toks.prefix(28).joined(separator: " "))
-                        if toks.count > 28 { lines.append("     " + Array(toks.dropFirst(28)).joined(separator: " ")) }
-                    }
-                }
-                // 47b frames are paired 1:1 with 0x25 ownship — extended device data, not traffic.
-                if let cnt47 = d.frameSizeCounts[47], let cnt25 = d.rawMsgTypeCounts[0x25] {
-                    lines.append("47b×\(cnt47) = 0x25×\(cnt25) (ownship ext)")
-                }
-                // Show 21b/43b counts alongside 0x25 to check for ownship pairing.
-                // When 21b count == 43b count they always arrive together — a paired
-                // device-status message, not individual traffic frames.
-                let cnt21 = d.frameSizeCounts[21]
-                let cnt43 = d.frameSizeCounts[43]
-                let cnt25 = d.rawMsgTypeCounts[0x25]
-                if let c21 = cnt21, let c43 = cnt43, c21 == c43 {
-                    let hint = cnt25.map { " 0x25×\($0)" } ?? ""
-                    lines.append("21b=43b×\(c21)\(hint) (paired, not traffic)")
-                } else {
-                    for (sz, cntSz) in [(21, cnt21), (43, cnt43)] {
-                        if let c = cntSz, let c25 = cnt25 {
-                            let ownship = c25 > 0 && abs(c - c25) <= max(1, c25 / 10)
-                            lines.append("\(sz)b×\(c) 0x25×\(c25)\(ownship ? " (ownship?)" : "")")
-                        }
-                    }
-                }
-                if let hex25 = d.lastMsg25Hex {
-                    let trimmed = hex25.count > 90 ? String(hex25.prefix(90)) + "…" : hex25
-                    lines.append("0x25: \(trimmed)")
-                }
-                // 20b ring buffer: hex + both lon-offset hypotheses so the user
-                // can compare directly to the ForeFlight aircraft list.
-                for (i, f20) in d.recent20bFrames.prefix(2).enumerated() {
-                    lines.append("G\(i+1): \(f20)")
-                }
-                // Ring buffer of recent 22-byte frames for ForeFlight correlation.
-                // [..] = lat field, {..} = lon field per voting result.
-                let latOff = d.propLatByteOffset
-                let lonOff = d.propLonByteOffset
-                for (i, frameHex) in d.recent22bFrames.prefix(4).enumerated() {
-                    let parts = frameHex.components(separatedBy: " ")
-                    let annotated = parts.enumerated().map { (idx, h) -> String in
-                        if let lo = latOff, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
-                        if let lo = lonOff, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    lines.append("F\(i+1): \(annotated)")
-                }
-                if let hex43 = d.sampleFramesBySize[43] {
-                    let hit43 = d.undecodedHits[43]
-                    let parts43 = hex43.components(separatedBy: " ")
-                    let annotated43 = parts43.enumerated().map { (idx, h) -> String in
-                        if let hit = hit43, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
-                        if let hit = hit43, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    let toks43 = annotated43.components(separatedBy: " ")
-                    lines.append("43b: " + toks43.prefix(22).joined(separator: " "))
-                    let rest43 = Array(toks43.dropFirst(22))
-                    if !rest43.isEmpty { lines.append("     " + rest43.joined(separator: " ")) }
-                }
-                if let hex47 = d.sampleFramesBySize[47] {
-                    // Prefer xcorr-confirmed offsets for 47b; fall back to 22b calibration.
-                    let hit47 = d.undecodedHits[47]
-                    let latOff47 = hit47.map { $0.latOff } ?? d.propLatByteOffset
-                    let lonOff47 = hit47.map { $0.lonOff } ?? d.propLonByteOffset
-                    let parts47 = hex47.components(separatedBy: " ")
-                    let annotated47 = parts47.enumerated().map { (idx, h) -> String in
-                        if let lo = latOff47, idx >= lo && idx <= lo + 2 { return "[\(h)]" }
-                        if let lo = lonOff47, idx >= lo && idx <= lo + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    let toks47 = annotated47.components(separatedBy: " ")
-                    lines.append("47b: " + toks47.prefix(28).joined(separator: " "))
-                    let rest47 = Array(toks47.dropFirst(28))
-                    if !rest47.isEmpty { lines.append("     " + rest47.joined(separator: " ")) }
-                }
-                if let hex21 = d.sampleFramesBySize[21] {
-                    let hit21 = d.undecodedHits[21]
-                    let parts21 = hex21.components(separatedBy: " ")
-                    let annotated21 = parts21.enumerated().map { (idx, h) -> String in
-                        if let hit = hit21, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
-                        if let hit = hit21, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    lines.append("21b: " + annotated21)
-                }
-                if let hex56 = d.sampleFramesBySize[56] {
-                    let hit56 = d.undecodedHits[56]
-                    let parts56 = hex56.components(separatedBy: " ")
-                    let ann56 = parts56.enumerated().map { (idx, h) -> String in
-                        if let hit = hit56, idx >= hit.latOff && idx <= hit.latOff + 2 { return "[\(h)]" }
-                        if let hit = hit56, idx >= hit.lonOff && idx <= hit.lonOff + 2 { return "{\(h)}" }
-                        return h
-                    }.joined(separator: " ")
-                    let toks56 = ann56.components(separatedBy: " ")
-                    lines.append("56b: " + toks56.prefix(28).joined(separator: " "))
-                    let rest56 = Array(toks56.dropFirst(28))
-                    if !rest56.isEmpty { lines.append("     " + rest56.joined(separator: " ")) }
-                }
-                if let hex70 = d.sampleFramesBySize[70] {
-                    // Annotate confirmed slots: [lat] at b[3-5,9-11], {lon} at b[38-40,44-46].
-                    let latRanges  = [3...5, 6...8, 9...11]
-                    let lonRanges  = [38...40, 41...43, 44...46]
-                    let bytes70 = hex70.components(separatedBy: " ")
-                    let annotated70 = bytes70.enumerated().map { (idx, h) -> String in
-                        if latRanges.contains(where: { $0.contains(idx) }) { return "[\(h)]" }
-                        if lonRanges.contains(where: { $0.contains(idx) }) { return "{\(h)}" }
-                        return h
-                    }
-                    lines.append("70b: " + annotated70.prefix(35).joined(separator: " "))
-                    let rest70 = Array(annotated70.dropFirst(35))
-                    if !rest70.isEmpty { lines.append("     " + rest70.joined(separator: " ")) }
-                }
-                // 28b = 0x25 ownship frame — shown raw for reference.
-                if let hex28 = d.sampleFramesBySize[28] {
-                    lines.append("28b: \(hex28)")
-                }
-            }
-            var diagStr = "\(parsedStr) | \(rawStr)"
-            if let hex = d.firstPacketHex {
-                let byteCount = hex.components(separatedBy: " ").count
-                let flagsStr = d.firstPacketFlagPositions.map(String.init).joined(separator: ",")
-                let trimmedHex = hex.count > 120 ? String(hex.prefix(120)) + "…" : hex
-                diagStr += " | first[\(byteCount)b flags@[\(flagsStr)] \(trimmedHex)]"
-            }
-            lines.append("📡 ADS-B: Receiving (\(diagStr))")
-        case .searching:     lines.append("📡 ADS-B: Searching…")
-        case .notAvailable:  lines.append("📡 ADS-B: Unavailable")
-        case .disconnected:  lines.append("📡 ADS-B: Off")
+            let ipPart = d.sentryIPCaptured.map { " | \($0)" } ?? ""
+            lines.append("⚠️ Sentry\(ipPart)")
+        case .searching:    lines.append("📡 ADS-B: Searching…")
+        case .notAvailable: lines.append("📡 ADS-B: Unavailable")
+        case .disconnected: lines.append("📡 ADS-B: Off")
         }
 
-        // When internet is offline, cached internet aircraft may still be in the dict
-        // (they age out via 90s cleanup).  Show the cached count so the user knows xcorr
-        // still has reference aircraft to work with.
+        // Internet
         if connectionLogic.isInternetAvailable {
-            let d2 = connectionLogic.adsbDiag
-            if let status = d2.lastInternetFetchStatus {
-                if status.isEmpty {
-                    lines.append("🌐 Internet: Online (\(d2.lastInternetFetchCount)ac)")
-                } else {
-                    lines.append("🌐 Internet: Online ⚠️ \(status)")
-                }
+            if let status = d.lastInternetFetchStatus {
+                lines.append(status.isEmpty
+                    ? "🌐 Online (\(d.lastInternetFetchCount)ac)"
+                    : "🌐 Online ⚠️ \(status)")
             } else {
-                lines.append("🌐 Internet: Online (fetching…)")
+                lines.append("🌐 Online (fetching…)")
             }
         } else {
-            let cachedNet = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
-            if cachedNet > 0 {
-                lines.append("🌐 Internet: Offline (\(cachedNet) cached)")
-            } else {
-                lines.append("🌐 Internet: Offline")
-            }
+            let cached = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
+            lines.append(cached > 0 ? "🌐 Offline (\(cached) cached)" : "🌐 Offline")
         }
 
+        // GPS + altitude
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
-        let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
+        let gpsSource  = usingADSBGPS ? "ADS-B" : "iPhone"
         if let loc = displayLoc {
             let gpsAccStr: String
             if lastHorizontalAccuracy < 0 {
                 gpsAccStr = "?"
             } else if lastHorizontalAccuracy > gpsAccuracyThreshold {
-                gpsAccStr = String(format: "⚠️ ±%.0fm", lastHorizontalAccuracy)
+                gpsAccStr = String(format: "⚠️±%.0fm", lastHorizontalAccuracy)
             } else {
                 gpsAccStr = String(format: "±%.0fm", lastHorizontalAccuracy)
             }
-            lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource)  \(gpsAccStr))", loc.latitude, loc.longitude))
+            lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource) \(gpsAccStr))", loc.latitude, loc.longitude))
 
             let altSource = baroBaselineSet ? "baro" : "GPS"
             let compassAccStr: String
@@ -1693,116 +1494,125 @@ class ARTrafficViewController: UIViewController {
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = String(format: "%+.1f°", arKitNorthCorrectionDeg)
-            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
+            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)", displayAlt, altSource, userHeading, compassAccStr))
         } else if lastHorizontalAccuracy > 0 {
-            // Rough fix — spatial filter active but AR positioning not yet usable.
-            lines.append(String(format: "📍 GPS: ±%.0fm (filter only, AR pending)", lastHorizontalAccuracy))
+            lines.append(String(format: "📍 GPS ±%.0fm (AR pending)", lastHorizontalAccuracy))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
 
-        // ARKit tracking state
+        // AR
         let arStateStr: String
         switch arTrackingState {
-        case .normal:
-            arStateStr = "AR: ✓"
+        case .normal:                  arStateStr = "AR: ✓"
         case .limited(let reason):
             switch reason {
-            case .initializing:   arStateStr = "AR: Initializing…"
-            case .relocalizing:   arStateStr = "AR: Relocalizing…"
-            case .excessiveMotion: arStateStr = "AR: ⚠️ Motion"
+            case .initializing:        arStateStr = "AR: Initializing…"
+            case .relocalizing:        arStateStr = "AR: Relocalizing…"
+            case .excessiveMotion:     arStateStr = "AR: ⚠️ Motion"
             case .insufficientFeatures: arStateStr = "AR: ⚠️ Features"
-            @unknown default:     arStateStr = "AR: Limited"
+            @unknown default:          arStateStr = "AR: Limited"
             }
-        case .notAvailable:
-            arStateStr = "AR: Not available"
-        @unknown default:
-            arStateStr = "AR: Unknown"
+        case .notAvailable:            arStateStr = "AR: Not available"
+        @unknown default:              arStateStr = "AR: Unknown"
         }
         lines.append("📷 \(arStateStr)")
 
-        // TCAS status
+        // TCAS
         switch currentTCASEvaluation.overallLevel {
-        case .none:
-            break
+        case .none: break
         case .trafficAdvisory:
-            let count = currentTCASEvaluation.threats.count
-            lines.append("⚠️ TCAS TA: \(count) aircraft")
+            lines.append("⚠️ TCAS TA: \(currentTCASEvaluation.threats.count) aircraft")
         case .resolutionAdvisory:
-            let raCount = currentTCASEvaluation.threats.values.filter { $0 == .resolutionAdvisory }.count
-            lines.append("🔴 TCAS RA: \(raCount) aircraft")
+            let n = currentTCASEvaluation.threats.values.filter { $0 == .resolutionAdvisory }.count
+            lines.append("🔴 TCAS RA: \(n) aircraft")
         }
 
-        // Traffic
+        // Decoder summary (one line)
+        if connectionLogic.connectionStatus == .receiving {
+            var decoders: [String] = []
+            if d.calibrationStatus  != nil { decoders.append("22b") }
+            if d.calibrationV2Status != nil { decoders.append("22v2") }
+            if d.frameSizeCounts[70]  != nil || d.frameSizeCounts[560] != nil { decoders.append("70b") }
+            if d.prop560DecodeCount > 0 { decoders.append("560b") }
+            let wCount = d.uniqueAircraftSeen.filter { $0.hasPrefix("W") }.count
+            if wCount > 0 {
+                decoders.append("56b(W×\(wCount))")
+            } else if d.frameSizeCounts[56] != nil {
+                decoders.append("56b(scanning)")
+            }
+            if !decoders.isEmpty { lines.append("✅ " + decoders.joined(separator: " · ")) }
+        }
+
+        // Aircraft
         let total   = connectionLogic.detectedAircraft.count
         let adsbCnt = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
         let netCnt  = connectionLogic.internetAircraftCount
-
-        // Count ADS-B aircraft confirmed by a nearby internet aircraft (within 0.1° ≈ 6nm).
-        // Matching by position rather than ICAO because the 560b ICAO bytes are unverified.
         let internetPositions = connectionLogic.detectedAircraft.values
             .filter { $0.source == .internet }
             .map { ($0.latitude, $0.longitude) }
-        let confirmedCnt = connectionLogic.detectedAircraft.values
-            .filter { ac in
-                guard ac.source == .adsb else { return false }
-                return internetPositions.contains { (iLat, iLon) in
-                    abs(iLat - ac.latitude) < 0.1 && abs(iLon - ac.longitude) < 0.1
-                }
-            }.count
+        let confirmedCnt = connectionLogic.detectedAircraft.values.filter { ac in
+            guard ac.source == .adsb else { return false }
+            return internetPositions.contains { abs($0.0 - ac.latitude) < 0.1 && abs($0.1 - ac.longitude) < 0.1 }
+        }.count
 
         var trafficLine = "🛩 Aircraft: \(total)"
-        var parts: [String] = []
+        var tparts: [String] = []
         if adsbCnt > 0 {
-            let seen = connectionLogic.adsbDiag.uniqueAircraftSeen.count
+            let seen = d.uniqueAircraftSeen.count
             let seenSuffix = seen > adsbCnt ? " seen:\(seen)" : ""
             let confSuffix = confirmedCnt > 0 ? " ✅\(confirmedCnt)" : ""
-            parts.append("ADS-B:\(adsbCnt)\(confSuffix)\(seenSuffix)")
+            tparts.append("ADS-B:\(adsbCnt)\(confSuffix)\(seenSuffix)")
         }
-        if netCnt  > 0 { parts.append("Net:\(netCnt)") }
-        if !parts.isEmpty { trafficLine += " (\(parts.joined(separator: " ")))" }
-        if let lastUpdate = connectionLogic.detectedAircraft.values
-            .max(by: { $0.lastUpdate < $1.lastUpdate })?.lastUpdate {
-            let ageSec = Int(-lastUpdate.timeIntervalSinceNow)
-            trafficLine += "  [\(ageSec)s ago]"
+        if netCnt > 0 { tparts.append("Net:\(netCnt)") }
+        if !tparts.isEmpty { trafficLine += " (\(tparts.joined(separator: " ")))" }
+        if let last = connectionLogic.detectedAircraft.values.max(by: { $0.lastUpdate < $1.lastUpdate })?.lastUpdate {
+            trafficLine += "  [\(Int(-last.timeIntervalSinceNow))s ago]"
         }
         lines.append(trafficLine)
 
-        // Show decoded positions of all aircraft (sorted by distance) for ForeFlight cross-check.
-        if let userLoc = activeLocation {
+        if let userLoc = displayLoc {
             let nearby = connectionLogic.detectedAircraft.values
                 .map { ac -> (Aircraft, Double) in
                     let dlat = ac.latitude  - userLoc.latitude
                     let dlon = (ac.longitude - userLoc.longitude) * cos(userLoc.latitude * .pi / 180)
-                    return (ac, sqrt(dlat*dlat + dlon*dlon) * 60)  // nm
+                    return (ac, sqrt(dlat*dlat + dlon*dlon) * 60)
                 }
                 .sorted { $0.1 < $1.1 }
             for (ac, distNM) in nearby {
                 let srcTag: String
                 if ac.source == .internet {
                     srcTag = "🌐"
-                } else if internetPositions.contains(where: { (iLat, iLon) in
-                    abs(iLat - ac.latitude) < 0.1 && abs(iLon - ac.longitude) < 0.1
-                }) {
+                } else if internetPositions.contains(where: { abs($0.0 - ac.latitude) < 0.1 && abs($0.1 - ac.longitude) < 0.1 }) {
                     srcTag = "✅"
                 } else {
                     srcTag = "📡"
                 }
-                // ~ prefix flags ADS-B aircraft whose altitude is the 10000ft fallback
-                // (decode failed — actual altitude unknown).
                 let altPrefix = (ac.source == .adsb && ac.altitude == 10_000) ? "~" : ""
                 lines.append(String(format: "  %@%@ %.4f° %.4f° %@%.0fft %.0fnm",
                                     srcTag, ac.callsign, ac.latitude, ac.longitude, altPrefix, ac.altitude, distNM))
             }
         }
 
-        lines.append("🛫 Airports loaded: \(airports.count)")
+        lines.append("🛫 Airports: \(airports.count)")
+
+        if !logSavedNote.isEmpty { lines.append(logSavedNote) }
 
         let newText = lines.map { "  \($0)  " }.joined(separator: "\n")
         guard newText != statusLabel.text else { return }
         statusLabel.text = newText
+
+        // Auto-capture on first W decode or any new xcorr convergence
+        if connectionLogic.connectionStatus == .receiving {
+            if !d.prop56bLastDecodedHex.isEmpty && capturedEventKeys.insert("w56_first").inserted {
+                appendToHUDLog(reason: "First W56 decode")
+            }
+            for (n, _) in d.undecodedHits where capturedEventKeys.insert("xcorr_\(n)b").inserted {
+                appendToHUDLog(reason: "xcorr \(n)b lock")
+            }
+        }
     }
+
 
 }
 
