@@ -143,6 +143,8 @@ struct ADSBDiagnostics {
     var lastInternetFetchCount: Int = 0
     /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
     var recent20bFrames: [String] = []
+    /// Ring buffer of the last 8 distinct 70-byte 0x26 frames, newest first.
+    var recent70bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
     /// decoded an aircraft position. Lets us verify which bytes actually encode lat/lon.
     var capturedPositionFrameHex: String = ""
@@ -637,6 +639,13 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.recent20bFrames.insert(hex, at: 0)
                         if self.adsbDiag.recent20bFrames.count > 4 {
                             self.adsbDiag.recent20bFrames.removeLast()
+                        }
+                    }
+                } else if copy26.count == 70 {
+                    if self.adsbDiag.recent70bFrames.first != hex {
+                        self.adsbDiag.recent70bFrames.insert(hex, at: 0)
+                        if self.adsbDiag.recent70bFrames.count > 8 {
+                            self.adsbDiag.recent70bFrames.removeLast()
                         }
                     }
                 }

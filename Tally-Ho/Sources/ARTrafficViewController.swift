@@ -812,6 +812,9 @@ class ARTrafficViewController: UIViewController {
             where rawFrames.allSatisfy({ !$0.hasPrefix("\(size)b:") }) {
             cal.append("\(size)b sample: \(hex)")
         }
+        for (i, frame) in d.recent70bFrames.enumerated() {
+            cal.append("70b[\(i)]: \(frame)")
+        }
         if !cal.isEmpty {
             entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"
         }
