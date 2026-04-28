@@ -843,6 +843,9 @@ class ARTrafficViewController: UIViewController {
            let latS = d.propLatScale,    let lonS = d.propLonScale {
             cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
         }
+        if !d.capturedPositionFrameHex.isEmpty { cal.append("decoded22v1: \(d.capturedPositionFrameHex)") }
+        if !d.capturedV2FrameHex.isEmpty       { cal.append("decoded22v2: \(d.capturedV2FrameHex)") }
+        if !d.capturedV3FrameHex.isEmpty       { cal.append("decoded22v3: \(d.capturedV3FrameHex)") }
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
         }

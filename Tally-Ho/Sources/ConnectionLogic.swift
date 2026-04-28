@@ -154,6 +154,10 @@ struct ADSBDiagnostics {
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
     /// decoded an aircraft position. Lets us verify which bytes actually encode lat/lon.
     var capturedPositionFrameHex: String = ""
+    /// Raw hex of last v2-decoded 22b frame (callsign: hex), for unknown-byte analysis.
+    var capturedV2FrameHex: String = ""
+    /// Raw hex of last v3-decoded 22b frame (callsign: hex), for unknown-byte analysis.
+    var capturedV3FrameHex: String = ""
     /// The raw bytes (space-separated hex) of the most recent 47b frame that successfully
     /// decoded an aircraft position via decodeProprietaryTraffic.
     var captured47bFrameHex: String = ""
@@ -680,6 +684,7 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
+                        self.adsbDiag.capturedV2FrameHex = "\(ac.callsign): \(hex)"
                     } else if let ac = self.decode22bV3(copy26), self.isPhysicallyReceivable(ac) {
                         // Capture internet-match label before adding to detectedAircraft
                         // to avoid a circular self-match in matchLabelForPosition.
@@ -689,6 +694,7 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
+                        self.adsbDiag.capturedV3FrameHex = "\(ac.callsign): \(hex)"
                         if let tag = v3Tag {
                             self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
