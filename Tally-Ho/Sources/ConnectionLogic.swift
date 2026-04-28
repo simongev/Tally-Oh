@@ -1161,11 +1161,14 @@ class ConnectionLogic: ObservableObject {
             return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
         }
 
-        // Slot 0 lat@3/lon@38 was removed: lon bytes 38-40 are a fixed protocol field
-        // that always decode to -80.17°W regardless of actual aircraft position.
-        // Slot 1 lat@11/lon@46 confirmed ×3 (NKS832/RPA5643 hits).
+        // 48-byte variable section (b[2-49]) is three 16-byte sub-records.
+        // Each sub-record: 2b header | 3b lat (internal+2) | 7b middle | 3b lon (internal+12) | 1b tail.
+        // Slot C (lat@36/lon@46) is structurally confirmed: bytes 34-49 repeat across frames
+        // encoding the same persistent aircraft.  Slots A/B decode the variable traffic region.
         let slots: [(latOff: Int, lonOff: Int, id: String)] = [
-            (11, 46, "T70B"),
+            ( 4, 14, "T70A"),
+            (20, 30, "T70B"),
+            (36, 46, "T70C"),
         ]
 
         var result: [Aircraft] = []
@@ -1176,9 +1179,10 @@ class ConnectionLogic: ObservableObject {
 
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
-            // Reject positions more than 10° from user — prevents phantom aircraft.
+            // Reject positions more than 3° from user (~200nm) — tighter than generic 10° guard
+            // because 70b positions validated to always be ≥100nm away when decoded incorrectly.
             if let loc = currentLocation,
-               abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
+               abs(lat - loc.latitude) > 3 || abs(lon - loc.longitude) > 3 { continue }
             // Reject ownship echo.
             if let loc = currentLocation,
                abs(lat - loc.latitude) < ownshipRejectionRadius &&
@@ -1219,26 +1223,30 @@ class ConnectionLogic: ObservableObject {
         var result: [Aircraft] = []
         for i in 0..<8 {
             let base = i * 70
-            let latOff = base + 11
-            let lonOff = base + 46
-            guard lonOff + 2 < b.count else { continue }
+            // Same 3 × 16-byte sub-record layout as standalone 70b bundles.
+            let subSlots: [(latOff: Int, lonOff: Int, suffix: String)] = [
+                (base +  4, base + 14, "A"),
+                (base + 20, base + 30, "B"),
+                (base + 36, base + 46, "C"),
+            ]
+            for slot in subSlots {
+            guard slot.lonOff + 2 < b.count else { continue }
 
-            let lat = Double(s24le(latOff)) * scale
-            let lon = Double(s24le(lonOff)) * scale
+            let lat = Double(s24le(slot.latOff)) * scale
+            let lon = Double(s24le(slot.lonOff)) * scale
 
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
             if let loc = currentLocation,
-               abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { continue }
+               abs(lat - loc.latitude) > 3 || abs(lon - loc.longitude) > 3 { continue }
             // Reject ownship echo.
             if let loc = currentLocation,
                abs(lat - loc.latitude) < ownshipRejectionRadius &&
                abs(lon - loc.longitude) < ownshipRejectionRadius { continue }
 
-            let icaoHex = String(format: "%02X%02X%02X", b[base + 1], b[base + 2], b[base + 3])
-            let acId = icaoHex == "000000" ? "B560_\(i)" : icaoHex
+            let acId = "B560_\(i)\(slot.suffix)"
 
-            let altOff = base + 49  // max(latOff-base, lonOff-base) + 3 = 46+3 = 49
+            let altOff = slot.lonOff + 3
             var altFt: Double = 10_000
             if altOff + 1 < b.count {
                 let raw12 = (Int(b[altOff]) << 4) | (Int(b[altOff + 1]) >> 4)
@@ -1250,6 +1258,7 @@ class ConnectionLogic: ObservableObject {
                                    latitude: lat, longitude: lon,
                                    altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
                                    lastUpdate: Date(), source: .adsb))
+            } // for slot in subSlots
         }
         return result
     }
