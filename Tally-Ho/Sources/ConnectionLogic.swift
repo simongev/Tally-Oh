@@ -675,12 +675,25 @@ class ConnectionLogic: ObservableObject {
                         }
                     }
                 } else if copy26.count == 70 {
-                    // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3).
+                    // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3, Build 185).
+                    // Falls through to xcorr when the hardcoded layout produces no nearby aircraft
+                    // (firmware may have changed encoding since Build 185).
+                    // maxByte:50 excludes the constant 18-byte device footer (bytes 50-67)
+                    // that would otherwise accumulate false xcorr votes for the same offset.
+                    var decoded70 = false
                     for ac in self.decodeProprietaryBundle(copy26) {
                         guard self.isPhysicallyReceivable(ac) else { continue }
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
+                        decoded70 = true
+                    }
+                    if !decoded70, self.adsbDiag.undecodedHits[70] == nil {
+                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[70]?.contains(hex) ?? false
+                        if !alreadySeen {
+                            self.adsbDiag.xcorrSeenFrames[70, default: []].insert(hex)
+                            self.scanUndecodedFrame(copy26, maxByte: 50)
+                        }
                     }
                 } else if copy26.count == 560 {
                     // 560b = 8×70b bundle — same LE 1e-5 encoding per sub-record.
@@ -1256,7 +1269,7 @@ class ConnectionLogic: ObservableObject {
     /// Per-size results stored in adsbDiag.undecodedXcorrResults[n].
     ///
     /// Must be called on the main thread.
-    private func scanUndecodedFrame(_ payload: Data) {
+    private func scanUndecodedFrame(_ payload: Data, maxByte: Int? = nil) {
         let n = payload.count
         // 47b frames are paired with 0x25 ownship (count always matches) — skip.
         guard n != 47 else { return }
@@ -1299,7 +1312,7 @@ class ConnectionLogic: ObservableObject {
         // Stop scanning so the ✅ display is preserved and the hit is never overwritten.
         guard adsbDiag.undecodedHits[n] == nil else { return }
 
-        let maxOff = n - 3
+        let maxOff = min(maxByte ?? n, n) - 3
         guard maxOff >= 3 else { return }
 
         func s24le(_ i: Int) -> Double {
