@@ -806,13 +806,18 @@ class ARTrafficViewController: UIViewController {
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
         copyStatusButton.isHidden = statusLabel.isHidden
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let logURL = docs.appendingPathComponent("tally-hud-log.txt")
-        shareLogButton.isHidden = statusLabel.isHidden
-            || !(FileManager.default.fileExists(atPath: logURL.path))
+        shareLogButton.isHidden   = statusLabel.isHidden
     }
 
     @objc private func shareLogTapped() {
+        // Always save the current state first so the file always exists when shared.
+        let d = connectionLogic.adsbDiag
+        var frames: [String] = []
+        for (i, f) in d.recent22bFrames.enumerated() { frames.append("22b[\(i)]: \(f)") }
+        for (i, f) in d.recent20bFrames.enumerated() { frames.append("20b[\(i)]: \(f)") }
+        for (i, f) in d.recent28bFrames.enumerated() { frames.append("28b[\(i)]: \(f)") }
+        appendToHUDLog(reason: "Manual save", rawFrames: frames)
+
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let logURL = docs.appendingPathComponent("tally-hud-log.txt")
         guard FileManager.default.fileExists(atPath: logURL.path) else { return }
@@ -844,9 +849,10 @@ class ARTrafficViewController: UIViewController {
             where rawFrames.allSatisfy({ !$0.hasPrefix("\(size)b:") }) {
             cal.append("\(size)b sample: \(hex)")
         }
-        for (i, frame) in d.recent70bFrames.enumerated() {
-            cal.append("70b[\(i)]: \(frame)")
-        }
+        for (i, frame) in d.recent22bFrames.enumerated() { cal.append("22b[\(i)]: \(frame)") }
+        for (i, frame) in d.recent20bFrames.enumerated() { cal.append("20b[\(i)]: \(frame)") }
+        for (i, frame) in d.recent28bFrames.enumerated() { cal.append("28b[\(i)]: \(frame)") }
+        for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
         if !cal.isEmpty {
             entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"
         }

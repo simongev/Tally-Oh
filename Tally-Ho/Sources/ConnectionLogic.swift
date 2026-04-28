@@ -145,6 +145,8 @@ struct ADSBDiagnostics {
     var lastInternetFetchCount: Int = 0
     /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
     var recent20bFrames: [String] = []
+    /// Ring buffer of the last 4 distinct 28-byte 0x26 frames, newest first.
+    var recent28bFrames: [String] = []
     /// Ring buffer of the last 8 distinct 70-byte 0x26 frames, newest first.
     var recent70bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
@@ -622,7 +624,7 @@ class ConnectionLogic: ObservableObject {
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                 // Always refresh high-interest frame sizes so HUD stays current.
                 // Other sizes: first-seen only.
-                let alwaysRefreshSizes: Set<Int> = [70, 22, 20, 21, 43, 47, 56]
+                let alwaysRefreshSizes: Set<Int> = [70, 28, 22, 20, 21, 43, 47, 56]
                 if alwaysRefreshSizes.contains(copy26.count) {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
@@ -642,6 +644,13 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.recent20bFrames.insert(hex, at: 0)
                         if self.adsbDiag.recent20bFrames.count > 4 {
                             self.adsbDiag.recent20bFrames.removeLast()
+                        }
+                    }
+                } else if copy26.count == 28 {
+                    if self.adsbDiag.recent28bFrames.first != hex {
+                        self.adsbDiag.recent28bFrames.insert(hex, at: 0)
+                        if self.adsbDiag.recent28bFrames.count > 4 {
+                            self.adsbDiag.recent28bFrames.removeLast()
                         }
                     }
                 } else if copy26.count == 70 {
