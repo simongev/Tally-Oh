@@ -133,6 +133,7 @@ class ARTrafficViewController: UIViewController {
     private var arSceneView: ARSCNView!
     private var statusLabel: UITextView!
     private var copyStatusButton: UIButton!
+    private var shareLogButton: UIButton!
     private var settingsButton: UIButton!
     private var mapButton: UIButton!
     private var backButton: UIButton!
@@ -377,6 +378,24 @@ class ARTrafficViewController: UIViewController {
             copyStatusButton.topAnchor.constraint(equalTo: statusLabel.topAnchor, constant: 4),
             copyStatusButton.widthAnchor.constraint(equalToConstant: 28),
             copyStatusButton.heightAnchor.constraint(equalToConstant: 28)
+        ])
+
+        // Share log button — below the copy button; shares tally-hud-log.txt via the system sheet.
+        shareLogButton = UIButton(type: .system)
+        shareLogButton.translatesAutoresizingMaskIntoConstraints = false
+        shareLogButton.setImage(UIImage(systemName: "square.and.arrow.up"), for: .normal)
+        shareLogButton.tintColor = .white
+        shareLogButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        shareLogButton.layer.cornerRadius = 12
+        shareLogButton.isHidden = true
+        shareLogButton.addTarget(self, action: #selector(shareLogTapped), for: .touchUpInside)
+        view.addSubview(shareLogButton)
+
+        NSLayoutConstraint.activate([
+            shareLogButton.trailingAnchor.constraint(equalTo: copyStatusButton.trailingAnchor),
+            shareLogButton.topAnchor.constraint(equalTo: copyStatusButton.bottomAnchor, constant: 4),
+            shareLogButton.widthAnchor.constraint(equalToConstant: 28),
+            shareLogButton.heightAnchor.constraint(equalToConstant: 28)
         ])
 
         // Settings button (bottom right)
@@ -787,6 +806,19 @@ class ARTrafficViewController: UIViewController {
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
         copyStatusButton.isHidden = statusLabel.isHidden
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let logURL = docs.appendingPathComponent("tally-hud-log.txt")
+        shareLogButton.isHidden = statusLabel.isHidden
+            || !(FileManager.default.fileExists(atPath: logURL.path))
+    }
+
+    @objc private func shareLogTapped() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let logURL = docs.appendingPathComponent("tally-hud-log.txt")
+        guard FileManager.default.fileExists(atPath: logURL.path) else { return }
+        let vc = UIActivityViewController(activityItems: [logURL], applicationActivities: nil)
+        vc.popoverPresentationController?.sourceView = shareLogButton
+        present(vc, animated: true)
     }
 
     private func appendToHUDLog(reason: String, rawFrames: [String] = []) {
