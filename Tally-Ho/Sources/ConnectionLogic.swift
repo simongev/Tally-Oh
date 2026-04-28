@@ -202,6 +202,10 @@ struct ADSBDiagnostics {
     var uniqueAircraftSeen: Set<String> = []
     /// Count of 560b frames that produced ≥1 decoded aircraft (for HUD display).
     var prop560DecodeCount: Int = 0
+    /// Per-ICAO velocity decoded from ADS-B type-19 squitters.
+    /// Key: 6-char uppercase hex ICAO from b[1-3] (e.g. "002FD2").
+    /// Populated from type-19 ME fields inside position decoders and the undecoded handler.
+    var adsbVelocityCache: [String: (track: Double, speed: Double, verticalRate: Double)] = [:]
 }
 
 // MARK: - ConnectionLogic
@@ -704,6 +708,12 @@ class ConnectionLogic: ObservableObject {
                             if self.adsbDiag.recent22bUndecodedFrames.count > 8 {
                                 self.adsbDiag.recent22bUndecodedFrames.removeLast()
                             }
+                        }
+                        // Cache velocity from type-19 ME (e.g. position out of ±10° range).
+                        let bArr = Array(copy26)
+                        if let vel = Self.decodeType19ME(bArr, meOffset: 8) {
+                            let key = String(format: "%02X%02X%02X", bArr[1], bArr[2], bArr[3])
+                            self.adsbDiag.adsbVelocityCache[key] = vel
                         }
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
                         if !alreadySeen {
@@ -1659,9 +1669,16 @@ class ConnectionLogic: ObservableObject {
             let dec = Double(raw12) * 25.0 - 1000.0
             if dec >= -1000 && dec <= 50_000 { altFt = dec }
         }
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        var vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        if let v = Self.decodeType19ME(b, meOffset: 8) {
+            vel = v
+            adsbDiag.adsbVelocityCache[icaoKey] = v
+        }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
-                        altitude: altFt, track: 0, groundSpeed: 0, verticalRate: 0,
+                        altitude: altFt,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
                         lastUpdate: Date(), source: .adsb)
     }
 
@@ -1684,9 +1701,16 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) < ownshipRejectionRadius &&
            abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         let icao = String(format: "V%02X%02X%02X", b[1], b[2], b[3])
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        var vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        if let v = Self.decodeType19ME(b, meOffset: 8) {
+            vel = v
+            adsbDiag.adsbVelocityCache[icaoKey] = v
+        }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
-                        altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                        altitude: 10_000,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
                         lastUpdate: Date(), source: .adsb)
     }
 
@@ -1709,10 +1733,39 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) < ownshipRejectionRadius &&
            abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         let icao = String(format: "X%02X%02X%02X", b[1], b[2], b[3])
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        var vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        if let v = Self.decodeType19ME(b, meOffset: 13) {
+            vel = v
+            adsbDiag.adsbVelocityCache[icaoKey] = v
+        }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
-                        altitude: 10_000, track: 0, groundSpeed: 0, verticalRate: 0,
+                        altitude: 10_000,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
                         lastUpdate: Date(), source: .adsb)
+    }
+
+    /// Decode ADS-B type-19 subtype-1 (ground speed) ME field starting at byte offset `o`.
+    /// Returns (track°, speed kt, verticalRate fpm) or nil if not a valid type-19 subtype-1 ME.
+    private static func decodeType19ME(_ b: [UInt8], meOffset o: Int)
+        -> (track: Double, speed: Double, verticalRate: Double)? {
+        guard o + 6 < b.count else { return nil }
+        guard (b[o] & 0xF8) == 0x98, (b[o] & 0x07) == 1 else { return nil }  // type 19 subtype 1
+        let ewDir = (Int(b[o+1]) >> 2) & 1          // 0=east, 1=west
+        let ewRaw = ((Int(b[o+1]) & 0x03) << 8) | Int(b[o+2])
+        let nsDir = Int(b[o+3]) >> 7                // 0=north, 1=south
+        let nsRaw = ((Int(b[o+3]) & 0x7F) << 3) | (Int(b[o+4]) >> 5)
+        guard ewRaw > 0, nsRaw > 0 else { return nil }
+        let ew = Double(ewRaw - 1) * (ewDir == 0 ? 1.0 : -1.0)
+        let ns = Double(nsRaw - 1) * (nsDir == 0 ? 1.0 : -1.0)
+        let speed = (ew * ew + ns * ns).squareRoot()
+        guard speed > 0, speed < 700 else { return nil }  // sub-supersonic sanity check
+        let track = (atan2(ew, ns) * 180.0 / .pi + 360.0).truncatingRemainder(dividingBy: 360.0)
+        let vrSign = (Int(b[o+4]) >> 3) & 1
+        let vrRaw  = ((Int(b[o+4]) & 0x07) << 6) | (Int(b[o+5]) >> 2)
+        let vRate  = vrRaw > 0 ? Double(vrRaw - 1) * 64.0 * (vrSign == 1 ? -1.0 : 1.0) : 0.0
+        return (track: track, speed: speed, verticalRate: vRate)
     }
 
     /// Internet-match label for a decoded (lat,lon): "[net]" within ±0.10° of an internet

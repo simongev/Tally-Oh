@@ -861,6 +861,10 @@ class ARTrafficViewController: UIViewController {
         for (i, frame) in d.recent47bFrames.enumerated() { cal.append("47b[\(i)]: \(frame)") }
         for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
         for (i, frame) in d.recent22bUndecodedFrames.enumerated() { cal.append("22b?[\(i)]: \(frame)") }
+        for (key, vel) in d.adsbVelocityCache.sorted(by: { $0.key < $1.key }) {
+            cal.append(String(format: "vel[%@]: hdg=%.0f° spd=%.0f kt vr=%.0f fpm",
+                              key, vel.track, vel.speed, vel.verticalRate))
+        }
         if !d.rawMsgTypeCounts.isEmpty {
             let msgLine = d.rawMsgTypeCounts
                 .sorted { $0.key < $1.key }
