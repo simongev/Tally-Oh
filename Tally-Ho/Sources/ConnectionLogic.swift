@@ -147,6 +147,8 @@ struct ADSBDiagnostics {
     var recent20bFrames: [String] = []
     /// Ring buffer of the last 4 distinct 47-byte 0x26 frames, newest first.
     var recent47bFrames: [String] = []
+    /// Ring buffer of the last 8 distinct 22-byte 0x26 frames that failed all decoders, newest first.
+    var recent22bUndecodedFrames: [String] = []
     /// Ring buffer of the last 8 distinct 70-byte 0x26 frames, newest first.
     var recent70bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
@@ -691,6 +693,12 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
                     } else {
+                        if self.adsbDiag.recent22bUndecodedFrames.first != hex {
+                            self.adsbDiag.recent22bUndecodedFrames.insert(hex, at: 0)
+                            if self.adsbDiag.recent22bUndecodedFrames.count > 8 {
+                                self.adsbDiag.recent22bUndecodedFrames.removeLast()
+                            }
+                        }
                         let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
                         if !alreadySeen {
                             self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)

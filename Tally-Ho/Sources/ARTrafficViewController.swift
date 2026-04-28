@@ -816,6 +816,7 @@ class ARTrafficViewController: UIViewController {
         for (i, f) in d.recent22bFrames.enumerated() { frames.append("22b[\(i)]: \(f)") }
         for (i, f) in d.recent20bFrames.enumerated() { frames.append("20b[\(i)]: \(f)") }
         for (i, f) in d.recent47bFrames.enumerated() { frames.append("47b[\(i)]: \(f)") }
+        for (i, f) in d.recent22bUndecodedFrames.enumerated() { frames.append("22b?[\(i)]: \(f)") }
         appendToHUDLog(reason: "Manual save", rawFrames: frames)
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -856,6 +857,7 @@ class ARTrafficViewController: UIViewController {
         for (i, frame) in d.recent20bFrames.enumerated() { cal.append("20b[\(i)]: \(frame)") }
         for (i, frame) in d.recent47bFrames.enumerated() { cal.append("47b[\(i)]: \(frame)") }
         for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
+        for (i, frame) in d.recent22bUndecodedFrames.enumerated() { cal.append("22b?[\(i)]: \(frame)") }
         if !d.rawMsgTypeCounts.isEmpty {
             let msgLine = d.rawMsgTypeCounts
                 .sorted { $0.key < $1.key }
