@@ -703,14 +703,17 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
                     } else {
-                        if self.adsbDiag.recent22bUndecodedFrames.first != hex {
-                            self.adsbDiag.recent22bUndecodedFrames.insert(hex, at: 0)
+                        // Prefix each entry with the ME type code (b[8] high 5 bits) so the
+                        // share log immediately shows which ADS-B squitter types are undecoded.
+                        let bArr = Array(copy26)
+                        let tcTagged = String(format: "tc%02d: %@", Int(bArr[8]) >> 3, hex)
+                        if self.adsbDiag.recent22bUndecodedFrames.first != tcTagged {
+                            self.adsbDiag.recent22bUndecodedFrames.insert(tcTagged, at: 0)
                             if self.adsbDiag.recent22bUndecodedFrames.count > 8 {
                                 self.adsbDiag.recent22bUndecodedFrames.removeLast()
                             }
                         }
                         // Cache velocity from type-19 ME (e.g. position out of ±10° range).
-                        let bArr = Array(copy26)
                         if let vel = Self.decodeType19ME(bArr, meOffset: 8) {
                             let key = String(format: "%02X%02X%02X", bArr[1], bArr[2], bArr[3])
                             self.adsbDiag.adsbVelocityCache[key] = vel
@@ -1746,26 +1749,42 @@ class ConnectionLogic: ObservableObject {
                         lastUpdate: Date(), source: .adsb)
     }
 
-    /// Decode ADS-B type-19 subtype-1 (ground speed) ME field starting at byte offset `o`.
-    /// Returns (track°, speed kt, verticalRate fpm) or nil if not a valid type-19 subtype-1 ME.
+    /// Decode ADS-B type-19 (airborne velocity) ME field starting at byte offset `o`.
+    /// Handles subtype 1 (ground speed EW/NS vectors) and subtypes 3/4 (true airspeed +
+    /// magnetic heading, when heading-status bit is set). Returns (track°, speed kt, 0) or nil.
+    /// VR is not extracted — ADS-B VR bits produce unreliable values in this frame format.
     private static func decodeType19ME(_ b: [UInt8], meOffset o: Int)
         -> (track: Double, speed: Double, verticalRate: Double)? {
         guard o + 6 < b.count else { return nil }
-        guard (b[o] & 0xF8) == 0x98, (b[o] & 0x07) == 1 else { return nil }  // type 19 subtype 1
-        let ewDir = (Int(b[o+1]) >> 2) & 1          // 0=east, 1=west
-        let ewRaw = ((Int(b[o+1]) & 0x03) << 8) | Int(b[o+2])
-        let nsDir = Int(b[o+3]) >> 7                // 0=north, 1=south
-        let nsRaw = ((Int(b[o+3]) & 0x7F) << 3) | (Int(b[o+4]) >> 5)
-        guard ewRaw > 0, nsRaw > 0 else { return nil }
-        let ew = Double(ewRaw - 1) * (ewDir == 0 ? 1.0 : -1.0)
-        let ns = Double(nsRaw - 1) * (nsDir == 0 ? 1.0 : -1.0)
-        let speed = (ew * ew + ns * ns).squareRoot()
-        guard speed > 0, speed < 700 else { return nil }  // sub-supersonic sanity check
-        let track = (atan2(ew, ns) * 180.0 / .pi + 360.0).truncatingRemainder(dividingBy: 360.0)
-        let vrSign = (Int(b[o+4]) >> 3) & 1
-        let vrRaw  = ((Int(b[o+4]) & 0x07) << 6) | (Int(b[o+5]) >> 2)
-        let vRate  = vrRaw > 0 ? Double(vrRaw - 1) * 64.0 * (vrSign == 1 ? -1.0 : 1.0) : 0.0
-        return (track: track, speed: speed, verticalRate: vRate)
+        guard (b[o] & 0xF8) == 0x98 else { return nil }  // type code 19
+        let subtype = Int(b[o] & 0x07)
+        switch subtype {
+        case 1:
+            // Ground speed: EW and NS velocity components.
+            let ewDir = (Int(b[o+1]) >> 2) & 1     // 0=east, 1=west
+            let ewRaw = ((Int(b[o+1]) & 0x03) << 8) | Int(b[o+2])
+            let nsDir = Int(b[o+3]) >> 7            // 0=north, 1=south
+            let nsRaw = ((Int(b[o+3]) & 0x7F) << 3) | (Int(b[o+4]) >> 5)
+            guard ewRaw > 0, nsRaw > 0 else { return nil }
+            let ew = Double(ewRaw - 1) * (ewDir == 0 ? 1.0 : -1.0)
+            let ns = Double(nsRaw - 1) * (nsDir == 0 ? 1.0 : -1.0)
+            let speed = (ew * ew + ns * ns).squareRoot()
+            guard speed > 0, speed < 700 else { return nil }
+            let track = (atan2(ew, ns) * 180.0 / .pi + 360.0).truncatingRemainder(dividingBy: 360.0)
+            return (track: track, speed: speed, verticalRate: 0)
+        case 3, 4:
+            // True airspeed + magnetic heading (when heading-status bit is set).
+            guard (Int(b[o+1]) >> 2) & 1 == 1 else { return nil }
+            let hdgRaw = ((Int(b[o+1]) & 0x03) << 8) | Int(b[o+2])
+            let spdRaw = ((Int(b[o+3]) & 0x7F) << 3) | (Int(b[o+4]) >> 5)
+            guard spdRaw > 0 else { return nil }
+            let speed = Double(spdRaw - 1) * (subtype == 4 ? 4.0 : 1.0)
+            guard speed > 0, speed < 700 else { return nil }
+            let track = Double(hdgRaw) * (360.0 / 1024.0)
+            return (track: track, speed: speed, verticalRate: 0)
+        default:
+            return nil
+        }
     }
 
     /// Internet-match label for a decoded (lat,lon): "[net]" within ±0.10° of an internet
