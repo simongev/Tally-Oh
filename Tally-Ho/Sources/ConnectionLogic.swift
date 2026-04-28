@@ -1398,14 +1398,26 @@ class ConnectionLogic: ObservableObject {
               let lonOff = Int(lonParts[0]), let msi = Int(lonParts[1]),
               lsi < nsc, msi < nsc else { return }
 
-        adsbDiag.undecodedHits[n] = ADSBDiagnostics.UndecodedHit(
+        let proposedHit = ADSBDiagnostics.UndecodedHit(
             isLE: isLE, latOff: latOff, lonOff: lonOff,
             latScale: scales[lsi], lonScale: scales[msi], votes: bestVotes)
-        adsbDiag.undecodedXcorrResults[n] = "✅\(bestKey) ×\(bestVotes)"
-        // Immediately decode the triggering frame so xcorrDecodedSamples is
-        // populated right away — without this, the HUD position annotation only
-        // appears after the NEXT frame of this size arrives.
-        _ = decodeWithHit(payload, hit: adsbDiag.undecodedHits[n]!)
+        // Validate before committing: decoded position must be within 10° of the user.
+        // Dense internet-aircraft references (200+ ground aircraft) can drive false
+        // convergence to offsets that produce geographically distant positions.
+        // If decodeWithHit returns nil, wipe votes for this frame size so xcorr can
+        // start accumulating again on subsequent frames (typically in-flight with fewer
+        // and closer references).
+        if let ac = decodeWithHit(payload, hit: proposedHit), isPhysicallyReceivable(ac) {
+            adsbDiag.undecodedHits[n] = proposedHit
+            adsbDiag.undecodedXcorrResults[n] = "✅\(bestKey) ×\(bestVotes)"
+            _ = decodeWithHit(payload, hit: proposedHit)
+        } else {
+            adsbDiag.undecodedXcorrVotes = adsbDiag.undecodedXcorrVotes.filter {
+                !$0.key.hasPrefix(sizePrefix)
+            }
+            adsbDiag.xcorrSeenFrames[n] = nil
+            adsbDiag.undecodedXcorrResults[n] = "🔄\(bestKey) ×\(bestVotes) (far→reset)"
+        }
     }
 
     /// Decode a payload using a confirmed xcorr hit.
