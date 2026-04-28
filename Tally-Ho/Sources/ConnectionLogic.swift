@@ -1381,7 +1381,10 @@ class ConnectionLogic: ObservableObject {
         adsbDiag.undecodedXcorrResults[n] = "🔍\(bestKey) ×\(bestVotes)/\(thirdVotes)"
 
         // Confirm at ≥8 votes with winner leading 3rd by ≥4.
-        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 4 else { return }
+        // Require a GPS fix: without currentLocation the position-validation check in
+        // the commit block below is a no-op, allowing noise to pass (seen in Build 238
+        // when xcorr converged within seconds of app launch before GPS was ready).
+        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 4, currentLocation != nil else { return }
 
         // Parse the winning key: "\(n)b LE|BE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)"
         // e.g. "47b LE lat@5s1 lon@8s2"
