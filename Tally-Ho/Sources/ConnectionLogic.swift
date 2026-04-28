@@ -145,6 +145,8 @@ struct ADSBDiagnostics {
     var lastInternetFetchCount: Int = 0
     /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
     var recent20bFrames: [String] = []
+    /// Ring buffer of the last 4 distinct 47-byte 0x26 frames, newest first.
+    var recent47bFrames: [String] = []
     /// Ring buffer of the last 8 distinct 70-byte 0x26 frames, newest first.
     var recent70bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
@@ -647,6 +649,13 @@ class ConnectionLogic: ObservableObject {
                         self.adsbDiag.recent20bFrames.insert(hex, at: 0)
                         if self.adsbDiag.recent20bFrames.count > 4 {
                             self.adsbDiag.recent20bFrames.removeLast()
+                        }
+                    }
+                } else if copy26.count == 47 {
+                    if self.adsbDiag.recent47bFrames.first != hex {
+                        self.adsbDiag.recent47bFrames.insert(hex, at: 0)
+                        if self.adsbDiag.recent47bFrames.count > 4 {
+                            self.adsbDiag.recent47bFrames.removeLast()
                         }
                     }
                 } else if copy26.count == 70 {
@@ -1337,8 +1346,6 @@ class ConnectionLogic: ObservableObject {
     /// Must be called on the main thread.
     private func scanUndecodedFrame(_ payload: Data, maxByte: Int? = nil) {
         let n = payload.count
-        // 47b frames are paired with 0x25 ownship (count always matches) — skip.
-        guard n != 47 else { return }
         let b = Array(payload)
 
         // lat and lon are tried with all combinations of these scales.

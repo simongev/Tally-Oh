@@ -815,6 +815,7 @@ class ARTrafficViewController: UIViewController {
         var frames: [String] = []
         for (i, f) in d.recent22bFrames.enumerated() { frames.append("22b[\(i)]: \(f)") }
         for (i, f) in d.recent20bFrames.enumerated() { frames.append("20b[\(i)]: \(f)") }
+        for (i, f) in d.recent47bFrames.enumerated() { frames.append("47b[\(i)]: \(f)") }
         appendToHUDLog(reason: "Manual save", rawFrames: frames)
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -844,12 +845,16 @@ class ARTrafficViewController: UIViewController {
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
         }
+        for (size, result) in d.undecodedXcorrResults.sorted(by: { $0.key < $1.key }) {
+            cal.append("xcorr[\(size)b]: \(result)")
+        }
         for (size, hex) in d.sampleFramesBySize.sorted(by: { $0.key < $1.key })
             where rawFrames.allSatisfy({ !$0.hasPrefix("\(size)b:") }) {
             cal.append("\(size)b sample: \(hex)")
         }
         for (i, frame) in d.recent22bFrames.enumerated() { cal.append("22b[\(i)]: \(frame)") }
         for (i, frame) in d.recent20bFrames.enumerated() { cal.append("20b[\(i)]: \(frame)") }
+        for (i, frame) in d.recent47bFrames.enumerated() { cal.append("47b[\(i)]: \(frame)") }
         for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
         if !cal.isEmpty {
             entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"
@@ -1616,6 +1621,14 @@ class ARTrafficViewController: UIViewController {
                 decoders.append("\(size)b(✅)")
             }
             if !decoders.isEmpty { lines.append("✅ " + decoders.joined(separator: " · ")) }
+
+            // xcorr progress for all actively-scanned frame sizes.
+            // Shows in-progress vote state ("🔍…") and resets ("🔄…").
+            // Confirmed hits ("✅…") are already shown in the decoder line above.
+            for (_, result) in d.undecodedXcorrResults.sorted(by: { $0.key < $1.key })
+                where !result.hasPrefix("✅") {
+                lines.append(result)
+            }
 
             // Frame-size histogram: top-5 sizes by receive count.
             let topSizes = d.frameSizeCounts
