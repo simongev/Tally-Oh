@@ -1576,6 +1576,15 @@ class ARTrafficViewController: UIViewController {
                 decoders.append("56b(scanning)")
             }
             if !decoders.isEmpty { lines.append("✅ " + decoders.joined(separator: " · ")) }
+
+            // Frame-size histogram: top-4 sizes by receive count.
+            let topSizes = d.frameSizeCounts
+                .sorted { $0.value > $1.value }
+                .prefix(4)
+            if !topSizes.isEmpty {
+                let hist = topSizes.map { "\($0.key)b×\($0.value)" }.joined(separator: " ")
+                lines.append("📊 \(hist)")
+            }
         }
 
         // Aircraft
@@ -1596,7 +1605,8 @@ class ARTrafficViewController: UIViewController {
             let seen = d.uniqueAircraftSeen.count
             let seenSuffix = seen > adsbCnt ? " seen:\(seen)" : ""
             let confSuffix = confirmedCnt > 0 ? " ✅\(confirmedCnt)" : ""
-            tparts.append("ADS-B:\(adsbCnt)\(confSuffix)\(seenSuffix)")
+            let stdSuffix = " std:\(d.parsedStdTraffic)"
+            tparts.append("ADS-B:\(adsbCnt)\(confSuffix)\(seenSuffix)\(stdSuffix)")
         }
         if netCnt > 0 { tparts.append("Net:\(netCnt)") }
         if !tparts.isEmpty { trafficLine += " (\(tparts.joined(separator: " ")))" }

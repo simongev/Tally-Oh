@@ -60,6 +60,8 @@ struct ADSBDiagnostics {
     var parsedHeartbeat: Int = 0
     var parsedOwnship: Int = 0
     var parsedTraffic: Int = 0
+    /// Traffic decoded specifically from standard GDL90 0x14 frames (subset of parsedTraffic).
+    var parsedStdTraffic: Int = 0
     var parsedFail: Int = 0
     /// Count of each raw GDL90 message type seen (keyed by msg type byte, e.g. 0x26).
     var rawMsgTypeCounts: [UInt8: Int] = [:]
@@ -592,6 +594,7 @@ class ConnectionLogic: ObservableObject {
                         self.detectedAircraft[ac.id] = ac
                         self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
                         self.adsbDiag.parsedTraffic += 1
+                        self.adsbDiag.parsedStdTraffic += 1
                     }
                 }
             } else {
@@ -728,10 +731,10 @@ class ConnectionLogic: ObservableObject {
                     }
                     if added > 0 { self.adsbDiag.prop560DecodeCount += 1 }
                 } else if [20, 21, 43, 47, 56].contains(copy26.count) {
-                    // 20b: ground-only device status (never appears in flight). Skip.
-                    // 47b/21b/43b: confirmed not traffic. Skip.
                     // 56b: dominant in-flight frame (500+/session).
                     // Decode priority: (1) hardcoded experimental, (2) xcorr hit, (3) xcorr scan.
+                    // 20b/21b/43b/47b: previously labelled "not traffic"; now scanned via xcorr
+                    // to detect if nearby aircraft are encoded here (may explain ForeFlight gap).
                     if copy26.count == 56 {
                         var decoded56 = false
                         // (1) Experimental hardcoded format: LE lat@52×1.07e-5 lon@18×1.00e-5.
@@ -770,6 +773,27 @@ class ConnectionLogic: ObservableObject {
                             let alreadySeen = self.adsbDiag.xcorrSeenFrames[56]?.contains(hex) ?? false
                             if !alreadySeen {
                                 self.adsbDiag.xcorrSeenFrames[56, default: []].insert(hex)
+                                self.scanUndecodedFrame(copy26)
+                            }
+                        }
+                    } else {
+                        // 20b / 21b / 43b / 47b: try confirmed xcorr hit first, then scan.
+                        // scanUndecodedFrame silently skips 47b (its own guard), so calling it
+                        // for all four sizes is safe.
+                        let size = copy26.count
+                        var decodedSmall = false
+                        if let hit = self.adsbDiag.undecodedHits[size],
+                           let ac = self.decodeWithHit(copy26, hit: hit),
+                           self.isPhysicallyReceivable(ac) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                            self.adsbDiag.parsedTraffic += 1
+                            decodedSmall = true
+                        }
+                        if !decodedSmall {
+                            let alreadySeen = self.adsbDiag.xcorrSeenFrames[size]?.contains(hex) ?? false
+                            if !alreadySeen {
+                                self.adsbDiag.xcorrSeenFrames[size, default: []].insert(hex)
                                 self.scanUndecodedFrame(copy26)
                             }
                         }
