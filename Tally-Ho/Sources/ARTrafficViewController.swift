@@ -1607,12 +1607,16 @@ class ARTrafficViewController: UIViewController {
             } else if d.frameSizeCounts[56] != nil {
                 decoders.append("56b(scanning)")
             }
+            // Show xcorr-confirmed hits for any non-standard frame size (20b, 28b, etc.)
+            for (size, _) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
+                decoders.append("\(size)b(✅)")
+            }
             if !decoders.isEmpty { lines.append("✅ " + decoders.joined(separator: " · ")) }
 
-            // Frame-size histogram: top-4 sizes by receive count.
+            // Frame-size histogram: top-5 sizes by receive count.
             let topSizes = d.frameSizeCounts
                 .sorted { $0.value > $1.value }
-                .prefix(4)
+                .prefix(5)
             if !topSizes.isEmpty {
                 let hist = topSizes.map { "\($0.key)b×\($0.value)" }.joined(separator: " ")
                 lines.append("📊 \(hist)")

@@ -798,13 +798,38 @@ class ConnectionLogic: ObservableObject {
                             }
                         }
                     }
-                } else if ![70, 22, 20, 21, 43, 47, 56, 560].contains(copy26.count),
-                          let ac = self.decodeProprietaryTraffic(copy26),
-                          self.isPhysicallyReceivable(ac) {
-                    // Catch-all for other frame sizes: try 22b-calibrated offsets.
-                    self.detectedAircraft[ac.id] = ac
-                    self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
-                    self.adsbDiag.parsedTraffic += 1
+                } else if ![70, 22, 20, 21, 43, 47, 56, 560].contains(copy26.count) {
+                    // Catch-all for any other frame size (e.g. 28b).
+                    // Three-step fallback: xcorr hit → v1-calibrated → xcorr scan.
+                    let size = copy26.count
+                    var decodedCatchAll = false
+                    // (1) xcorr-confirmed hit for this size (from a prior session).
+                    if let hit = self.adsbDiag.undecodedHits[size],
+                       let ac = self.decodeWithHit(copy26, hit: hit),
+                       self.isPhysicallyReceivable(ac) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                        decodedCatchAll = true
+                    }
+                    // (2) 22b-calibrated v1 offsets.
+                    if !decodedCatchAll,
+                       let ac = self.decodeProprietaryTraffic(copy26),
+                       self.isPhysicallyReceivable(ac) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                        decodedCatchAll = true
+                    }
+                    // (3) xcorr scan for new unique frames so the format can be discovered.
+                    // scanUndecodedFrame silently skips 47b via its own guard.
+                    if !decodedCatchAll {
+                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[size]?.contains(hex) ?? false
+                        if !alreadySeen {
+                            self.adsbDiag.xcorrSeenFrames[size, default: []].insert(hex)
+                            self.scanUndecodedFrame(copy26)
+                        }
+                    }
                 }
                 self.startSentryRegistration()
             }
