@@ -815,7 +815,6 @@ class ARTrafficViewController: UIViewController {
         var frames: [String] = []
         for (i, f) in d.recent22bFrames.enumerated() { frames.append("22b[\(i)]: \(f)") }
         for (i, f) in d.recent20bFrames.enumerated() { frames.append("20b[\(i)]: \(f)") }
-        for (i, f) in d.recent28bFrames.enumerated() { frames.append("28b[\(i)]: \(f)") }
         appendToHUDLog(reason: "Manual save", rawFrames: frames)
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -851,7 +850,6 @@ class ARTrafficViewController: UIViewController {
         }
         for (i, frame) in d.recent22bFrames.enumerated() { cal.append("22b[\(i)]: \(frame)") }
         for (i, frame) in d.recent20bFrames.enumerated() { cal.append("20b[\(i)]: \(frame)") }
-        for (i, frame) in d.recent28bFrames.enumerated() { cal.append("28b[\(i)]: \(frame)") }
         for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
         if !cal.isEmpty {
             entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"

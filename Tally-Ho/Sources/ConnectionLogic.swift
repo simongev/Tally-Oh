@@ -145,8 +145,6 @@ struct ADSBDiagnostics {
     var lastInternetFetchCount: Int = 0
     /// Ring buffer of the last 4 distinct 20-byte 0x26 frames, newest first.
     var recent20bFrames: [String] = []
-    /// Ring buffer of the last 4 distinct 28-byte 0x26 frames, newest first.
-    var recent28bFrames: [String] = []
     /// Ring buffer of the last 8 distinct 70-byte 0x26 frames, newest first.
     var recent70bFrames: [String] = []
     /// The raw bytes (space-separated hex) of the most recent 22b frame that successfully
@@ -565,11 +563,13 @@ class ConnectionLogic: ObservableObject {
     private func handleGDL90Message(_ payload: Data) {
         guard let msgType = payload.first else { return }
 
-        // Always track raw message type and frame size for diagnostics.
+        // Always track raw message type for diagnostics.
+        // frameSizeCounts is incremented only for 0x26 traffic frames (see case 0x26 below)
+        // so the histogram shows the true distribution of proprietary traffic frame sizes,
+        // not mixed with 0x25 ownship frames (e.g. 28b/47b ownship was inflating histogram).
         let frameSize = payload.count
         DispatchQueue.main.async {
             self.adsbDiag.rawMsgTypeCounts[msgType, default: 0] += 1
-            self.adsbDiag.frameSizeCounts[frameSize, default: 0] += 1
         }
 
         switch msgType {
@@ -621,10 +621,13 @@ class ConnectionLogic: ObservableObject {
             let copy26 = payload
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                // Count only 0x26 traffic frames so the histogram reflects actual traffic
+                // distribution (not mixed with 0x25 ownship frames that share some sizes).
+                self.adsbDiag.frameSizeCounts[copy26.count, default: 0] += 1
                 let hex = copy26.map { String(format: "%02X", $0) }.joined(separator: " ")
                 // Always refresh high-interest frame sizes so HUD stays current.
-                // Other sizes: first-seen only.
-                let alwaysRefreshSizes: Set<Int> = [70, 28, 22, 20, 21, 43, 47, 56]
+                // Other sizes: first-seen only. 28b removed: those frames are 0x25 ownship.
+                let alwaysRefreshSizes: Set<Int> = [70, 22, 20, 21, 43, 47, 56]
                 if alwaysRefreshSizes.contains(copy26.count) {
                     self.adsbDiag.sampleFramesBySize[copy26.count] = hex
                 } else if self.adsbDiag.sampleFramesBySize[copy26.count] == nil {
@@ -646,13 +649,6 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.recent20bFrames.removeLast()
                         }
                     }
-                } else if copy26.count == 28 {
-                    if self.adsbDiag.recent28bFrames.first != hex {
-                        self.adsbDiag.recent28bFrames.insert(hex, at: 0)
-                        if self.adsbDiag.recent28bFrames.count > 4 {
-                            self.adsbDiag.recent28bFrames.removeLast()
-                        }
-                    }
                 } else if copy26.count == 70 {
                     if self.adsbDiag.recent70bFrames.first != hex {
                         self.adsbDiag.recent70bFrames.insert(hex, at: 0)
@@ -663,9 +659,12 @@ class ConnectionLogic: ObservableObject {
                 }
 
                 // 70b voting removed — encoding confirmed and hardcoded (Build 185).
-                // 22b: two hardcoded formats. v1=BE lat@15 lon@5 180/2^24 (far traffic).
-                //      v2=LE lat@2 1e-5 lon@5 180/2^24 (confirmed xcorr ×26, Build 212).
-                //      Frames failing both go through xcorr for any future unknown format.
+                // 22b: three hardcoded formats tried in order. ALL unique 22b frames are also
+                // xcorr-scanned regardless of decode success. Rationale: v1/v2/v3 each apply
+                // fixed byte offsets; a v4 format for nearby aircraft would decode via v1/v2/v3
+                // to a "valid but distant" position (within the ±10° rejection window) and
+                // silently skip xcorr. Scanning all unique frames lets xcorr accumulate votes
+                // for v4's byte offsets whenever nearby aircraft emit 22b frames.
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26), self.isPhysicallyReceivable(ac) {
                         self.detectedAircraft[ac.id] = ac
@@ -688,12 +687,12 @@ class ConnectionLogic: ObservableObject {
                         if let tag = v3Tag {
                             self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
-                    } else {
-                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
-                        if !alreadySeen {
-                            self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)
-                            self.scanUndecodedFrame(copy26)
-                        }
+                    }
+                    // xcorr scan every unique 22b frame, decoded or not.
+                    let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
+                    if !alreadySeen {
+                        self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)
+                        self.scanUndecodedFrame(copy26)
                     }
                 } else if copy26.count == 70 {
                     // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3, Build 185).
