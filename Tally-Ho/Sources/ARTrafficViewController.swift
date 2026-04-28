@@ -856,6 +856,13 @@ class ARTrafficViewController: UIViewController {
         for (i, frame) in d.recent20bFrames.enumerated() { cal.append("20b[\(i)]: \(frame)") }
         for (i, frame) in d.recent47bFrames.enumerated() { cal.append("47b[\(i)]: \(frame)") }
         for (i, frame) in d.recent70bFrames.enumerated() { cal.append("70b[\(i)]: \(frame)") }
+        if !d.rawMsgTypeCounts.isEmpty {
+            let msgLine = d.rawMsgTypeCounts
+                .sorted { $0.key < $1.key }
+                .map { String(format: "0x%02X:%d", $0.key, $0.value) }
+                .joined(separator: " ")
+            cal.append("msg types: \(msgLine)")
+        }
         if !cal.isEmpty {
             entry += "\n--- calibration ---\n" + cal.joined(separator: "\n") + "\n"
         }
@@ -1625,8 +1632,9 @@ class ARTrafficViewController: UIViewController {
             // xcorr progress for all actively-scanned frame sizes.
             // Shows in-progress vote state ("🔍…") and resets ("🔄…").
             // Confirmed hits ("✅…") are already shown in the decoder line above.
-            for (_, result) in d.undecodedXcorrResults.sorted(by: { $0.key < $1.key })
-                where !result.hasPrefix("✅") {
+            // Size 22 is excluded: v1/v2/v3 are confirmed; xcorr just rediscovers them.
+            for (size, result) in d.undecodedXcorrResults.sorted(by: { $0.key < $1.key })
+                where !result.hasPrefix("✅") && size != 22 {
                 lines.append(result)
             }
 

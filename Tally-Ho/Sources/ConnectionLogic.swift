@@ -668,12 +668,6 @@ class ConnectionLogic: ObservableObject {
                 }
 
                 // 70b voting removed — encoding confirmed and hardcoded (Build 185).
-                // 22b: three hardcoded formats tried in order. ALL unique 22b frames are also
-                // xcorr-scanned regardless of decode success. Rationale: v1/v2/v3 each apply
-                // fixed byte offsets; a v4 format for nearby aircraft would decode via v1/v2/v3
-                // to a "valid but distant" position (within the ±10° rejection window) and
-                // silently skip xcorr. Scanning all unique frames lets xcorr accumulate votes
-                // for v4's byte offsets whenever nearby aircraft emit 22b frames.
                 if copy26.count == 22 {
                     if let ac = self.decodeProprietarySingle(copy26), self.isPhysicallyReceivable(ac) {
                         self.detectedAircraft[ac.id] = ac
@@ -696,12 +690,12 @@ class ConnectionLogic: ObservableObject {
                         if let tag = v3Tag {
                             self.adsbDiag.calibrationV3Status = "✅22v3 BE lat@10 lon@6 ×1e-5\(tag.isEmpty ? "" : " \(tag)")"
                         }
-                    }
-                    // xcorr scan every unique 22b frame, decoded or not.
-                    let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
-                    if !alreadySeen {
-                        self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)
-                        self.scanUndecodedFrame(copy26)
+                    } else {
+                        let alreadySeen = self.adsbDiag.xcorrSeenFrames[22]?.contains(hex) ?? false
+                        if !alreadySeen {
+                            self.adsbDiag.xcorrSeenFrames[22, default: []].insert(hex)
+                            self.scanUndecodedFrame(copy26)
+                        }
                     }
                 } else if copy26.count == 70 {
                     // 70b bundle — hardcoded LE 1e-5 lat@11/lon@46 (confirmed ×3, Build 185).
