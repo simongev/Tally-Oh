@@ -1182,7 +1182,7 @@ class ConnectionLogic: ObservableObject {
             // Reject positions more than 3° from user (~200nm) — tighter than generic 10° guard
             // because 70b positions validated to always be ≥100nm away when decoded incorrectly.
             if let loc = currentLocation,
-               abs(lat - loc.latitude) > 3 || abs(lon - loc.longitude) > 3 { continue }
+               abs(lat - loc.latitude) > 4 || abs(lon - loc.longitude) > 4 { continue }
             // Reject ownship echo.
             if let loc = currentLocation,
                abs(lat - loc.latitude) < ownshipRejectionRadius &&
@@ -1238,7 +1238,7 @@ class ConnectionLogic: ObservableObject {
             guard (-90...90).contains(lat), (-180...180).contains(lon) else { continue }
             guard abs(lat) > 1.0 || abs(lon) > 1.0 else { continue }
             if let loc = currentLocation,
-               abs(lat - loc.latitude) > 3 || abs(lon - loc.longitude) > 3 { continue }
+               abs(lat - loc.latitude) > 4 || abs(lon - loc.longitude) > 4 { continue }
             // Reject ownship echo.
             if let loc = currentLocation,
                abs(lat - loc.latitude) < ownshipRejectionRadius &&
@@ -1393,7 +1393,7 @@ class ConnectionLogic: ObservableObject {
         // Require a GPS fix: without currentLocation the position-validation check in
         // the commit block below is a no-op, allowing noise to pass (seen in Build 238
         // when xcorr converged within seconds of app launch before GPS was ready).
-        guard bestVotes >= 8, (bestVotes - thirdVotes) >= 4, currentLocation != nil else { return }
+        guard bestVotes >= 14, (bestVotes - thirdVotes) >= 6, currentLocation != nil else { return }
 
         // Parse the winning key: "\(n)b LE|BE lat@\(latOff)s\(lsi) lon@\(lonOff)s\(msi)"
         // e.g. "47b LE lat@5s1 lon@8s2"

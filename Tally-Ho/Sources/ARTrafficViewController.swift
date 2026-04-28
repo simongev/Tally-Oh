@@ -1640,11 +1640,8 @@ class ARTrafficViewController: UIViewController {
                 appendToHUDLog(reason: "First W56 decode",
                                rawFrames: [d.prop56bLastDecodedHex])
             }
-            for (n, _) in d.undecodedHits where capturedEventKeys.insert("xcorr_\(n)b").inserted {
-                var frames: [String] = []
-                if let hex = d.sampleFramesBySize[n] { frames.append("\(n)b: \(hex)") }
-                appendToHUDLog(reason: "xcorr \(n)b lock", rawFrames: frames)
-            }
+            // xcorr lock no longer auto-saves: result already appears in every
+            // calibration section, and sampleFramesBySize[n] is not the convergence frame.
             // Ground correlation: fires once we have ≥20 56b frames and internet aircraft.
             // Waiting for 20 frames (~20s) avoids firing on the very first connection burst.
             let netCount = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
