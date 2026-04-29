@@ -865,6 +865,9 @@ class ARTrafficViewController: UIViewController {
             cal.append(String(format: "vel[%@]: hdg=%.0f° spd=%.0f kt vr=%.0f fpm",
                               key, vel.track, vel.speed, vel.verticalRate))
         }
+        if !d.capturedVelFrameV1Hex.isEmpty { cal.append("velframe_v1: \(d.capturedVelFrameV1Hex)") }
+        if !d.capturedVelFrameV2Hex.isEmpty { cal.append("velframe_v2: \(d.capturedVelFrameV2Hex)") }
+        if !d.capturedVelFrameV3Hex.isEmpty { cal.append("velframe_v3: \(d.capturedVelFrameV3Hex)") }
         if !d.rawMsgTypeCounts.isEmpty {
             let msgLine = d.rawMsgTypeCounts
                 .sorted { $0.key < $1.key }

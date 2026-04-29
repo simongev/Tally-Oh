@@ -206,6 +206,11 @@ struct ADSBDiagnostics {
     /// Key: 6-char uppercase hex ICAO from b[1-3] (e.g. "002FD2").
     /// Populated from type-19 ME fields inside position decoders and the undecoded handler.
     var adsbVelocityCache: [String: (track: Double, speed: Double, verticalRate: Double)] = [:]
+    /// Last 22b v1/v2/v3 decoded frame for which decodeType19ME returned non-nil.
+    /// Empty until a position-decoder path sees a type-19 ME. Used in share log only.
+    var capturedVelFrameV1Hex: String = ""
+    var capturedVelFrameV2Hex: String = ""
+    var capturedVelFrameV3Hex: String = ""
 }
 
 // MARK: - ConnectionLogic
@@ -1677,6 +1682,7 @@ class ConnectionLogic: ObservableObject {
         if let v = Self.decodeType19ME(b, meOffset: 8) {
             vel = v
             adsbDiag.adsbVelocityCache[icaoKey] = v
+            adsbDiag.capturedVelFrameV1Hex = "\(icao): \(b.map { String(format: "%02X", $0) }.joined(separator: " "))"
         }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
@@ -1709,6 +1715,7 @@ class ConnectionLogic: ObservableObject {
         if let v = Self.decodeType19ME(b, meOffset: 8) {
             vel = v
             adsbDiag.adsbVelocityCache[icaoKey] = v
+            adsbDiag.capturedVelFrameV2Hex = "\(icao): \(b.map { String(format: "%02X", $0) }.joined(separator: " "))"
         }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
@@ -1741,6 +1748,7 @@ class ConnectionLogic: ObservableObject {
         if let v = Self.decodeType19ME(b, meOffset: 13) {
             vel = v
             adsbDiag.adsbVelocityCache[icaoKey] = v
+            adsbDiag.capturedVelFrameV3Hex = "\(icao): \(b.map { String(format: "%02X", $0) }.joined(separator: " "))"
         }
         return Aircraft(id: icao, callsign: icao,
                         latitude: lat, longitude: lon,
