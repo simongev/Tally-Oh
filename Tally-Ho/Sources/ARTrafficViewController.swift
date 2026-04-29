@@ -840,8 +840,11 @@ class ARTrafficViewController: UIViewController {
         if let s = d.calibrationV2Status  { cal.append(s) }
         if let s = d.calibrationV3Status  { cal.append(s) }
         if let s = d.calibrationV4Status  { cal.append(s) }
-        if let s = d.calibrationV5Status  { cal.append(s) }
-        if let s = d.calibration47bStatus { cal.append(s) }
+        if let s = d.calibrationV5Status    { cal.append(s) }
+        if let s = d.calibrationV6Status    { cal.append(s) }
+        if let s = d.calibration47bStatus   { cal.append(s) }
+        if let s = d.calibration47bV2Status { cal.append(s) }
+        if let s = d.calibration20bStatus   { cal.append(s) }
         if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
            let latS = d.propLatScale,    let lonS = d.propLonScale {
             cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
@@ -852,6 +855,9 @@ class ARTrafficViewController: UIViewController {
         if !d.capturedV4FrameHex.isEmpty       { cal.append("decoded22v4: \(d.capturedV4FrameHex)") }
         if !d.capturedV5FrameHex.isEmpty       { cal.append("decoded22v5: \(d.capturedV5FrameHex)") }
         if !d.captured47bHardcodedHex.isEmpty  { cal.append("decoded47b: \(d.captured47bHardcodedHex)") }
+        if !d.capturedV6FrameHex.isEmpty       { cal.append("decoded22v6: \(d.capturedV6FrameHex)") }
+        if !d.captured47bV2Hex.isEmpty         { cal.append("decoded47b-v2: \(d.captured47bV2Hex)") }
+        if !d.captured20bHex.isEmpty           { cal.append("decoded20b: \(d.captured20bHex)") }
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
         }
