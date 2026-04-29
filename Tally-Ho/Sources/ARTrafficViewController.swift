@@ -840,6 +840,7 @@ class ARTrafficViewController: UIViewController {
         if let s = d.calibrationV2Status  { cal.append(s) }
         if let s = d.calibrationV3Status  { cal.append(s) }
         if let s = d.calibrationV4Status  { cal.append(s) }
+        if let s = d.calibrationV5Status  { cal.append(s) }
         if let s = d.calibration47bStatus { cal.append(s) }
         if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
            let latS = d.propLatScale,    let lonS = d.propLonScale {
@@ -849,6 +850,7 @@ class ARTrafficViewController: UIViewController {
         if !d.capturedV2FrameHex.isEmpty       { cal.append("decoded22v2: \(d.capturedV2FrameHex)") }
         if !d.capturedV3FrameHex.isEmpty       { cal.append("decoded22v3: \(d.capturedV3FrameHex)") }
         if !d.capturedV4FrameHex.isEmpty       { cal.append("decoded22v4: \(d.capturedV4FrameHex)") }
+        if !d.capturedV5FrameHex.isEmpty       { cal.append("decoded22v5: \(d.capturedV5FrameHex)") }
         if !d.captured47bHardcodedHex.isEmpty  { cal.append("decoded47b: \(d.captured47bHardcodedHex)") }
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
