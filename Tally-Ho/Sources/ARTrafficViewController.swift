@@ -850,6 +850,9 @@ class ARTrafficViewController: UIViewController {
         if let s = d.calibration43bV1Status { cal.append(s) }
         if let s = d.calibrationV8Status    { cal.append(s) }
         if let s = d.calibration47bV4Status { cal.append(s) }
+        if let s = d.calibrationV9Status    { cal.append(s) }
+        if let s = d.calibration47bV5Status { cal.append(s) }
+        if let s = d.calibration20bV2Status { cal.append(s) }
         if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
            let latS = d.propLatScale,    let lonS = d.propLonScale {
             cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
@@ -868,6 +871,9 @@ class ARTrafficViewController: UIViewController {
         if !d.captured43bV1Hex.isEmpty         { cal.append("decoded43b-v1: \(d.captured43bV1Hex)") }
         if !d.capturedV8FrameHex.isEmpty       { cal.append("decoded22v8: \(d.capturedV8FrameHex)") }
         if !d.captured47bV4Hex.isEmpty         { cal.append("decoded47b-v4: \(d.captured47bV4Hex)") }
+        if !d.capturedV9FrameHex.isEmpty       { cal.append("decoded22v9: \(d.capturedV9FrameHex)") }
+        if !d.captured47bV5Hex.isEmpty         { cal.append("decoded47b-v5: \(d.captured47bV5Hex)") }
+        if !d.captured20bV2Hex.isEmpty         { cal.append("decoded20b-v2: \(d.captured20bV2Hex)") }
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
         }

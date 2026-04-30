@@ -233,6 +233,12 @@ struct ADSBDiagnostics {
     var capturedV8FrameHex: String = ""
     var calibration47bV4Status: String? = nil
     var captured47bV4Hex: String = ""
+    var calibrationV9Status: String? = nil
+    var capturedV9FrameHex: String = ""
+    var calibration47bV5Status: String? = nil
+    var captured47bV5Hex: String = ""
+    var calibration20bV2Status: String? = nil
+    var captured20bV2Hex: String = ""
 }
 
 // MARK: - ConnectionLogic
@@ -769,6 +775,14 @@ class ConnectionLogic: ObservableObject {
                         if self.adsbDiag.calibrationV8Status == nil {
                             self.adsbDiag.calibrationV8Status = "✅22v8 LE lat@12×1.00e-05 lon@3×1.00e-05 (hardcoded)"
                         }
+                    } else if let ac = self.decode22bV9(copy26), self.isPhysicallyReceivable(ac) {
+                        self.detectedAircraft[ac.id] = ac
+                        self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                        self.adsbDiag.parsedTraffic += 1
+                        self.adsbDiag.capturedV9FrameHex = "\(ac.callsign): \(hex)"
+                        if self.adsbDiag.calibrationV9Status == nil {
+                            self.adsbDiag.calibrationV9Status = "✅22v9 BE lat@2×1.07e-05 lon@16×1.07e-05 (hardcoded)"
+                        }
                     } else {
                         // Prefix each entry with the ME type code (b[8] high 5 bits) so the
                         // share log immediately shows which ADS-B squitter types are undecoded.
@@ -949,6 +963,28 @@ class ConnectionLogic: ObservableObject {
                             self.adsbDiag.captured47bV4Hex = "\(ac.callsign): \(hex)"
                             if self.adsbDiag.calibration47bV4Status == nil {
                                 self.adsbDiag.calibration47bV4Status = "✅47b-v4 LE lat@27×1.00e-05 lon@30×2.15e-05 (hardcoded)"
+                            }
+                            decodedSmall = true
+                        } else if copy26.count == 47,
+                           let ac = self.decode47bV5Hardcoded(copy26),
+                           self.isPhysicallyReceivable(ac) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                            self.adsbDiag.parsedTraffic += 1
+                            self.adsbDiag.captured47bV5Hex = "\(ac.callsign): \(hex)"
+                            if self.adsbDiag.calibration47bV5Status == nil {
+                                self.adsbDiag.calibration47bV5Status = "✅47b-v5 LE lat@28×2.15e-05 lon@31×1.07e-05 (hardcoded)"
+                            }
+                            decodedSmall = true
+                        } else if copy26.count == 20,
+                           let ac = self.decode20bV2Hardcoded(copy26),
+                           self.isPhysicallyReceivable(ac) {
+                            self.detectedAircraft[ac.id] = ac
+                            self.adsbDiag.uniqueAircraftSeen.insert(ac.id)
+                            self.adsbDiag.parsedTraffic += 1
+                            self.adsbDiag.captured20bV2Hex = "\(ac.callsign): \(hex)"
+                            if self.adsbDiag.calibration20bV2Status == nil {
+                                self.adsbDiag.calibration20bV2Status = "✅20b-v2 LE lat@6×1.07e-05 lon@11×1.00e-05 (hardcoded)"
                             }
                             decodedSmall = true
                         } else if let hit = self.adsbDiag.undecodedHits[size],
@@ -2187,6 +2223,90 @@ class ConnectionLogic: ObservableObject {
            abs(lat - loc.latitude) < ownshipRejectionRadius &&
            abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
         let icao = String(format: "M%02X%02X%02X", b[1], b[2], b[3])
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        let vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
+                        lastUpdate: Date(), source: .adsb)
+    }
+
+    /// 22b sub-type v9: BE lat@2 ×(180/2^24), lon@16 ×(180/2^24).
+    /// Confirmed by xcorr ×3/3 (Build 259). Prefix "N".
+    private func decode22bV9(_ payload: Data) -> Aircraft? {
+        guard payload.count == 22 else { return nil }
+        let b = Array(payload)
+        func s24be(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) << 16 | Int32(b[i+1]) << 8 | Int32(b[i+2])
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        let lat = Double(s24be(2))  * (180.0 / 16_777_216.0)
+        let lon = Double(s24be(16)) * (180.0 / 16_777_216.0)
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
+        let icao = String(format: "N%02X%02X%02X", b[1], b[2], b[3])
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        let vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
+                        lastUpdate: Date(), source: .adsb)
+    }
+
+    /// Hardcoded 47b decoder v5: LE lat@28 ×(360/2^24), lon@31 ×(180/2^24).
+    /// Confirmed by xcorr ×5/3 (Build 259). Prefix "P".
+    private func decode47bV5Hardcoded(_ payload: Data) -> Aircraft? {
+        guard payload.count == 47 else { return nil }
+        let b = Array(payload)
+        func s24le(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        let lat = Double(s24le(28)) * (360.0 / 16_777_216.0)
+        let lon = Double(s24le(31)) * (180.0 / 16_777_216.0)
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
+        let icao = String(format: "P%02X%02X%02X", b[1], b[2], b[3])
+        let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
+        let vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
+        return Aircraft(id: icao, callsign: icao,
+                        latitude: lat, longitude: lon,
+                        altitude: 10_000,
+                        track: vel.track, groundSpeed: vel.speed, verticalRate: vel.verticalRate,
+                        lastUpdate: Date(), source: .adsb)
+    }
+
+    /// Hardcoded 20b decoder v2: LE lat@6 ×(180/2^24), lon@11 ×1e-5.
+    /// Confirmed by xcorr ×2/2 (Build 259). Prefix "Q".
+    private func decode20bV2Hardcoded(_ payload: Data) -> Aircraft? {
+        guard payload.count == 20 else { return nil }
+        let b = Array(payload)
+        func s24le(_ i: Int) -> Int32 {
+            let v = Int32(b[i]) | Int32(b[i+1]) << 8 | Int32(b[i+2]) << 16
+            return v & 0x800000 != 0 ? v | Int32(bitPattern: 0xFF000000) : v
+        }
+        let lat = Double(s24le(6))  * (180.0 / 16_777_216.0)
+        let lon = Double(s24le(11)) * (1.0 / 100_000.0)
+        guard (-90...90).contains(lat), (-180...180).contains(lon) else { return nil }
+        guard abs(lat) > 1.0 || abs(lon) > 1.0 else { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) > 10 || abs(lon - loc.longitude) > 10 { return nil }
+        if let loc = currentLocation,
+           abs(lat - loc.latitude) < ownshipRejectionRadius &&
+           abs(lon - loc.longitude) < ownshipRejectionRadius { return nil }
+        let icao = String(format: "Q%02X%02X%02X", b[1], b[2], b[3])
         let icaoKey = String(format: "%02X%02X%02X", b[1], b[2], b[3])
         let vel = adsbDiag.adsbVelocityCache[icaoKey] ?? (track: 0, speed: 0, verticalRate: 0)
         return Aircraft(id: icao, callsign: icao,
