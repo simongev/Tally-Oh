@@ -861,6 +861,8 @@ class ARTrafficViewController: UIViewController {
         if let s = d.calibration56bV2Status  { cal.append(s) }
         if let s = d.calibrationV12Status    { cal.append(s) }
         if let s = d.calibration56bV3Status  { cal.append(s) }
+        if let s = d.calibration56bV4Status  { cal.append(s) }
+        if let s = d.calibration56bV5Status  { cal.append(s) }
         if let lat = d.propLatByteOffset, let lon = d.propLonByteOffset,
            let latS = d.propLatScale,    let lonS = d.propLonScale {
             cal.append(String(format: "22b offsets: lat@%d×%.2e  lon@%d×%.2e", lat, latS, lon, lonS))
@@ -890,6 +892,8 @@ class ARTrafficViewController: UIViewController {
         if !d.captured56bV2Hex.isEmpty         { cal.append("decoded56b-v2: \(d.captured56bV2Hex)") }
         if !d.capturedV12FrameHex.isEmpty      { cal.append("decoded22v12: \(d.capturedV12FrameHex)") }
         if !d.captured56bV3Hex.isEmpty         { cal.append("decoded56b-v3: \(d.captured56bV3Hex)") }
+        if !d.captured56bV4Hex.isEmpty         { cal.append("decoded56b-v4: \(d.captured56bV4Hex)") }
+        if !d.captured56bV5Hex.isEmpty         { cal.append("decoded56b-v5: \(d.captured56bV5Hex)") }
         for (size, hit) in d.undecodedHits.sorted(by: { $0.key < $1.key }) {
             cal.append("\(size)b xcorr: \(hit.display)")
         }
