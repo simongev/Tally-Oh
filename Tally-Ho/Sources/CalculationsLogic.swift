@@ -178,12 +178,17 @@ class CalculationsLogic {
 
     /// Predict where an aircraft will be `aheadSeconds` in the future,
     /// compensating for ADS-B report latency and network delay.
+    /// Extrapolation is capped at 10s past the last report: beyond that the
+    /// straight-line/constant-speed assumption is too likely to have diverged
+    /// from a maneuvering aircraft's real position, so the prediction freezes
+    /// at the 10s point instead of continuing to coast indefinitely.
     static func predictedPosition(
         for aircraft: Aircraft,
         aheadSeconds: Double = 0
     ) -> (coordinate: CLLocationCoordinate2D, altitude: Double) {
+        let maxCoastSeconds = 10.0
         let age = -aircraft.lastUpdate.timeIntervalSinceNow  // seconds since last report
-        let total = age + aheadSeconds
+        let total = min(age + aheadSeconds, maxCoastSeconds)
         guard total > 0, aircraft.groundSpeed > 0 else {
             return (aircraft.coordinate, aircraft.altitude)
         }
