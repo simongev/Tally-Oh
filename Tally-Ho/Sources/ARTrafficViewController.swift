@@ -253,6 +253,7 @@ class ARTrafficViewController: UIViewController {
         super.viewWillAppear(animated)
 
         startARSession()
+        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
         // (pausing the AR session, invalidating the timer, stopping the altimeter).
@@ -1168,7 +1169,8 @@ class ARTrafficViewController: UIViewController {
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos
+                cameraWorldPosition: cameraPos,
+                northCorrectionDeg:  arKitNorthCorrectionDeg
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -1613,6 +1615,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             arKitNorthCorrectionDeg = isFirstHeadingFix
                 ? decl
                 : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
+            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         }
 
         isFirstHeadingFix = false
