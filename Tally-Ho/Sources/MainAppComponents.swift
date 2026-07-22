@@ -62,6 +62,8 @@ class ARComponentFactory {
         mat.diffuse.contents  = UIColor(red: 0.1, green: 0.45, blue: 1.0, alpha: 1.0)
         mat.emission.contents = UIColor(red: 0.05, green: 0.25, blue: 0.6, alpha: 1)
         mat.isDoubleSided     = true
+        mat.readsFromDepthBuffer = false
+        mat.writesToDepthBuffer  = false
         cone.materials = [mat]
         return cone
     }()
@@ -141,6 +143,8 @@ class ARComponentFactory {
         m.emission.contents = ringImageNormal
         m.isDoubleSided     = true
         m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
         return m
     }()
     private static let ringMaterialTA: SCNMaterial = {
@@ -149,6 +153,8 @@ class ARComponentFactory {
         m.emission.contents = ringImageTA
         m.isDoubleSided     = true
         m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
         return m
     }()
     private static let ringMaterialRA: SCNMaterial = {
@@ -157,6 +163,8 @@ class ARComponentFactory {
         m.emission.contents = ringImageRA
         m.isDoubleSided     = true
         m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
         return m
     }()
 
@@ -470,6 +478,8 @@ class ARComponentFactory {
         mat.diffuse.contents   = image       // single GPU texture upload (no emission duplicate)
         mat.isDoubleSided      = true
         mat.transparencyMode   = .aOne
+        mat.readsFromDepthBuffer = false
+        mat.writesToDepthBuffer  = false
         plane.materials = [mat]
 
         let node = SCNNode(geometry: plane)
