@@ -176,17 +176,32 @@ class CalculationsLogic {
         )
     }
 
+    /// Beyond this report age, a target is flagged "stale" in the UI (dashed ring) —
+    /// still shown and dead-reckoned, but visually marked as not a fresh position fix.
+    /// Chosen to clear the internet-source 8s fetch cadence (ConnectionLogic.swift)
+    /// plus jitter, while still catching a genuinely stale report promptly.
+    static let staleAircraftAgeSeconds: Double = 10.0
+
+    /// Hard ceiling on dead-reckoning extrapolation: beyond this age we stop projecting
+    /// the aircraft further forward and freeze it at the 20s-extrapolated point, rather
+    /// than coasting in a straight line indefinitely.
+    static let maxCoastSeconds: Double = 20.0
+
+    /// Whether an aircraft's last report is old enough to be flagged as stale in the UI.
+    static func isStale(_ aircraft: Aircraft) -> Bool {
+        -aircraft.lastUpdate.timeIntervalSinceNow > staleAircraftAgeSeconds
+    }
+
     /// Predict where an aircraft will be `aheadSeconds` in the future,
     /// compensating for ADS-B report latency and network delay.
-    /// Extrapolation is capped at 10s past the last report: beyond that the
-    /// straight-line/constant-speed assumption is too likely to have diverged
-    /// from a maneuvering aircraft's real position, so the prediction freezes
-    /// at the 10s point instead of continuing to coast indefinitely.
+    /// Extrapolation is capped at `maxCoastSeconds` past the last report: beyond that
+    /// the straight-line/constant-speed assumption is too likely to have diverged from
+    /// a maneuvering aircraft's real position, so the prediction freezes at that point
+    /// instead of continuing to coast indefinitely.
     static func predictedPosition(
         for aircraft: Aircraft,
         aheadSeconds: Double = 0
     ) -> (coordinate: CLLocationCoordinate2D, altitude: Double) {
-        let maxCoastSeconds = 10.0
         let age = -aircraft.lastUpdate.timeIntervalSinceNow  // seconds since last report
         let total = min(age + aheadSeconds, maxCoastSeconds)
         guard total > 0, aircraft.groundSpeed > 0 else {

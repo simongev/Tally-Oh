@@ -126,6 +126,24 @@ class ARComponentFactory {
         thickness:   CGFloat(aircraftRingThickness),
         color: UIColor(red: 1.0, green: 0.85, blue: 0.0, alpha: 1.0))   // yellow — dimmed, not selected
 
+    // Dashed variants — same colors/sizes per TCAS level, used when the aircraft's
+    // last report is older than CalculationsLogic.staleAircraftAgeSeconds, so a
+    // dead-reckoned/uncertain position reads visually differently from a live fix.
+    private static let ringImageNormalStale: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadius),
+        thickness:   CGFloat(aircraftRingThickness),
+        color: UIColor(red: 1.0, green: 0.15, blue: 0.15, alpha: 1.0), dashed: true)
+
+    private static let ringImageTAStale: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadiusTA),
+        thickness:   CGFloat(aircraftRingThicknessTA),
+        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0), dashed: true)
+
+    private static let ringImageRAStale: UIImage = makeRingImage(
+        outerRadius: CGFloat(aircraftRingRadiusRA),
+        thickness:   CGFloat(aircraftRingThicknessRA),
+        color: UIColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0), dashed: true)
+
     static func ringImage(for level: TCASAlertLevel) -> UIImage {
         switch level {
         case .none:               return ringImageNormal
@@ -167,8 +185,45 @@ class ARComponentFactory {
         m.writesToDepthBuffer  = false
         return m
     }()
+    private static let ringMaterialNormalStale: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageNormalStale
+        m.emission.contents = ringImageNormalStale
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
+        return m
+    }()
+    private static let ringMaterialTAStale: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageTAStale
+        m.emission.contents = ringImageTAStale
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
+        return m
+    }()
+    private static let ringMaterialRAStale: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageRAStale
+        m.emission.contents = ringImageRAStale
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
+        return m
+    }()
 
-    static func ringMaterial(for level: TCASAlertLevel) -> SCNMaterial {
+    static func ringMaterial(for level: TCASAlertLevel, isStale: Bool = false) -> SCNMaterial {
+        if isStale {
+            switch level {
+            case .none:               return ringMaterialNormalStale
+            case .trafficAdvisory:    return ringMaterialTAStale
+            case .resolutionAdvisory: return ringMaterialRAStale
+            }
+        }
         switch level {
         case .none:               return ringMaterialNormal
         case .trafficAdvisory:    return ringMaterialTA
@@ -244,7 +299,8 @@ class ARComponentFactory {
         distanceNM: Double = 0,
         cameraWorldPosition: SCNVector3 = .init(),
         settings: ARVisualizationSettings,
-        tcasLevel: TCASAlertLevel = .none
+        tcasLevel: TCASAlertLevel = .none,
+        isStale: Bool = false
     ) -> SCNNode {
 
         let container = SCNNode()
@@ -255,11 +311,12 @@ class ARComponentFactory {
         // uploaded only once and reused across all aircraft nodes at that level.
         let ringSize = ringPlaneSize(for: tcasLevel)
         let plane = SCNPlane(width: ringSize, height: ringSize)
-        plane.materials = [ringMaterial(for: tcasLevel)]
+        plane.materials = [ringMaterial(for: tcasLevel, isStale: isStale)]
 
         let ringNode = SCNNode(geometry: plane)
         ringNode.name = "ring"
         ringNode.accessibilityLabel = String(tcasLevel.rawValue)   // level tag for material restore
+        ringNode.setValue(isStale ? "\(tcasLevel.rawValue)s" : "\(tcasLevel.rawValue)", forKey: "ringMatTag")
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .all
         ringNode.constraints = [billboard]
@@ -282,6 +339,9 @@ class ARComponentFactory {
 
         // Seed distance scale so applySelectedAppearance can compose it on first selection pass.
         container.setValue(NSNumber(value: markerDistanceScale(distanceNM)), forKey: "distanceScale")
+        // Seed staleness so applySelectedAppearance restores the correct (dashed vs solid)
+        // ring material when a selection change requires reapplying it.
+        container.setValue(NSNumber(value: isStale), forKey: "isStale")
 
         // Rings render above all labels; within each layer, closer beats farther.
         let ro = markerRenderingOrder(distanceNM)
@@ -296,7 +356,8 @@ class ARComponentFactory {
     private static func makeRingImage(
         outerRadius: CGFloat,
         thickness: CGFloat,
-        color: UIColor
+        color: UIColor,
+        dashed: Bool = false
     ) -> UIImage {
         let dim = Int((outerRadius * 2 + 4).rounded()) * 16
         let size = CGSize(width: dim, height: dim)
@@ -306,14 +367,30 @@ class ARComponentFactory {
             let scale   = CGFloat(dim) / (outerRadius * 2 + 4)
             let outerPx = outerRadius * scale
             let innerPx = (outerRadius - thickness) * scale
-            ctx.cgContext.addEllipse(in: CGRect(
-                x: centre.x - outerPx, y: centre.y - outerPx,
-                width: outerPx * 2, height: outerPx * 2))
-            ctx.cgContext.addEllipse(in: CGRect(
-                x: centre.x - innerPx, y: centre.y - innerPx,
-                width: innerPx * 2, height: innerPx * 2))
-            ctx.cgContext.setFillColor(color.cgColor)
-            ctx.cgContext.fillPath(using: .evenOdd)
+            if dashed {
+                // Stroke the ring's midline with a dashed pattern instead of filling a
+                // solid annulus, so a stale (dead-reckoned, not freshly reported)
+                // aircraft is visually distinct from one with a live position fix.
+                let midRadius   = (outerPx + innerPx) / 2
+                let strokeWidth = outerPx - innerPx
+                let path = UIBezierPath(
+                    arcCenter: centre, radius: midRadius,
+                    startAngle: 0, endAngle: .pi * 2, clockwise: true)
+                path.lineWidth = strokeWidth
+                let dashLen = strokeWidth * 1.8
+                path.setLineDash([dashLen, dashLen], count: 2, phase: 0)
+                color.setStroke()
+                path.stroke()
+            } else {
+                ctx.cgContext.addEllipse(in: CGRect(
+                    x: centre.x - outerPx, y: centre.y - outerPx,
+                    width: outerPx * 2, height: outerPx * 2))
+                ctx.cgContext.addEllipse(in: CGRect(
+                    x: centre.x - innerPx, y: centre.y - innerPx,
+                    width: innerPx * 2, height: innerPx * 2))
+                ctx.cgContext.setFillColor(color.cgColor)
+                ctx.cgContext.fillPath(using: .evenOdd)
+            }
         }
     }
 
@@ -363,6 +440,7 @@ class ARComponentFactory {
         let distScale = (container.value(forKey: "distanceScale") as? NSNumber)?.floatValue ?? 1.0
         let finalScale: Float = selected ? 1.0 : distScale
         container.scale = SCNVector3(finalScale, finalScale, finalScale)
+        let isStale = (container.value(forKey: "isStale") as? NSNumber)?.boolValue ?? false
         container.enumerateChildNodes { node, _ in
             guard node.name != "label" else { return }
             if node.geometry is SCNCone, let mat = node.geometry?.firstMaterial {
@@ -390,8 +468,9 @@ class ARComponentFactory {
                     }
                 } else {
                     // Either no selection is active (all rings red) or this IS the selected
-                    // node (selected ring stays red). Restore the shared red material.
-                    plane.materials = [ringMaterial(for: level)]
+                    // node (selected ring stays red). Restore the shared red material,
+                    // preserving the dashed/stale appearance if applicable.
+                    plane.materials = [ringMaterial(for: level, isStale: isStale)]
                 }
             }
         }
@@ -561,8 +640,12 @@ class ARComponentFactory {
         distanceNM: Double = 0,
         settings: ARVisualizationSettings,
         selectedNodeID: String? = nil,
-        tcasLevel: TCASAlertLevel = .none
+        tcasLevel: TCASAlertLevel = .none,
+        isStale: Bool = false
     ) {
+        // Keep staleness current on the container so applySelectedAppearance can
+        // restore the correct (dashed vs solid) ring material on a selection change.
+        node.setValue(NSNumber(value: isStale), forKey: "isStale")
         // Refresh label
         let labelNode = node.childNode(withName: "label", recursively: false)
 
@@ -592,21 +675,27 @@ class ARComponentFactory {
             }
         }
 
-        // Update ring size, shared material, and pulse only when TCAS level changes.
-        // Use the node's "accessibilityLabel" as a cheap String level-tag ("0"/"1"/"2")
-        // to skip no-op updates and allow applySelectedAppearance to restore the right material.
+        // Update ring size/material only when TCAS level or staleness changes.
+        // "accessibilityLabel" stays a pure numeric level tag ("0"/"1"/"2") since
+        // applySelectedAppearance parses it as Int; staleness is tracked separately
+        // via "ringMatTag" so either change alone triggers a material refresh.
         if let ringNode = node.childNode(withName: "ring", recursively: false) {
             let levelTag = String(tcasLevel.rawValue)   // "0" = none, "1" = TA, "2" = RA
-            if ringNode.accessibilityLabel != levelTag {
+            let combinedTag = levelTag + (isStale ? "s" : "")
+            if (ringNode.value(forKey: "ringMatTag") as? String) != combinedTag {
+                let levelChanged = ringNode.accessibilityLabel != levelTag
                 ringNode.accessibilityLabel = levelTag
-                let newSize = ringPlaneSize(for: tcasLevel)
+                ringNode.setValue(combinedTag, forKey: "ringMatTag")
                 if let plane = ringNode.geometry as? SCNPlane {
                     SCNTransaction.begin()
                     SCNTransaction.disableActions = true
-                    plane.width  = newSize
-                    plane.height = newSize
-                    // Swap to the shared material for this level
-                    plane.materials = [ringMaterial(for: tcasLevel)]
+                    if levelChanged {
+                        let newSize = ringPlaneSize(for: tcasLevel)
+                        plane.width  = newSize
+                        plane.height = newSize
+                    }
+                    // Swap to the shared material for this level/staleness combination
+                    plane.materials = [ringMaterial(for: tcasLevel, isStale: isStale)]
                     SCNTransaction.commit()
                 }
             }
@@ -905,6 +994,7 @@ class ARSceneManager {
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
             guard distNM <= settings.aircraftMaxDistance else { continue }
             guard settings.passes(callsign: ac.callsign) else { continue }
+            let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
@@ -930,7 +1020,8 @@ class ARSceneManager {
                     distanceNM: distNM,
                     settings: settings,
                     selectedNodeID: selectedNodeID,
-                    tcasLevel: tcasLevel
+                    tcasLevel: tcasLevel,
+                    isStale: isStale
                 )
             } else {
                 // Enforce hard total-node cap and per-tick creation rate limit
@@ -944,7 +1035,8 @@ class ARSceneManager {
                     distanceNM: distNM,
                     cameraWorldPosition: cameraWorldPosition,
                     settings: settings,
-                    tcasLevel: tcasLevel
+                    tcasLevel: tcasLevel,
+                    isStale: isStale
                 )
                 SCNTransaction.begin()
                 SCNTransaction.disableActions = true
