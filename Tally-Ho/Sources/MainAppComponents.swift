@@ -897,14 +897,18 @@ class ARSceneManager {
             // Filter out ground aircraft unless the user has enabled them
             if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
 
-            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
+            // Cull/order/label using the same dead-reckoned position the marker is
+            // actually drawn at — mixing the raw last-reported coordinate here with
+            // the predicted coordinate below caused pop-in/pop-out and wrong depth
+            // stacking whenever a report was stale and the aircraft fast-moving.
+            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
             guard distNM <= settings.aircraftMaxDistance else { continue }
             guard settings.passes(callsign: ac.callsign) else { continue }
 
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
 
-            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: predAlt,
