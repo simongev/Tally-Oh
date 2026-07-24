@@ -195,6 +195,7 @@ class ARTrafficViewController: UIViewController {
     private var userHeading: Double = 0
     private var lastHeadingAccuracy: CLLocationDirectionAccuracy = -1
     private var arTrackingState: ARCamera.TrackingState = .notAvailable
+    private var isCalibrationPopupShowing = false
 
     private let altimeter = CMAltimeter()
     private var baroRelativeAltitude: Double = 0
@@ -619,6 +620,23 @@ class ARTrafficViewController: UIViewController {
         isFirstHeadingFix = true
         arSceneView.transform = .identity
         currentZoomScale = 1.0
+    }
+
+    /// Re-present the launch-time calibration screen as a full-screen popup when
+    /// GPS or compass accuracy degrades past the warning threshold while on the
+    /// ground. Ground-only (see call sites): recalibrating can't fix compass/GPS
+    /// degradation that's normal in flight, and a full-screen popup would block
+    /// the live AR traffic view exactly when it's needed most.
+    private func presentCalibrationPopupIfNeeded() {
+        guard !isCalibrationPopupShowing, presentedViewController == nil else { return }
+        isCalibrationPopupShowing = true
+        let calibration = CalibrationViewController()
+        calibration.modalPresentationStyle = .fullScreen
+        calibration.onComplete = { [weak self, weak calibration] _ in
+            calibration?.dismiss(animated: true)
+            self?.isCalibrationPopupShowing = false
+        }
+        present(calibration, animated: true)
     }
 
     // MARK: - Actions
@@ -1509,6 +1527,14 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
 
         let hAcc = loc.horizontalAccuracy
+        // Ground-only: prompt recalibration if GPS accuracy crosses from good to
+        // bad (same threshold as the status-bar ⚠️ warning), before it's overwritten
+        // below. Not applied in flight — GPS is expected to degrade there.
+        let wasGoodGPS = lastHorizontalAccuracy >= 0 && lastHorizontalAccuracy <= gpsAccuracyThreshold
+        if !tcasEnabled && wasGoodGPS && hAcc > gpsAccuracyThreshold {
+            presentCalibrationPopupIfNeeded()
+        }
+
         // Inside an aircraft fuselage the GPS signal is attenuated; accuracy
         // typically degrades to 30–150 m, which would make the strict ground
         // threshold (30 m) reject every fix.  In flight (tcasEnabled = altitude
@@ -1587,6 +1613,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
             startARSession()
+            presentCalibrationPopupIfNeeded()
         }
 
         lastHeadingAccuracy = accuracy
