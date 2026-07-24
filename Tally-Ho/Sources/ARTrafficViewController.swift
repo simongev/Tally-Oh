@@ -212,10 +212,6 @@ class ARTrafficViewController: UIViewController {
 
     private var arKitNorthCorrectionDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
-    /// ARKit's own north-calibration residual (distinct from geographic declination),
-    /// captured once per AR session — see startARSession()/didUpdateHeading().
-    private var arKitAlignmentResidualDeg: Double = 0
-    private var hasCapturedAlignmentResidual = false
 
     // MARK: - Lifecycle
 
@@ -621,11 +617,6 @@ class ARTrafficViewController: UIViewController {
         // compass heading, so apply the next heading fix directly rather than
         // blending it in from the previous session's smoothed state.
         isFirstHeadingFix = true
-        // A fresh session re-locks ARKit's own north calibration from scratch, so
-        // re-capture the one-shot alignment residual rather than carrying over a
-        // value measured at a different location/orientation.
-        hasCapturedAlignmentResidual = false
-        arKitAlignmentResidualDeg = 0
         arSceneView.transform = .identity
         currentZoomScale = 1.0
     }
@@ -1617,51 +1608,13 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             var decl = newHeading.trueHeading - newHeading.magneticHeading
             while decl >  180 { decl -= 360 }
             while decl < -180 { decl += 360 }
-
-            // One-shot ARKit north-calibration residual: ARKit locks its world −Z axis
-            // from its own sensor fusion at session start, which can be a few degrees
-            // off true magnetic north if the compass was locally disturbed at that
-            // moment (e.g. near parked aircraft/metal hangar structures on the ground) —
-            // something geographic declination can't capture, since it's a location
-            // lookup, not sensor-derived. Measured ONCE per AR session (not every
-            // callback) and held fixed afterward: continuously re-measuring this was
-            // tried previously and reverted for reduced accuracy, because it also
-            // picked up ARKit's own normal moment-to-moment tracking drift, not just
-            // the one-time calibration offset.
-            if !hasCapturedAlignmentResidual, accuracy <= 15, let pov = arSceneView.pointOfView {
-                let t  = simd_float4x4(pov.worldTransform)
-                let lz = t.columns.2   // camera local Z axis expressed in world space
-                // Horizontal magnitude: near zero when device points almost straight up/down
-                // (pitch > ~79°). Bearing is unreliable in that case — skip and try again
-                // on a later callback rather than locking in a bad reading.
-                let horizMag = sqrt(lz.x * lz.x + lz.z * lz.z)
-                if horizMag > 0.2 {
-                    let cameraARKitBearingRad = atan2(-lz.x, lz.z)
-                    var cameraARKitBearing = Double(cameraARKitBearingRad) * (180.0 / .pi)
-                    if cameraARKitBearing < 0 { cameraARKitBearing += 360 }
-
-                    var err = cameraARKitBearing - newHeading.magneticHeading
-                    while err >  180 { err -= 360 }
-                    while err < -180 { err += 360 }
-
-                    // Reject implausibly large errors (> 30°): momentary outlier from a
-                    // rapid rotation or brief compass transient — wait for a better reading.
-                    if abs(err) < 30 {
-                        arKitAlignmentResidualDeg = err
-                        hasCapturedAlignmentResidual = true
-                    }
-                }
-            }
-
             // Smooth the north correction heavily (alpha=0.15, ~0.7 s time constant)
             // so that magnetometer noise doesn't shift every AR node on each callback.
             // Geographic declination changes only over tens of miles, so this lag is
-            // imperceptible in practice. The alignment residual is already fixed once
-            // captured, so it just rides along as a constant additive offset.
-            let totalCorrection = decl + arKitAlignmentResidualDeg
+            // imperceptible in practice.
             arKitNorthCorrectionDeg = isFirstHeadingFix
-                ? totalCorrection
-                : smoothAngle(current: arKitNorthCorrectionDeg, new: totalCorrection, alpha: 0.15)
+                ? decl
+                : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
             sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         }
 
