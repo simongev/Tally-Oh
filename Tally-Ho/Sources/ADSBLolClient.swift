@@ -37,6 +37,8 @@ class ADSBLolClient {
         let baroRate: FlexDouble?   // "baro_rate"
         let geomRate: FlexDouble?   // "geom_rate"
         let t:        String?       // aircraft type e.g. "B738"
+        let seenPos:  Double?       // "seen_pos" — seconds since this aircraft's
+                                     // position was last updated server-side
 
         enum CodingKeys: String, CodingKey {
             case hex, lat, lon, flight, r, track, gs, t
@@ -44,6 +46,7 @@ class ADSBLolClient {
             case altGeom  = "alt_geom"
             case baroRate = "baro_rate"
             case geomRate = "geom_rate"
+            case seenPos  = "seen_pos"
         }
     }
 
@@ -109,7 +112,9 @@ class ADSBLolClient {
 
     private static let decoder: JSONDecoder = {
         let d = JSONDecoder()
-        // adsb.lol doesn't use date fields, but configure once for reuse.
+        // No Date-typed fields are decoded here — "seen_pos" is read as a plain
+        // Double (seconds of staleness) and applied in makeAircraft(from:) below,
+        // not via JSONDecoder's date-decoding strategy.
         return d
     }()
 
@@ -148,6 +153,13 @@ class ADSBLolClient {
 
         let verticalRate: Double = e.baroRate?.value ?? e.geomRate?.value ?? 0
 
+        // adsb.lol reports "seen_pos": how many seconds old this aircraft's
+        // position already was server-side when it was served to us. Without
+        // this, lastUpdate would only reflect local parse time, understating
+        // true position age and causing predictedPosition()'s dead-reckoning to
+        // lag behind a fast-moving aircraft's real current position.
+        let positionStaleness = e.seenPos ?? 0
+
         return Aircraft(
             id:           icao,
             callsign:     callsign,
@@ -158,7 +170,7 @@ class ADSBLolClient {
             track:        e.track ?? 0,
             groundSpeed:  e.gs    ?? 0,
             verticalRate: verticalRate,
-            lastUpdate:   Date(),
+            lastUpdate:   Date().addingTimeInterval(-positionStaleness),
             source:       .internet
         )
     }
