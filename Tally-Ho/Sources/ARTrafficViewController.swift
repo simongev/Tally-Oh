@@ -181,7 +181,7 @@ private final class HUDOverlayView: UIView {
         case 90:  return "E"
         case 180: return "S"
         case 270: return "W"
-        default:  return String(format: "%02d", Int(value) / 10)
+        default:  return String(format: "%03d", Int(value))
         }
     }
 
@@ -283,18 +283,13 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from a reference
-        // direction at the pivot. point = pivot + R*(sin(rad), -cos(rad))
-        // — at rad=0 that reference is straight up (0° tick closest to the
-        // top, ±60° ticks lower, the "sad face" ⌢ shape of a real ADI's
-        // roll dial). `roseBaseRad` rotates that whole reference direction
-        // 90° clockwise ("to the right") so the assembly sits on its side,
-        // with the rest of the geometry below built the same way relative
-        // to whatever direction that points.
-        let roseBaseRad = Double.pi / 2
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
+        // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
+        // closest to the top (smallest y) and the ±60° ticks lower — the
+        // "sad face" ⌢ shape of a real ADI's roll dial.
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
-            let rad = deg * .pi / 180 + roseBaseRad
+            let rad = deg * .pi / 180
             let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
             let innerR = bankRadius - (isMajor ? 10 : 6)
@@ -307,9 +302,7 @@ private final class HUDOverlayView: UIView {
         // Fixed triangle at the center of the rose (aircraft/wings-level
         // reference — like a real ADI's fixed aircraft symbol, which sits
         // at the middle of the instrument while the roll scale rotates
-        // around it) always pointing straight up ("top"), independent of
-        // roseBaseRad — only the tick scale above is rotated onto its side,
-        // not this fixed reference marker.
+        // around it) always pointing straight up ("top").
         let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
         let baseLeft  = CGPoint(x: bankPivot.x - 5, y: bankPivot.y + 4)
         let baseRight = CGPoint(x: bankPivot.x + 5, y: bankPivot.y + 4)
@@ -343,7 +336,12 @@ private final class HUDOverlayView: UIView {
             arcPath.move(to: rotated(tick.inner))
             arcPath.addLine(to: rotated(tick.outer))
         }
-
+        // Also called from layoutBankRose() (a different context than the
+        // per-frame dispatch block below), so this needs its own action-
+        // disabling transaction rather than relying on an outer one —
+        // nested CATransactions are cheap (only the outermost commit
+        // actually flushes), so this doesn't add meaningful overhead when
+        // called from within the caller's own transaction.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         bankArcLayer.path = arcPath
@@ -437,8 +435,8 @@ private final class HUDOverlayView: UIView {
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
             if let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.center = CGPoint(x: pair.0.x - 12, y: pair.0.y)
-                lr.center = CGPoint(x: pair.1.x + 12, y: pair.1.y)
+                ll.center = CGPoint(x: pair.0.x - 15, y: pair.0.y)
+                lr.center = CGPoint(x: pair.1.x + 15, y: pair.1.y)
                 ll.isHidden = false
                 lr.isHidden = false
             }
@@ -645,7 +643,16 @@ class ARTrafficViewController: UIViewController {
     /// so a session restart doesn't visibly ease in from stale data.
     private var smoothedHUDForward: SIMD3<Float>?
     private var smoothedHUDCamRight: SIMD3<Float>?
-    private let hudSmoothingFactor: Float = 0.25
+    // Higher than a naive 60Hz filter would use, since the HUD update below
+    // now only runs every other AR frame (~30Hz) to cut per-frame work —
+    // this keeps the filter's effective responsiveness roughly the same at
+    // half the update rate.
+    private let hudSmoothingFactor: Float = 0.4
+    /// Skip every other AR frame for the HUD's ladder/bank recompute — an
+    /// attitude readout doesn't need 60Hz precision, and halving the work
+    /// (fewer projectPoint calls, layer/label updates, and main-thread
+    /// dispatches per second) noticeably reduces stutter.
+    private var hudFrameCounter = 0
 
     // Dynamic leading constraints on statusLabel
     private var statusLeadingToEdge: NSLayoutConstraint!
@@ -2067,8 +2074,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard sceneManager?.settings.showHUD == true,
               let camTransform = arSceneView.session.currentFrame?.camera.transform else {
             DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            hudFrameCounter = 0
             return
         }
+        hudFrameCounter += 1
+        guard hudFrameCounter % 2 == 0 else { return }
 
         let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
         // ARKit looks along local -Z; that axis in world space is the negative of
@@ -2114,14 +2124,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Short, compact center instrument — 10° rungs drawn longer than the
         // 5° ones (both still shorter than the horizon) so they read as the
         // "bigger" graduation.
-        guard let horizon = projectedPair(yOffset: 0, halfWidth: 9) else {
+        guard let horizon = projectedPair(yOffset: 0, halfWidth: 7) else {
             DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
             return
         }
-        let plus5   = projectedPair(yOffset: rise5,   halfWidth: 5)
-        let minus5  = projectedPair(yOffset: -rise5,  halfWidth: 5)
-        let plus10  = projectedPair(yOffset: rise10,  halfWidth: 7)
-        let minus10 = projectedPair(yOffset: -rise10, halfWidth: 7)
+        let plus5   = projectedPair(yOffset: rise5,   halfWidth: 4)
+        let minus5  = projectedPair(yOffset: -rise5,  halfWidth: 4)
+        let plus10  = projectedPair(yOffset: rise10,  halfWidth: 6)
+        let minus10 = projectedPair(yOffset: -rise10, halfWidth: 6)
 
         // Bank (roll) angle, for the top-of-screen bank-angle rose — a 2D
         // screen instrument, not projected through 3D like the ladder rungs
@@ -2140,12 +2150,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // One transaction for both updates (was two separate ones) —
+            // fewer Core Animation commits per update.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             if let plus5, let minus5 {
                 self.hudOverlayView.updateLadder(horizon: horizon, plus5: plus5, minus5: minus5, plus10: plus10, minus10: minus10)
             } else {
                 self.hudOverlayView.hideLadder()
             }
             self.hudOverlayView.updateBank(rollDeg: rollDeg)
+            CATransaction.commit()
         }
     }
 
