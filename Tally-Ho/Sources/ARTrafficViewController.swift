@@ -155,19 +155,35 @@ private final class HUDOverlayView: UIView {
     /// bankPivot each frame in updateBank(rollDeg:) to animate the scale.
     private var bankNeutralTicks: [(inner: CGPoint, outer: CGPoint)] = []
 
-    // Heading "half rose" at the bottom: unlike the bank rose, the tick
-    // marks and their labels sit at fixed screen positions (offsets from
-    // current heading, not from a fixed compass value) — only the label
-    // *text* at each slot changes as heading changes, and only on the
-    // ~0.25s readout cadence (updateHeading(headingDeg:)), not per AR
-    // frame, since nothing here needs to visually track live attitude the
-    // way the bank rose/ladder do.
+    // Heading "half rose" at the bottom: a rotating compass card, like a
+    // real magnetic/gyro compass rose — 12 ticks at fixed absolute compass
+    // values (every 30°), each number permanently tied to its tick. The
+    // whole assembly rotates around headingPivot as heading changes so the
+    // current heading always sits under the fixed lubber-line pointer.
+    // Each label's text is set once (a tick's value never changes); only
+    // position/visibility update, on the ~0.25s readout cadence
+    // (updateHeading(headingDeg:)) rather than per AR frame, since a
+    // heading readout doesn't need 60Hz precision.
     private let headingArcLayer     = CAShapeLayer()
     private let headingPointerLayer = CAShapeLayer()
     private var headingPivot: CGPoint = .zero
     private let headingRadius: CGFloat = 60
-    private let headingTickOffsets: [Double] = [-90, -60, -30, 0, 30, 60, 90]
-    private var headingTickLabels: [UILabel] = []
+    private struct HeadingTick {
+        let absValue: Double
+        let label: UILabel
+    }
+    private var headingTicks: [HeadingTick] = []
+    private var lastHeadingDeg: Double = 0
+
+    private static func headingLabelText(for value: Double) -> String {
+        switch value {
+        case 0:   return "N"
+        case 90:  return "E"
+        case 180: return "S"
+        case 270: return "W"
+        default:  return String(format: "%02d", Int(value) / 10)
+        }
+    }
 
     private let speedTape = HUDTapeView(unit: "KT", tickSpacing: 10, labelEvery: 20, range: 50, isLeftTape: true)
     private let altTape   = HUDTapeView(unit: "FT", tickSpacing: 100, labelEvery: 200, range: 500, isLeftTape: false)
@@ -229,12 +245,15 @@ private final class HUDOverlayView: UIView {
         layer.addSublayer(headingPointerLayer)
         headingPointerLayer.fillColor = Self.hudGreen.cgColor
 
-        for _ in headingTickOffsets {
+        headingTicks = stride(from: 0.0, to: 360.0, by: 30.0).map { val in
             let lbl = UILabel()
-            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+            let isCardinal = val.truncatingRemainder(dividingBy: 90) == 0
+            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: isCardinal ? 13 : 12, weight: isCardinal ? .bold : .semibold)
             lbl.textAlignment = .center
+            lbl.text = Self.headingLabelText(for: val)
+            lbl.isHidden = true
             addSubview(lbl)
-            headingTickLabels.append(lbl)
+            return HeadingTick(absValue: val, label: lbl)
         }
 
         addSubview(speedTape)
@@ -285,20 +304,19 @@ private final class HUDOverlayView: UIView {
             return (inner, outer)
         }
 
-        // Fixed triangle at the rotated reference direction (aircraft/
-        // wings-level reference) — built once here and never touched again;
-        // the rose (tick scale) is what rotates around it, not the other
-        // way round. Apex points inward (toward the pivot); the base is
-        // spread along the tangential direction so the triangle itself is
-        // rotated consistently with the ticks above, not just translated.
-        let sinB = CGFloat(sin(roseBaseRad)), cosB = CGFloat(cos(roseBaseRad))
-        let apex = CGPoint(x: bankPivot.x + (bankRadius - 12) * sinB, y: bankPivot.y - (bankRadius - 12) * cosB)
-        let baseCenter = CGPoint(x: bankPivot.x + (bankRadius - 4) * sinB, y: bankPivot.y - (bankRadius - 4) * cosB)
-        let tangentX = cosB, tangentY = sinB
+        // Fixed triangle at the center of the rose (aircraft/wings-level
+        // reference — like a real ADI's fixed aircraft symbol, which sits
+        // at the middle of the instrument while the roll scale rotates
+        // around it) always pointing straight up ("top"), independent of
+        // roseBaseRad — only the tick scale above is rotated onto its side,
+        // not this fixed reference marker.
+        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
+        let baseLeft  = CGPoint(x: bankPivot.x - 5, y: bankPivot.y + 4)
+        let baseRight = CGPoint(x: bankPivot.x + 5, y: bankPivot.y + 4)
         let pointerPath = CGMutablePath()
-        pointerPath.move(to: CGPoint(x: baseCenter.x - 5 * tangentX, y: baseCenter.y - 5 * tangentY))
+        pointerPath.move(to: baseLeft)
         pointerPath.addLine(to: apex)
-        pointerPath.addLine(to: CGPoint(x: baseCenter.x + 5 * tangentX, y: baseCenter.y + 5 * tangentY))
+        pointerPath.addLine(to: baseRight)
         pointerPath.closeSubpath()
         bankPointerLayer.path = pointerPath
 
@@ -332,20 +350,51 @@ private final class HUDOverlayView: UIView {
         CATransaction.commit()
     }
 
-    /// Build the heading rose's fixed tick marks, labels, and lubber-line
-    /// pointer. Unlike the bank rose, none of this moves per-frame — only
-    /// depends on bounds, so it only runs from layoutSubviews. The ticks use
-    /// the same point formula as the (pre-rotation) bank rose but anchored
-    /// at headingPivot near the bottom of the screen, so the fan opens
-    /// upward from there — the "half a rose" shape mirroring the bank rose
-    /// above.
+    /// Build the heading rose's fixed lubber-line pointer, then position the
+    /// (already-built, static-text) ticks for the last known heading — only
+    /// depends on bounds, so it only runs from layoutSubviews; per-heading
+    /// updates go through updateHeading(headingDeg:) below.
     private func layoutHeadingRose() {
+        // Fixed lubber-line triangle pointing up into the arc from the
+        // pivot — marks "this is your current heading". Never moves; the
+        // rose (tick scale) is what rotates around it, mirroring the bank
+        // rose's fixed-pointer/rotating-scale relationship.
+        let tip = CGPoint(x: headingPivot.x, y: headingPivot.y - headingRadius + 12)
+        let pointerPath = CGMutablePath()
+        pointerPath.move(to: CGPoint(x: tip.x - 5, y: tip.y + 8))
+        pointerPath.addLine(to: tip)
+        pointerPath.addLine(to: CGPoint(x: tip.x + 5, y: tip.y + 8))
+        pointerPath.closeSubpath()
+        headingPointerLayer.path = pointerPath
+
+        updateHeading(headingDeg: lastHeadingDeg)
+    }
+
+    /// Rotate the heading rose to the current true heading — like a real
+    /// magnetic/gyro compass card, the whole assembly (ticks + their
+    /// permanently-attached numbers) rotates around headingPivot so the
+    /// current heading always sits under the fixed pointer above. Only
+    /// position/visibility change here; each label's text was set once at
+    /// construction and never touched again. Called on the ~0.25s
+    /// status-readout cadence, not per AR frame.
+    func updateHeading(headingDeg: Double) {
+        lastHeadingDeg = headingDeg
+        guard !headingTicks.isEmpty else { return }
+        let visibleHalfRangeDeg = 100.0  // slight overscan past the nominal ±90° window
+
         let arcPath = CGMutablePath()
-        for (i, deg) in headingTickOffsets.enumerated() {
-            let rad = deg * .pi / 180
-            let isCenter = deg == 0
+        for tick in headingTicks {
+            var rel = (tick.absValue - headingDeg).truncatingRemainder(dividingBy: 360)
+            if rel > 180 { rel -= 360 }
+            if rel < -180 { rel += 360 }
+            guard abs(rel) <= visibleHalfRangeDeg else {
+                tick.label.isHidden = true
+                continue
+            }
+            let rad = rel * .pi / 180
+            let isCardinal = tick.absValue.truncatingRemainder(dividingBy: 90) == 0
             let outerR = headingRadius
-            let innerR = headingRadius - (isCenter ? 10 : 6)
+            let innerR = headingRadius - (isCardinal ? 10 : 6)
             let sinR = CGFloat(sin(rad)), cosR = CGFloat(cos(rad))
             let outer = CGPoint(x: headingPivot.x + outerR * sinR, y: headingPivot.y - outerR * cosR)
             let inner = CGPoint(x: headingPivot.x + innerR * sinR, y: headingPivot.y - innerR * cosR)
@@ -354,35 +403,10 @@ private final class HUDOverlayView: UIView {
 
             let labelR = outerR + 14
             let labelCenter = CGPoint(x: headingPivot.x + labelR * sinR, y: headingPivot.y - labelR * cosR)
-            let lbl = headingTickLabels[i]
-            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: isCenter ? 13 : 12, weight: isCenter ? .bold : .semibold)
-            lbl.frame = CGRect(x: labelCenter.x - 16, y: labelCenter.y - 7, width: 32, height: 14)
+            tick.label.frame = CGRect(x: labelCenter.x - 16, y: labelCenter.y - 7, width: 32, height: 14)
+            tick.label.isHidden = false
         }
         headingArcLayer.path = arcPath
-
-        // Fixed lubber-line triangle pointing up into the arc from the
-        // pivot — marks "this tick is your current heading". Mirrors the
-        // (pre-rotation) bank-rose triangle, just flipped to point up
-        // instead of down since the arc is above rather than below it.
-        let tip = CGPoint(x: headingPivot.x, y: headingPivot.y - headingRadius + 12)
-        let pointerPath = CGMutablePath()
-        pointerPath.move(to: CGPoint(x: tip.x - 5, y: tip.y + 8))
-        pointerPath.addLine(to: tip)
-        pointerPath.addLine(to: CGPoint(x: tip.x + 5, y: tip.y + 8))
-        pointerPath.closeSubpath()
-        headingPointerLayer.path = pointerPath
-    }
-
-    /// Refresh the heading-rose tick labels for the current true heading.
-    /// Tick *positions* are fixed (set in layoutHeadingRose()); only the
-    /// text at each slot changes here. Called on the ~0.25s status-readout
-    /// cadence, not per AR frame — no sizeToFit(), frames are already fixed.
-    func updateHeading(headingDeg: Double) {
-        for (i, offset) in headingTickOffsets.enumerated() {
-            let value = (headingDeg + offset).truncatingRemainder(dividingBy: 360)
-            let normalized = value < 0 ? value + 360 : value
-            headingTickLabels[i].text = String(format: "%03d", Int(normalized.rounded()) % 360)
-        }
     }
 
     /// Update the horizon/pitch-ladder lines. Each pair is (leftEndpoint, rightEndpoint)
@@ -450,7 +474,7 @@ private final class HUDOverlayView: UIView {
         bankPointerLayer.fillColor = color
         headingArcLayer.strokeColor = color
         headingPointerLayer.fillColor = color
-        for lbl in headingTickLabels { lbl.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
+        for tick in headingTicks { tick.label.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
         speedTape.setBrightness(b)
         altTape.setBrightness(b)
     }
