@@ -29,6 +29,7 @@ extension ARVisualizationSettings {
             "showSmallAirports":     showSmallAirports,
             "showAirportDistance":   showAirportDistance,
             "showHUD":               showHUD,
+            "hudBrightness":         hudBrightness.rawValue,
         ]
         UserDefaults.standard.set(d, forKey: ARVisualizationSettings.udKey)
     }
@@ -52,6 +53,9 @@ extension ARVisualizationSettings {
         s.showSmallAirports    = d["showSmallAirports"]    as? Bool   ?? s.showSmallAirports
         s.showAirportDistance  = d["showAirportDistance"]  as? Bool   ?? s.showAirportDistance
         s.showHUD              = d["showHUD"]              as? Bool   ?? s.showHUD
+        if let raw = d["hudBrightness"] as? Int, let b = HUDBrightness(rawValue: raw) {
+            s.hudBrightness = b
+        }
         // Re-build the normalised filter cache after loading from disk.
         s.updateFilter()
         return s
@@ -97,6 +101,16 @@ class SettingsViewController: UITableViewController {
         )
         /// A non-interactive row that displays an auto-detected value (e.g. ADS-B ownship).
         case readOnlyValue(title: String, subtitle: String, value: String)
+        /// A tappable row that lets the user pick one value from a small fixed list of
+        /// display-name options (e.g. HUD brightness). `options` pairs a raw Int value
+        /// with its display name.
+        case optionPicker(
+            title: String,
+            subtitle: String,
+            options: [(value: Int, name: String)],
+            getter: (ARVisualizationSettings) -> Int,
+            setter: (inout ARVisualizationSettings, Int) -> Void
+        )
     }
 
     private struct Section {
@@ -218,6 +232,13 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.showHUD },
                 setter: { $0.showHUD = $1 }
             ),
+            .optionPicker(
+                title: "HUD Brightness",
+                subtitle: "Dimmer keeps traffic markers visible underneath",
+                options: HUDBrightness.allCases.map { ($0.rawValue, $0.displayName) },
+                getter: { $0.hudBrightness.rawValue },
+                setter: { $0.hudBrightness = HUDBrightness(rawValue: $1) ?? $0.hudBrightness }
+            ),
         ])]
         if wifiInAir {
             result.append(Section(
@@ -282,6 +303,7 @@ class SettingsViewController: UITableViewController {
         tableView.register(SliderCell.self,         forCellReuseIdentifier: "slider")
         tableView.register(TextFieldCell.self,      forCellReuseIdentifier: "textField")
         tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "callsignPicker")
+        tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "optionPicker")
         tableView.register(ReadOnlyValueCell.self,  forCellReuseIdentifier: "readOnlyValue")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
@@ -358,6 +380,12 @@ class SettingsViewController: UITableViewController {
             let cell = tableView.dequeueReusableCell(withIdentifier: "readOnlyValue", for: indexPath) as! ReadOnlyValueCell
             cell.configure(title: title, subtitle: subtitle, value: value)
             return cell
+
+        case let .optionPicker(title, subtitle, options, getter, _):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "optionPicker", for: indexPath) as! CallsignPickerCell
+            let currentName = options.first(where: { $0.value == getter(settings) })?.name
+            cell.configure(title: title, subtitle: subtitle, current: currentName)
+            return cell
         }
     }
 
@@ -370,6 +398,29 @@ class SettingsViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         let row = sections[indexPath.section].rows[indexPath.row]
+
+        if case let .optionPicker(title, _, options, getter, setter) = row {
+            let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
+            let current = getter(settings)
+            for option in options {
+                let isSelected = option.value == current
+                let optionTitle = (isSelected ? "✓ " : "") + option.name
+                alert.addAction(UIAlertAction(title: optionTitle, style: .default) { [weak self] _ in
+                    guard let self else { return }
+                    setter(&self.settings, option.value)
+                    tableView.reloadRows(at: [indexPath], with: .none)
+                })
+            }
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            if let popover = alert.popoverPresentationController,
+               let cell = tableView.cellForRow(at: indexPath) {
+                popover.sourceView = cell
+                popover.sourceRect = cell.bounds
+            }
+            present(alert, animated: true)
+            return
+        }
+
         guard case let .callsignPicker(_, _, options, _, setter) = row else { return }
 
         let alert = UIAlertController(

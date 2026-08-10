@@ -126,80 +126,235 @@ private final class OffScreenArrowView: UIView {
 
 // MARK: - HUD Overlay
 
-/// Modern-HUD-style overlay: a gravity-referenced horizon line with ±5° pitch
-/// ticks (moves/tilts with device attitude, computed from ARKit's camera
-/// transform — independent of the compass/GPS bearing math used for aircraft
-/// markers, so it isn't affected by the accuracy issues that affect bearing),
-/// plus fixed-position speed/altitude readout boxes.
+/// Modern-HUD-style overlay: a gravity-referenced horizon line with labeled
+/// ±5°/±10° pitch rungs and a bank-angle scale (all tilt/move with device
+/// attitude, computed from ARKit's camera transform — independent of the
+/// compass/GPS bearing math used for aircraft markers, so it isn't affected
+/// by the accuracy issues that affect bearing), plus speed/altitude tapes.
 private final class HUDOverlayView: UIView {
 
     static let hudGreen = UIColor(red: 0.10, green: 1.0, blue: 0.30, alpha: 1.0)
 
-    private let horizonLayer = CAShapeLayer()
-    private let plus5Layer   = CAShapeLayer()
-    private let minus5Layer  = CAShapeLayer()
+    /// One pitch-ladder rung: its line layer plus (for non-horizon rungs) the
+    /// two endpoint number labels.
+    private struct Rung {
+        let line: CAShapeLayer
+        let labelLeft: UILabel?
+        let labelRight: UILabel?
+    }
+    private var rungs: [Rung] = []
 
-    private let speedBox = HUDReadoutBox(unit: "KT")
-    private let altBox   = HUDReadoutBox(unit: "FT")
+    // Bank-angle "rose": fixed tick arc + fixed wings-level caret (built once
+    // per layout) and a pointer that rotates every frame with live roll.
+    private let bankArcLayer     = CAShapeLayer()
+    private let bankCaretLayer   = CAShapeLayer()
+    private let bankPointerLayer = CAShapeLayer()
+    private var bankPivot: CGPoint = .zero
+    private let bankRadius: CGFloat = 60
+
+    private let speedTape = HUDTapeView(unit: "KT", tickSpacing: 10, labelEvery: 20, range: 50, isLeftTape: true)
+    private let altTape   = HUDTapeView(unit: "FT", tickSpacing: 100, labelEvery: 200, range: 500, isLeftTape: false)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isUserInteractionEnabled = false
 
-        for lineLayer in [horizonLayer, plus5Layer, minus5Layer] {
-            lineLayer.strokeColor = Self.hudGreen.cgColor
-            lineLayer.fillColor = nil
-            lineLayer.lineCap = .round
-            lineLayer.isHidden = true
-            layer.addSublayer(lineLayer)
+        func makeRungLine(width: CGFloat, dashed: Bool) -> CAShapeLayer {
+            let l = CAShapeLayer()
+            l.fillColor = nil
+            l.lineCap = .round
+            l.lineWidth = width
+            l.isHidden = true
+            if dashed { l.lineDashPattern = [6, 5] }
+            layer.addSublayer(l)
+            return l
         }
-        horizonLayer.lineWidth = 3
-        plus5Layer.lineWidth = 2
-        minus5Layer.lineWidth = 2
+        func makeLabel() -> UILabel {
+            let lbl = UILabel()
+            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
+            lbl.textAlignment = .center
+            lbl.isHidden = true
+            addSubview(lbl)
+            return lbl
+        }
 
-        addSubview(speedBox)
-        addSubview(altBox)
+        // Order: horizon, +10, +5, -5, -10.
+        rungs = [
+            Rung(line: makeRungLine(width: 2, dashed: false), labelLeft: nil, labelRight: nil),
+            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(), labelRight: makeLabel()),
+            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(), labelRight: makeLabel()),
+            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(), labelRight: makeLabel()),
+            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(), labelRight: makeLabel()),
+        ]
+
+        for l in [bankArcLayer, bankCaretLayer, bankPointerLayer] {
+            l.fillColor = nil
+            l.lineWidth = 1.5
+            l.lineCap = .round
+            layer.addSublayer(l)
+        }
+        bankCaretLayer.fillColor = Self.hudGreen.cgColor
+        bankPointerLayer.fillColor = Self.hudGreen.cgColor
+
+        addSubview(speedTape)
+        addSubview(altTape)
+
+        setBrightness(.medium)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let boxSize = CGSize(width: 84, height: 48)
-        speedBox.frame = CGRect(
-            x: 16, y: bounds.midY - boxSize.height / 2,
-            width: boxSize.width, height: boxSize.height)
-        altBox.frame = CGRect(
-            x: bounds.width - boxSize.width - 16, y: bounds.midY - boxSize.height / 2,
-            width: boxSize.width, height: boxSize.height)
+
+        let tapeSize = CGSize(width: 60, height: 220)
+        speedTape.frame = CGRect(x: 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
+        altTape.frame   = CGRect(x: bounds.width - tapeSize.width - 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
+
+        bankPivot = CGPoint(x: bounds.midX, y: 150)
+        layoutBankRose()
+    }
+
+    /// Rebuild the fixed tick arc + wings-level caret. Only depends on bounds,
+    /// so it only needs to run from layoutSubviews, not per-frame.
+    private func layoutBankRose() {
+        let arcPath = CGMutablePath()
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up (12 o'clock)
+        // at the pivot — 0° is longest/centered under the fixed caret.
+        let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
+        for deg in tickAngles {
+            let rad = deg * .pi / 180
+            let isMajor = [0, 30, 60, -30, -60].contains(deg)
+            let outerR = bankRadius
+            let innerR = bankRadius - (isMajor ? 10 : 6)
+            // Angle measured from straight up, sweeping clockwise for positive deg.
+            let dx = sin(rad), dy = -cos(rad)
+            let outer = CGPoint(x: bankPivot.x + outerR * CGFloat(dx), y: bankPivot.y - outerR * CGFloat(dy))
+            let inner = CGPoint(x: bankPivot.x + innerR * CGFloat(dx), y: bankPivot.y - innerR * CGFloat(dy))
+            arcPath.move(to: inner)
+            arcPath.addLine(to: outer)
+        }
+        bankArcLayer.path = arcPath
+
+        // Fixed downward-pointing caret at 12 o'clock (wings-level reference).
+        let caretPath = CGMutablePath()
+        let caretTip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius + 12)
+        caretPath.move(to: CGPoint(x: caretTip.x - 5, y: caretTip.y - 8))
+        caretPath.addLine(to: caretTip)
+        caretPath.addLine(to: CGPoint(x: caretTip.x + 5, y: caretTip.y - 8))
+        caretPath.closeSubpath()
+        bankCaretLayer.path = caretPath
+
+        // Pointer triangle position is fully recomputed per-frame in updateBank(_:),
+        // since it needs to rotate around bankPivot (which generally isn't the
+        // layer's own bounding-box center) — simplest to redraw its 3 points
+        // with plain 2D rotation math rather than fight CALayer's anchorPoint/
+        // position semantics for an off-center pivot.
+        updateBank(rollDeg: lastRollDeg)
+    }
+
+    private var lastRollDeg: Double = 0
+
+    /// Rotate the bank pointer to the current roll angle (degrees, positive = right wing down).
+    /// Recomputes the pointer's 3 triangle vertices directly (rotated around
+    /// bankPivot) rather than using a CALayer transform, since bankPivot is not
+    /// the layer's own bounds center.
+    func updateBank(rollDeg: Double) {
+        lastRollDeg = rollDeg
+        let rad = rollDeg * .pi / 180
+        func rotated(_ p: CGPoint) -> CGPoint {
+            let dx = p.x - bankPivot.x, dy = p.y - bankPivot.y
+            let c = CGFloat(cos(rad)), s = CGFloat(sin(rad))
+            return CGPoint(x: bankPivot.x + dx * c - dy * s, y: bankPivot.y + dx * s + dy * c)
+        }
+        let pTip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius - 2)
+        let p1 = rotated(pTip)
+        let p2 = rotated(CGPoint(x: pTip.x - 5, y: pTip.y - 8))
+        let p3 = rotated(CGPoint(x: pTip.x + 5, y: pTip.y - 8))
+
+        let pointerPath = CGMutablePath()
+        pointerPath.move(to: p2)
+        pointerPath.addLine(to: p1)
+        pointerPath.addLine(to: p3)
+        pointerPath.closeSubpath()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bankPointerLayer.path = pointerPath
+        CATransaction.commit()
     }
 
     /// Update the horizon/pitch-ladder lines. Each pair is (leftEndpoint, rightEndpoint)
     /// in this view's coordinate space, already projected from 3D world points.
-    func updateLadder(horizon: (CGPoint, CGPoint), plus5: (CGPoint, CGPoint), minus5: (CGPoint, CGPoint)) {
+    /// `plus10`/`minus10` are optional since they can be nil near vertical look angles.
+    func updateLadder(
+        horizon: (CGPoint, CGPoint),
+        plus5: (CGPoint, CGPoint), minus5: (CGPoint, CGPoint),
+        plus10: (CGPoint, CGPoint)?, minus10: (CGPoint, CGPoint)?
+    ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        horizonLayer.path = linePath(horizon.0, horizon.1)
-        plus5Layer.path   = linePath(plus5.0, plus5.1)
-        minus5Layer.path  = linePath(minus5.0, minus5.1)
-        horizonLayer.isHidden = false
-        plus5Layer.isHidden = false
-        minus5Layer.isHidden = false
+
+        let pairs: [(Rung, (CGPoint, CGPoint)?, String?)] = [
+            (rungs[0], horizon, nil),
+            (rungs[1], plus10, "10"),
+            (rungs[2], plus5, "5"),
+            (rungs[3], minus5, "5"),
+            (rungs[4], minus10, "10"),
+        ]
+        for (rung, pair, text) in pairs {
+            guard let pair else {
+                rung.line.isHidden = true
+                rung.labelLeft?.isHidden = true
+                rung.labelRight?.isHidden = true
+                continue
+            }
+            rung.line.path = linePath(pair.0, pair.1)
+            rung.line.isHidden = false
+            if let text, let ll = rung.labelLeft, let lr = rung.labelRight {
+                ll.text = text
+                lr.text = text
+                ll.sizeToFit()
+                lr.sizeToFit()
+                ll.center = CGPoint(x: pair.0.x - 12, y: pair.0.y)
+                lr.center = CGPoint(x: pair.1.x + 12, y: pair.1.y)
+                ll.isHidden = false
+                lr.isHidden = false
+            }
+        }
         CATransaction.commit()
     }
 
     /// Hide the ladder lines only (e.g. device pointed nearly straight up/down,
-    /// where the horizontal-forward direction is undefined). Readout boxes stay visible.
+    /// where the horizontal-forward direction is undefined). Tapes stay visible.
     func hideLadder() {
-        horizonLayer.isHidden = true
-        plus5Layer.isHidden = true
-        minus5Layer.isHidden = true
+        for rung in rungs {
+            rung.line.isHidden = true
+            rung.labelLeft?.isHidden = true
+            rung.labelRight?.isHidden = true
+        }
     }
 
     func updateReadouts(speedKt: Double, altitudeFt: Double) {
-        speedBox.setValue(String(format: "%.0f", speedKt))
-        altBox.setValue(String(format: "%.0f", altitudeFt))
+        speedTape.setValue(speedKt)
+        altTape.setValue(altitudeFt)
+    }
+
+    /// Apply a brightness preset (alpha only) to every HUD element so the
+    /// overlay stays legible without fully hiding aircraft markers underneath.
+    func setBrightness(_ b: HUDBrightness) {
+        let color = Self.hudGreen.withAlphaComponent(b.alpha).cgColor
+        for rung in rungs {
+            rung.line.strokeColor = color
+            rung.labelLeft?.textColor = Self.hudGreen.withAlphaComponent(b.alpha)
+            rung.labelRight?.textColor = Self.hudGreen.withAlphaComponent(b.alpha)
+        }
+        bankArcLayer.strokeColor = color
+        bankCaretLayer.fillColor = color
+        bankPointerLayer.fillColor = color
+        speedTape.setBrightness(b)
+        altTape.setBrightness(b)
     }
 
     private func linePath(_ a: CGPoint, _ b: CGPoint) -> CGPath {
@@ -210,43 +365,134 @@ private final class HUDOverlayView: UIView {
     }
 }
 
-/// Small bordered HUD-green readout box (value + unit), used for speed/altitude.
-private final class HUDReadoutBox: UIView {
+/// Vertical scrolling PFD/HUD-style tape (speed or altitude): a scale of tick
+/// marks and numbers that shifts as the value changes, with a bold current-value
+/// readout box fixed at the vertical center. `isLeftTape` mirrors the layout so
+/// the scale reads outward from the tape toward its own screen edge and the
+/// numbers sit inward, near the tape's inner (screen-center-facing) edge —
+/// matching the airspeed-left/altitude-right convention of real HUDs.
+private final class HUDTapeView: UIView {
+
+    private let tickSpacing: Double
+    private let labelEvery: Double
+    private let range: Double
+    private let isLeftTape: Bool
+
+    private let ticksLayer = CAShapeLayer()
+    private var tickLabels: [UILabel] = []
+
+    private let centerBox = UIView()
     private let valueLabel = UILabel()
+    private let unitLabel = UILabel()
 
-    init(unit: String) {
+    private var currentValue: Double = 0
+
+    init(unit: String, tickSpacing: Double, labelEvery: Double, range: Double, isLeftTape: Bool) {
+        self.tickSpacing = tickSpacing
+        self.labelEvery = labelEvery
+        self.range = range
+        self.isLeftTape = isLeftTape
         super.init(frame: .zero)
-        backgroundColor = UIColor.black.withAlphaComponent(0.35)
-        layer.borderColor = HUDOverlayView.hudGreen.cgColor
-        layer.borderWidth = 1.5
-        layer.cornerRadius = 6
+        isUserInteractionEnabled = false
 
-        valueLabel.textColor = HUDOverlayView.hudGreen
-        valueLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 20, weight: .bold)
+        ticksLayer.fillColor = nil
+        ticksLayer.lineWidth = 1.5
+        layer.addSublayer(ticksLayer)
+
+        for _ in 0..<((Int(range / labelEvery) * 2) + 2) {
+            let lbl = UILabel()
+            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+            lbl.textAlignment = isLeftTape ? .right : .left
+            addSubview(lbl)
+            tickLabels.append(lbl)
+        }
+
+        centerBox.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        centerBox.layer.borderColor = HUDOverlayView.hudGreen.cgColor
+        centerBox.layer.borderWidth = 1.5
+        centerBox.layer.cornerRadius = 4
+        addSubview(centerBox)
+
+        valueLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 18, weight: .bold)
         valueLabel.textAlignment = .center
+        centerBox.addSubview(valueLabel)
 
-        let unitLabel = UILabel()
-        unitLabel.textColor = HUDOverlayView.hudGreen
-        unitLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        unitLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
         unitLabel.textAlignment = .center
         unitLabel.text = unit
-
-        let stack = UIStackView(arrangedSubviews: [valueLabel, unitLabel])
-        stack.axis = .vertical
-        stack.alignment = .center
-        stack.spacing = 0
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
+        addSubview(unitLabel)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func setValue(_ text: String) {
-        valueLabel.text = text
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        centerBox.frame = CGRect(x: 0, y: bounds.midY - 15, width: bounds.width, height: 30)
+        unitLabel.frame = CGRect(x: 0, y: bounds.midY + 16, width: bounds.width, height: 14)
+        rebuild()
+    }
+
+    func setValue(_ value: Double) {
+        currentValue = value
+        rebuild()
+    }
+
+    func setBrightness(_ b: HUDBrightness) {
+        let color = HUDOverlayView.hudGreen.withAlphaComponent(b.alpha)
+        ticksLayer.strokeColor = color.cgColor
+        valueLabel.textColor = color
+        unitLabel.textColor = color
+        for lbl in tickLabels { lbl.textColor = color }
+        centerBox.backgroundColor = UIColor.black.withAlphaComponent(0.25 * Double(b.alpha) / 0.7)
+        rebuild()
+    }
+
+    /// Redraw the tick marks/numbers and the center readout for `currentValue`.
+    /// Runs on the 0.25s status-update cadence, not per AR frame — cheap.
+    private func rebuild() {
+        guard bounds.height > 0 else { return }
+        valueLabel.text = String(format: "%.0f", currentValue)
+
+        let pxPerUnit = CGFloat(bounds.height / 2) / CGFloat(range)
+        let anchorX: CGFloat = isLeftTape ? bounds.width - 4 : 4
+        let dir: CGFloat = isLeftTape ? -1 : 1
+
+        let path = CGMutablePath()
+        var labelIndex = 0
+        let lowestTick = (currentValue - range).rounded(toNearest: tickSpacing)
+        var tickValue = lowestTick
+        while tickValue <= currentValue + range {
+            defer { tickValue += tickSpacing }
+            let y = bounds.midY - CGFloat(tickValue - currentValue) * pxPerUnit
+            guard y >= -10, y <= bounds.height + 10 else { continue }
+            let isLabeled = tickValue.truncatingRemainder(dividingBy: labelEvery) == 0
+            let tickLen: CGFloat = isLabeled ? 12 : 6
+            path.move(to: CGPoint(x: anchorX, y: y))
+            path.addLine(to: CGPoint(x: anchorX + dir * tickLen, y: y))
+
+            if isLabeled, labelIndex < tickLabels.count, abs(y - bounds.midY) > 18 {
+                let lbl = tickLabels[labelIndex]
+                lbl.text = String(format: "%.0f", tickValue)
+                lbl.sizeToFit()
+                let labelX = isLeftTape ? anchorX + dir * tickLen - 4 - lbl.bounds.width : anchorX + dir * tickLen + 4
+                lbl.frame = CGRect(x: labelX, y: y - 7, width: lbl.bounds.width, height: 14)
+                lbl.isHidden = false
+                labelIndex += 1
+            }
+        }
+        for i in labelIndex..<tickLabels.count { tickLabels[i].isHidden = true }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        ticksLayer.path = path
+        CATransaction.commit()
+    }
+}
+
+private extension Double {
+    /// Rounds down to the nearest multiple of `step`.
+    func rounded(toNearest step: Double) -> Double {
+        (self / step).rounded(.down) * step
     }
 }
 
@@ -439,6 +685,7 @@ class ARTrafficViewController: UIViewController {
         hudOverlayView = HUDOverlayView(frame: view.bounds)
         hudOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         hudOverlayView.isHidden = !(sceneManager?.settings.showHUD ?? true)
+        hudOverlayView.setBrightness(sceneManager?.settings.hudBrightness ?? .medium)
         view.addSubview(hudOverlayView)
 
         statusLabel = UILabel()
@@ -814,6 +1061,7 @@ class ARTrafficViewController: UIViewController {
             updatedSettings.save()
             self.connectionLogic.updateInternetQueryRadius(updatedSettings.aircraftMaxDistance)
             self.hudOverlayView.isHidden = !updatedSettings.showHUD
+            self.hudOverlayView.setBrightness(updatedSettings.hudBrightness)
 
             // Selectively clear only what changed — never wipe aircraft when only
             // airport settings changed, and vice versa.
@@ -1694,7 +1942,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         let distance: Float = 50
         let center = camPos + forward * distance
-        let rise5: Float = distance * Float(tan(5.0 * Double.pi / 180.0))
+        let rise5:  Float = distance * Float(tan(5.0  * Double.pi / 180.0))
+        let rise10: Float = distance * Float(tan(10.0 * Double.pi / 180.0))
 
         func projectedPair(yOffset: Float, halfWidth: Float) -> (CGPoint, CGPoint)? {
             let c  = SIMD3<Float>(center.x, center.y + yOffset, center.z)
@@ -1708,15 +1957,33 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             return (CGPoint(x: CGFloat(sp1.x), y: CGFloat(sp1.y)), CGPoint(x: CGFloat(sp2.x), y: CGFloat(sp2.y)))
         }
 
-        guard let horizon = projectedPair(yOffset: 0, halfWidth: 40),
-              let plus5   = projectedPair(yOffset: rise5, halfWidth: 18),
-              let minus5  = projectedPair(yOffset: -rise5, halfWidth: 18) else {
+        // Shorter than v1 (was 40/18) so the ladder reads as a compact
+        // center instrument rather than spanning the whole screen width.
+        guard let horizon = projectedPair(yOffset: 0, halfWidth: 14) else {
             DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
             return
         }
+        let plus5   = projectedPair(yOffset: rise5,   halfWidth: 8)
+        let minus5  = projectedPair(yOffset: -rise5,  halfWidth: 8)
+        let plus10  = projectedPair(yOffset: rise10,  halfWidth: 8)
+        let minus10 = projectedPair(yOffset: -rise10, halfWidth: 8)
+
+        // Bank (roll) angle, for the top-of-screen bank-angle rose — a 2D
+        // screen instrument, not projected through 3D like the ladder rungs
+        // above. Camera's right vector's vertical component vs. its
+        // horizontal-plane magnitude gives roll relative to gravity.
+        let camRight = SIMD3<Float>(camTransform.columns.0.x, camTransform.columns.0.y, camTransform.columns.0.z)
+        let rightHorizLen = sqrt(camRight.x * camRight.x + camRight.z * camRight.z)
+        let rollDeg = Double(atan2(camRight.y, rightHorizLen)) * 180.0 / Double.pi
 
         DispatchQueue.main.async { [weak self] in
-            self?.hudOverlayView.updateLadder(horizon: horizon, plus5: plus5, minus5: minus5)
+            guard let self else { return }
+            if let plus5, let minus5 {
+                self.hudOverlayView.updateLadder(horizon: horizon, plus5: plus5, minus5: minus5, plus10: plus10, minus10: minus10)
+            } else {
+                self.hudOverlayView.hideLadder()
+            }
+            self.hudOverlayView.updateBank(rollDeg: rollDeg)
         }
     }
 

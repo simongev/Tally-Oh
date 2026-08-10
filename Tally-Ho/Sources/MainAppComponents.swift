@@ -784,6 +784,32 @@ struct ARVisualizationSettings {
 
     // MARK: HUD
     var showHUD: Bool = true
+    var hudBrightness: HUDBrightness = .medium
+}
+
+/// HUD stroke/background brightness preset. Drives alpha only (not color),
+/// so the HUD stays readable while letting AR content underneath show
+/// through — see HUDOverlayView.setBrightness(_:) in ARTrafficViewController.swift.
+enum HUDBrightness: Int, CaseIterable {
+    case low = 0
+    case medium = 1
+    case high = 2
+
+    var displayName: String {
+        switch self {
+        case .low:    return "Low"
+        case .medium: return "Medium"
+        case .high:   return "High"
+        }
+    }
+
+    var alpha: CGFloat {
+        switch self {
+        case .low:    return 0.5
+        case .medium: return 0.7
+        case .high:   return 0.9
+        }
+    }
 }
 
 // MARK: - Scene Manager
