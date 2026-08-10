@@ -354,7 +354,7 @@ class MapViewController: UIViewController {
         ])
 
         decreaseButton = makeRoundButton(symbol: "minus.circle.fill")
-        decreaseButton.addTarget(self, action: #selector(decreaseRange), for: .touchUpInside)
+        decreaseButton.addTarget(self, action: #selector(increaseRange), for: .touchUpInside)
 
         rangeLabel = UILabel()
         rangeLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -363,7 +363,7 @@ class MapViewController: UIViewController {
         rangeLabel.textAlignment = .center
 
         increaseButton = makeRoundButton(symbol: "plus.circle.fill")
-        increaseButton.addTarget(self, action: #selector(increaseRange), for: .touchUpInside)
+        increaseButton.addTarget(self, action: #selector(decreaseRange), for: .touchUpInside)
 
         controlBar.addSubview(decreaseButton)
         controlBar.addSubview(rangeLabel)
@@ -457,8 +457,8 @@ class MapViewController: UIViewController {
         canvasView.setNeedsDisplay()
 
         rangeLabel.text = "\(Int(currentRangeNM)) NM"
-        decreaseButton.alpha = currentRangeNM <= 10 ? 0.35 : 1.0
-        increaseButton.alpha = currentRangeNM >= 50 ? 0.35 : 1.0
+        decreaseButton.alpha = currentRangeNM >= 50 ? 0.35 : 1.0
+        increaseButton.alpha = currentRangeNM <= 10 ? 0.35 : 1.0
     }
 
     // MARK: - Range buttons
