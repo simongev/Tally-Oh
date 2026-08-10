@@ -144,13 +144,16 @@ private final class HUDOverlayView: UIView {
     }
     private var rungs: [Rung] = []
 
-    // Bank-angle "rose": fixed tick arc + fixed wings-level caret (built once
-    // per layout) and a pointer that rotates every frame with live roll.
+    // Bank-angle "rose": a fixed triangle (aircraft/wings reference — never
+    // moves) with the tick-mark scale rotating around it every frame to
+    // show live roll, like a real HUD's conformal bank scale.
     private let bankArcLayer     = CAShapeLayer()
-    private let bankCaretLayer   = CAShapeLayer()
     private let bankPointerLayer = CAShapeLayer()
     private var bankPivot: CGPoint = .zero
     private let bankRadius: CGFloat = 60
+    /// Neutral (roll = 0) tick endpoints, rebuilt on layout; rotated around
+    /// bankPivot each frame in updateBank(rollDeg:) to animate the scale.
+    private var bankNeutralTicks: [(inner: CGPoint, outer: CGPoint)] = []
 
     private let speedTape = HUDTapeView(unit: "KT", tickSpacing: 10, labelEvery: 20, range: 50, isLeftTape: true)
     private let altTape   = HUDTapeView(unit: "FT", tickSpacing: 100, labelEvery: 200, range: 500, isLeftTape: false)
@@ -170,10 +173,16 @@ private final class HUDOverlayView: UIView {
             layer.addSublayer(l)
             return l
         }
-        func makeLabel() -> UILabel {
+        // Text is static per rung (e.g. always "10" for the +10 rung), so set
+        // it and size the label once here rather than every frame in
+        // updateLadder() — sizeToFit() involves text layout and doing it at
+        // 60Hz for unchanging text was wasted work contributing to jank.
+        func makeLabel(text: String) -> UILabel {
             let lbl = UILabel()
             lbl.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
             lbl.textAlignment = .center
+            lbl.text = text
+            lbl.sizeToFit()
             lbl.isHidden = true
             addSubview(lbl)
             return lbl
@@ -182,19 +191,19 @@ private final class HUDOverlayView: UIView {
         // Order: horizon, +10, +5, -5, -10.
         rungs = [
             Rung(line: makeRungLine(width: 2, dashed: false), labelLeft: nil, labelRight: nil),
-            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(), labelRight: makeLabel()),
-            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(), labelRight: makeLabel()),
-            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(), labelRight: makeLabel()),
-            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(), labelRight: makeLabel()),
+            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(text: "10"), labelRight: makeLabel(text: "10")),
+            Rung(line: makeRungLine(width: 1.5, dashed: false), labelLeft: makeLabel(text: "5"), labelRight: makeLabel(text: "5")),
+            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(text: "5"), labelRight: makeLabel(text: "5")),
+            Rung(line: makeRungLine(width: 1.5, dashed: true),  labelLeft: makeLabel(text: "10"), labelRight: makeLabel(text: "10")),
         ]
 
-        for l in [bankArcLayer, bankCaretLayer, bankPointerLayer] {
-            l.fillColor = nil
-            l.lineWidth = 1.5
-            l.lineCap = .round
-            layer.addSublayer(l)
-        }
-        bankCaretLayer.fillColor = Self.hudGreen.cgColor
+        bankArcLayer.fillColor = nil
+        bankArcLayer.lineWidth = 1.5
+        bankArcLayer.lineCap = .round
+        layer.addSublayer(bankArcLayer)
+
+        bankPointerLayer.strokeColor = nil
+        layer.addSublayer(bankPointerLayer)
         bankPointerLayer.fillColor = Self.hudGreen.cgColor
 
         addSubview(speedTape)
@@ -216,72 +225,66 @@ private final class HUDOverlayView: UIView {
         layoutBankRose()
     }
 
-    /// Rebuild the fixed tick arc + wings-level caret. Only depends on bounds,
-    /// so it only needs to run from layoutSubviews, not per-frame.
+    /// Rebuild the neutral (roll = 0) tick positions and the fixed pointer
+    /// triangle. Only depends on bounds, so it only needs to run from
+    /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
+    /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        let arcPath = CGMutablePath()
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up (12 o'clock)
-        // at the pivot — 0° is longest/centered under the fixed caret.
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up
+        // (12 o'clock) at the pivot. point.y = pivot.y - R*cos(rad) puts the
+        // 0° tick closest to the top (smallest y) and the ±60° ticks lower —
+        // the "sad face" ⌢ shape of a real ADI's roll dial, traced along the
+        // top rim of a circle centered on bankPivot.
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
-        for deg in tickAngles {
+        bankNeutralTicks = tickAngles.map { deg in
             let rad = deg * .pi / 180
             let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
             let innerR = bankRadius - (isMajor ? 10 : 6)
-            // Angle measured from straight up, sweeping clockwise for positive deg.
-            let dx = sin(rad), dy = -cos(rad)
-            let outer = CGPoint(x: bankPivot.x + outerR * CGFloat(dx), y: bankPivot.y - outerR * CGFloat(dy))
-            let inner = CGPoint(x: bankPivot.x + innerR * CGFloat(dx), y: bankPivot.y - innerR * CGFloat(dy))
-            arcPath.move(to: inner)
-            arcPath.addLine(to: outer)
+            let sinR = CGFloat(sin(rad)), cosR = CGFloat(cos(rad))
+            let outer = CGPoint(x: bankPivot.x + outerR * sinR, y: bankPivot.y - outerR * cosR)
+            let inner = CGPoint(x: bankPivot.x + innerR * sinR, y: bankPivot.y - innerR * cosR)
+            return (inner, outer)
         }
-        bankArcLayer.path = arcPath
 
-        // Fixed downward-pointing caret at 12 o'clock (wings-level reference).
-        let caretPath = CGMutablePath()
-        let caretTip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius + 12)
-        caretPath.move(to: CGPoint(x: caretTip.x - 5, y: caretTip.y - 8))
-        caretPath.addLine(to: caretTip)
-        caretPath.addLine(to: CGPoint(x: caretTip.x + 5, y: caretTip.y - 8))
-        caretPath.closeSubpath()
-        bankCaretLayer.path = caretPath
+        // Fixed downward-pointing triangle at 12 o'clock (aircraft/wings-level
+        // reference) — built once here and never touched again; the rose
+        // (tick scale) is what rotates around it, not the other way round.
+        let tip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius + 12)
+        let pointerPath = CGMutablePath()
+        pointerPath.move(to: CGPoint(x: tip.x - 5, y: tip.y - 8))
+        pointerPath.addLine(to: tip)
+        pointerPath.addLine(to: CGPoint(x: tip.x + 5, y: tip.y - 8))
+        pointerPath.closeSubpath()
+        bankPointerLayer.path = pointerPath
 
-        // Pointer triangle position is fully recomputed per-frame in updateBank(_:),
-        // since it needs to rotate around bankPivot (which generally isn't the
-        // layer's own bounding-box center) — simplest to redraw its 3 points
-        // with plain 2D rotation math rather than fight CALayer's anchorPoint/
-        // position semantics for an off-center pivot.
         updateBank(rollDeg: lastRollDeg)
     }
 
     private var lastRollDeg: Double = 0
 
-    /// Rotate the bank pointer to the current roll angle (degrees, positive = right wing down).
-    /// Recomputes the pointer's 3 triangle vertices directly (rotated around
-    /// bankPivot) rather than using a CALayer transform, since bankPivot is not
-    /// the layer's own bounds center.
+    /// Rotate the bank rose (tick scale) to the current roll angle (degrees,
+    /// positive = right wing down) by rotating each neutral tick point
+    /// around bankPivot — the fixed pointer triangle is untouched.
     func updateBank(rollDeg: Double) {
         lastRollDeg = rollDeg
+        guard !bankNeutralTicks.isEmpty else { return }
         let rad = rollDeg * .pi / 180
+        let c = CGFloat(cos(rad)), s = CGFloat(sin(rad))
         func rotated(_ p: CGPoint) -> CGPoint {
             let dx = p.x - bankPivot.x, dy = p.y - bankPivot.y
-            let c = CGFloat(cos(rad)), s = CGFloat(sin(rad))
             return CGPoint(x: bankPivot.x + dx * c - dy * s, y: bankPivot.y + dx * s + dy * c)
         }
-        let pTip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius - 2)
-        let p1 = rotated(pTip)
-        let p2 = rotated(CGPoint(x: pTip.x - 5, y: pTip.y - 8))
-        let p3 = rotated(CGPoint(x: pTip.x + 5, y: pTip.y - 8))
 
-        let pointerPath = CGMutablePath()
-        pointerPath.move(to: p2)
-        pointerPath.addLine(to: p1)
-        pointerPath.addLine(to: p3)
-        pointerPath.closeSubpath()
+        let arcPath = CGMutablePath()
+        for tick in bankNeutralTicks {
+            arcPath.move(to: rotated(tick.inner))
+            arcPath.addLine(to: rotated(tick.outer))
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        bankPointerLayer.path = pointerPath
+        bankArcLayer.path = arcPath
         CATransaction.commit()
     }
 
@@ -296,14 +299,14 @@ private final class HUDOverlayView: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
-        let pairs: [(Rung, (CGPoint, CGPoint)?, String?)] = [
-            (rungs[0], horizon, nil),
-            (rungs[1], plus10, "10"),
-            (rungs[2], plus5, "5"),
-            (rungs[3], minus5, "5"),
-            (rungs[4], minus10, "10"),
+        let pairs: [(Rung, (CGPoint, CGPoint)?)] = [
+            (rungs[0], horizon),
+            (rungs[1], plus10),
+            (rungs[2], plus5),
+            (rungs[3], minus5),
+            (rungs[4], minus10),
         ]
-        for (rung, pair, text) in pairs {
+        for (rung, pair) in pairs {
             guard let pair else {
                 rung.line.isHidden = true
                 rung.labelLeft?.isHidden = true
@@ -312,11 +315,7 @@ private final class HUDOverlayView: UIView {
             }
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
-            if let text, let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.text = text
-                lr.text = text
-                ll.sizeToFit()
-                lr.sizeToFit()
+            if let ll = rung.labelLeft, let lr = rung.labelRight {
                 ll.center = CGPoint(x: pair.0.x - 12, y: pair.0.y)
                 lr.center = CGPoint(x: pair.1.x + 12, y: pair.1.y)
                 ll.isHidden = false
@@ -351,7 +350,6 @@ private final class HUDOverlayView: UIView {
             rung.labelRight?.textColor = Self.hudGreen.withAlphaComponent(b.alpha)
         }
         bankArcLayer.strokeColor = color
-        bankCaretLayer.fillColor = color
         bankPointerLayer.fillColor = color
         speedTape.setBrightness(b)
         altTape.setBrightness(b)
@@ -513,6 +511,16 @@ class ARTrafficViewController: UIViewController {
     /// fix. Used for the HUD speed readout when ADS-B ownship isn't available —
     /// mirrors the activeAltitude fallback pattern.
     private var gpsSpeedKt: Double = 0
+    /// Exponentially-smoothed camera forward/right vectors used only for the
+    /// HUD ladder/bank rose — filters ARKit's normal per-frame attitude noise
+    /// so the overlay glides instead of visibly jittering (more noticeable
+    /// after the ladder lines were shortened, since the same absolute pixel
+    /// wobble is now a bigger fraction of a short line). nil means "snap to
+    /// the raw value next frame" — set on init and reset in startARSession()
+    /// so a session restart doesn't visibly ease in from stale data.
+    private var smoothedHUDForward: SIMD3<Float>?
+    private var smoothedHUDCamRight: SIMD3<Float>?
+    private let hudSmoothingFactor: Float = 0.25
 
     // Dynamic leading constraints on statusLabel
     private var statusLeadingToEdge: NSLayoutConstraint!
@@ -1004,6 +1012,10 @@ class ARTrafficViewController: UIViewController {
         arSceneView.transform = .identity
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
+        // Same reasoning as isFirstHeadingFix above: don't ease the HUD in
+        // from the previous session's smoothed attitude.
+        smoothedHUDForward = nil
+        smoothedHUDCamRight = nil
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -1937,8 +1949,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
             return
         }
-        let forward = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
-        let right   = SIMD3<Float>(forward.z, 0, -forward.x)
+        let forwardHoriz = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
+        let forward: SIMD3<Float>
+        if let prev = smoothedHUDForward {
+            forward = simd_normalize(prev + (forwardHoriz - prev) * hudSmoothingFactor)
+        } else {
+            forward = forwardHoriz
+        }
+        smoothedHUDForward = forward
+        let right = SIMD3<Float>(forward.z, 0, -forward.x)
 
         let distance: Float = 50
         let center = camPos + forward * distance
@@ -1972,7 +1991,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // screen instrument, not projected through 3D like the ladder rungs
         // above. Camera's right vector's vertical component vs. its
         // horizontal-plane magnitude gives roll relative to gravity.
-        let camRight = SIMD3<Float>(camTransform.columns.0.x, camTransform.columns.0.y, camTransform.columns.0.z)
+        let camRightRaw = SIMD3<Float>(camTransform.columns.0.x, camTransform.columns.0.y, camTransform.columns.0.z)
+        let camRight: SIMD3<Float>
+        if let prev = smoothedHUDCamRight {
+            camRight = simd_normalize(prev + (camRightRaw - prev) * hudSmoothingFactor)
+        } else {
+            camRight = camRightRaw
+        }
+        smoothedHUDCamRight = camRight
         let rightHorizLen = sqrt(camRight.x * camRight.x + camRight.z * camRight.z)
         let rollDeg = Double(atan2(camRight.y, rightHorizLen)) * 180.0 / Double.pi
 

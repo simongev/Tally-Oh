@@ -101,10 +101,11 @@ class SettingsViewController: UITableViewController {
         )
         /// A non-interactive row that displays an auto-detected value (e.g. ADS-B ownship).
         case readOnlyValue(title: String, subtitle: String, value: String)
-        /// A tappable row that lets the user pick one value from a small fixed list of
-        /// display-name options (e.g. HUD brightness). `options` pairs a raw Int value
-        /// with its display name.
-        case optionPicker(
+        /// A row with an inline segmented control ("tabs") for picking exactly one
+        /// value from a small fixed list of display-name options (e.g. HUD brightness).
+        /// `options` pairs a raw Int value with its display name. Unlike callsignPicker,
+        /// selection happens directly in the segmented control — no action sheet.
+        case segmentedOption(
             title: String,
             subtitle: String,
             options: [(value: Int, name: String)],
@@ -139,6 +140,21 @@ class SettingsViewController: UITableViewController {
 
     private lazy var sections: [Section] = {
         var result: [Section] = [
+        Section(header: "📟  HUD", rows: [
+            .toggle(
+                title: "Show HUD",
+                subtitle: "Horizon line and speed/altitude readout",
+                getter: { $0.showHUD },
+                setter: { $0.showHUD = $1 }
+            ),
+            .segmentedOption(
+                title: "HUD Brightness",
+                subtitle: "Dimmer keeps traffic markers visible underneath",
+                options: HUDBrightness.allCases.map { ($0.rawValue, $0.displayName) },
+                getter: { $0.hudBrightness.rawValue },
+                setter: { $0.hudBrightness = HUDBrightness(rawValue: $1) ?? $0.hudBrightness }
+            ),
+        ]),
         Section(header: "✈️  Aircraft", rows: [
             .toggle(
                 title: "Show Aircraft",
@@ -224,21 +240,6 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.airportMaxDistance },
                 setter: { $0.airportMaxDistance = $1 }
             ),
-        ]),
-        Section(header: "📟  HUD", rows: [
-            .toggle(
-                title: "Show HUD",
-                subtitle: "Horizon line and speed/altitude readout",
-                getter: { $0.showHUD },
-                setter: { $0.showHUD = $1 }
-            ),
-            .optionPicker(
-                title: "HUD Brightness",
-                subtitle: "Dimmer keeps traffic markers visible underneath",
-                options: HUDBrightness.allCases.map { ($0.rawValue, $0.displayName) },
-                getter: { $0.hudBrightness.rawValue },
-                setter: { $0.hudBrightness = HUDBrightness(rawValue: $1) ?? $0.hudBrightness }
-            ),
         ])]
         if wifiInAir {
             result.append(Section(
@@ -302,9 +303,9 @@ class SettingsViewController: UITableViewController {
         tableView.register(ToggleCell.self,         forCellReuseIdentifier: "toggle")
         tableView.register(SliderCell.self,         forCellReuseIdentifier: "slider")
         tableView.register(TextFieldCell.self,      forCellReuseIdentifier: "textField")
-        tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "callsignPicker")
-        tableView.register(CallsignPickerCell.self, forCellReuseIdentifier: "optionPicker")
-        tableView.register(ReadOnlyValueCell.self,  forCellReuseIdentifier: "readOnlyValue")
+        tableView.register(CallsignPickerCell.self,   forCellReuseIdentifier: "callsignPicker")
+        tableView.register(SegmentedOptionCell.self,  forCellReuseIdentifier: "segmentedOption")
+        tableView.register(ReadOnlyValueCell.self,    forCellReuseIdentifier: "readOnlyValue")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
         tableView.keyboardDismissMode = .onDrag
@@ -381,10 +382,19 @@ class SettingsViewController: UITableViewController {
             cell.configure(title: title, subtitle: subtitle, value: value)
             return cell
 
-        case let .optionPicker(title, subtitle, options, getter, _):
-            let cell = tableView.dequeueReusableCell(withIdentifier: "optionPicker", for: indexPath) as! CallsignPickerCell
-            let currentName = options.first(where: { $0.value == getter(settings) })?.name
-            cell.configure(title: title, subtitle: subtitle, current: currentName)
+        case let .segmentedOption(title, subtitle, options, getter, _):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "segmentedOption", for: indexPath) as! SegmentedOptionCell
+            cell.configure(
+                title: title, subtitle: subtitle,
+                options: options.map { $0.name },
+                selectedIndex: options.firstIndex(where: { $0.value == getter(settings) }) ?? 0
+            ) { [weak self] selectedIndex in
+                guard let self else { return }
+                let rows = self.sections[indexPath.section].rows
+                if case let .segmentedOption(_, _, options, _, setter) = rows[indexPath.row] {
+                    setter(&self.settings, options[selectedIndex].value)
+                }
+            }
             return cell
         }
     }
@@ -398,28 +408,6 @@ class SettingsViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         let row = sections[indexPath.section].rows[indexPath.row]
-
-        if case let .optionPicker(title, _, options, getter, setter) = row {
-            let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
-            let current = getter(settings)
-            for option in options {
-                let isSelected = option.value == current
-                let optionTitle = (isSelected ? "✓ " : "") + option.name
-                alert.addAction(UIAlertAction(title: optionTitle, style: .default) { [weak self] _ in
-                    guard let self else { return }
-                    setter(&self.settings, option.value)
-                    tableView.reloadRows(at: [indexPath], with: .none)
-                })
-            }
-            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-            if let popover = alert.popoverPresentationController,
-               let cell = tableView.cellForRow(at: indexPath) {
-                popover.sourceView = cell
-                popover.sourceRect = cell.bounds
-            }
-            present(alert, animated: true)
-            return
-        }
 
         guard case let .callsignPicker(_, _, options, _, setter) = row else { return }
 
@@ -576,6 +564,63 @@ final class SliderCell: UITableViewCell {
         slider.value = Float(v)
         updateValueLabel(v)
         onChange?(v)
+    }
+}
+
+// MARK: - SegmentedOptionCell
+
+/// Row with an inline UISegmentedControl ("tabs") for choosing exactly one
+/// of a small fixed set of options (e.g. HUD brightness) — selection is
+/// immediate, no action sheet.
+final class SegmentedOptionCell: UITableViewCell {
+
+    private let titleLabel    = UILabel()
+    private let subtitleLabel = UILabel()
+    private let segmented     = UISegmentedControl()
+
+    private var onChange: ((Int) -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+
+        titleLabel.font = .systemFont(ofSize: 16, weight: .medium)
+        subtitleLabel.font = .systemFont(ofSize: 13)
+        subtitleLabel.textColor = .secondaryLabel
+        subtitleLabel.numberOfLines = 2
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, subtitleLabel, segmented])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+        ])
+
+        segmented.addTarget(self, action: #selector(segmentChanged), for: .valueChanged)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, subtitle: String, options: [String], selectedIndex: Int, onChange: @escaping (Int) -> Void) {
+        self.onChange = onChange
+        titleLabel.text = title
+        subtitleLabel.text = subtitle
+
+        segmented.removeAllSegments()
+        for (i, name) in options.enumerated() {
+            segmented.insertSegment(withTitle: name, at: i, animated: false)
+        }
+        segmented.selectedSegmentIndex = selectedIndex
+    }
+
+    @objc private func segmentChanged() {
+        onChange?(segmented.selectedSegmentIndex)
     }
 }
 
