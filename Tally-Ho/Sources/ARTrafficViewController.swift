@@ -155,6 +155,20 @@ private final class HUDOverlayView: UIView {
     /// bankPivot each frame in updateBank(rollDeg:) to animate the scale.
     private var bankNeutralTicks: [(inner: CGPoint, outer: CGPoint)] = []
 
+    // Heading "half rose" at the bottom: unlike the bank rose, the tick
+    // marks and their labels sit at fixed screen positions (offsets from
+    // current heading, not from a fixed compass value) — only the label
+    // *text* at each slot changes as heading changes, and only on the
+    // ~0.25s readout cadence (updateHeading(headingDeg:)), not per AR
+    // frame, since nothing here needs to visually track live attitude the
+    // way the bank rose/ladder do.
+    private let headingArcLayer     = CAShapeLayer()
+    private let headingPointerLayer = CAShapeLayer()
+    private var headingPivot: CGPoint = .zero
+    private let headingRadius: CGFloat = 60
+    private let headingTickOffsets: [Double] = [-90, -60, -30, 0, 30, 60, 90]
+    private var headingTickLabels: [UILabel] = []
+
     private let speedTape = HUDTapeView(unit: "KT", tickSpacing: 10, labelEvery: 20, range: 50, isLeftTape: true)
     private let altTape   = HUDTapeView(unit: "FT", tickSpacing: 100, labelEvery: 200, range: 500, isLeftTape: false)
 
@@ -206,6 +220,23 @@ private final class HUDOverlayView: UIView {
         layer.addSublayer(bankPointerLayer)
         bankPointerLayer.fillColor = Self.hudGreen.cgColor
 
+        headingArcLayer.fillColor = nil
+        headingArcLayer.lineWidth = 1.5
+        headingArcLayer.lineCap = .round
+        layer.addSublayer(headingArcLayer)
+
+        headingPointerLayer.strokeColor = nil
+        layer.addSublayer(headingPointerLayer)
+        headingPointerLayer.fillColor = Self.hudGreen.cgColor
+
+        for _ in headingTickOffsets {
+            let lbl = UILabel()
+            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+            lbl.textAlignment = .center
+            addSubview(lbl)
+            headingTickLabels.append(lbl)
+        }
+
         addSubview(speedTape)
         addSubview(altTape)
 
@@ -223,6 +254,9 @@ private final class HUDOverlayView: UIView {
 
         bankPivot = CGPoint(x: bounds.midX, y: 150)
         layoutBankRose()
+
+        headingPivot = CGPoint(x: bounds.midX, y: bounds.height - 150)
+        layoutHeadingRose()
     }
 
     /// Rebuild the neutral (roll = 0) tick positions and the fixed pointer
@@ -230,14 +264,18 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up
-        // (12 o'clock) at the pivot. point.y = pivot.y - R*cos(rad) puts the
-        // 0° tick closest to the top (smallest y) and the ±60° ticks lower —
-        // the "sad face" ⌢ shape of a real ADI's roll dial, traced along the
-        // top rim of a circle centered on bankPivot.
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from a reference
+        // direction at the pivot. point = pivot + R*(sin(rad), -cos(rad))
+        // — at rad=0 that reference is straight up (0° tick closest to the
+        // top, ±60° ticks lower, the "sad face" ⌢ shape of a real ADI's
+        // roll dial). `roseBaseRad` rotates that whole reference direction
+        // 90° clockwise ("to the right") so the assembly sits on its side,
+        // with the rest of the geometry below built the same way relative
+        // to whatever direction that points.
+        let roseBaseRad = Double.pi / 2
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
-            let rad = deg * .pi / 180
+            let rad = deg * .pi / 180 + roseBaseRad
             let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
             let innerR = bankRadius - (isMajor ? 10 : 6)
@@ -247,14 +285,20 @@ private final class HUDOverlayView: UIView {
             return (inner, outer)
         }
 
-        // Fixed downward-pointing triangle at 12 o'clock (aircraft/wings-level
-        // reference) — built once here and never touched again; the rose
-        // (tick scale) is what rotates around it, not the other way round.
-        let tip = CGPoint(x: bankPivot.x, y: bankPivot.y - bankRadius + 12)
+        // Fixed triangle at the rotated reference direction (aircraft/
+        // wings-level reference) — built once here and never touched again;
+        // the rose (tick scale) is what rotates around it, not the other
+        // way round. Apex points inward (toward the pivot); the base is
+        // spread along the tangential direction so the triangle itself is
+        // rotated consistently with the ticks above, not just translated.
+        let sinB = CGFloat(sin(roseBaseRad)), cosB = CGFloat(cos(roseBaseRad))
+        let apex = CGPoint(x: bankPivot.x + (bankRadius - 12) * sinB, y: bankPivot.y - (bankRadius - 12) * cosB)
+        let baseCenter = CGPoint(x: bankPivot.x + (bankRadius - 4) * sinB, y: bankPivot.y - (bankRadius - 4) * cosB)
+        let tangentX = cosB, tangentY = sinB
         let pointerPath = CGMutablePath()
-        pointerPath.move(to: CGPoint(x: tip.x - 5, y: tip.y - 8))
-        pointerPath.addLine(to: tip)
-        pointerPath.addLine(to: CGPoint(x: tip.x + 5, y: tip.y - 8))
+        pointerPath.move(to: CGPoint(x: baseCenter.x - 5 * tangentX, y: baseCenter.y - 5 * tangentY))
+        pointerPath.addLine(to: apex)
+        pointerPath.addLine(to: CGPoint(x: baseCenter.x + 5 * tangentX, y: baseCenter.y + 5 * tangentY))
         pointerPath.closeSubpath()
         bankPointerLayer.path = pointerPath
 
@@ -286,6 +330,59 @@ private final class HUDOverlayView: UIView {
         CATransaction.setDisableActions(true)
         bankArcLayer.path = arcPath
         CATransaction.commit()
+    }
+
+    /// Build the heading rose's fixed tick marks, labels, and lubber-line
+    /// pointer. Unlike the bank rose, none of this moves per-frame — only
+    /// depends on bounds, so it only runs from layoutSubviews. The ticks use
+    /// the same point formula as the (pre-rotation) bank rose but anchored
+    /// at headingPivot near the bottom of the screen, so the fan opens
+    /// upward from there — the "half a rose" shape mirroring the bank rose
+    /// above.
+    private func layoutHeadingRose() {
+        let arcPath = CGMutablePath()
+        for (i, deg) in headingTickOffsets.enumerated() {
+            let rad = deg * .pi / 180
+            let isCenter = deg == 0
+            let outerR = headingRadius
+            let innerR = headingRadius - (isCenter ? 10 : 6)
+            let sinR = CGFloat(sin(rad)), cosR = CGFloat(cos(rad))
+            let outer = CGPoint(x: headingPivot.x + outerR * sinR, y: headingPivot.y - outerR * cosR)
+            let inner = CGPoint(x: headingPivot.x + innerR * sinR, y: headingPivot.y - innerR * cosR)
+            arcPath.move(to: inner)
+            arcPath.addLine(to: outer)
+
+            let labelR = outerR + 14
+            let labelCenter = CGPoint(x: headingPivot.x + labelR * sinR, y: headingPivot.y - labelR * cosR)
+            let lbl = headingTickLabels[i]
+            lbl.font = UIFont.monospacedDigitSystemFont(ofSize: isCenter ? 13 : 12, weight: isCenter ? .bold : .semibold)
+            lbl.frame = CGRect(x: labelCenter.x - 16, y: labelCenter.y - 7, width: 32, height: 14)
+        }
+        headingArcLayer.path = arcPath
+
+        // Fixed lubber-line triangle pointing up into the arc from the
+        // pivot — marks "this tick is your current heading". Mirrors the
+        // (pre-rotation) bank-rose triangle, just flipped to point up
+        // instead of down since the arc is above rather than below it.
+        let tip = CGPoint(x: headingPivot.x, y: headingPivot.y - headingRadius + 12)
+        let pointerPath = CGMutablePath()
+        pointerPath.move(to: CGPoint(x: tip.x - 5, y: tip.y + 8))
+        pointerPath.addLine(to: tip)
+        pointerPath.addLine(to: CGPoint(x: tip.x + 5, y: tip.y + 8))
+        pointerPath.closeSubpath()
+        headingPointerLayer.path = pointerPath
+    }
+
+    /// Refresh the heading-rose tick labels for the current true heading.
+    /// Tick *positions* are fixed (set in layoutHeadingRose()); only the
+    /// text at each slot changes here. Called on the ~0.25s status-readout
+    /// cadence, not per AR frame — no sizeToFit(), frames are already fixed.
+    func updateHeading(headingDeg: Double) {
+        for (i, offset) in headingTickOffsets.enumerated() {
+            let value = (headingDeg + offset).truncatingRemainder(dividingBy: 360)
+            let normalized = value < 0 ? value + 360 : value
+            headingTickLabels[i].text = String(format: "%03d", Int(normalized.rounded()) % 360)
+        }
     }
 
     /// Update the horizon/pitch-ladder lines. Each pair is (leftEndpoint, rightEndpoint)
@@ -351,6 +448,9 @@ private final class HUDOverlayView: UIView {
         }
         bankArcLayer.strokeColor = color
         bankPointerLayer.fillColor = color
+        headingArcLayer.strokeColor = color
+        headingPointerLayer.fillColor = color
+        for lbl in headingTickLabels { lbl.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
         speedTape.setBrightness(b)
         altTape.setBrightness(b)
     }
@@ -411,22 +511,23 @@ private final class HUDTapeView: UIView {
         centerBox.layer.cornerRadius = 4
         addSubview(centerBox)
 
-        valueLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 18, weight: .bold)
+        valueLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold)
         valueLabel.textAlignment = .center
         centerBox.addSubview(valueLabel)
 
-        unitLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+        unitLabel.font = UIFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
         unitLabel.textAlignment = .center
         unitLabel.text = unit
-        addSubview(unitLabel)
+        centerBox.addSubview(unitLabel)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        centerBox.frame = CGRect(x: 0, y: bounds.midY - 15, width: bounds.width, height: 30)
-        unitLabel.frame = CGRect(x: 0, y: bounds.midY + 16, width: bounds.width, height: 14)
+        centerBox.frame = CGRect(x: 0, y: bounds.midY - 20, width: bounds.width, height: 40)
+        valueLabel.frame = CGRect(x: 0, y: 2, width: centerBox.bounds.width, height: 22)
+        unitLabel.frame = CGRect(x: 0, y: 24, width: centerBox.bounds.width, height: 14)
         rebuild()
     }
 
@@ -468,7 +569,7 @@ private final class HUDTapeView: UIView {
             path.move(to: CGPoint(x: anchorX, y: y))
             path.addLine(to: CGPoint(x: anchorX + dir * tickLen, y: y))
 
-            if isLabeled, labelIndex < tickLabels.count, abs(y - bounds.midY) > 18 {
+            if isLabeled, labelIndex < tickLabels.count, abs(y - bounds.midY) > 22 {
                 let lbl = tickLabels[labelIndex]
                 lbl.text = String(format: "%.0f", tickValue)
                 lbl.sizeToFit()
@@ -1813,6 +1914,16 @@ class ARTrafficViewController: UIViewController {
     private func updateStatusLabel() {
         if sceneManager?.settings.showHUD == true {
             hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: activeAltitude)
+            // Same world-frame convention as CalculationsLogic.calculateARPosition's
+            // bearing math (world -Z = ARKit's raw-magnetic north): derive heading
+            // from the same smoothed forward vector used for the pitch ladder, then
+            // add back the declination correction so the rose reads *true* heading,
+            // consistent with how aircraft bearings are corrected elsewhere.
+            if let fwd = smoothedHUDForward {
+                let rawHeadingDeg = Double(atan2(fwd.x, -fwd.z)) * 180.0 / Double.pi
+                let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + 360).truncatingRemainder(dividingBy: 360)
+                hudOverlayView.updateHeading(headingDeg: trueHeadingDeg)
+            }
         }
 
         var lines: [String] = []
@@ -1976,16 +2087,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             return (CGPoint(x: CGFloat(sp1.x), y: CGFloat(sp1.y)), CGPoint(x: CGFloat(sp2.x), y: CGFloat(sp2.y)))
         }
 
-        // Shorter than v1 (was 40/18) so the ladder reads as a compact
-        // center instrument rather than spanning the whole screen width.
-        guard let horizon = projectedPair(yOffset: 0, halfWidth: 14) else {
+        // Short, compact center instrument — 10° rungs drawn longer than the
+        // 5° ones (both still shorter than the horizon) so they read as the
+        // "bigger" graduation.
+        guard let horizon = projectedPair(yOffset: 0, halfWidth: 9) else {
             DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
             return
         }
-        let plus5   = projectedPair(yOffset: rise5,   halfWidth: 8)
-        let minus5  = projectedPair(yOffset: -rise5,  halfWidth: 8)
-        let plus10  = projectedPair(yOffset: rise10,  halfWidth: 8)
-        let minus10 = projectedPair(yOffset: -rise10, halfWidth: 8)
+        let plus5   = projectedPair(yOffset: rise5,   halfWidth: 5)
+        let minus5  = projectedPair(yOffset: -rise5,  halfWidth: 5)
+        let plus10  = projectedPair(yOffset: rise10,  halfWidth: 7)
+        let minus10 = projectedPair(yOffset: -rise10, halfWidth: 7)
 
         // Bank (roll) angle, for the top-of-screen bank-angle rose — a 2D
         // screen instrument, not projected through 3D like the ladder rungs
