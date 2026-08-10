@@ -28,6 +28,7 @@ extension ARVisualizationSettings {
             "showMediumAirports":    showMediumAirports,
             "showSmallAirports":     showSmallAirports,
             "showAirportDistance":   showAirportDistance,
+            "showHUD":               showHUD,
         ]
         UserDefaults.standard.set(d, forKey: ARVisualizationSettings.udKey)
     }
@@ -50,6 +51,7 @@ extension ARVisualizationSettings {
         s.showMediumAirports   = d["showMediumAirports"]   as? Bool   ?? s.showMediumAirports
         s.showSmallAirports    = d["showSmallAirports"]    as? Bool   ?? s.showSmallAirports
         s.showAirportDistance  = d["showAirportDistance"]  as? Bool   ?? s.showAirportDistance
+        s.showHUD              = d["showHUD"]              as? Bool   ?? s.showHUD
         // Re-build the normalised filter cache after loading from disk.
         s.updateFilter()
         return s
@@ -207,6 +209,14 @@ class SettingsViewController: UITableViewController {
                 min: 5, max: 50, step: 5,
                 getter: { $0.airportMaxDistance },
                 setter: { $0.airportMaxDistance = $1 }
+            ),
+        ]),
+        Section(header: "📟  HUD", rows: [
+            .toggle(
+                title: "Show HUD",
+                subtitle: "Horizon line and speed/altitude readout",
+                getter: { $0.showHUD },
+                setter: { $0.showHUD = $1 }
             ),
         ])]
         if wifiInAir {

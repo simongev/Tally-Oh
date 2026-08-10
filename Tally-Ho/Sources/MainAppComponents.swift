@@ -781,6 +781,9 @@ struct ARVisualizationSettings {
         default:               return false
         }
     }
+
+    // MARK: HUD
+    var showHUD: Bool = true
 }
 
 // MARK: - Scene Manager

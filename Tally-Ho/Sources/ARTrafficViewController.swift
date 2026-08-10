@@ -124,6 +124,132 @@ private final class OffScreenArrowView: UIView {
     }
 }
 
+// MARK: - HUD Overlay
+
+/// Modern-HUD-style overlay: a gravity-referenced horizon line with ±5° pitch
+/// ticks (moves/tilts with device attitude, computed from ARKit's camera
+/// transform — independent of the compass/GPS bearing math used for aircraft
+/// markers, so it isn't affected by the accuracy issues that affect bearing),
+/// plus fixed-position speed/altitude readout boxes.
+private final class HUDOverlayView: UIView {
+
+    static let hudGreen = UIColor(red: 0.10, green: 1.0, blue: 0.30, alpha: 1.0)
+
+    private let horizonLayer = CAShapeLayer()
+    private let plus5Layer   = CAShapeLayer()
+    private let minus5Layer  = CAShapeLayer()
+
+    private let speedBox = HUDReadoutBox(unit: "KT")
+    private let altBox   = HUDReadoutBox(unit: "FT")
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+
+        for lineLayer in [horizonLayer, plus5Layer, minus5Layer] {
+            lineLayer.strokeColor = Self.hudGreen.cgColor
+            lineLayer.fillColor = nil
+            lineLayer.lineCap = .round
+            lineLayer.isHidden = true
+            layer.addSublayer(lineLayer)
+        }
+        horizonLayer.lineWidth = 3
+        plus5Layer.lineWidth = 2
+        minus5Layer.lineWidth = 2
+
+        addSubview(speedBox)
+        addSubview(altBox)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let boxSize = CGSize(width: 84, height: 48)
+        speedBox.frame = CGRect(
+            x: 16, y: bounds.midY - boxSize.height / 2,
+            width: boxSize.width, height: boxSize.height)
+        altBox.frame = CGRect(
+            x: bounds.width - boxSize.width - 16, y: bounds.midY - boxSize.height / 2,
+            width: boxSize.width, height: boxSize.height)
+    }
+
+    /// Update the horizon/pitch-ladder lines. Each pair is (leftEndpoint, rightEndpoint)
+    /// in this view's coordinate space, already projected from 3D world points.
+    func updateLadder(horizon: (CGPoint, CGPoint), plus5: (CGPoint, CGPoint), minus5: (CGPoint, CGPoint)) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        horizonLayer.path = linePath(horizon.0, horizon.1)
+        plus5Layer.path   = linePath(plus5.0, plus5.1)
+        minus5Layer.path  = linePath(minus5.0, minus5.1)
+        horizonLayer.isHidden = false
+        plus5Layer.isHidden = false
+        minus5Layer.isHidden = false
+        CATransaction.commit()
+    }
+
+    /// Hide the ladder lines only (e.g. device pointed nearly straight up/down,
+    /// where the horizontal-forward direction is undefined). Readout boxes stay visible.
+    func hideLadder() {
+        horizonLayer.isHidden = true
+        plus5Layer.isHidden = true
+        minus5Layer.isHidden = true
+    }
+
+    func updateReadouts(speedKt: Double, altitudeFt: Double) {
+        speedBox.setValue(String(format: "%.0f", speedKt))
+        altBox.setValue(String(format: "%.0f", altitudeFt))
+    }
+
+    private func linePath(_ a: CGPoint, _ b: CGPoint) -> CGPath {
+        let path = CGMutablePath()
+        path.move(to: a)
+        path.addLine(to: b)
+        return path
+    }
+}
+
+/// Small bordered HUD-green readout box (value + unit), used for speed/altitude.
+private final class HUDReadoutBox: UIView {
+    private let valueLabel = UILabel()
+
+    init(unit: String) {
+        super.init(frame: .zero)
+        backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        layer.borderColor = HUDOverlayView.hudGreen.cgColor
+        layer.borderWidth = 1.5
+        layer.cornerRadius = 6
+
+        valueLabel.textColor = HUDOverlayView.hudGreen
+        valueLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 20, weight: .bold)
+        valueLabel.textAlignment = .center
+
+        let unitLabel = UILabel()
+        unitLabel.textColor = HUDOverlayView.hudGreen
+        unitLabel.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        unitLabel.textAlignment = .center
+        unitLabel.text = unit
+
+        let stack = UIStackView(arrangedSubviews: [valueLabel, unitLabel])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func setValue(_ text: String) {
+        valueLabel.text = text
+    }
+}
+
 // MARK: - ARTrafficViewController
 
 class ARTrafficViewController: UIViewController {
@@ -136,6 +262,11 @@ class ARTrafficViewController: UIViewController {
     private var mapButton: UIButton!
     private var backButton: UIButton!
     private var offScreenArrowView: OffScreenArrowView!
+    private var hudOverlayView: HUDOverlayView!
+    /// Ground speed from the phone's own GPS (knots), updated on every location
+    /// fix. Used for the HUD speed readout when ADS-B ownship isn't available —
+    /// mirrors the activeAltitude fallback pattern.
+    private var gpsSpeedKt: Double = 0
 
     // Dynamic leading constraints on statusLabel
     private var statusLeadingToEdge: NSLayoutConstraint!
@@ -304,6 +435,11 @@ class ARTrafficViewController: UIViewController {
         offScreenArrowView = OffScreenArrowView(frame: view.bounds)
         offScreenArrowView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(offScreenArrowView)
+
+        hudOverlayView = HUDOverlayView(frame: view.bounds)
+        hudOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        hudOverlayView.isHidden = !(sceneManager?.settings.showHUD ?? true)
+        view.addSubview(hudOverlayView)
 
         statusLabel = UILabel()
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -619,6 +755,7 @@ class ARTrafficViewController: UIViewController {
         // blending it in from the previous session's smoothed state.
         isFirstHeadingFix = true
         arSceneView.transform = .identity
+        hudOverlayView.transform = .identity
         currentZoomScale = 1.0
     }
 
@@ -676,6 +813,7 @@ class ARTrafficViewController: UIViewController {
             self.sceneManager?.settings = updatedSettings
             updatedSettings.save()
             self.connectionLogic.updateInternetQueryRadius(updatedSettings.aircraftMaxDistance)
+            self.hudOverlayView.isHidden = !updatedSettings.showHUD
 
             // Selectively clear only what changed — never wipe aircraft when only
             // airport settings changed, and vice versa.
@@ -788,7 +926,12 @@ class ARTrafficViewController: UIViewController {
             // so adjusting fieldOfView has no effect. A UIView transform scales the
             // already-rendered Metal content at composite time, which is the only
             // reliable way to achieve full-scene digital zoom in ARKit.
-            arSceneView.transform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
+            let zoomTransform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
+            arSceneView.transform = zoomTransform
+            // HUD content is drawn at raw (unzoomed) projected screen coordinates;
+            // applying the same transform keeps the horizon/ladder aligned with the
+            // now-magnified AR content beneath it.
+            hudOverlayView.transform = zoomTransform
         default:
             break
         }
@@ -1018,6 +1161,17 @@ class ARTrafficViewController: UIViewController {
             return ownship.altitude
         }
         return userAltitude
+    }
+
+    /// Ground speed in knots for the HUD readout — prefers ADS-B ownship (more
+    /// precise) over phone GPS, mirroring activeAltitude's fallback pattern.
+    private var activeGroundSpeedKt: Double {
+        if connectionLogic.connectionStatus == .receiving,
+           let ownship = connectionLogic.ownshipData,
+           ownship.groundSpeed > 0 {
+            return ownship.groundSpeed
+        }
+        return gpsSpeedKt
     }
 
     private var usingADSBGPS: Bool {
@@ -1397,6 +1551,10 @@ class ARTrafficViewController: UIViewController {
     // MARK: - HUD
 
     private func updateStatusLabel() {
+        if sceneManager?.settings.showHUD == true {
+            hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: activeAltitude)
+        }
+
         var lines: [String] = []
 
         switch connectionLogic.connectionStatus {
@@ -1503,6 +1661,63 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
         sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
+        updateHUDLadder()
+    }
+
+    /// Compute and push the HUD horizon/pitch-ladder geometry for this frame.
+    /// Runs on the SceneKit rendering thread (like the aircraft/airport ticks
+    /// above — see the tickNodeSnapshot thread-safety comment on ARSceneManager);
+    /// only the final view/layer update is dispatched to main.
+    private func updateHUDLadder() {
+        guard sceneManager?.settings.showHUD == true,
+              let camTransform = arSceneView.session.currentFrame?.camera.transform else {
+            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            return
+        }
+
+        let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
+        // ARKit looks along local -Z; that axis in world space is the negative of
+        // the transform's third column (same convention used for the off-screen
+        // arrow's behind-camera check elsewhere in this file).
+        let forwardRaw = SIMD3<Float>(-camTransform.columns.2.x, -camTransform.columns.2.y, -camTransform.columns.2.z)
+
+        // Flatten to the world-horizontal plane — ARKit's .gravityAndHeading aligns
+        // world Y to true gravity, so this ladder is purely attitude-referenced,
+        // independent of the compass/declination math used for aircraft bearing.
+        let horizLen = sqrt(forwardRaw.x * forwardRaw.x + forwardRaw.z * forwardRaw.z)
+        guard horizLen > 0.05 else {   // looking nearly straight up/down
+            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            return
+        }
+        let forward = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
+        let right   = SIMD3<Float>(forward.z, 0, -forward.x)
+
+        let distance: Float = 50
+        let center = camPos + forward * distance
+        let rise5: Float = distance * Float(tan(5.0 * Double.pi / 180.0))
+
+        func projectedPair(yOffset: Float, halfWidth: Float) -> (CGPoint, CGPoint)? {
+            let c  = SIMD3<Float>(center.x, center.y + yOffset, center.z)
+            let p1 = c - right * halfWidth
+            let p2 = c + right * halfWidth
+            // Behind-camera guard via dot product (projectPoint's z is unreliable
+            // for this — same technique used for the off-screen arrow elsewhere).
+            guard simd_dot(forwardRaw, p1 - camPos) > 0, simd_dot(forwardRaw, p2 - camPos) > 0 else { return nil }
+            let sp1 = arSceneView.projectPoint(SCNVector3(p1.x, p1.y, p1.z))
+            let sp2 = arSceneView.projectPoint(SCNVector3(p2.x, p2.y, p2.z))
+            return (CGPoint(x: CGFloat(sp1.x), y: CGFloat(sp1.y)), CGPoint(x: CGFloat(sp2.x), y: CGFloat(sp2.y)))
+        }
+
+        guard let horizon = projectedPair(yOffset: 0, halfWidth: 40),
+              let plus5   = projectedPair(yOffset: rise5, halfWidth: 18),
+              let minus5  = projectedPair(yOffset: -rise5, halfWidth: 18) else {
+            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            return
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.hudOverlayView.updateLadder(horizon: horizon, plus5: plus5, minus5: minus5)
+        }
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
@@ -1565,6 +1780,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         }
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
+
+        // For the HUD speed readout — speed magnitude validity doesn't depend on
+        // course accuracy, unlike the dead-reckoning velocity push below.
+        if loc.speed >= 0 {
+            gpsSpeedKt = loc.speed * 1.944
+        }
 
         // Push velocity state immediately (not throttled to the 4 Hz timer) so the
         // 60 Hz dead-reckoning tick has the freshest possible baseline. At 500 kt
