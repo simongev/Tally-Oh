@@ -150,7 +150,7 @@ private final class HUDOverlayView: UIView {
     private let bankArcLayer     = CAShapeLayer()
     private let bankPointerLayer = CAShapeLayer()
     private var bankPivot: CGPoint = .zero
-    private let bankRadius: CGFloat = 80
+    private let bankRadius: CGFloat = 60
     /// Neutral (roll = 0) tick endpoints, rebuilt on layout; rotated around
     /// bankPivot each frame in updateBank(rollDeg:) to animate the scale.
     private var bankNeutralTicks: [(inner: CGPoint, outer: CGPoint)] = []
@@ -283,22 +283,22 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±50°, measured from straight up at the
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
         // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
-        // highest (smallest y) and the ±50° ticks lower — the arc bulges
-        // upward above bankPivot, a shallow "sad face" fan (flatter/wider
-        // than a tight semicircle — confirmed against reference photos:
-        // level flight shows a centered sad-face arc over a plain
-        // triangle). Per-frame roll rotation (updateBank(rollDeg:) below)
-        // tilts this whole arc to either side around bankPivot, exactly
-        // like the pitch ladder's horizon line tilts with roll — that's
-        // what "the arc moves left/right when tilted" describes.
-        let tickAngles: [Double] = [-50, -30, -20, -10, 0, 10, 20, 30, 50]
+        // highest (smallest y) and the ±60° ticks lower — the arc bulges
+        // upward above bankPivot, a "sad face" ⌢ shape (confirmed against
+        // reference photos: level flight shows a centered sad-face arc over
+        // a plain triangle). Per-frame roll rotation (updateBank(rollDeg:)
+        // below) tilts this whole arc to either side around bankPivot,
+        // driven by the horizon line's own on-screen slope (see
+        // updateHUDLadder()) so the direction always matches how the
+        // horizon itself tilts.
+        let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
             let rad = deg * .pi / 180
-            let isMajor = [0, 30, 50, -30, -50].contains(deg)
+            let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
-            let innerR = bankRadius - (isMajor ? 12 : 7)
+            let innerR = bankRadius - (isMajor ? 10 : 6)
             let sinR = CGFloat(sin(rad)), cosR = CGFloat(cos(rad))
             let outer = CGPoint(x: bankPivot.x + outerR * sinR, y: bankPivot.y - outerR * cosR)
             let inner = CGPoint(x: bankPivot.x + innerR * sinR, y: bankPivot.y - innerR * cosR)
@@ -643,15 +643,16 @@ class ARTrafficViewController: UIViewController {
     /// fix. Used for the HUD speed readout when ADS-B ownship isn't available —
     /// mirrors the activeAltitude fallback pattern.
     private var gpsSpeedKt: Double = 0
-    /// Exponentially-smoothed camera forward/right vectors used only for the
-    /// HUD ladder/bank rose — filters ARKit's normal per-frame attitude noise
-    /// so the overlay glides instead of visibly jittering (more noticeable
-    /// after the ladder lines were shortened, since the same absolute pixel
-    /// wobble is now a bigger fraction of a short line). nil means "snap to
-    /// the raw value next frame" — set on init and reset in startARSession()
-    /// so a session restart doesn't visibly ease in from stale data.
+    /// Exponentially-smoothed camera forward vector used for the HUD ladder/
+    /// bank rose (the bank rose derives its rotation from the smoothed
+    /// horizon line, so this is the only vector that needs smoothing now) —
+    /// filters ARKit's normal per-frame attitude noise so the overlay
+    /// glides instead of visibly jittering (more noticeable after the
+    /// ladder lines were shortened, since the same absolute pixel wobble is
+    /// now a bigger fraction of a short line). nil means "snap to the raw
+    /// value next frame" — set on init and reset in startARSession() so a
+    /// session restart doesn't visibly ease in from stale data.
     private var smoothedHUDForward: SIMD3<Float>?
-    private var smoothedHUDCamRight: SIMD3<Float>?
     // Higher than a naive 60Hz filter would use, since the HUD update below
     // now only runs every other AR frame (~30Hz) to cut per-frame work —
     // this keeps the filter's effective responsiveness roughly the same at
@@ -1156,7 +1157,6 @@ class ARTrafficViewController: UIViewController {
         // Same reasoning as isFirstHeadingFix above: don't ease the HUD in
         // from the previous session's smoothed attitude.
         smoothedHUDForward = nil
-        smoothedHUDCamRight = nil
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2137,20 +2137,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let plus10  = projectedPair(yOffset: rise10,  halfWidth: 6)
         let minus10 = projectedPair(yOffset: -rise10, halfWidth: 6)
 
-        // Bank (roll) angle, for the top-of-screen bank-angle rose — a 2D
-        // screen instrument, not projected through 3D like the ladder rungs
-        // above. Camera's right vector's vertical component vs. its
-        // horizontal-plane magnitude gives roll relative to gravity.
-        let camRightRaw = SIMD3<Float>(camTransform.columns.0.x, camTransform.columns.0.y, camTransform.columns.0.z)
-        let camRight: SIMD3<Float>
-        if let prev = smoothedHUDCamRight {
-            camRight = simd_normalize(prev + (camRightRaw - prev) * hudSmoothingFactor)
-        } else {
-            camRight = camRightRaw
-        }
-        smoothedHUDCamRight = camRight
-        let rightHorizLen = sqrt(camRight.x * camRight.x + camRight.z * camRight.z)
-        let rollDeg = Double(atan2(camRight.y, rightHorizLen)) * 180.0 / Double.pi
+        // Bank (roll) angle, for the top-of-screen bank-angle rose — derived
+        // from the horizon line's own on-screen slope (computed just above)
+        // rather than a separate camera-vector formula, so the rose's
+        // rotation is guaranteed to match the direction the horizon line
+        // itself tilts (already correct/user-confirmed) instead of risking
+        // an independent sign bug. When banked right, the horizon's right
+        // point renders lower (larger y) than its left point, giving a
+        // positive angle — matches updateBank(rollDeg:)'s "positive = right
+        // wing down" convention.
+        let rollDeg = Double(atan2(horizon.1.y - horizon.0.y, horizon.1.x - horizon.0.x)) * 180.0 / Double.pi
 
         // Heading, for the bottom-of-screen compass rose — a 2D screen
         // instrument like the bank rose above, computed from the same
