@@ -347,15 +347,19 @@ private final class HUDOverlayView: UIView {
         }
 
         // Fixed triangle below the rose (aircraft/wings-level reference),
-        // always pointing straight up toward the arc — matches the
-        // reference photos. Built once here and never touched by
-        // updateBank(rollDeg:) — only the tick scale above rotates. Offset
-        // clearly below bankPivot (the arc itself sits entirely above the
-        // pivot, from ~-30 to -60pt) so there's a visible gap between the
-        // arc and the triangle rather than the triangle sitting inside it.
-        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y + 20)
-        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 36)
-        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 36)
+        // always pointing straight up toward the arc. Built once here and
+        // never touched by updateBank(rollDeg:) — only the tick scale
+        // above rotates, this stays screen-fixed. Anchored explicitly to
+        // the arc's own lowest tick (rather than a bare constant offset
+        // from bankPivot) so the relationship is self-evident: apex sits
+        // `gap` points below the bottom of the arc, base a further 16pt
+        // below that.
+        let arcBottomY = bankPivot.y - bankRadius * CGFloat(cos(60.0 * .pi / 180.0))
+        let gap: CGFloat = 20
+        let apex = CGPoint(x: bankPivot.x, y: arcBottomY + gap)
+        let baseY = apex.y + 16
+        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: baseY)
+        let baseRight = CGPoint(x: bankPivot.x + 7, y: baseY)
         let pointerPath = CGMutablePath()
         pointerPath.move(to: baseLeft)
         pointerPath.addLine(to: apex)
@@ -842,6 +846,12 @@ class ARTrafficViewController: UIViewController {
     private var updateTimer: Timer?
     private var currentZoomScale: CGFloat = 1.0
     private var pinchStartScale: CGFloat = 1.0
+    /// 1-finger pan offset while zoomed in, in final screen points (applied
+    /// after scale — see applyZoomAndPanTransform()). Clamped in
+    /// clampPanOffset() so panning never shows past the edge of the scaled
+    /// Metal content.
+    private var panOffset: CGPoint = .zero
+    private var panStartOffset: CGPoint = .zero
     private var cancellables = Set<AnyCancellable>()
 
     private var lastAirportFilterLocation: CLLocationCoordinate2D?
@@ -1190,6 +1200,13 @@ class ARTrafficViewController: UIViewController {
         // touch handling cannot swallow the two-finger event before we see it.
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         view.addGestureRecognizer(pinch)
+
+        // 1-finger pan, only effective while zoomed in (see handlePan) — same
+        // reasoning as pinch for being on view rather than arSceneView.
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(pan)
     }
 
     // MARK: - Airport Loading
@@ -1264,6 +1281,7 @@ class ARTrafficViewController: UIViewController {
         arSceneView.transform = .identity
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
+        panOffset = .zero
         // Same reasoning as isFirstHeadingFix above: don't ease the HUD in
         // from the previous session's smoothed attitude.
         smoothedHUDForward = nil
@@ -1432,20 +1450,59 @@ class ARTrafficViewController: UIViewController {
         case .changed:
             let scale = pinchStartScale * gesture.scale
             currentZoomScale = max(1.0, min(4.0, scale))
-            // Digital zoom: scale the AR view layer in the compositor.
-            // ARKit owns the camera's projectionTransform and resets it every frame,
-            // so adjusting fieldOfView has no effect. A UIView transform scales the
-            // already-rendered Metal content at composite time, which is the only
-            // reliable way to achieve full-scene digital zoom in ARKit.
-            let zoomTransform = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
-            arSceneView.transform = zoomTransform
-            // HUD content is drawn at raw (unzoomed) projected screen coordinates;
-            // applying the same transform keeps the horizon/ladder aligned with the
-            // now-magnified AR content beneath it.
-            hudOverlayView.transform = zoomTransform
+            clampPanOffset()
+            applyZoomAndPanTransform()
         default:
             break
         }
+    }
+
+    /// 1-finger pan, active only while zoomed in — lets the user look
+    /// around the magnified view instead of only being able to un-zoom.
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        guard currentZoomScale > 1.0 else { return }
+        switch gesture.state {
+        case .began:
+            panStartOffset = panOffset
+        case .changed:
+            let t = gesture.translation(in: view)
+            panOffset = CGPoint(x: panStartOffset.x + t.x, y: panStartOffset.y + t.y)
+            clampPanOffset()
+            applyZoomAndPanTransform()
+        default:
+            break
+        }
+    }
+
+    /// Keeps panOffset from ever showing past the edge of the scaled Metal
+    /// content — the visible viewport can shift by at most half the extra
+    /// (zoomed - unzoomed) width/height in either direction.
+    private func clampPanOffset() {
+        let maxPanX = (currentZoomScale - 1) * view.bounds.width / 2
+        let maxPanY = (currentZoomScale - 1) * view.bounds.height / 2
+        panOffset = CGPoint(
+            x: max(-maxPanX, min(maxPanX, panOffset.x)),
+            y: max(-maxPanY, min(maxPanY, panOffset.y))
+        )
+    }
+
+    /// Digital zoom: scale the AR view layer in the compositor, with the
+    /// pan offset applied after (in final screen points, so a given finger
+    /// drag distance moves the content the same amount regardless of zoom
+    /// level). ARKit owns the camera's projectionTransform and resets it
+    /// every frame, so adjusting fieldOfView has no effect — a UIView
+    /// transform scales the already-rendered Metal content at composite
+    /// time, which is the only reliable way to achieve full-scene digital
+    /// zoom in ARKit.
+    private func applyZoomAndPanTransform() {
+        var t = CGAffineTransform(scaleX: currentZoomScale, y: currentZoomScale)
+        t.tx = panOffset.x
+        t.ty = panOffset.y
+        arSceneView.transform = t
+        // HUD content is drawn at raw (unzoomed) projected screen coordinates;
+        // applying the same transform keeps the horizon/ladder aligned with the
+        // now-magnified AR content beneath it.
+        hudOverlayView.transform = t
     }
 
     // MARK: - Hit Testing / Selection
