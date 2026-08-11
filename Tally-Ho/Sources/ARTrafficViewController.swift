@@ -265,12 +265,14 @@ private final class HUDOverlayView: UIView {
             return HeadingTick(absValue: val, label: lbl)
         }
 
+        addSubview(speedTape)
+        addSubview(altTape)
+
+        // Added last so it's topmost in z-order — an off-screen-horizon
+        // warning shouldn't ever be covered by another HUD element.
         horizonArrowLayer.strokeColor = nil
         horizonArrowLayer.isHidden = true
         layer.addSublayer(horizonArrowLayer)
-
-        addSubview(speedTape)
-        addSubview(altTape)
 
         setBrightness(.medium)
     }
@@ -284,10 +286,15 @@ private final class HUDOverlayView: UIView {
         speedTape.frame = CGRect(x: 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
         altTape.frame   = CGRect(x: bounds.width - tapeSize.width - 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
 
-        bankPivot = CGPoint(x: bounds.midX, y: 150)
+        // Proportional to bounds.height (not a fixed pixel offset) so the
+        // two roses stay well separated in both portrait and landscape —
+        // a fixed 150pt from each edge left only ~100pt of clearance
+        // between them on a ~400pt-tall landscape screen, enough for their
+        // ~60-90pt tick/label extents to visually collide.
+        bankPivot = CGPoint(x: bounds.midX, y: bounds.height * 0.15)
         layoutBankRose()
 
-        headingPivot = CGPoint(x: bounds.midX, y: bounds.height - 150)
+        headingPivot = CGPoint(x: bounds.midX, y: bounds.height * 0.85)
         layoutHeadingRose()
     }
 
@@ -325,9 +332,9 @@ private final class HUDOverlayView: UIView {
         // clearly below bankPivot (the arc itself sits entirely above the
         // pivot, from ~-30 to -60pt) so there's a visible gap between the
         // arc and the triangle rather than the triangle sitting inside it.
-        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y + 10)
-        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 23)
-        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 23)
+        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y + 20)
+        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 36)
+        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 36)
         let pointerPath = CGMutablePath()
         pointerPath.move(to: baseLeft)
         pointerPath.addLine(to: apex)
@@ -469,9 +476,18 @@ private final class HUDOverlayView: UIView {
                     let ux = dx / len, uy = dy / len
                     ll.center = CGPoint(x: pair.0.x - ux * offset, y: pair.0.y - uy * offset)
                     lr.center = CGPoint(x: pair.1.x + ux * offset, y: pair.1.y + uy * offset)
+                    // Tilt the label text itself to match the line's
+                    // on-screen angle (e.g. during roll), not just its
+                    // position — both labels share the same line, so the
+                    // same rotation applies to both.
+                    let rotation = CGAffineTransform(rotationAngle: atan2(uy, ux))
+                    ll.transform = rotation
+                    lr.transform = rotation
                 } else {
                     ll.center = pair.0
                     lr.center = pair.1
+                    ll.transform = .identity
+                    lr.transform = .identity
                 }
                 ll.isHidden = false
                 lr.isHidden = false
@@ -499,8 +515,8 @@ private final class HUDOverlayView: UIView {
             horizonArrowLayer.isHidden = true
             return
         }
-        let halfWidth: CGFloat = 8
-        let height: CGFloat = 12
+        let halfWidth: CGFloat = 12
+        let height: CGFloat = 18
         let margin: CGFloat = 30
         let cx = bounds.midX
         let path = CGMutablePath()
