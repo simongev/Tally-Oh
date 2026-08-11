@@ -283,13 +283,18 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
-        // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
-        // closest to the top (smallest y) and the ±60° ticks lower — the
-        // "sad face" ⌢ shape of a real ADI's roll dial.
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from a reference
+        // direction at the pivot. point = pivot + R*(sin(rad), -cos(rad))
+        // — at rad=0 that reference is straight up (0° tick closest to the
+        // top, ±60° ticks lower, the "sad face" ⌢ shape of a real ADI's
+        // roll dial). `roseBaseRad` rotates that reference direction 90°
+        // clockwise ("to the right") as the arc's default/level-flight
+        // orientation — the fixed triangle below is built independently
+        // and always points straight up regardless of this offset.
+        let roseBaseRad = Double.pi / 2
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
-            let rad = deg * .pi / 180
+            let rad = deg * .pi / 180 + roseBaseRad
             let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
             let innerR = bankRadius - (isMajor ? 10 : 6)
@@ -302,7 +307,9 @@ private final class HUDOverlayView: UIView {
         // Fixed triangle at the center of the rose (aircraft/wings-level
         // reference — like a real ADI's fixed aircraft symbol, which sits
         // at the middle of the instrument while the roll scale rotates
-        // around it) always pointing straight up ("top").
+        // around it) always pointing straight up ("top"), independent of
+        // roseBaseRad above — only the tick scale is rotated, not this
+        // fixed reference marker.
         let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
         let baseLeft  = CGPoint(x: bankPivot.x - 5, y: bankPivot.y + 4)
         let baseRight = CGPoint(x: bankPivot.x + 5, y: bankPivot.y + 4)
@@ -435,8 +442,8 @@ private final class HUDOverlayView: UIView {
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
             if let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.center = CGPoint(x: pair.0.x - 15, y: pair.0.y)
-                lr.center = CGPoint(x: pair.1.x + 15, y: pair.1.y)
+                ll.center = CGPoint(x: pair.0.x - 20, y: pair.0.y)
+                lr.center = CGPoint(x: pair.1.x + 20, y: pair.1.y)
                 ll.isHidden = false
                 lr.isHidden = false
             }
@@ -1945,16 +1952,11 @@ class ARTrafficViewController: UIViewController {
     private func updateStatusLabel() {
         if sceneManager?.settings.showHUD == true {
             hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: activeAltitude)
-            // Same world-frame convention as CalculationsLogic.calculateARPosition's
-            // bearing math (world -Z = ARKit's raw-magnetic north): derive heading
-            // from the same smoothed forward vector used for the pitch ladder, then
-            // add back the declination correction so the rose reads *true* heading,
-            // consistent with how aircraft bearings are corrected elsewhere.
-            if let fwd = smoothedHUDForward {
-                let rawHeadingDeg = Double(atan2(fwd.x, -fwd.z)) * 180.0 / Double.pi
-                let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + 360).truncatingRemainder(dividingBy: 360)
-                hudOverlayView.updateHeading(headingDeg: trueHeadingDeg)
-            }
+            // Heading-rose updates happen in updateHUDLadder()'s 30Hz
+            // dispatch block now, not here — it's a visibly rotating
+            // element, so it needs the same smoothed per-frame cadence as
+            // the ladder/bank rose rather than this 0.25s readout timer
+            // (was a visible ~4Hz step-jump before).
         }
 
         var lines: [String] = []
@@ -2148,10 +2150,21 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let rightHorizLen = sqrt(camRight.x * camRight.x + camRight.z * camRight.z)
         let rollDeg = Double(atan2(camRight.y, rightHorizLen)) * 180.0 / Double.pi
 
+        // Heading, for the bottom-of-screen compass rose — a 2D screen
+        // instrument like the bank rose above, computed from the same
+        // smoothed forward vector as the pitch ladder. Same world-frame
+        // convention as CalculationsLogic.calculateARPosition's bearing
+        // math (world -Z = ARKit's raw-magnetic north); add back the
+        // declination correction so the rose reads *true* heading,
+        // consistent with how aircraft bearings are corrected elsewhere.
+        let rawHeadingDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
+        let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + 360).truncatingRemainder(dividingBy: 360)
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // One transaction for both updates (was two separate ones) —
-            // fewer Core Animation commits per update.
+            // One transaction for all three updates (was two separate
+            // transactions before the heading rose moved here) — fewer
+            // Core Animation commits per update.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             if let plus5, let minus5 {
@@ -2160,6 +2173,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 self.hudOverlayView.hideLadder()
             }
             self.hudOverlayView.updateBank(rollDeg: rollDeg)
+            self.hudOverlayView.updateHeading(headingDeg: trueHeadingDeg)
             CATransaction.commit()
         }
     }
