@@ -285,13 +285,16 @@ private final class HUDOverlayView: UIView {
     private func layoutBankRose() {
         // Ticks at 0/±10/±20/±30/±45/±60°, measured from a reference
         // direction at the pivot. point = pivot + R*(sin(rad), -cos(rad))
-        // — at rad=0 that reference is straight up (0° tick closest to the
-        // top, ±60° ticks lower, the "sad face" ⌢ shape of a real ADI's
-        // roll dial). `roseBaseRad` rotates that reference direction 90°
-        // clockwise ("to the right") as the arc's default/level-flight
-        // orientation — the fixed triangle below is built independently
-        // and always points straight up regardless of this offset.
-        let roseBaseRad = Double.pi / 2
+        // — at rad=0 that reference is straight up. `roseBaseRad` points
+        // that reference straight down instead, so the arc sits below the
+        // pivot facing down (bulging down in the middle, ends curling up
+        // toward the sides) — the fixed triangle below is built
+        // independently and always points straight up regardless of this
+        // offset. Per-frame roll rotation (updateBank(rollDeg:) below)
+        // tilts this whole arc to either side around bankPivot exactly
+        // like the pitch ladder's horizon line tilts with roll, since both
+        // derive from the same live attitude data.
+        let roseBaseRad = Double.pi
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
             let rad = deg * .pi / 180 + roseBaseRad
@@ -442,8 +445,8 @@ private final class HUDOverlayView: UIView {
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
             if let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.center = CGPoint(x: pair.0.x - 20, y: pair.0.y)
-                lr.center = CGPoint(x: pair.1.x + 20, y: pair.1.y)
+                ll.center = CGPoint(x: pair.0.x - 28, y: pair.0.y)
+                lr.center = CGPoint(x: pair.1.x + 28, y: pair.1.y)
                 ll.isHidden = false
                 lr.isHidden = false
             }
@@ -593,12 +596,15 @@ private final class HUDTapeView: UIView {
             defer { tickValue += tickSpacing }
             let y = bounds.midY - CGFloat(tickValue - currentValue) * pxPerUnit
             guard y >= -10, y <= bounds.height + 10 else { continue }
+            // Skip ticks (and their labels) that fall behind the center
+            // readout box — the scale shouldn't render inside/through it.
+            guard abs(y - bounds.midY) > 22 else { continue }
             let isLabeled = tickValue.truncatingRemainder(dividingBy: labelEvery) == 0
             let tickLen: CGFloat = isLabeled ? 12 : 6
             path.move(to: CGPoint(x: anchorX, y: y))
             path.addLine(to: CGPoint(x: anchorX + dir * tickLen, y: y))
 
-            if isLabeled, labelIndex < tickLabels.count, abs(y - bounds.midY) > 22 {
+            if isLabeled, labelIndex < tickLabels.count {
                 let lbl = tickLabels[labelIndex]
                 lbl.text = String(format: "%.0f", tickValue)
                 lbl.sizeToFit()
