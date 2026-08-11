@@ -354,8 +354,12 @@ private final class HUDOverlayView: UIView {
         // from bankPivot) so the relationship is self-evident: apex sits
         // `gap` points below the bottom of the arc, base a further 16pt
         // below that.
-        let arcBottomY = bankPivot.y - bankRadius * CGFloat(cos(60.0 * .pi / 180.0))
-        let gap: CGFloat = 20
+        // True lowest pixel of the tick assembly — the ±60° ticks are major
+        // ticks, so their INNER endpoint (radius 50) sits closer to the
+        // pivot than their outer endpoint (radius 60, what a naive
+        // outer-radius calc would use).
+        let arcBottomY = bankNeutralTicks.map { max($0.inner.y, $0.outer.y) }.max() ?? bankPivot.y
+        let gap: CGFloat = 40
         let apex = CGPoint(x: bankPivot.x, y: arcBottomY + gap)
         let baseY = apex.y + 16
         let baseLeft  = CGPoint(x: bankPivot.x - 7, y: baseY)
@@ -742,7 +746,7 @@ private extension Double {
 
 // MARK: - ARTrafficViewController
 
-class ARTrafficViewController: UIViewController {
+class ARTrafficViewController: UIViewController, UIAdaptivePresentationControllerDelegate {
 
     // MARK: - UI
 
@@ -1335,6 +1339,7 @@ class ARTrafficViewController: UIViewController {
             adsbOwnshipCallsign: adsbCallsign
         ) { [weak self] updated in
             guard let self else { return }
+            self.resumeARIfPaused()
             let old = self.sceneManager?.settings
             var updatedSettings = updated
             updatedSettings.updateFilter()
@@ -1375,7 +1380,37 @@ class ARTrafficViewController: UIViewController {
         }
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .formSheet
+        // .formSheet doesn't hide the presenting view, so unlike .fullScreen
+        // (map, calibration) it never fires viewWillDisappear/viewWillAppear
+        // on us — meaning the AR session and HUD update loop would otherwise
+        // keep running full tilt underneath the sheet. Pause explicitly here
+        // and resume in presentationControllerDidDismiss(_:), which fires for
+        // both the Done button and an interactive swipe-down dismiss.
+        arSceneView.session.pause()
+        updateTimer?.invalidate()
+        altimeter.stopRelativeAltitudeUpdates()
+        nav.presentationController?.delegate = self
         present(nav, animated: true)
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        resumeARIfPaused()
+    }
+
+    /// Resumes the AR session/update timer/altimeter after Settings closes.
+    /// Called from both presentationControllerDidDismiss(_:) (covers an
+    /// interactive swipe-down dismiss) and the Settings onDismiss closure
+    /// below (covers the Done button) since it's not guaranteed which of
+    /// those fires for any given dismissal — resuming twice is harmless
+    /// (startARSession() just resets tracking again).
+    private func resumeARIfPaused() {
+        guard !(updateTimer?.isValid ?? false) else { return }
+        startARSession()
+        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+        setupAltimeter()
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.updateVisualization()
+        }
     }
 
     /// Returns the aircraft list to show on the 2D map.
