@@ -286,15 +286,22 @@ private final class HUDOverlayView: UIView {
         speedTape.frame = CGRect(x: 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
         altTape.frame   = CGRect(x: bounds.width - tapeSize.width - 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
 
-        // Proportional to bounds.height (not a fixed pixel offset) so the
-        // two roses stay well separated in both portrait and landscape —
-        // a fixed 150pt from each edge left only ~100pt of clearance
-        // between them on a ~400pt-tall landscape screen, enough for their
-        // ~60-90pt tick/label extents to visually collide.
-        bankPivot = CGPoint(x: bounds.midX, y: bounds.height * 0.15)
+        // Proportional to the *safe area*, not raw bounds — a notch/Dynamic
+        // Island intrudes from a side of the screen in landscape, which
+        // becomes part of the vertical extent in this view's own unrotated
+        // coordinate space. Positioning from raw bounds.height risked the
+        // bank rose's tick arc (up to 60pt above its pivot) rendering
+        // under/behind that housing, which would look exactly like "no arc
+        // above the triangle" despite the geometry itself being correct.
+        // 12%/88% (vs. a wider split) also gives the two roses a bit more
+        // separation in landscape, now measured from the actually-usable
+        // area instead of the raw screen edge.
+        let safeTop = safeAreaInsets.top
+        let safeHeight = bounds.height - safeAreaInsets.top - safeAreaInsets.bottom
+        bankPivot = CGPoint(x: bounds.midX, y: safeTop + safeHeight * 0.12)
         layoutBankRose()
 
-        headingPivot = CGPoint(x: bounds.midX, y: bounds.height * 0.85)
+        headingPivot = CGPoint(x: bounds.midX, y: safeTop + safeHeight * 0.88)
         layoutHeadingRose()
     }
 
@@ -479,8 +486,15 @@ private final class HUDOverlayView: UIView {
                     // Tilt the label text itself to match the line's
                     // on-screen angle (e.g. during roll), not just its
                     // position — both labels share the same line, so the
-                    // same rotation applies to both.
-                    let rotation = CGAffineTransform(rotationAngle: atan2(uy, ux))
+                    // same rotation applies to both. Normalize into
+                    // (-90°, 90°] first — the raw atan2 can land near
+                    // ±180° depending on which end of the line is "first"
+                    // (harmless for a plain line segment, but would flip
+                    // the text fully upside down instead of just tilting).
+                    var angle = atan2(uy, ux)
+                    if angle > .pi / 2 { angle -= .pi }
+                    if angle < -.pi / 2 { angle += .pi }
+                    let rotation = CGAffineTransform(rotationAngle: angle)
                     ll.transform = rotation
                     lr.transform = rotation
                 } else {
@@ -517,7 +531,9 @@ private final class HUDOverlayView: UIView {
         }
         let halfWidth: CGFloat = 12
         let height: CGFloat = 18
-        let margin: CGFloat = 30
+        // Noticeably inward from the edge (not just past the safe area)
+        // without going all the way to screen center.
+        let margin = max(safeAreaInsets.top, safeAreaInsets.bottom) + bounds.height * 0.15
         let cx = bounds.midX
         let path = CGMutablePath()
         switch direction {
