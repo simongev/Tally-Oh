@@ -269,8 +269,12 @@ private final class HUDOverlayView: UIView {
         addSubview(altTape)
 
         // Added last so it's topmost in z-order — an off-screen-horizon
-        // warning shouldn't ever be covered by another HUD element.
-        horizonArrowLayer.strokeColor = nil
+        // warning shouldn't ever be covered by another HUD element. Open
+        // 2-line chevron (stroke, not fill) rather than a solid triangle.
+        horizonArrowLayer.fillColor = nil
+        horizonArrowLayer.lineWidth = 3
+        horizonArrowLayer.lineCap = .round
+        horizonArrowLayer.lineJoin = .round
         horizonArrowLayer.isHidden = true
         layer.addSublayer(horizonArrowLayer)
 
@@ -283,8 +287,18 @@ private final class HUDOverlayView: UIView {
         super.layoutSubviews()
 
         let tapeSize = CGSize(width: 60, height: 220)
-        speedTape.frame = CGRect(x: 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
-        altTape.frame   = CGRect(x: bounds.width - tapeSize.width - 12, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
+        // Capped at a fixed distance from center (matching roughly how far
+        // out they sit in portrait) rather than pinned to the raw screen
+        // edge — in landscape, a much wider screen would otherwise spread
+        // them far apart with a large empty gap between them. Still
+        // clamped to the safe area so a notch/Dynamic Island intruding
+        // from a side never clips them.
+        let refOffsetFromCenter: CGFloat = 195
+        let speedX = max(safeAreaInsets.left + 8, bounds.midX - refOffsetFromCenter)
+        let altX = min(bounds.width - safeAreaInsets.right - tapeSize.width - 8,
+                        bounds.midX + refOffsetFromCenter - tapeSize.width)
+        speedTape.frame = CGRect(x: speedX, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
+        altTape.frame   = CGRect(x: altX, y: bounds.midY - tapeSize.height / 2, width: tapeSize.width, height: tapeSize.height)
 
         // Proportional to the *safe area*, not raw bounds — a notch/Dynamic
         // Island intrudes from a side of the screen in landscape, which
@@ -531,24 +545,25 @@ private final class HUDOverlayView: UIView {
         }
         let halfWidth: CGFloat = 12
         let height: CGFloat = 18
-        // Noticeably inward from the edge (not just past the safe area)
-        // without going all the way to screen center.
-        let margin = max(safeAreaInsets.top, safeAreaInsets.bottom) + bounds.height * 0.15
+        // Noticeably closer to center than just past the safe area, per
+        // feedback that the previous 0.15 fraction still read as "at the
+        // edge" — still not all the way to screen center.
+        let margin = max(safeAreaInsets.top, safeAreaInsets.bottom) + bounds.height * 0.25
         let cx = bounds.midX
+        // Open 2-line chevron (not a closed/filled triangle): two strokes
+        // meeting at the tip, pointing toward the horizon.
         let path = CGMutablePath()
         switch direction {
         case .up:
             let tipY = margin
             path.move(to: CGPoint(x: cx - halfWidth, y: tipY + height))
-            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY + height))
             path.addLine(to: CGPoint(x: cx, y: tipY))
-            path.closeSubpath()
+            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY + height))
         case .down:
             let tipY = bounds.height - margin
             path.move(to: CGPoint(x: cx - halfWidth, y: tipY - height))
-            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY - height))
             path.addLine(to: CGPoint(x: cx, y: tipY))
-            path.closeSubpath()
+            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY - height))
         }
         horizonArrowLayer.path = path
         horizonArrowLayer.isHidden = false
@@ -573,7 +588,7 @@ private final class HUDOverlayView: UIView {
         headingArcLayer.strokeColor = color
         headingPointerLayer.fillColor = color
         for tick in headingTicks { tick.label.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
-        horizonArrowLayer.fillColor = color
+        horizonArrowLayer.strokeColor = color
         speedTape.setBrightness(b)
         altTape.setBrightness(b)
     }
