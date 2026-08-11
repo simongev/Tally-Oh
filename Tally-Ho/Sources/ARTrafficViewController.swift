@@ -150,7 +150,7 @@ private final class HUDOverlayView: UIView {
     private let bankArcLayer     = CAShapeLayer()
     private let bankPointerLayer = CAShapeLayer()
     private var bankPivot: CGPoint = .zero
-    private let bankRadius: CGFloat = 60
+    private let bankRadius: CGFloat = 80
     /// Neutral (roll = 0) tick endpoints, rebuilt on layout; rotated around
     /// bankPivot each frame in updateBank(rollDeg:) to animate the scale.
     private var bankNeutralTicks: [(inner: CGPoint, outer: CGPoint)] = []
@@ -283,54 +283,41 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
+        // Ticks at 0/±10/±20/±30/±50°, measured from straight up at the
         // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
-        // highest (smallest y) and the ±60° ticks lower — the arc bulges
-        // upward above bankPivot, tracing the top of a circle centered
-        // below it. Matches a real HUD's bank scale (confirmed against a
-        // reference photo). Per-frame roll rotation (updateBank(rollDeg:)
-        // below) tilts this whole arc to either side around bankPivot,
-        // exactly like the pitch ladder's horizon line tilts with roll.
-        let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
+        // highest (smallest y) and the ±50° ticks lower — the arc bulges
+        // upward above bankPivot, a shallow "sad face" fan (flatter/wider
+        // than a tight semicircle — confirmed against reference photos:
+        // level flight shows a centered sad-face arc over a plain
+        // triangle). Per-frame roll rotation (updateBank(rollDeg:) below)
+        // tilts this whole arc to either side around bankPivot, exactly
+        // like the pitch ladder's horizon line tilts with roll — that's
+        // what "the arc moves left/right when tilted" describes.
+        let tickAngles: [Double] = [-50, -30, -20, -10, 0, 10, 20, 30, 50]
         bankNeutralTicks = tickAngles.map { deg in
             let rad = deg * .pi / 180
-            let isMajor = [0, 30, 60, -30, -60].contains(deg)
+            let isMajor = [0, 30, 50, -30, -50].contains(deg)
             let outerR = bankRadius
-            let innerR = bankRadius - (isMajor ? 10 : 6)
+            let innerR = bankRadius - (isMajor ? 12 : 7)
             let sinR = CGFloat(sin(rad)), cosR = CGFloat(cos(rad))
             let outer = CGPoint(x: bankPivot.x + outerR * sinR, y: bankPivot.y - outerR * cosR)
             let inner = CGPoint(x: bankPivot.x + innerR * sinR, y: bankPivot.y - innerR * cosR)
             return (inner, outer)
         }
 
-        // Fixed "hourglass" aircraft symbol at the center of the rose,
-        // below the tick arc — matches the reference photo: a downward
-        // triangle stacked tip-to-tip on an upward triangle, with a short
-        // horizontal bar through the pinch point. Built once as a single
-        // filled compound path (three subpaths, one fill) and never
-        // touched by updateBank(rollDeg:) — only the tick scale rotates.
-        let topTri = CGMutablePath()
-        topTri.move(to: CGPoint(x: bankPivot.x - 10, y: bankPivot.y - 8))
-        topTri.addLine(to: CGPoint(x: bankPivot.x + 10, y: bankPivot.y - 8))
-        topTri.addLine(to: bankPivot)
-        topTri.closeSubpath()
-
-        let bottomTri = CGMutablePath()
-        bottomTri.move(to: CGPoint(x: bankPivot.x - 10, y: bankPivot.y + 8))
-        bottomTri.addLine(to: CGPoint(x: bankPivot.x + 10, y: bankPivot.y + 8))
-        bottomTri.addLine(to: bankPivot)
-        bottomTri.closeSubpath()
-
-        let wingBar = CGPath(
-            rect: CGRect(x: bankPivot.x - 13, y: bankPivot.y - 1, width: 26, height: 2),
-            transform: nil
-        )
-
-        let symbolPath = CGMutablePath()
-        symbolPath.addPath(topTri)
-        symbolPath.addPath(bottomTri)
-        symbolPath.addPath(wingBar)
-        bankPointerLayer.path = symbolPath
+        // Fixed triangle at the center of the rose (aircraft/wings-level
+        // reference), always pointing straight up — matches the reference
+        // photos. Built once here and never touched by updateBank(rollDeg:)
+        // — only the tick scale above rotates.
+        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
+        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 5)
+        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 5)
+        let pointerPath = CGMutablePath()
+        pointerPath.move(to: baseLeft)
+        pointerPath.addLine(to: apex)
+        pointerPath.addLine(to: baseRight)
+        pointerPath.closeSubpath()
+        bankPointerLayer.path = pointerPath
 
         updateBank(rollDeg: lastRollDeg)
     }
