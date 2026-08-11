@@ -283,21 +283,17 @@ private final class HUDOverlayView: UIView {
     /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
     /// per-frame work of rotating the ticks around bankPivot.
     private func layoutBankRose() {
-        // Ticks at 0/±10/±20/±30/±45/±60°, measured from a reference
-        // direction at the pivot. point = pivot + R*(sin(rad), -cos(rad))
-        // — at rad=0 that reference is straight up. `roseBaseRad` points
-        // that reference straight down instead, so the arc sits below the
-        // pivot facing down (bulging down in the middle, ends curling up
-        // toward the sides) — the fixed triangle below is built
-        // independently and always points straight up regardless of this
-        // offset. Per-frame roll rotation (updateBank(rollDeg:) below)
-        // tilts this whole arc to either side around bankPivot exactly
-        // like the pitch ladder's horizon line tilts with roll, since both
-        // derive from the same live attitude data.
-        let roseBaseRad = Double.pi
+        // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
+        // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
+        // highest (smallest y) and the ±60° ticks lower — the arc bulges
+        // upward above bankPivot, tracing the top of a circle centered
+        // below it. Matches a real HUD's bank scale (confirmed against a
+        // reference photo). Per-frame roll rotation (updateBank(rollDeg:)
+        // below) tilts this whole arc to either side around bankPivot,
+        // exactly like the pitch ladder's horizon line tilts with roll.
         let tickAngles: [Double] = [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]
         bankNeutralTicks = tickAngles.map { deg in
-            let rad = deg * .pi / 180 + roseBaseRad
+            let rad = deg * .pi / 180
             let isMajor = [0, 30, 60, -30, -60].contains(deg)
             let outerR = bankRadius
             let innerR = bankRadius - (isMajor ? 10 : 6)
@@ -307,21 +303,34 @@ private final class HUDOverlayView: UIView {
             return (inner, outer)
         }
 
-        // Fixed triangle at the center of the rose (aircraft/wings-level
-        // reference — like a real ADI's fixed aircraft symbol, which sits
-        // at the middle of the instrument while the roll scale rotates
-        // around it) always pointing straight up ("top"), independent of
-        // roseBaseRad above — only the tick scale is rotated, not this
-        // fixed reference marker.
-        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
-        let baseLeft  = CGPoint(x: bankPivot.x - 5, y: bankPivot.y + 4)
-        let baseRight = CGPoint(x: bankPivot.x + 5, y: bankPivot.y + 4)
-        let pointerPath = CGMutablePath()
-        pointerPath.move(to: baseLeft)
-        pointerPath.addLine(to: apex)
-        pointerPath.addLine(to: baseRight)
-        pointerPath.closeSubpath()
-        bankPointerLayer.path = pointerPath
+        // Fixed "hourglass" aircraft symbol at the center of the rose,
+        // below the tick arc — matches the reference photo: a downward
+        // triangle stacked tip-to-tip on an upward triangle, with a short
+        // horizontal bar through the pinch point. Built once as a single
+        // filled compound path (three subpaths, one fill) and never
+        // touched by updateBank(rollDeg:) — only the tick scale rotates.
+        let topTri = CGMutablePath()
+        topTri.move(to: CGPoint(x: bankPivot.x - 10, y: bankPivot.y - 8))
+        topTri.addLine(to: CGPoint(x: bankPivot.x + 10, y: bankPivot.y - 8))
+        topTri.addLine(to: bankPivot)
+        topTri.closeSubpath()
+
+        let bottomTri = CGMutablePath()
+        bottomTri.move(to: CGPoint(x: bankPivot.x - 10, y: bankPivot.y + 8))
+        bottomTri.addLine(to: CGPoint(x: bankPivot.x + 10, y: bankPivot.y + 8))
+        bottomTri.addLine(to: bankPivot)
+        bottomTri.closeSubpath()
+
+        let wingBar = CGPath(
+            rect: CGRect(x: bankPivot.x - 13, y: bankPivot.y - 1, width: 26, height: 2),
+            transform: nil
+        )
+
+        let symbolPath = CGMutablePath()
+        symbolPath.addPath(topTri)
+        symbolPath.addPath(bottomTri)
+        symbolPath.addPath(wingBar)
+        bankPointerLayer.path = symbolPath
 
         updateBank(rollDeg: lastRollDeg)
     }
@@ -445,8 +454,8 @@ private final class HUDOverlayView: UIView {
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
             if let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.center = CGPoint(x: pair.0.x - 28, y: pair.0.y)
-                lr.center = CGPoint(x: pair.1.x + 28, y: pair.1.y)
+                ll.center = CGPoint(x: pair.0.x - 40, y: pair.0.y)
+                lr.center = CGPoint(x: pair.1.x + 40, y: pair.1.y)
                 ll.isHidden = false
                 lr.isHidden = false
             }
