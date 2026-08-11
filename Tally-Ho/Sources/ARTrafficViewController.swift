@@ -185,6 +185,15 @@ private final class HUDOverlayView: UIView {
         }
     }
 
+    /// Fixed-position indicator shown when the pitch ladder's horizon line
+    /// itself isn't visible on screen (phone pitched too far up/down) —
+    /// points toward whichever edge the horizon has scrolled off, so the
+    /// user has some attitude reference even when none of the ladder is
+    /// in view. Unlike the ladder itself, this is a plain fixed screen
+    /// position/shape (not 3D-projected) for robustness at extreme angles.
+    enum HorizonArrowDirection { case up, down }
+    private let horizonArrowLayer = CAShapeLayer()
+
     private let speedTape = HUDTapeView(unit: "KT", tickSpacing: 10, labelEvery: 20, range: 50, isLeftTape: true)
     private let altTape   = HUDTapeView(unit: "FT", tickSpacing: 100, labelEvery: 200, range: 500, isLeftTape: false)
 
@@ -256,6 +265,10 @@ private final class HUDOverlayView: UIView {
             return HeadingTick(absValue: val, label: lbl)
         }
 
+        horizonArrowLayer.strokeColor = nil
+        horizonArrowLayer.isHidden = true
+        layer.addSublayer(horizonArrowLayer)
+
         addSubview(speedTape)
         addSubview(altTape)
 
@@ -305,13 +318,16 @@ private final class HUDOverlayView: UIView {
             return (inner, outer)
         }
 
-        // Fixed triangle at the center of the rose (aircraft/wings-level
-        // reference), always pointing straight up — matches the reference
-        // photos. Built once here and never touched by updateBank(rollDeg:)
-        // — only the tick scale above rotates.
-        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y - 8)
-        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 5)
-        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 5)
+        // Fixed triangle below the rose (aircraft/wings-level reference),
+        // always pointing straight up toward the arc — matches the
+        // reference photos. Built once here and never touched by
+        // updateBank(rollDeg:) — only the tick scale above rotates. Offset
+        // clearly below bankPivot (the arc itself sits entirely above the
+        // pivot, from ~-30 to -60pt) so there's a visible gap between the
+        // arc and the triangle rather than the triangle sitting inside it.
+        let apex = CGPoint(x: bankPivot.x, y: bankPivot.y + 10)
+        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: bankPivot.y + 23)
+        let baseRight = CGPoint(x: bankPivot.x + 7, y: bankPivot.y + 23)
         let pointerPath = CGMutablePath()
         pointerPath.move(to: baseLeft)
         pointerPath.addLine(to: apex)
@@ -441,8 +457,22 @@ private final class HUDOverlayView: UIView {
             rung.line.path = linePath(pair.0, pair.1)
             rung.line.isHidden = false
             if let ll = rung.labelLeft, let lr = rung.labelRight {
-                ll.center = CGPoint(x: pair.0.x - 40, y: pair.0.y)
-                lr.center = CGPoint(x: pair.1.x + 40, y: pair.1.y)
+                // Position labels along the line's own direction, extended
+                // past each endpoint — tracks the line's actual on-screen
+                // tilt (e.g. during roll) instead of a fixed horizontal
+                // offset, so the labels stay attached to the line itself
+                // rather than sitting at a screen-relative position.
+                let dx = pair.1.x - pair.0.x, dy = pair.1.y - pair.0.y
+                let len = sqrt(dx * dx + dy * dy)
+                let offset: CGFloat = 44
+                if len > 0.01 {
+                    let ux = dx / len, uy = dy / len
+                    ll.center = CGPoint(x: pair.0.x - ux * offset, y: pair.0.y - uy * offset)
+                    lr.center = CGPoint(x: pair.1.x + ux * offset, y: pair.1.y + uy * offset)
+                } else {
+                    ll.center = pair.0
+                    lr.center = pair.1
+                }
                 ll.isHidden = false
                 lr.isHidden = false
             }
@@ -458,6 +488,38 @@ private final class HUDOverlayView: UIView {
             rung.labelLeft?.isHidden = true
             rung.labelRight?.isHidden = true
         }
+    }
+
+    /// Show/hide the fixed off-screen-horizon arrow. `nil` hides it. Width
+    /// matches the pitch-ladder line marks (~14pt); fixed screen position
+    /// (not 3D-projected) so it stays reliable at the extreme pitch angles
+    /// where the ladder itself can't be projected sensibly.
+    func updateHorizonArrow(direction: HorizonArrowDirection?) {
+        guard let direction else {
+            horizonArrowLayer.isHidden = true
+            return
+        }
+        let halfWidth: CGFloat = 8
+        let height: CGFloat = 12
+        let margin: CGFloat = 30
+        let cx = bounds.midX
+        let path = CGMutablePath()
+        switch direction {
+        case .up:
+            let tipY = margin
+            path.move(to: CGPoint(x: cx - halfWidth, y: tipY + height))
+            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY + height))
+            path.addLine(to: CGPoint(x: cx, y: tipY))
+            path.closeSubpath()
+        case .down:
+            let tipY = bounds.height - margin
+            path.move(to: CGPoint(x: cx - halfWidth, y: tipY - height))
+            path.addLine(to: CGPoint(x: cx + halfWidth, y: tipY - height))
+            path.addLine(to: CGPoint(x: cx, y: tipY))
+            path.closeSubpath()
+        }
+        horizonArrowLayer.path = path
+        horizonArrowLayer.isHidden = false
     }
 
     func updateReadouts(speedKt: Double, altitudeFt: Double) {
@@ -479,6 +541,7 @@ private final class HUDOverlayView: UIView {
         headingArcLayer.strokeColor = color
         headingPointerLayer.fillColor = color
         for tick in headingTicks { tick.label.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
+        horizonArrowLayer.fillColor = color
         speedTape.setBrightness(b)
         altTape.setBrightness(b)
     }
@@ -2077,7 +2140,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     private func updateHUDLadder() {
         guard sceneManager?.settings.showHUD == true,
               let camTransform = arSceneView.session.currentFrame?.camera.transform else {
-            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            DispatchQueue.main.async { [weak self] in
+                self?.hudOverlayView.hideLadder()
+                self?.hudOverlayView.updateHorizonArrow(direction: nil)
+            }
             hudFrameCounter = 0
             return
         }
@@ -2090,12 +2156,22 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // arrow's behind-camera check elsewhere in this file).
         let forwardRaw = SIMD3<Float>(-camTransform.columns.2.x, -camTransform.columns.2.y, -camTransform.columns.2.z)
 
+        // Direction for the fixed off-screen-horizon arrow, if the horizon
+        // line itself turns out not to be visible below: forwardRaw.y < 0
+        // means the camera is pitched down (looking toward the ground), so
+        // the true horizon is above the current view — arrow points up —
+        // and vice versa.
+        let arrowDirection: HUDOverlayView.HorizonArrowDirection = forwardRaw.y < 0 ? .up : .down
+
         // Flatten to the world-horizontal plane — ARKit's .gravityAndHeading aligns
         // world Y to true gravity, so this ladder is purely attitude-referenced,
         // independent of the compass/declination math used for aircraft bearing.
         let horizLen = sqrt(forwardRaw.x * forwardRaw.x + forwardRaw.z * forwardRaw.z)
         guard horizLen > 0.05 else {   // looking nearly straight up/down
-            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            DispatchQueue.main.async { [weak self] in
+                self?.hudOverlayView.hideLadder()
+                self?.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
+            }
             return
         }
         let forwardHoriz = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
@@ -2129,7 +2205,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // 5° ones (both still shorter than the horizon) so they read as the
         // "bigger" graduation.
         guard let horizon = projectedPair(yOffset: 0, halfWidth: 7) else {
-            DispatchQueue.main.async { [weak self] in self?.hudOverlayView.hideLadder() }
+            DispatchQueue.main.async { [weak self] in
+                self?.hudOverlayView.hideLadder()
+                self?.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
+            }
             return
         }
         let plus5   = projectedPair(yOffset: rise5,   halfWidth: 4)
@@ -2172,6 +2251,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             }
             self.hudOverlayView.updateBank(rollDeg: rollDeg)
             self.hudOverlayView.updateHeading(headingDeg: trueHeadingDeg)
+            // The horizon line projected successfully above, but at a
+            // steep-but-not-extreme pitch it can still land outside the
+            // visible area — show the same fixed arrow in that case too.
+            let margin: CGFloat = 20
+            let visibleRange = -margin...(self.hudOverlayView.bounds.height + margin)
+            if visibleRange.contains(horizon.0.y) || visibleRange.contains(horizon.1.y) {
+                self.hudOverlayView.updateHorizonArrow(direction: nil)
+            } else {
+                self.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
+            }
             CATransaction.commit()
         }
     }
