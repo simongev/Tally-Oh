@@ -144,11 +144,9 @@ private final class HUDOverlayView: UIView {
     }
     private var rungs: [Rung] = []
 
-    // Bank-angle "rose": a fixed triangle (aircraft/wings reference — never
-    // moves) with the tick-mark scale rotating around it every frame to
+    // Bank-angle "rose": a tick-mark scale that rotates every frame to
     // show live roll, like a real HUD's conformal bank scale.
     private let bankArcLayer     = CAShapeLayer()
-    private let bankPointerLayer = CAShapeLayer()
     private var bankPivot: CGPoint = .zero
     private let bankRadius: CGFloat = 60
     /// Neutral (roll = 0) tick endpoints, rebuilt on layout; rotated around
@@ -241,10 +239,6 @@ private final class HUDOverlayView: UIView {
         bankArcLayer.lineCap = .round
         layer.addSublayer(bankArcLayer)
 
-        bankPointerLayer.strokeColor = nil
-        layer.addSublayer(bankPointerLayer)
-        bankPointerLayer.fillColor = Self.hudGreen.cgColor
-
         headingArcLayer.fillColor = nil
         headingArcLayer.lineWidth = 1.5
         headingArcLayer.lineCap = .round
@@ -319,10 +313,10 @@ private final class HUDOverlayView: UIView {
         layoutHeadingRose()
     }
 
-    /// Rebuild the neutral (roll = 0) tick positions and the fixed pointer
-    /// triangle. Only depends on bounds, so it only needs to run from
-    /// layoutSubviews, not per-frame — updateBank(rollDeg:) does the
-    /// per-frame work of rotating the ticks around bankPivot.
+    /// Rebuild the neutral (roll = 0) tick positions. Only depends on
+    /// bounds, so it only needs to run from layoutSubviews, not per-frame —
+    /// updateBank(rollDeg:) does the per-frame work of rotating the ticks
+    /// around bankPivot.
     private func layoutBankRose() {
         // Ticks at 0/±10/±20/±30/±45/±60°, measured from straight up at the
         // pivot. point = pivot + R*(sin(rad), -cos(rad)) puts the 0° tick
@@ -346,31 +340,6 @@ private final class HUDOverlayView: UIView {
             return (inner, outer)
         }
 
-        // Fixed triangle below the rose (aircraft/wings-level reference),
-        // always pointing straight up toward the arc. Built once here and
-        // never touched by updateBank(rollDeg:) — only the tick scale
-        // above rotates, this stays screen-fixed. Anchored explicitly to
-        // the arc's own lowest tick (rather than a bare constant offset
-        // from bankPivot) so the relationship is self-evident: apex sits
-        // `gap` points below the bottom of the arc, base a further 16pt
-        // below that.
-        // True lowest pixel of the tick assembly — the ±60° ticks are major
-        // ticks, so their INNER endpoint (radius 50) sits closer to the
-        // pivot than their outer endpoint (radius 60, what a naive
-        // outer-radius calc would use).
-        let arcBottomY = bankNeutralTicks.map { max($0.inner.y, $0.outer.y) }.max() ?? bankPivot.y
-        let gap: CGFloat = 40
-        let apex = CGPoint(x: bankPivot.x, y: arcBottomY + gap)
-        let baseY = apex.y + 16
-        let baseLeft  = CGPoint(x: bankPivot.x - 7, y: baseY)
-        let baseRight = CGPoint(x: bankPivot.x + 7, y: baseY)
-        let pointerPath = CGMutablePath()
-        pointerPath.move(to: baseLeft)
-        pointerPath.addLine(to: apex)
-        pointerPath.addLine(to: baseRight)
-        pointerPath.closeSubpath()
-        bankPointerLayer.path = pointerPath
-
         updateBank(rollDeg: lastRollDeg)
     }
 
@@ -378,7 +347,7 @@ private final class HUDOverlayView: UIView {
 
     /// Rotate the bank rose (tick scale) to the current roll angle (degrees,
     /// positive = right wing down) by rotating each neutral tick point
-    /// around bankPivot — the fixed pointer triangle is untouched.
+    /// around bankPivot.
     func updateBank(rollDeg: Double) {
         lastRollDeg = rollDeg
         guard !bankNeutralTicks.isEmpty else { return }
@@ -592,7 +561,6 @@ private final class HUDOverlayView: UIView {
             rung.labelRight?.textColor = Self.hudGreen.withAlphaComponent(b.alpha)
         }
         bankArcLayer.strokeColor = color
-        bankPointerLayer.fillColor = color
         headingArcLayer.strokeColor = color
         headingPointerLayer.fillColor = color
         for tick in headingTicks { tick.label.textColor = Self.hudGreen.withAlphaComponent(b.alpha) }
@@ -761,26 +729,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// fix. Used for the HUD speed readout when ADS-B ownship isn't available —
     /// mirrors the activeAltitude fallback pattern.
     private var gpsSpeedKt: Double = 0
-    /// Exponentially-smoothed camera forward vector used for the HUD ladder/
-    /// bank rose (the bank rose derives its rotation from the smoothed
-    /// horizon line, so this is the only vector that needs smoothing now) —
-    /// filters ARKit's normal per-frame attitude noise so the overlay
-    /// glides instead of visibly jittering (more noticeable after the
-    /// ladder lines were shortened, since the same absolute pixel wobble is
-    /// now a bigger fraction of a short line). nil means "snap to the raw
-    /// value next frame" — set on init and reset in startARSession() so a
-    /// session restart doesn't visibly ease in from stale data.
-    private var smoothedHUDForward: SIMD3<Float>?
-    // Higher than a naive 60Hz filter would use, since the HUD update below
-    // now only runs every other AR frame (~30Hz) to cut per-frame work —
-    // this keeps the filter's effective responsiveness roughly the same at
-    // half the update rate.
-    private let hudSmoothingFactor: Float = 0.4
-    /// Skip every other AR frame for the HUD's ladder/bank recompute — an
-    /// attitude readout doesn't need 60Hz precision, and halving the work
-    /// (fewer projectPoint calls, layer/label updates, and main-thread
-    /// dispatches per second) noticeably reduces stutter.
-    private var hudFrameCounter = 0
 
     // Dynamic leading constraints on statusLabel
     private var statusLeadingToEdge: NSLayoutConstraint!
@@ -1286,9 +1234,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
         panOffset = .zero
-        // Same reasoning as isFirstHeadingFix above: don't ease the HUD in
-        // from the previous session's smoothed attitude.
-        smoothedHUDForward = nil
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2156,11 +2101,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private func updateStatusLabel() {
         if sceneManager?.settings.showHUD == true {
             hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: activeAltitude)
-            // Heading-rose updates happen in updateHUDLadder()'s 30Hz
+            // Heading-rose updates happen in updateHUDLadder()'s per-frame
             // dispatch block now, not here — it's a visibly rotating
-            // element, so it needs the same smoothed per-frame cadence as
-            // the ladder/bank rose rather than this 0.25s readout timer
-            // (was a visible ~4Hz step-jump before).
+            // element, so it needs the same per-frame cadence as the
+            // ladder/bank rose rather than this 0.25s readout timer (was a
+            // visible ~4Hz step-jump before).
         }
 
         var lines: [String] = []
@@ -2283,11 +2228,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 self?.hudOverlayView.hideLadder()
                 self?.hudOverlayView.updateHorizonArrow(direction: nil)
             }
-            hudFrameCounter = 0
             return
         }
-        hudFrameCounter += 1
-        guard hudFrameCounter % 2 == 0 else { return }
 
         let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
         // ARKit looks along local -Z; that axis in world space is the negative of
@@ -2313,14 +2255,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             }
             return
         }
-        let forwardHoriz = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
-        let forward: SIMD3<Float>
-        if let prev = smoothedHUDForward {
-            forward = simd_normalize(prev + (forwardHoriz - prev) * hudSmoothingFactor)
-        } else {
-            forward = forwardHoriz
-        }
-        smoothedHUDForward = forward
+        // Raw, unfiltered per-frame direction — same approach already used for
+        // aircraft/airport node tracking (tickAircraftPositions/tickAirportPositions
+        // in renderer(_:updateAtTime:) above), which reads as smooth without any
+        // extra smoothing or throttling.
+        let forward = forwardHoriz
         let right = SIMD3<Float>(forward.z, 0, -forward.x)
 
         let distance: Float = 50
@@ -2368,7 +2307,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         // Heading, for the bottom-of-screen compass rose — a 2D screen
         // instrument like the bank rose above, computed from the same
-        // smoothed forward vector as the pitch ladder. Same world-frame
+        // forward vector as the pitch ladder. Same world-frame
         // convention as CalculationsLogic.calculateARPosition's bearing
         // math (world -Z = ARKit's raw-magnetic north); add back the
         // declination correction so the rose reads *true* heading,
