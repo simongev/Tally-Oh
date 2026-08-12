@@ -2259,7 +2259,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // aircraft/airport node tracking (tickAircraftPositions/tickAirportPositions
         // in renderer(_:updateAtTime:) above), which reads as smooth without any
         // extra smoothing or throttling.
-        let forward = forwardHoriz
+        let forward = SIMD3<Float>(forwardRaw.x / horizLen, 0, forwardRaw.z / horizLen)
         let right = SIMD3<Float>(forward.z, 0, -forward.x)
 
         let distance: Float = 50
