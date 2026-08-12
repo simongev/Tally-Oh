@@ -2214,22 +2214,32 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let cam = SCNVector3(t.m41, t.m42, t.m43)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
         sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
-        updateHUDLadder()
+        updateHUDLadder(pov: pov)
     }
 
     /// Compute and push the HUD horizon/pitch-ladder geometry for this frame.
     /// Runs on the SceneKit rendering thread (like the aircraft/airport ticks
     /// above — see the tickNodeSnapshot thread-safety comment on ARSceneManager);
     /// only the final view/layer update is dispatched to main.
-    private func updateHUDLadder() {
-        guard sceneManager?.settings.showHUD == true,
-              let camTransform = arSceneView.session.currentFrame?.camera.transform else {
+    ///
+    /// Takes the same `pov` (and its worldTransform) already used for the
+    /// aircraft/airport ticks in renderer(_:updateAtTime:), rather than a
+    /// separate arSceneView.session.currentFrame?.camera.transform lookup —
+    /// the two can be a slightly different snapshot in time, which showed up
+    /// as position jitter in the projected horizon/ladder (very visible for a
+    /// thin precise line) while barely perturbing angle-only values like
+    /// rollDeg/heading (computed from two points sharing the same common-mode
+    /// offset, or from an axis already discarded by the horizontal flatten
+    /// below) — hence bank/heading already read smooth while the ladder didn't.
+    private func updateHUDLadder(pov: SCNNode) {
+        guard sceneManager?.settings.showHUD == true else {
             DispatchQueue.main.async { [weak self] in
                 self?.hudOverlayView.hideLadder()
                 self?.hudOverlayView.updateHorizonArrow(direction: nil)
             }
             return
         }
+        let camTransform = SCNMatrix4ToMat4(pov.worldTransform)
 
         let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
         // ARKit looks along local -Z; that axis in world space is the negative of
