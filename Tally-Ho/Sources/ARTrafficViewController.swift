@@ -2239,7 +2239,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             }
             return
         }
-        let camTransform = SCNMatrix4ToMat4(pov.worldTransform)
+        let camTransform = simd_float4x4(pov.worldTransform)
 
         let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
         // ARKit looks along local -Z; that axis in world space is the negative of
