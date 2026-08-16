@@ -2362,15 +2362,30 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             while d < -180 { d += 360 }
             return d
         }
-        if let ref = headingStableRefDeg, abs(angleDiff(ref, rawHeadingDeg)) < 3 {
-            // still within the stable window; ref stays fixed so slow drift
-            // within tolerance doesn't keep resetting the stability timer
+        if let ref = headingStableRefDeg {
+            let dev = abs(angleDiff(ref, rawHeadingDeg))
+            if dev > 10 {
+                // A real reorientation (panning to look at something) — restart.
+                headingStableRefDeg = rawHeadingDeg
+                headingStableSince = Date()
+            } else {
+                // Within tolerance — a cockpit has constant engine vibration
+                // plus natural hand tremor holding a phone at arm's length,
+                // easily enough to spike a couple of degrees frame-to-frame
+                // even while genuinely "holding steady". Slowly re-anchor the
+                // reference toward the current reading (so it doesn't lock
+                // onto one noisy sample, and gradual re-aiming isn't
+                // penalized either) without resetting the stability timer —
+                // a hard reset on every small excursion meant the 15s
+                // countdown could restart indefinitely and never complete.
+                headingStableRefDeg = ref + angleDiff(ref, rawHeadingDeg) * 0.02
+            }
         } else {
             headingStableRefDeg = rawHeadingDeg
             headingStableSince = Date()
         }
         let stableForSeconds = Date().timeIntervalSince(headingStableSince ?? Date())
-        let confidentCourseFix = stableForSeconds >= 15
+        let confidentCourseFix = stableForSeconds >= 10
             && lastGPSSpeedKt >= 40
             && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy < 30
         if confidentCourseFix {
