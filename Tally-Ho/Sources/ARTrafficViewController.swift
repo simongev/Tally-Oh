@@ -813,6 +813,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var arKitNorthCorrectionDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
 
+    // Second, independent heading correction layered on top of
+    // arKitNorthCorrectionDeg (which only covers geographic magnetic
+    // declination). Cockpit magnetic interference can bias ARKit's own
+    // world-alignment heading by tens of degrees at session start, and
+    // declination correction can't touch that (it cancels out of the
+    // raw-magnetometer terms by construction). This term instead learns
+    // that bias opportunistically from GPS ground track, only while the
+    // phone is held steady (so camera-forward ≈ direction of travel) and
+    // the aircraft is moving fast enough for a trustworthy course — and
+    // is frozen the rest of the time.
+    private var interferenceBiasCorrectionDeg: Double = 0
+    private var lastGPSCourseDeg: Double = -1
+    private var lastGPSCourseAccuracy: Double = -1
+    private var lastGPSSpeedKt: Double = 0
+    private var headingStableRefDeg: Double?
+    private var headingStableSince: Date?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -1234,6 +1251,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
         panOffset = .zero
+        // A fresh ARKit world alignment needs its own interference-bias
+        // learning restarted — a value learned for the previous alignment
+        // isn't valid for this one.
+        interferenceBiasCorrectionDeg = 0
+        headingStableRefDeg = nil
+        headingStableSince = nil
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2142,7 +2165,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = String(format: "%+.1f°", arKitNorthCorrectionDeg)
+            let corrStr = String(format: "%+.1f°/%+.1f°", arKitNorthCorrectionDeg, interferenceBiasCorrectionDeg)
             lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
@@ -2323,7 +2346,41 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // declination correction so the rose reads *true* heading,
         // consistent with how aircraft bearings are corrected elsewhere.
         let rawHeadingDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-        let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + 360).truncatingRemainder(dividingBy: 360)
+
+        // Learn and cancel out cockpit magnetic interference in ARKit's own
+        // world-alignment heading (arKitNorthCorrectionDeg only covers
+        // geographic declination, which is a different, EMF-immune
+        // correction — see the property doc comment). Opportunistic: only
+        // nudges interferenceBiasCorrectionDeg while there's real evidence
+        // camera-forward ≈ direction of travel (phone held steady for a
+        // while) and GPS course is trustworthy (fast, low course error);
+        // frozen the rest of the time so panning to look at traffic doesn't
+        // corrupt it.
+        func angleDiff(_ a: Double, _ b: Double) -> Double {
+            var d = b - a
+            while d >  180 { d -= 360 }
+            while d < -180 { d += 360 }
+            return d
+        }
+        if let ref = headingStableRefDeg, abs(angleDiff(ref, rawHeadingDeg)) < 3 {
+            // still within the stable window; ref stays fixed so slow drift
+            // within tolerance doesn't keep resetting the stability timer
+        } else {
+            headingStableRefDeg = rawHeadingDeg
+            headingStableSince = Date()
+        }
+        let stableForSeconds = Date().timeIntervalSince(headingStableSince ?? Date())
+        let confidentCourseFix = stableForSeconds >= 15
+            && lastGPSSpeedKt >= 40
+            && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy < 30
+        if confidentCourseFix {
+            let currentEstimate = rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
+            let residual = angleDiff(currentEstimate, lastGPSCourseDeg)
+            interferenceBiasCorrectionDeg = max(-60, min(60, interferenceBiasCorrectionDeg + residual * 0.01))
+        }
+
+        let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg + 360)
+            .truncatingRemainder(dividingBy: 360)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -2418,7 +2475,13 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // course accuracy, unlike the dead-reckoning velocity push below.
         if loc.speed >= 0 {
             gpsSpeedKt = loc.speed * 1.944
+            lastGPSSpeedKt = gpsSpeedKt
         }
+        // Cached for updateHUDLadder() (SceneKit render thread) to read — the
+        // GPS-course heading-bias learning below needs the same course/accuracy
+        // validity signal already used for the dead-reckoning velocity push.
+        lastGPSCourseDeg = loc.course
+        lastGPSCourseAccuracy = loc.courseAccuracy
 
         // Push velocity state immediately (not throttled to the 4 Hz timer) so the
         // 60 Hz dead-reckoning tick has the freshest possible baseline. At 500 kt
