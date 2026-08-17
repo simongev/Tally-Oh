@@ -2102,6 +2102,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         var lines: [String] = []
 
+        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
+            lines.append("🔖 Build \(build)")
+        }
+
         switch connectionLogic.connectionStatus {
         case .receiving:     lines.append("📡 ADS-B: Receiving")
         case .searching:     lines.append("📡 ADS-B: Searching…")
