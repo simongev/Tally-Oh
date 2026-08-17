@@ -794,6 +794,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var baroRelativeAltitude: Double = 0
     private var baroBaselineAltitudeFeet: Double = 0
     private var baroBaselineSet = false
+    /// Whether userAltitude is currently reporting standard-pressure
+    /// altitude (transition-altitude-and-above) rather than the
+    /// GPS-anchored true-MSL fusion (below it). Hysteresis state — see
+    /// setupAltimeter().
+    private var usingPressureAltitude = false
 
     private var updateTimer: Timer?
     private var currentZoomScale: CGFloat = 1.0
@@ -1157,7 +1162,30 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 self.baroRelativeAltitude = relM
             }
             let fusedFeet = self.baroBaselineAltitudeFeet + relM * CalculationsLogic.metersToFeet
-            self.userAltitude = fusedFeet
+
+            // Above the transition altitude, real altimeters are set to
+            // standard pressure (29.92"/1013.25hPa) and read *pressure
+            // altitude*, not true MSL — a genuinely different quantity from
+            // the GPS-anchored fusion above, which approximates true MSL
+            // (correct below the transition, where altimeters are set to
+            // the local altimeter setting). Compute pressure altitude
+            // directly from the phone's own absolute barometric pressure,
+            // independent of GPS entirely — exactly what a 29.92-set
+            // altimeter shows.
+            if let pressureKPa = data.pressure?.doubleValue {
+                let pressureInHg = pressureKPa * 0.2953
+                let pressureAltFeet = 145366.45 * (1 - pow(pressureInHg / 29.9213, 0.190284))
+                // Hysteresis around the 18,000ft transition so switching
+                // formulas near the boundary doesn't visibly flicker.
+                if self.usingPressureAltitude {
+                    self.usingPressureAltitude = fusedFeet > 17_500
+                } else {
+                    self.usingPressureAltitude = pressureAltFeet > 18_500
+                }
+                self.userAltitude = self.usingPressureAltitude ? pressureAltFeet : fusedFeet
+            } else {
+                self.userAltitude = fusedFeet
+            }
         }
     }
 
@@ -2156,7 +2184,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             }
             lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource)  \(gpsAccStr))", loc.latitude, loc.longitude))
 
-            let altSource = baroBaselineSet ? "baro" : "GPS"
+            let altSource = usingPressureAltitude ? "std29.92" : (baroBaselineSet ? "baro" : "GPS")
             let compassAccStr: String
             if lastHeadingAccuracy < 0 {
                 compassAccStr = "?"
