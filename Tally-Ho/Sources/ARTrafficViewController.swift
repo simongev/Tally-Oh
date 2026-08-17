@@ -1172,20 +1172,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // directly from the phone's own absolute barometric pressure,
             // independent of GPS entirely — exactly what a 29.92-set
             // altimeter shows.
-            if let pressureKPa = data.pressure?.doubleValue {
-                let pressureInHg = pressureKPa * 0.2953
-                let pressureAltFeet = 145366.45 * (1 - pow(pressureInHg / 29.9213, 0.190284))
-                // Hysteresis around the 18,000ft transition so switching
-                // formulas near the boundary doesn't visibly flicker.
-                if self.usingPressureAltitude {
-                    self.usingPressureAltitude = fusedFeet > 17_500
-                } else {
-                    self.usingPressureAltitude = pressureAltFeet > 18_500
-                }
-                self.userAltitude = self.usingPressureAltitude ? pressureAltFeet : fusedFeet
+            let pressureKPa = data.pressure.doubleValue
+            let pressureInHg = pressureKPa * 0.2953
+            let pressureAltFeet = 145366.45 * (1 - pow(pressureInHg / 29.9213, 0.190284))
+            // Hysteresis around the 18,000ft transition so switching
+            // formulas near the boundary doesn't visibly flicker.
+            if self.usingPressureAltitude {
+                self.usingPressureAltitude = fusedFeet > 17_500
             } else {
-                self.userAltitude = fusedFeet
+                self.usingPressureAltitude = pressureAltFeet > 18_500
             }
+            self.userAltitude = self.usingPressureAltitude ? pressureAltFeet : fusedFeet
         }
     }
 
