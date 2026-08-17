@@ -782,6 +782,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var userLocation: CLLocationCoordinate2D?
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
     private var lastHorizontalAccuracy: CLLocationAccuracy = -1
+    private var lastVerticalAccuracy: CLLocationAccuracy = -1
     private var userAltitude: Double = 0
     private var gpsMSLAltitudeFeet: Double = 0
     private var userHeading: Double = 0
@@ -2138,7 +2139,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
             let corrStr = String(format: "%+.1f°/%+.1f°", arKitNorthCorrectionDeg, interferenceBiasCorrectionDeg)
-            lines.append(String(format: "✈️ %.0f ft (GPS)   🧭 %.0f° (%@)  Δ%@", displayAlt, userHeading, compassAccStr, corrStr))
+            let altAccStr = lastVerticalAccuracy > 0
+                ? String(format: "±%.0fft", lastVerticalAccuracy * CalculationsLogic.metersToFeet)
+                : "?"
+            lines.append(String(format: "✈️ %.0f ft (GPS %@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altAccStr, userHeading, compassAccStr, corrStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -2455,7 +2459,16 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // pressurization, making it the only sensor still meaningful here.
         let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
         gpsMSLAltitudeFeet = newGPSFeet
-        userAltitude = newGPSFeet
+        lastVerticalAccuracy = loc.verticalAccuracy
+        // Light smoothing — GPS vertical accuracy is inherently noisier than
+        // horizontal (worse satellite geometry on the vertical axis, further
+        // degraded by reduced sky visibility inside an aircraft fuselage),
+        // so a single fix can swing the displayed altitude by a large
+        // amount. This reduces frame-to-frame jitter from transient noise;
+        // it won't fully correct a sustained bias from consistently poor
+        // vertical geometry, which lastVerticalAccuracy (surfaced in the
+        // diagnostic panel) helps distinguish from a software bug.
+        userAltitude = isFirstFix ? newGPSFeet : userAltitude + (newGPSFeet - userAltitude) * 0.15
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
