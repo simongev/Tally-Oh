@@ -1023,6 +1023,10 @@ class ARSceneManager {
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
             guard distNM <= settings.aircraftMaxDistance else { continue }
             guard settings.passes(callsign: ac.callsign) else { continue }
+            // While airborne, traffic more than 10,000ft above/below the user's own
+            // altitude isn't relevant for visual traffic awareness — e.g. no reason to
+            // show 5,000ft traffic while cruising at 40,000ft.
+            if !onGround && abs(predAlt - userAltitude) > 10_000 { continue }
             let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)

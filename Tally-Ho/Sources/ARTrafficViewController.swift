@@ -6,7 +6,6 @@
 import UIKit
 import ARKit
 import CoreLocation
-import CoreMotion
 import Combine
 
 // MARK: - Selection State
@@ -790,16 +789,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var arTrackingState: ARCamera.TrackingState = .notAvailable
     private var isCalibrationPopupShowing = false
 
-    private let altimeter = CMAltimeter()
-    private var baroRelativeAltitude: Double = 0
-    private var baroBaselineAltitudeFeet: Double = 0
-    private var baroBaselineSet = false
-    /// Whether userAltitude is currently reporting standard-pressure
-    /// altitude (transition-altitude-and-above) rather than the
-    /// GPS-anchored true-MSL fusion (below it). Hysteresis state — see
-    /// setupAltimeter().
-    private var usingPressureAltitude = false
-
     private var updateTimer: Timer?
     private var currentZoomScale: CGFloat = 1.0
     private var pinchStartScale: CGFloat = 1.0
@@ -844,7 +833,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         setupUI()
         setupARScene()
         setupLocation()
-        setupAltimeter()
         setupObservers()
         setupGestures()
         loadAirports()
@@ -858,7 +846,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userLocation        = seed.coordinate
             gpsMSLAltitudeFeet  = seed.altitude * CalculationsLogic.metersToFeet
             userAltitude        = gpsMSLAltitudeFeet
-            baroBaselineAltitudeFeet = gpsMSLAltitudeFeet
             lastHorizontalAccuracy   = seed.horizontalAccuracy
             bestHorizontalAccuracy   = seed.horizontalAccuracy
             connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
@@ -878,11 +865,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
-        // (pausing the AR session, invalidating the timer, stopping the altimeter).
-        // Restart everything here so the AR view is fully live again when it reappears.
-
-        // Restart the altimeter (stopped in viewWillDisappear).
-        setupAltimeter()
+        // (pausing the AR session, invalidating the timer). Restart everything here so
+        // the AR view is fully live again when it reappears.
 
         // Restart the 4 Hz update loop if it was invalidated while we were away.
         if !(updateTimer?.isValid ?? false) {
@@ -905,7 +889,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         super.viewWillDisappear(animated)
         arSceneView.session.pause()
         updateTimer?.invalidate()
-        altimeter.stopRelativeAltitudeUpdates()
     }
 
     deinit {
@@ -1149,43 +1132,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
-    private func setupAltimeter() {
-        guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
-        altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
-            guard let self, let data, error == nil else { return }
-            let relM = data.relativeAltitude.doubleValue
-            if !self.baroBaselineSet {
-                self.baroBaselineAltitudeFeet = self.gpsMSLAltitudeFeet
-                self.baroBaselineSet = true
-                self.baroRelativeAltitude = 0
-            } else {
-                self.baroRelativeAltitude = relM
-            }
-            let fusedFeet = self.baroBaselineAltitudeFeet + relM * CalculationsLogic.metersToFeet
-
-            // Above the transition altitude, real altimeters are set to
-            // standard pressure (29.92"/1013.25hPa) and read *pressure
-            // altitude*, not true MSL — a genuinely different quantity from
-            // the GPS-anchored fusion above, which approximates true MSL
-            // (correct below the transition, where altimeters are set to
-            // the local altimeter setting). Compute pressure altitude
-            // directly from the phone's own absolute barometric pressure,
-            // independent of GPS entirely — exactly what a 29.92-set
-            // altimeter shows.
-            let pressureKPa = data.pressure.doubleValue
-            let pressureInHg = pressureKPa * 0.2953
-            let pressureAltFeet = 145366.45 * (1 - pow(pressureInHg / 29.9213, 0.190284))
-            // Hysteresis around the 18,000ft transition so switching
-            // formulas near the boundary doesn't visibly flicker.
-            if self.usingPressureAltitude {
-                self.usingPressureAltitude = fusedFeet > 17_500
-            } else {
-                self.usingPressureAltitude = pressureAltFeet > 18_500
-            }
-            self.userAltitude = self.usingPressureAltitude ? pressureAltFeet : fusedFeet
-        }
-    }
-
     private func setupGestures() {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         arSceneView.addGestureRecognizer(tap)
@@ -1381,7 +1327,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // both the Done button and an interactive swipe-down dismiss.
         arSceneView.session.pause()
         updateTimer?.invalidate()
-        altimeter.stopRelativeAltitudeUpdates()
         nav.presentationController?.delegate = self
         present(nav, animated: true)
     }
@@ -1390,8 +1335,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         resumeARIfPaused()
     }
 
-    /// Resumes the AR session/update timer/altimeter after Settings closes.
-    /// Called from both presentationControllerDidDismiss(_:) (covers an
+    /// Resumes the AR session/update timer after Settings closes. Called
+    /// from both presentationControllerDidDismiss(_:) (covers an
     /// interactive swipe-down dismiss) and the Settings onDismiss closure
     /// below (covers the Done button) since it's not guaranteed which of
     /// those fires for any given dismissal — resuming twice is harmless
@@ -1400,7 +1345,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard !(updateTimer?.isValid ?? false) else { return }
         startARSession()
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
-        setupAltimeter()
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
@@ -2181,7 +2125,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             }
             lines.append(String(format: "📍 %.4f°  %.4f°  (\(gpsSource)  \(gpsAccStr))", loc.latitude, loc.longitude))
 
-            let altSource = usingPressureAltitude ? "std29.92" : (baroBaselineSet ? "baro" : "GPS")
             let compassAccStr: String
             if lastHeadingAccuracy < 0 {
                 compassAccStr = "?"
@@ -2191,7 +2134,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
             let corrStr = String(format: "%+.1f°/%+.1f°", arKitNorthCorrectionDeg, interferenceBiasCorrectionDeg)
-            lines.append(String(format: "✈️ %.0f ft (%@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altSource, userHeading, compassAccStr, corrStr))
+            lines.append(String(format: "✈️ %.0f ft (GPS)   🧭 %.0f° (%@)  Δ%@", displayAlt, userHeading, compassAccStr, corrStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -2500,14 +2443,15 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         let isFirstFix = (userLocation == nil)
         userLocation = loc.coordinate
 
+        // GPS altitude is used directly rather than fused with the phone's
+        // barometer — the barometer measures whatever pressure environment
+        // it's physically in, which inside a pressurized aircraft cabin is
+        // cabin pressure, not the outside static air the aircraft's own
+        // altimeter reads. GPS is satellite-based and unaffected by cabin
+        // pressurization, making it the only sensor still meaningful here.
         let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
         gpsMSLAltitudeFeet = newGPSFeet
-
-        if !baroBaselineSet {
-            userAltitude = newGPSFeet
-        } else {
-            baroBaselineAltitudeFeet = newGPSFeet - baroRelativeAltitude * CalculationsLogic.metersToFeet
-        }
+        userAltitude = newGPSFeet
 
         connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
 
