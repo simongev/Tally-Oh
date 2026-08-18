@@ -814,16 +814,18 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     // world-alignment heading by tens of degrees at session start, and
     // declination correction can't touch that (it cancels out of the
     // raw-magnetometer terms by construction). This term instead learns
-    // that bias opportunistically from GPS ground track, only while the
-    // phone is held steady (so camera-forward ≈ direction of travel) and
-    // the aircraft is moving fast enough for a trustworthy course — and
-    // is frozen the rest of the time.
+    // that bias continuously from GPS ground track, at a very slow rate,
+    // regardless of which way the camera currently points — no "hold the
+    // phone still" gate. The premise: the user's camera-pointing angle
+    // relative to the nose averages toward zero over many samples across
+    // a flight (no persistent directional bias in how they look around),
+    // so a slow enough average converges on the one thing every sample
+    // has in common — the constant interference bias — without ever
+    // needing to freeze or delay the displayed heading.
     private var interferenceBiasCorrectionDeg: Double = 0
     private var lastGPSCourseDeg: Double = -1
     private var lastGPSCourseAccuracy: Double = -1
     private var lastGPSSpeedKt: Double = 0
-    private var headingStableRefDeg: Double?
-    private var headingStableSince: Date?
 
     // MARK: - Lifecycle
 
@@ -1227,8 +1229,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // learning restarted — a value learned for the previous alignment
         // isn't valid for this one.
         interferenceBiasCorrectionDeg = 0
-        headingStableRefDeg = nil
-        headingStableSince = nil
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2326,48 +2326,33 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Learn and cancel out cockpit magnetic interference in ARKit's own
         // world-alignment heading (arKitNorthCorrectionDeg only covers
         // geographic declination, which is a different, EMF-immune
-        // correction — see the property doc comment). Opportunistic: only
-        // nudges interferenceBiasCorrectionDeg while there's real evidence
-        // camera-forward ≈ direction of travel (phone held steady for a
-        // while) and GPS course is trustworthy (fast, low course error);
-        // frozen the rest of the time so panning to look at traffic doesn't
-        // corrupt it.
+        // correction — see the property doc comment). Always-on, no
+        // "hold the phone still" gate: fed continuously whenever GPS
+        // course is trustworthy, at a per-frame gain small enough that no
+        // single sample (regardless of which way the camera happens to be
+        // pointed at that instant) meaningfully moves the estimate — only
+        // the average over many minutes and many camera orientations does,
+        // and the constant interference bias is the one thing every sample
+        // has in common. This keeps rawHeadingDeg's display fully
+        // responsive (matches on-ground behavior) while the correction
+        // drifts smoothly toward the right value in the background.
         func angleDiff(_ a: Double, _ b: Double) -> Double {
             var d = b - a
             while d >  180 { d -= 360 }
             while d < -180 { d += 360 }
             return d
         }
-        if let ref = headingStableRefDeg {
-            let dev = abs(angleDiff(ref, rawHeadingDeg))
-            if dev > 10 {
-                // A real reorientation (panning to look at something) — restart.
-                headingStableRefDeg = rawHeadingDeg
-                headingStableSince = Date()
-            } else {
-                // Within tolerance — a cockpit has constant engine vibration
-                // plus natural hand tremor holding a phone at arm's length,
-                // easily enough to spike a couple of degrees frame-to-frame
-                // even while genuinely "holding steady". Slowly re-anchor the
-                // reference toward the current reading (so it doesn't lock
-                // onto one noisy sample, and gradual re-aiming isn't
-                // penalized either) without resetting the stability timer —
-                // a hard reset on every small excursion meant the 15s
-                // countdown could restart indefinitely and never complete.
-                headingStableRefDeg = ref + angleDiff(ref, rawHeadingDeg) * 0.02
-            }
-        } else {
-            headingStableRefDeg = rawHeadingDeg
-            headingStableSince = Date()
-        }
-        let stableForSeconds = Date().timeIntervalSince(headingStableSince ?? Date())
-        let confidentCourseFix = stableForSeconds >= 10
-            && lastGPSSpeedKt >= 40
+        let confidentCourseFix = lastGPSSpeedKt >= 20
             && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy < 30
         if confidentCourseFix {
+            // GPS course is a shakier estimate of true track at low
+            // groundspeed, more reliable as speed increases — ramp the
+            // correction's influence smoothly rather than a hard cutoff.
+            let speedWeight = max(0, min(1, (lastGPSSpeedKt - 20) / 60))  // 0 at 20kt, 1 by 80kt
             let currentEstimate = rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
             let residual = angleDiff(currentEstimate, lastGPSCourseDeg)
-            interferenceBiasCorrectionDeg = max(-60, min(60, interferenceBiasCorrectionDeg + residual * 0.01))
+            interferenceBiasCorrectionDeg = max(-60, min(60,
+                interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight))
         }
 
         let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg + 360)
