@@ -762,7 +762,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - Core
 
-    private var connectionLogic = ConnectionLogic()
+    /// Set by AppDelegate right after init, before this VC's view (and thus
+    /// connectionLogic's first access) ever loads — lets a ConnectionLogic
+    /// already warmed up during the calibration screen carry its in-progress
+    /// ADS-B listening/internet fetch straight into this VC instead of
+    /// starting fresh from empty. Falls back to a brand-new instance if unset.
+    var preloadedConnectionLogic: ConnectionLogic?
+    private lazy var connectionLogic: ConnectionLogic = preloadedConnectionLogic ?? ConnectionLogic()
     private var sceneManager: ARSceneManager?
     private var locationManager = CLLocationManager()
 
@@ -778,6 +784,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var currentTCASEvaluation: TCASEvaluation = .clear
 
     var seedLocation: CLLocation?
+    /// Airports already parsed from CSV during the calibration screen — if
+    /// set, loadAirports() skips its own disk read and filters directly.
+    var preloadedAirports: [Airport]?
 
     private var userLocation: CLLocationCoordinate2D?
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
@@ -1162,28 +1171,34 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // This keeps allAirports small — previously it always held every airport within
         // 200 NM even when the user had set the display range to 10 NM.
         let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
+        if let parsed = preloadedAirports {
+            // Already parsed during the calibration screen — skip the disk read.
+            filterAndStoreAirports(parsed, rangeNM: rangeNM)
+        } else {
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
+                DispatchQueue.main.async { self?.filterAndStoreAirports(parsed, rangeNM: rangeNM) }
+            }
+        }
+    }
+
+    private func filterAndStoreAirports(_ parsed: [Airport], rangeNM: Double) {
+        let loc = userLocation ?? activeLocation
+        allAirports = parsed
+        guard let loc else {
+            updateStatusLabel()
+            return
+        }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                let loc = self.userLocation ?? self.activeLocation
-                self.allAirports = parsed
-                if let loc = loc {
-                    DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-                        let nearby = CalculationsLogic.filterAirportsInRange(
-                            airports: parsed,
-                            userCoord: loc,
-                            maxRangeNauticalMiles: rangeNM
-                        )
-                        DispatchQueue.main.async {
-                            self?.airports = nearby
-                            self?.lastAirportFilterLocation = loc
-                            self?.updateStatusLabel()
-                        }
-                    }
-                } else {
-                    self.updateStatusLabel()
-                }
+            let nearby = CalculationsLogic.filterAirportsInRange(
+                airports: parsed,
+                userCoord: loc,
+                maxRangeNauticalMiles: rangeNM
+            )
+            DispatchQueue.main.async {
+                self?.airports = nearby
+                self?.lastAirportFilterLocation = loc
+                self?.updateStatusLabel()
             }
         }
     }

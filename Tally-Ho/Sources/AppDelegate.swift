@@ -23,6 +23,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
 
+    // Started immediately at launch (alongside the calibration screen)
+    // rather than waiting for ARTrafficViewController to be created, so
+    // aircraft/airport data is already loading — and ideally ready — by
+    // the time calibration finishes and the AR view appears.
+    private let sharedConnectionLogic = ConnectionLogic()
+    private var preloadedAirports: [Airport]?
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -36,10 +43,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         window?.rootViewController = calibration
         window?.makeKeyAndVisible()
 
+        // ADS-B doesn't need a location fix at all — start listening right away.
+        sharedConnectionLogic.startListening()
+
+        // Airport CSV load doesn't need a location either — kick it off now.
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            let parsed = AirportDataParser.loadAirportsFromCSV()
+            DispatchQueue.main.async { self?.preloadedAirports = parsed }
+        }
+
+        // As soon as calibration has any location fix, start the internet
+        // traffic fetch — no need to wait for calibration's stricter
+        // GPS/compass "ready" thresholds just to begin prefetching.
+        calibration.onEarlyLocation = { [weak self] loc in
+            self?.sharedConnectionLogic.updateLocation(
+                loc.coordinate,
+                altitudeFeet: loc.altitude * CalculationsLogic.metersToFeet
+            )
+        }
+
         calibration.onComplete = { [weak self] seedLocation in
-            guard let window = self?.window else { return }
+            guard let self, let window = self.window else { return }
             let arVC = ARTrafficViewController()
             arVC.seedLocation = seedLocation
+            arVC.preloadedConnectionLogic = self.sharedConnectionLogic
+            arVC.preloadedAirports = self.preloadedAirports
             // Crossfade from calibration to AR
             UIView.transition(
                 with: window,

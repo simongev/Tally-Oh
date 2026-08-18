@@ -47,10 +47,19 @@ class CalibrationViewController: UIViewController {
     private var bestCompassAccuracy: CLLocationDirectionAccuracy = -1
 
     private var lastValidLocation: CLLocation?
+    private var earlyLocationSent = false
 
     // MARK: - Callback
 
     var onComplete: ((CLLocation?) -> Void)?
+    /// Fired once, on the very first location fix of any accuracy — lets the
+    /// caller start prefetching aircraft/airport data during calibration
+    /// instead of waiting for the full onComplete handoff. Deliberately not
+    /// gated on gpsAccuracyThreshold like lastValidLocation is: an
+    /// approximate starting position is good enough to prefetch a traffic/
+    /// airport radius around, and starting early matters more here than
+    /// precision.
+    var onEarlyLocation: ((CLLocation) -> Void)?
 
     // MARK: - Lifecycle
 
@@ -184,6 +193,10 @@ extension CalibrationViewController: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last, loc.horizontalAccuracy > 0 else { return }
+        if !earlyLocationSent {
+            earlyLocationSent = true
+            onEarlyLocation?(loc)
+        }
         if bestGPSAccuracy < 0 || loc.horizontalAccuracy < bestGPSAccuracy {
             bestGPSAccuracy = loc.horizontalAccuracy
         }
