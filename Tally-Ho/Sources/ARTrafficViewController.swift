@@ -778,6 +778,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var currentTCASEvaluation: TCASEvaluation = .clear
 
     var seedLocation: CLLocation?
+    /// Airport CSV data parsed ahead of time during the calibration screen (see
+    /// AppDelegate). Pure background-thread data — no ConnectionLogic/network
+    /// involvement — kept deliberately isolated from ARSession/view-lifecycle
+    /// timing after an earlier attempt at preloading ConnectionLogic itself
+    /// froze the AR camera. nil-safe: loadAirports() falls back to its normal
+    /// disk read if this hasn't finished (or wasn't started) in time.
+    var preloadedAirports: [Airport]?
 
     private var userLocation: CLLocationCoordinate2D?
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
@@ -1162,29 +1169,40 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // This keeps allAirports small — previously it always held every airport within
         // 200 NM even when the user had set the display range to 10 NM.
         let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
+
+        if let preloaded = preloadedAirports {
+            allAirports = preloaded
+            filterNearbyAirports(from: preloaded, rangeNM: rangeNM)
+            return
+        }
+
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let loc = self.userLocation ?? self.activeLocation
                 self.allAirports = parsed
-                if let loc = loc {
-                    DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-                        let nearby = CalculationsLogic.filterAirportsInRange(
-                            airports: parsed,
-                            userCoord: loc,
-                            maxRangeNauticalMiles: rangeNM
-                        )
-                        DispatchQueue.main.async {
-                            self?.airports = nearby
-                            self?.lastAirportFilterLocation = loc
-                            self?.updateStatusLabel()
-                        }
-                    }
-                } else {
-                    self.updateStatusLabel()
+                self.filterNearbyAirports(from: parsed, rangeNM: rangeNM)
+            }
+        }
+    }
+
+    private func filterNearbyAirports(from parsed: [Airport], rangeNM: Double) {
+        let loc = self.userLocation ?? self.activeLocation
+        if let loc = loc {
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                let nearby = CalculationsLogic.filterAirportsInRange(
+                    airports: parsed,
+                    userCoord: loc,
+                    maxRangeNauticalMiles: rangeNM
+                )
+                DispatchQueue.main.async {
+                    self?.airports = nearby
+                    self?.lastAirportFilterLocation = loc
+                    self?.updateStatusLabel()
                 }
             }
+        } else {
+            self.updateStatusLabel()
         }
     }
 

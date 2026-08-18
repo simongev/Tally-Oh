@@ -23,6 +23,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
 
+    /// Airport CSV parsed in the background while the calibration screen is up,
+    /// so it's ready by the time the AR view needs it. Deliberately just a data
+    /// array with no ConnectionLogic/network/ARSession involvement — an earlier
+    /// attempt at preloading ConnectionLogic itself froze the AR camera after
+    /// calibration, so this round keeps the preload to this one isolated piece.
+    private var preloadedAirports: [Airport]?
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -36,10 +43,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         window?.rootViewController = calibration
         window?.makeKeyAndVisible()
 
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let parsed = AirportDataParser.loadAirportsFromCSV()
+            DispatchQueue.main.async {
+                self?.preloadedAirports = parsed
+            }
+        }
+
         calibration.onComplete = { [weak self] seedLocation in
             guard let window = self?.window else { return }
             let arVC = ARTrafficViewController()
             arVC.seedLocation = seedLocation
+            arVC.preloadedAirports = self?.preloadedAirports
             // Crossfade from calibration to AR
             UIView.transition(
                 with: window,
