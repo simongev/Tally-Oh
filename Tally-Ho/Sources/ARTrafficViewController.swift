@@ -785,6 +785,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// froze the AR camera. nil-safe: loadAirports() falls back to its normal
     /// disk read if this hasn't finished (or wasn't started) in time.
     var preloadedAirports: [Airport]?
+    /// Aircraft from one standalone adsb.lol fetch made during calibration (see
+    /// AppDelegate.onEarlyLocation). Seeded into connectionLogic once in
+    /// viewDidLoad via seedInternetAircraft() — connectionLogic itself is still
+    /// constructed fresh, right here, exactly as without this preload.
+    var preloadedAircraft: [Aircraft]?
 
     private var userLocation: CLLocationCoordinate2D?
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
@@ -862,6 +867,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
 
         connectionLogic.startListening()
+
+        if let preloadedAircraft, !preloadedAircraft.isEmpty {
+            connectionLogic.seedInternetAircraft(preloadedAircraft)
+        }
 
         sceneManager?.onSelectionInvalidated = { [weak self] in
             self?.clearSelection()

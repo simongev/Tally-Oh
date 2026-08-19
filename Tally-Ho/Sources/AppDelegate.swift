@@ -30,6 +30,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     /// calibration, so this round keeps the preload to this one isolated piece.
     private var preloadedAirports: [Airport]?
 
+    /// Aircraft from one standalone adsb.lol fetch, kicked off as soon as
+    /// calibration reports its first (rough) location — well before the AR
+    /// view exists. This is a single plain-data network call via ADSBLolClient
+    /// directly; no ConnectionLogic instance is created or shared here, so
+    /// none of its timers/sockets/Combine publishers cross the AppDelegate/
+    /// ARTrafficViewController boundary — deliberately avoiding the structural
+    /// change (a shared, lazily-constructed ConnectionLogic) suspected in the
+    /// earlier camera-freeze regression.
+    private var preloadedAircraft: [Aircraft]?
+    private let earlyADSBClient = ADSBLolClient()
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -50,11 +61,32 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             }
         }
 
+        calibration.onEarlyLocation = { [weak self] loc in
+            guard let self else { return }
+            // Match the radius ConnectionLogic itself would use once the AR view
+            // is up (see ConnectionLogic.updateInternetQueryRadius / its 25 NM
+            // default), so the preloaded set lines up with what a real fetch
+            // would return for the user's configured range.
+            let maxDistance = ARVisualizationSettings.load()?.aircraftMaxDistance ?? 20.0
+            let radiusNM = max(10, maxDistance * 1.25)
+            self.earlyADSBClient.fetchAircraft(
+                latitude: loc.coordinate.latitude,
+                longitude: loc.coordinate.longitude,
+                radiusNM: radiusNM
+            ) { [weak self] result in
+                guard case .success(let aircraft) = result else { return }
+                DispatchQueue.main.async {
+                    self?.preloadedAircraft = aircraft
+                }
+            }
+        }
+
         calibration.onComplete = { [weak self] seedLocation in
             guard let window = self?.window else { return }
             let arVC = ARTrafficViewController()
             arVC.seedLocation = seedLocation
             arVC.preloadedAirports = self?.preloadedAirports
+            arVC.preloadedAircraft = self?.preloadedAircraft
             // Crossfade from calibration to AR
             UIView.transition(
                 with: window,

@@ -52,6 +52,13 @@ class CalibrationViewController: UIViewController {
 
     var onComplete: ((CLLocation?) -> Void)?
 
+    /// Fired once, the first time any location update arrives — well before
+    /// gpsAccuracyThreshold is met and the screen actually dismisses. Lets the
+    /// app kick off a network fetch that can overlap with the rest of
+    /// calibration instead of waiting until this screen is fully done.
+    var onEarlyLocation: ((CLLocation) -> Void)?
+    private var earlyLocationSent = false
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -189,6 +196,10 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         }
         if loc.horizontalAccuracy <= gpsAccuracyThreshold {
             lastValidLocation = loc
+        }
+        if !earlyLocationSent {
+            earlyLocationSent = true
+            onEarlyLocation?(loc)
         }
         updateReadiness()
     }

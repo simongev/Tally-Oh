@@ -411,6 +411,14 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
+    /// Seed detectedAircraft with a list fetched ahead of time (e.g. during the
+    /// calibration screen), so aircraft are visible on the very first frame
+    /// instead of waiting for the first regular fetch's network round-trip.
+    /// Runs through the exact same filter/cap/dedup logic as a normal fetch.
+    func seedInternetAircraft(_ list: [Aircraft]) {
+        mergeInternetAircraft(list)
+    }
+
     private func mergeInternetAircraft(_ list: [Aircraft]) {
         let fetchTime = Date()
 
