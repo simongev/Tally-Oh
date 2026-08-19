@@ -2170,6 +2170,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 ? String(format: "±%.0fft", lastVerticalAccuracy * CalculationsLogic.metersToFeet)
                 : "?"
             lines.append(String(format: "✈️ %.0f ft (GPS %@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altAccStr, userHeading, compassAccStr, corrStr))
+
+            // GPS course/speed feeding the interference-bias learner above —
+            // surfaced so a "compass still off" report can be diagnosed
+            // directly instead of guessing whether confidentCourseFix is
+            // ever actually true for this device/flight.
+            let courseStr = lastGPSCourseAccuracy >= 0
+                ? String(format: "%.0f°±%.0f°", lastGPSCourseDeg, lastGPSCourseAccuracy)
+                : "invalid"
+            lines.append(String(format: "🛩️ %.0fkt  course %@", lastGPSSpeedKt, courseStr))
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -2369,17 +2378,23 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             while d < -180 { d += 360 }
             return d
         }
-        let confidentCourseFix = lastGPSSpeedKt >= 20
-            && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy < 30
+        let confidentCourseFix = lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0
         if confidentCourseFix {
             // GPS course is a shakier estimate of true track at low
             // groundspeed, more reliable as speed increases — ramp the
             // correction's influence smoothly rather than a hard cutoff.
             let speedWeight = max(0, min(1, (lastGPSSpeedKt - 20) / 60))  // 0 at 20kt, 1 by 80kt
+            // Same reasoning for course accuracy: a passenger's phone deep in
+            // a pressurized fuselage (away from a window's sky view) may
+            // rarely or never get a course reading tight enough for a hard
+            // cutoff at 30° to ever pass, silently disabling this correction
+            // entirely. Ramp it out gradually instead — a degraded-but-not-
+            // terrible reading still contributes a little, just discounted.
+            let accuracyWeight = max(0, min(1, 1 - lastGPSCourseAccuracy / 90))  // 1 at 0°, 0 by 90°
             let currentEstimate = rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
             let residual = angleDiff(currentEstimate, lastGPSCourseDeg)
             interferenceBiasCorrectionDeg = max(-60, min(60,
-                interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight))
+                interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight * accuracyWeight))
         }
 
         let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg + 360)
