@@ -326,6 +326,27 @@ Build 2 moved ahead of the altitude work: session continuity and instant readine
 five-second glance usable at all, and they are low-risk changes that also make every later phase
 easier to evaluate in the field.
 
+### Convergence with the HUD line of work (merged into `main` as builds 2–36)
+
+Independent work on `main` reached several of the same conclusions, and two of its findings
+sharpen this plan rather than duplicating it:
+
+- **Barometric altitude fusion was removed (build 28)** for exactly the reason in F3: a cabin
+  barometer measures cabin pressure, so GPS is the only meaningful ownship altitude in a
+  pressurized aircraft. That decision stands; the barometer is now read for diagnostics only.
+  It means the *ownship* half of F3 is already solved — the remaining error is entirely on the
+  **target** side, where `alt_baro` is still compared against a geometric ownship altitude.
+- **A cockpit-interference heading correction already exists** (`interferenceBiasCorrectionDeg`,
+  builds 23–31), learned continuously from GPS ground track and applied **to the HUD heading
+  display only** — never to target placement. It is a fourth candidate estimator alongside
+  those in P3.6, and unlike the two reverted attempts it has survived field use.
+- **But it is reset to zero on every `startARSession()`** — which is every lift. Its learning
+  gain is deliberately tiny (converging "over many minutes and many camera orientations"), so
+  in the seconds-long glances this app is designed for it can never converge before being
+  discarded. This is F6 confirmed from the other direction: the per-lift world reset does not
+  just discard ARKit's tracking, it discards every correction learned on top of it. Session
+  continuity (P3.4) is what makes this estimator viable, which raises its priority.
+
 ### Build 1 — what shipped (app build 2)
 
 | Item | Where |
