@@ -9,7 +9,9 @@ phone, sees where the traffic is, and puts it down. Sessions are seconds long, a
 manual alignment anywhere** — if the user has to trim the AR, the app has failed. Every correction
 below must be learned and applied without user input.
 
-This document is the investigation result and the implementation plan. No code has been changed yet.
+This document is the investigation result and the implementation plan. Build 1 (P0 + P1) is
+implemented — see "Build 1 — what shipped" at the end of section 4; the remaining phases are
+still proposals.
 
 ---
 
@@ -314,7 +316,7 @@ Accuracy the user never sees doesn't count. On foreground:
 ### Suggested build order
 | Build | Content | Risk |
 |---|---|---|
-| 1 | P0 + P1 (bugs are strict improvements) | low |
+| 1 | P0 + P1 (bugs are strict improvements) — **implemented, build 2** | low |
 | 2 | P4 instant readiness + P3.2–P3.4 heading display, anchor hygiene, session continuity | low — biggest felt improvement per unit risk |
 | 3 | P2 frame-aware vertical | medium — new decision logic, but fully logged |
 | 4 | P3.5 sun-anchor auto-alignment | medium — self-validating and fully logged |
@@ -323,6 +325,28 @@ Accuracy the user never sees doesn't count. On foreground:
 Build 2 moved ahead of the altitude work: session continuity and instant readiness are what make a
 five-second glance usable at all, and they are low-risk changes that also make every later phase
 easier to evaluate in the field.
+
+### Build 1 — what shipped (app build 2)
+
+| Item | Where |
+|---|---|
+| GDL90 byte-unstuffing + CRC-16-CCITT verification, corrupt frames counted | `GDL90.swift` |
+| GDL90 0x0B ownship geometric altitude parsed (was discarded) | `GDL90.swift`, `ConnectionLogic.swift` |
+| "Value unavailable" sentinels preserved: altitude 0xFFF, speed 0xFFF, vertical rate 0x800, track-type 0 | `GDL90.swift` |
+| Airborne bit read from the Misc nibble | `GDL90.swift` |
+| Unified ownship estimator: per-source timestamps and velocity, single source selection, both vertical datums | `OwnshipEstimator.swift` |
+| Staleness-aware GPS gating + separate vertical-accuracy gate with bootstrap | `ARTrafficViewController.swift` |
+| Geoid separation derived from the phone's MSL-vs-ellipsoidal pair | `ARTrafficViewController.swift` |
+| adsb.lol `"ground"` sentinel → on-ground flag instead of 0 ft | `ADSBLolClient.swift` |
+| Targets with no reported altitude drawn at own level, not 0 ft MSL | `CalculationsLogic.swift` |
+| Targets with no valid track no longer coasted due north | `CalculationsLogic.swift` |
+| Flight recorder (1 Hz CSV ring buffer, per-lift markers, share-sheet export) | `FlightRecorder.swift`, Settings → Diagnostics |
+| Info panel: vertical datums + pressurization verdict, three heading candidates, coasting state, receiver link health | `ARTrafficViewController.swift` |
+| Unit tests: framing/CRC/stuffing, sentinels, source selection, dead reckoning, atmosphere | `Tally-HoTests/` |
+
+Not yet acted on, by design: the pressurization verdict and the second vertical datum are
+displayed and logged but do not yet change where targets are drawn — that is P2, and it ships
+with its own field validation.
 
 ---
 

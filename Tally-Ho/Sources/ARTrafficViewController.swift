@@ -6,6 +6,7 @@
 import UIKit
 import ARKit
 import CoreLocation
+import CoreMotion
 import Combine
 
 // MARK: - Selection State
@@ -711,6 +712,25 @@ private extension Double {
     }
 }
 
+// MARK: - GPS acceptance thresholds
+
+/// Thresholds governing which CoreLocation fixes are allowed to move ownship.
+///
+/// The previous rule discarded any fix worse than the accuracy limit outright, which meant a
+/// run of poor fixes left the app dead-reckoning indefinitely from an increasingly old
+/// position. At cruise speed that grows error much faster than a degraded fix contributes, so
+/// past a staleness limit a worse fix is preferred to an older one.
+private enum GPSGate {
+    /// Once the last accepted fix is older than this, accept degraded fixes up to the ceiling.
+    static let staleFixSeconds: TimeInterval = 10.0
+    /// Absolute worst horizontal accuracy ever accepted, in metres.
+    static let hardCeilingMeters: Double = 1_000.0
+    /// Vertical accuracy limits, in metres. Altitude error tilts every target at once, so it
+    /// is gated separately from horizontal accuracy.
+    static let verticalCeilingGroundMeters: Double = 50.0
+    static let verticalCeilingAirborneMeters: Double = 150.0
+}
+
 // MARK: - ARTrafficViewController
 
 class ARTrafficViewController: UIViewController, UIAdaptivePresentationControllerDelegate {
@@ -839,6 +859,44 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var lastGPSCourseAccuracy: Double = -1
     private var lastGPSSpeedKt: Double = 0
 
+    /// Single source of truth for ownship position, velocity and altitude. Fed by the ADS-B
+    /// receiver (off its own queue, with its own timestamps) and by CoreLocation.
+    private let ownshipEstimator = OwnshipEstimator()
+
+    /// Newest compass samples, kept for the flight log rather than for placement.
+    private var lastMagneticHeading: Double = -1
+    private var lastTrueHeading: Double = -1
+
+    /// Raw vertical references from the phone, recorded each fix.
+    private var gpsEllipsoidalAltitudeFeet: Double = 0
+    private var geoidSeparationFeet: Double?
+    /// Cabin pressure altitude from the phone's barometer. Diagnostic only — it never feeds
+    /// `userAltitude`, which stays GPS-derived (see setupDiagnosticAltimeter).
+    private var cabinPressureAltitudeFeet: Double?
+
+    /// Timestamp of the last position fix that passed the accuracy gate.
+    private var lastAcceptedFixTime: Date = .distantPast
+    /// Whether any GPS altitude has been accepted yet. Until one has, a fix is taken even if
+    /// its vertical accuracy is poor — an approximate altitude beats none.
+    private var hasAcceptedGPSAltitude = false
+
+    /// Per-lift markers: the app is used in seconds-long glances, so time-to-first-target is
+    /// measured from each foreground rather than once per launch.
+    private var liftStartTime: Date?
+    private var hasLoggedFirstTargetThisLift = false
+
+    /// Throttle for the 1 Hz flight-recorder sample, driven off the existing 4 Hz tick.
+    private var lastRecorderSampleTime: Date = .distantPast
+
+    /// Most recent measured pressure-to-geometric offset, for display. Not applied to
+    /// placement — that is the next phase.
+    private var latestDatumOffset: AltitudeDatumOffset.Estimate?
+
+    /// Reads absolute pressure only, so the cabin-versus-GPS altitude gap is measurable.
+    /// Deliberately not part of the altitude chain: build 28 removed barometric fusion
+    /// because a cabin barometer measures cabin pressure, and that decision stands.
+    private let diagnosticAltimeter = CMAltimeter()
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -857,12 +915,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             connectionLogic.updateInternetQueryRadius(saved.aircraftMaxDistance)
         }
 
+        // Both collaborators read and write the one ownship estimate.
+        connectionLogic.ownshipEstimator = ownshipEstimator
+        sceneManager?.ownshipEstimator   = ownshipEstimator
+        setupDiagnosticAltimeter()
+
         if let seed = seedLocation {
             userLocation        = seed.coordinate
             gpsMSLAltitudeFeet  = seed.altitude * CalculationsLogic.metersToFeet
             userAltitude        = gpsMSLAltitudeFeet
             lastHorizontalAccuracy   = seed.horizontalAccuracy
             bestHorizontalAccuracy   = seed.horizontalAccuracy
+            lastAcceptedFixTime      = seed.timestamp
+            ownshipEstimator.ingestPhoneLocation(
+                coordinate: seed.coordinate,
+                horizontalAccuracyM: seed.horizontalAccuracy,
+                groundSpeedKt: nil,
+                trackDeg: nil,
+                timestamp: seed.timestamp
+            )
+            ownshipEstimator.ingestPhoneAltitude(fusedMSLFt: userAltitude)
             connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
         }
 
@@ -877,11 +949,48 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
+    /// Subscribe to the barometer purely to record cabin pressure altitude.
+    ///
+    /// Barometric fusion was removed from the altitude chain deliberately: inside a
+    /// pressurized cabin the sensor measures cabin pressure, not outside static, so GPS is the
+    /// only meaningful altitude source. That stands — nothing here touches `userAltitude`.
+    /// What the reading is still good for is the comparison itself: the gap between cabin
+    /// pressure altitude and GPS geometric altitude is what identifies a pressurized cabin,
+    /// and it is one of the inputs the frame-aware vertical work is being built on.
+    private func setupDiagnosticAltimeter() {
+        guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
+        diagnosticAltimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
+            guard let self, let data, error == nil else { return }
+            let hectopascals = data.pressure.doubleValue * 10.0   // CoreMotion reports kPa
+            self.cabinPressureAltitudeFeet =
+                CalculationsLogic.pressureAltitudeFeet(hectopascals: hectopascals)
+            self.ownshipEstimator.ingestPhoneVerticalReferences(
+                pressureAltitudeFt: self.cabinPressureAltitudeFeet,
+                geoidSeparationFt: self.geoidSeparationFeet
+            )
+        }
+    }
+
+    /// Start a new measurement segment for this glance. Time-to-first-target and the ARKit
+    /// tracking states that follow are attributed to this lift.
+    private func beginLiftSession(reason: String) {
+        liftStartTime = Date()
+        hasLoggedFirstTargetThisLift = false
+        FlightRecorder.shared.beginLift(reason: reason)
+        FlightRecorder.shared.record(
+            event: "ar_session_start",
+            detail: String(format: "heading_acc=%.0f north_corr=%.1f bias=%.1f",
+                           lastHeadingAccuracy, arKitNorthCorrectionDeg,
+                           interferenceBiasCorrectionDeg)
+        )
+    }
+
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
         startARSession()
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+        beginLiftSession(reason: "viewWillAppear")
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
         // (pausing the AR session, invalidating the timer). Restart everything here so
@@ -908,6 +1017,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         super.viewWillDisappear(animated)
         arSceneView.session.pause()
         updateTimer?.invalidate()
+        FlightRecorder.shared.endLift(reason: "viewWillDisappear")
     }
 
     deinit {
@@ -1141,6 +1251,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         ) { [weak self] _ in
             self?.arSceneView.session.pause()
             self?.updateTimer?.fireDate = .distantFuture   // suspend the 4 Hz tick too
+            FlightRecorder.shared.endLift(reason: "background")
         }
         NotificationCenter.default.addObserver(
             forName: .appWillForeground, object: nil, queue: .main
@@ -1148,6 +1259,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             guard let self, self.isViewLoaded, self.view.window != nil else { return }
             self.startARSession()
             self.updateTimer?.fireDate = Date()            // resume immediately
+            self.beginLiftSession(reason: "foreground")
         }
     }
 
@@ -1713,52 +1825,31 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - Update Loop
 
+    /// Current ownship estimate. Every consumer of position/altitude reads this, so the
+    /// renderer, the HUD, TCAS, the map and the traffic query can never disagree about where
+    /// we are — and each source's own timestamp and velocity drive its own extrapolation.
+    private var ownship: OwnshipSnapshot { ownshipEstimator.snapshot() }
+
     private var activeLocation: CLLocationCoordinate2D? {
-        if connectionLogic.connectionStatus == .receiving,
-           let ownship = connectionLogic.ownshipData,
-           ownship.latitude != 0 || ownship.longitude != 0 {
-            return ownship.coordinate
-        }
-        return userLocation
+        let snapshot = ownship
+        return snapshot.hasPosition ? snapshot.coordinate : nil
     }
 
-    private var activeAltitude: Double {
-        if connectionLogic.connectionStatus == .receiving,
-           let ownship = connectionLogic.ownshipData,
-           ownship.altitude > -1000 {
-            return ownship.altitude
-        }
-        return userAltitude
-    }
+    private var activeAltitude: Double { ownship.displayAltitudeFt }
 
-    /// Ground speed in knots for the HUD readout — prefers ADS-B ownship (more
-    /// precise) over phone GPS, mirroring activeAltitude's fallback pattern.
+    /// Ground speed in knots for the HUD readout, from whichever source is authoritative.
     private var activeGroundSpeedKt: Double {
-        if connectionLogic.connectionStatus == .receiving,
-           let ownship = connectionLogic.ownshipData,
-           ownship.groundSpeed > 0 {
-            return ownship.groundSpeed
-        }
-        return gpsSpeedKt
+        let snapshot = ownship
+        return snapshot.hasVelocity ? snapshot.groundSpeedKt : gpsSpeedKt
     }
 
-    private var usingADSBGPS: Bool {
-        guard connectionLogic.connectionStatus == .receiving,
-              let ownship = connectionLogic.ownshipData else { return false }
-        return ownship.latitude != 0 || ownship.longitude != 0
-    }
+    private var usingADSBGPS: Bool { ownship.source == .adsb }
 
     /// TCAS is only meaningful when airborne. Suppress it below 200 ft to avoid
     /// false alerts from ground traffic and to reduce memory pressure on the ground.
     /// Uses ADS-B ownship altitude when connected, iPhone GPS altitude otherwise.
     private var tcasEnabled: Bool {
         activeAltitude > 200
-    }
-
-    /// True when ADS-B is connected AND ownship altitude is at or below 200 ft.
-    /// Used to tighten the node cap so ground traffic doesn't fill VRAM while taxiing.
-    private var userIsOnGroundWithADSB: Bool {
-        usingADSBGPS && activeAltitude <= 200
     }
 
     /// True when the user is airborne on a WiFi-only connection (no ADS-B device).
@@ -1769,7 +1860,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     }
 
     private func updateVisualization() {
-        guard let loc = activeLocation else { return }
+        // One snapshot drives the whole tick. Reading the estimator repeatedly would give
+        // each consumer a slightly different dead-reckoned position within the same frame.
+        let state = ownshipEstimator.snapshot()
+        guard state.hasPosition else { return }
+        let loc = state.coordinate
+        let altitude = state.displayAltitudeFt
+        let airborne = altitude > 200
+        let onGroundWithADSB = (state.source == .adsb) && altitude <= 200
 
         // Pre-filter by distance and basic visibility before touching SceneKit.
         // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
@@ -1777,10 +1875,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
         let maxDist = currentSettings.aircraftMaxDistance
         let showGround = currentSettings.showGroundAircraft
-        let wifiMode = wifiInAir
+        let wifiMode = airborne && state.source != .adsb
         let wifiOwnshipCallsign = currentSettings.wifiOwnshipCallsign
         let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
-            guard showGround || ac.altitude > 50 else { return false }
+            guard showGround || !ac.isGroundTraffic else { return false }
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate)
             guard distNM <= maxDist else { return false }
             if wifiMode {
@@ -1806,15 +1904,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // Evaluate TCAS only when airborne (> 200 ft). On the ground the proximity
         // of parked/taxiing aircraft would cause constant false TA/RA alerts.
         let tcas: TCASEvaluation
-        if tcasEnabled {
-            let ownship = connectionLogic.ownshipData
+        if airborne {
+            // Use the estimator's own velocity so the alerting geometry matches the geometry
+            // the markers are drawn with, whichever source is currently authoritative.
             tcas = TCASSystem.evaluate(
                 aircraft: aircraftList,
                 userLocation: loc,
-                userAltitude: activeAltitude,
-                userTrack: ownship?.track ?? userHeading,
-                userGroundSpeed: ownship?.groundSpeed ?? 0,
-                userVerticalRate: ownship?.verticalRate ?? 0
+                userAltitude: altitude,
+                userTrack: state.hasVelocity ? state.trackDeg : userHeading,
+                userGroundSpeed: state.hasVelocity ? state.groundSpeedKt : 0,
+                userVerticalRate: state.verticalRateFpm
             )
         } else {
             // Ground mode — clear any active TCAS alert and pass empty evaluation
@@ -1826,20 +1925,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sceneManager?.updateAircraft(
             aircraftList,
             userLocation: loc,
-            userAltitude: activeAltitude,
+            userAltitude: altitude,
             userHeading: userHeading,
             cameraWorldPosition: cameraPos,
             tcasEvaluation: tcas,
-            onGround: userIsOnGroundWithADSB
+            onGround: onGroundWithADSB
         )
         sceneManager?.updateAirports(
             airports,
             userLocation: loc,
-            userAltitude: activeAltitude,
+            userAltitude: altitude,
             userHeading: userHeading,
             cameraWorldPosition: cameraPos
         )
-        connectionLogic.updateLocation(loc, altitudeFeet: activeAltitude)
+        connectionLogic.updateLocation(loc, altitudeFeet: altitude)
+
+        noteFirstTargetIfNeeded(renderedCount: sceneManager?.renderedAircraftCount ?? 0)
+        recordFlightSampleIfDue(state: state, aircraft: aircraftList)
 
         // Update off-screen arrows at 4 Hz alongside the rest of the visualization.
         // Previously these ran at 60 Hz inside renderer(_:updateAtTime:); at 4 Hz
@@ -1851,6 +1953,96 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         updateTCASArrows()
         updateMetarAgeLabel()
         updateStatusLabel()
+    }
+
+    // MARK: - Flight Recorder
+
+    /// Log how long this glance took to put a target on screen. The app is used in
+    /// seconds-long lifts, so this is measured per lift rather than once per launch.
+    private func noteFirstTargetIfNeeded(renderedCount: Int) {
+        guard !hasLoggedFirstTargetThisLift, renderedCount > 0 else { return }
+        hasLoggedFirstTargetThisLift = true
+        let elapsed = liftStartTime.map { Date().timeIntervalSince($0) } ?? -1
+        let staleCount = connectionLogic.detectedAircraft.values
+            .filter { CalculationsLogic.isStale($0) }.count
+        FlightRecorder.shared.record(
+            event: "first_target",
+            detail: String(format: "t=%.2fs rendered=%d stale=%d", elapsed, renderedCount, staleCount)
+        )
+    }
+
+    /// Emit one flight-recorder row per second, driven off the existing 4 Hz tick so no
+    /// additional timer is needed.
+    private func recordFlightSampleIfDue(state: OwnshipSnapshot, aircraft: [Aircraft]) {
+        let now = Date()
+        guard now.timeIntervalSince(lastRecorderSampleTime) >= 1.0 else { return }
+        lastRecorderSampleTime = now
+        FlightRecorder.shared.record(currentFlightSample(state: state, aircraft: aircraft))
+    }
+
+    private func currentFlightSample(state: OwnshipSnapshot, aircraft: [Aircraft]) -> FlightRecorder.Sample {
+        var sample = FlightRecorder.Sample()
+        sample.ownship = state
+
+        sample.gpsMSLFt              = gpsMSLAltitudeFeet
+        sample.gpsHAEFt              = gpsEllipsoidalAltitudeFeet
+        sample.verticalAccuracyM     = lastVerticalAccuracy >= 0 ? lastVerticalAccuracy : nil
+        sample.gpsCourseDeg          = lastGPSCourseDeg >= 0 ? lastGPSCourseDeg : nil
+        sample.gpsCourseAccuracyDeg  = lastGPSCourseAccuracy >= 0 ? lastGPSCourseAccuracy : nil
+        sample.cabinPressureAltitudeFt = cabinPressureAltitudeFeet
+
+        sample.adsbPressureAltitudeFt = connectionLogic.ownshipData.map { $0.altitude }
+        sample.adsbHAEFt              = connectionLogic.ownshipGeometricAltitudeFt
+
+        sample.headingMagneticDeg = lastMagneticHeading >= 0 ? lastMagneticHeading : nil
+        sample.headingTrueDeg     = lastTrueHeading     >= 0 ? lastTrueHeading     : nil
+        sample.headingAccuracyDeg = lastHeadingAccuracy >= 0 ? lastHeadingAccuracy : nil
+        sample.declinationDeg     = arKitNorthCorrectionDeg
+        // The HUD's learned cockpit-interference term, recorded alongside declination so the
+        // two corrections can be told apart when reviewing a flight.
+        sample.interferenceBiasDeg = interferenceBiasCorrectionDeg
+
+        if let frame = arSceneView.session.currentFrame {
+            let angles = frame.camera.eulerAngles
+            sample.cameraPitchDeg = Double(angles.x) * 180.0 / .pi
+            sample.cameraYawDeg   = Double(angles.y) * 180.0 / .pi
+            sample.cameraRollDeg  = Double(angles.z) * 180.0 / .pi
+        }
+        sample.arTrackingState = arTrackingStateDescription
+
+        // Always recorded, including zero: an empty sky at the start of a lift is precisely
+        // the readiness signal worth capturing, not a missing value.
+        sample.aircraftCount        = aircraft.count
+        sample.adsbAircraftCount    = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
+        sample.internetAircraftCount = connectionLogic.internetAircraftCount
+        sample.staleAircraftCount   = connectionLogic.detectedAircraft.values.filter { CalculationsLogic.isStale($0) }.count
+        sample.renderedNodeCount    = sceneManager?.renderedAircraftCount
+
+        // Measured from the traffic actually on display, so the offset comes from aircraft
+        // sharing this air mass rather than from the whole fetch radius.
+        sample.targetsWithPressureAltitude  = aircraft.filter { $0.pressureAltitudeFt  != nil }.count
+        sample.targetsWithGeometricAltitude = aircraft.filter { $0.geometricAltitudeFt != nil }.count
+        sample.datumOffset = AltitudeDatumOffset.estimate(from: aircraft)
+        latestDatumOffset  = sample.datumOffset
+
+        return sample
+    }
+
+    /// Short label for the current ARKit tracking state, shared by the log and the info panel.
+    private var arTrackingStateDescription: String {
+        switch arTrackingState {
+        case .normal:        return "normal"
+        case .notAvailable:  return "unavailable"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:         return "limited:initializing"
+            case .relocalizing:         return "limited:relocalizing"
+            case .excessiveMotion:      return "limited:motion"
+            case .insufficientFeatures: return "limited:features"
+            @unknown default:           return "limited:other"
+            }
+        @unknown default:    return "unknown"
+        }
     }
 
     private func updateMetarAgeLabel() {
@@ -2145,6 +2337,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         let displayLoc = activeLocation
         let displayAlt = activeAltitude
+        let state = ownshipEstimator.snapshot()
         let gpsSource  = usingADSBGPS ? "ADS-B GPS" : "iPhone GPS"
         if let loc = displayLoc {
             let gpsAccStr: String
@@ -2179,6 +2372,33 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 ? String(format: "%.0f°±%.0f°", lastGPSCourseDeg, lastGPSCourseAccuracy)
                 : "invalid"
             lines.append(String(format: "🛩️ %.0fkt  course %@", lastGPSSpeedKt, courseStr))
+
+            // ── Vertical datums ───────────────────────────────────────────────────────
+            // The gap between cabin pressure altitude and GPS geometric altitude is the
+            // signature of a pressurized cabin: on an unpressurized aircraft the two track
+            // each other to within the local QNH and temperature error, while in a jet the
+            // cabin stays near 8,000 ft as the aircraft climbs past it.
+            if let cabin = cabinPressureAltitudeFeet, state.hasGeometricAltitude {
+                let delta = cabin - state.geometricAltitudeFt
+                let verdict = abs(delta) > PressurizationHeuristic.maxPlausibleDeltaFeet
+                    ? "PRESSURIZED"
+                    : "ambient"
+                lines.append(String(format: "🎚 cabin %.0f ft  geo %.0f ft  Δ%+.0f ft (%@)",
+                                    cabin, state.geometricAltitudeFt, delta, verdict))
+            }
+
+            // Measured pressure-to-geometric conversion from nearby traffic. Displayed only;
+            // it does not yet move any target.
+            if let offset = latestDatumOffset {
+                lines.append(String(format: "📊 datum offset %+.0f ft  (n=%d, IQR %.0f ft)",
+                                    offset.medianFt, offset.sampleCount, offset.spreadFt))
+            }
+            if state.hasGeoidSeparation {
+                lines.append(String(format: "📐 geoid %+.0f ft", state.geoidSeparationFt))
+            }
+            if state.wasDeadReckoned {
+                lines.append(String(format: "⏱ coasting %.1fs on %@", state.fixAge, state.source.rawValue))
+            }
         } else {
             lines.append("📍 GPS: Acquiring…")
         }
@@ -2230,6 +2450,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             trafficLine += "  [\(ageSec)s ago]"
         }
         lines.append(trafficLine)
+
+        // Receiver link health. A non-zero reject count with ADS-B connected means frames are
+        // arriving corrupted, which used to surface as targets that jump rather than as a
+        // number anyone could see.
+        let counters = FlightRecorder.shared.gdl90Counters()
+        if counters.valid > 0 || counters.crcFailures > 0 || counters.malformed > 0 {
+            lines.append(String(format: "📶 GDL90 ok:%d  rejected:%d (%.1f%%)",
+                                counters.valid,
+                                counters.crcFailures + counters.malformed,
+                                counters.rejectionRate * 100))
+        }
 
         lines.append("🛫 Airports loaded: \(airports.count)")
 
@@ -2432,6 +2663,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         arTrackingState = camera.trackingState
+        // Logged per transition: the first seconds of every lift are spent in a limited
+        // state, and how long that lasts is the thing the readiness work has to move.
+        let elapsedSinceLift = liftStartTime.map { Date().timeIntervalSince($0) } ?? -1
+        FlightRecorder.shared.record(
+            event: "ar_tracking_state",
+            detail: String(format: "%@ t=%.2fs", arTrackingStateDescription, elapsedSinceLift)
+        )
         DispatchQueue.main.async { self.updateStatusLabel() }
     }
 
@@ -2450,26 +2688,40 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
 
         let hAcc = loc.horizontalAccuracy
+        let airborne = activeAltitude > 200
+
         // Ground-only: prompt recalibration if GPS accuracy crosses from good to
         // bad (same threshold as the status-bar ⚠️ warning), before it's overwritten
         // below. Not applied in flight — GPS is expected to degrade there.
         let wasGoodGPS = lastHorizontalAccuracy >= 0 && lastHorizontalAccuracy <= gpsAccuracyThreshold
-        if !tcasEnabled && wasGoodGPS && hAcc > gpsAccuracyThreshold {
+        if !airborne && wasGoodGPS && hAcc > gpsAccuracyThreshold {
             presentCalibrationPopupIfNeeded()
         }
 
-        // Inside an aircraft fuselage the GPS signal is attenuated; accuracy
-        // typically degrades to 30–150 m, which would make the strict ground
-        // threshold (30 m) reject every fix.  In flight (tcasEnabled = altitude
-        // > 200 ft) allow up to 500 m — aircraft are separated by > 1 NM so
-        // this is still well within useful precision for AR positioning.
-        let effectiveThreshold = tcasEnabled ? 500.0 : gpsAccuracyThreshold
-        guard hAcc > 0 && hAcc <= effectiveThreshold else {
+        // Inside a fuselage the signal is attenuated and accuracy degrades to 30–150 m, so the
+        // strict ground threshold would reject every fix in flight.
+        let preferredThreshold = airborne ? 500.0 : gpsAccuracyThreshold
+
+        // A degraded fix still beats coasting on an old one. Once the last accepted fix is
+        // older than this, accept anything up to the hard ceiling: dead reckoning at cruise
+        // speed accumulates error far faster than the extra scatter in a poor fix.
+        let staleFixAge = Date().timeIntervalSince(lastAcceptedFixTime)
+        let acceptDegraded = staleFixAge > GPSGate.staleFixSeconds
+        let ceiling = acceptDegraded ? GPSGate.hardCeilingMeters : preferredThreshold
+
+        guard hAcc > 0, hAcc <= ceiling else {
             if hAcc > 0 { lastHorizontalAccuracy = hAcc }
             updateStatusLabel()
             return
         }
+        if acceptDegraded && hAcc > preferredThreshold {
+            FlightRecorder.shared.record(
+                event: "gps_degraded_accepted",
+                detail: String(format: "h_acc=%.0fm last_fix_age=%.1fs", hAcc, staleFixAge)
+            )
+        }
 
+        lastAcceptedFixTime = loc.timestamp
         lastHorizontalAccuracy = hAcc
         if bestHorizontalAccuracy < 0 || hAcc < bestHorizontalAccuracy {
             bestHorizontalAccuracy = hAcc
@@ -2478,52 +2730,80 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         let isFirstFix = (userLocation == nil)
         userLocation = loc.coordinate
 
-        // GPS altitude is used directly rather than fused with the phone's
-        // barometer — the barometer measures whatever pressure environment
-        // it's physically in, which inside a pressurized aircraft cabin is
-        // cabin pressure, not the outside static air the aircraft's own
-        // altimeter reads. GPS is satellite-based and unaffected by cabin
-        // pressurization, making it the only sensor still meaningful here.
-        let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
-        gpsMSLAltitudeFeet = newGPSFeet
+        // ── Altitude ──────────────────────────────────────────────────────────────────
+        // GPS altitude is used directly rather than fused with the phone's barometer — the
+        // barometer measures whatever pressure environment it is physically in, which inside
+        // a pressurized cabin is cabin pressure, not the outside static air the aircraft's own
+        // altimeter reads. GPS is satellite-based and unaffected by cabin pressurization,
+        // making it the only sensor still meaningful here.
+        //
+        // Vertical accuracy gates the update separately from horizontal: the two degrade
+        // independently, and a bad altitude tilts every target up or down at once.
         lastVerticalAccuracy = loc.verticalAccuracy
-        // Light smoothing — GPS vertical accuracy is inherently noisier than
-        // horizontal (worse satellite geometry on the vertical axis, further
-        // degraded by reduced sky visibility inside an aircraft fuselage),
-        // so a single fix can swing the displayed altitude by a large
-        // amount. This reduces frame-to-frame jitter from transient noise;
-        // it won't fully correct a sustained bias from consistently poor
-        // vertical geometry, which lastVerticalAccuracy (surfaced in the
-        // diagnostic panel) helps distinguish from a software bug.
-        userAltitude = isFirstFix ? newGPSFeet : userAltitude + (newGPSFeet - userAltitude) * 0.15
+        let verticalCeiling = airborne ? GPSGate.verticalCeilingAirborneMeters
+                                       : GPSGate.verticalCeilingGroundMeters
+        let verticalWithinCeiling = loc.verticalAccuracy > 0 && loc.verticalAccuracy <= verticalCeiling
+        // Bootstrap: some fixes report no vertical accuracy at all. Rejecting every one of
+        // those would leave the app with no altitude, which is worse than an approximate one.
+        let verticalUsable = verticalWithinCeiling || !hasAcceptedGPSAltitude
 
-        connectionLogic.updateLocation(loc.coordinate, altitudeFeet: userAltitude)
+        if verticalUsable {
+            if !verticalWithinCeiling {
+                FlightRecorder.shared.record(
+                    event: "gps_altitude_bootstrap",
+                    detail: String(format: "v_acc=%.1fm", loc.verticalAccuracy)
+                )
+            }
+            hasAcceptedGPSAltitude = true
+
+            let newGPSFeet = loc.altitude * CalculationsLogic.metersToFeet
+            gpsMSLAltitudeFeet = newGPSFeet
+
+            // The phone reports orthometric (MSL) and ellipsoidal altitude for the same fix,
+            // so their difference is the local geoid separation — what converts an ADS-B
+            // geometric altitude, which is ellipsoid-referenced, into the MSL frame.
+            gpsEllipsoidalAltitudeFeet = loc.ellipsoidalAltitude * CalculationsLogic.metersToFeet
+            geoidSeparationFeet = gpsEllipsoidalAltitudeFeet - newGPSFeet
+
+            // Light smoothing — GPS vertical accuracy is inherently noisier than horizontal
+            // (worse satellite geometry on the vertical axis, further degraded by reduced sky
+            // visibility inside a fuselage), so a single fix can swing the displayed altitude
+            // by a large amount.
+            userAltitude = isFirstFix ? newGPSFeet : userAltitude + (newGPSFeet - userAltitude) * 0.15
+
+            ownshipEstimator.ingestPhoneAltitude(fusedMSLFt: userAltitude)
+            ownshipEstimator.ingestPhoneVerticalReferences(
+                pressureAltitudeFt: cabinPressureAltitudeFeet,
+                geoidSeparationFt: geoidSeparationFeet
+            )
+        }
 
         // For the HUD speed readout — speed magnitude validity doesn't depend on
-        // course accuracy, unlike the dead-reckoning velocity push below.
+        // course accuracy, unlike the velocity push below.
         if loc.speed >= 0 {
             gpsSpeedKt = loc.speed * 1.944
             lastGPSSpeedKt = gpsSpeedKt
         }
-        // Cached for updateHUDLadder() (SceneKit render thread) to read — the
-        // GPS-course heading-bias learning below needs the same course/accuracy
-        // validity signal already used for the dead-reckoning velocity push.
+        // Cached for updateHUDLadder() (SceneKit render thread) to read — the GPS-course
+        // heading-bias learning needs the same course/accuracy validity signal.
         lastGPSCourseDeg = loc.course
         lastGPSCourseAccuracy = loc.courseAccuracy
 
-        // Push velocity state immediately (not throttled to the 4 Hz timer) so the
-        // 60 Hz dead-reckoning tick has the freshest possible baseline. At 500 kt
-        // this eliminates ≈62 m of positional error that accumulates between 4 Hz ticks.
-        // courseAccuracy < 30° is a loose guard; the dead-reckoner further requires
-        // speed > 5 kt before extrapolating, so no harm if the course is slightly noisy.
-        if loc.speed >= 0, loc.courseAccuracy >= 0, loc.courseAccuracy < 30 {
-            sceneManager?.updateUserVelocity(
-                speedKt:   loc.speed * 1.944,   // m/s → knots
-                course:    loc.course,
-                location:  loc.coordinate,
-                timestamp: loc.timestamp
-            )
-        }
+        // ── Position and velocity into the single estimator ───────────────────────────
+        // Pushed with this fix's own timestamp, so extrapolation between fixes is anchored to
+        // when the fix was taken rather than when it was processed. The estimator replaces the
+        // scene manager's own dead-reckoning state, which used to mix this timestamp with an
+        // ADS-B position written by a different code path.
+        let courseUsable = loc.speed >= 0 && loc.courseAccuracy >= 0 && loc.courseAccuracy < 30
+        ownshipEstimator.ingestPhoneLocation(
+            coordinate: loc.coordinate,
+            horizontalAccuracyM: hAcc,
+            groundSpeedKt: courseUsable ? loc.speed * 1.944 : nil,   // m/s → knots
+            trackDeg: courseUsable ? loc.course : nil,
+            timestamp: loc.timestamp
+        )
+
+        connectionLogic.updateLocation(loc.coordinate, altitudeFeet: activeAltitude)
 
         if isFirstFix {
             updateVisualization()
@@ -2540,7 +2820,6 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             lastAirportFilterLocation = loc.coordinate
             refreshNearbyAirports()
         }
-
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
@@ -2562,6 +2841,8 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         }
 
         lastHeadingAccuracy = accuracy
+        lastMagneticHeading = newHeading.magneticHeading
+        lastTrueHeading     = newHeading.trueHeading
         let trueNorth = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         // Smooth the displayed heading to eliminate sensor noise that causes the
         // compass to appear to spin while flying straight and level.  alpha=0.3

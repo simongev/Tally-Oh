@@ -45,8 +45,29 @@ struct Aircraft: Identifiable {
     var lastUpdate: Date
     var source: AircraftSource = .adsb
 
+    /// True when the source reported the aircraft as on the ground: the GDL90 Misc airborne
+    /// bit clear, or adsb.lol sending "ground" in place of a barometric altitude.
+    var isOnGround: Bool = false
+
+    /// False when the source reported no usable altitude. Keeping this separate from a 0 ft
+    /// reading matters: traffic on the ground at a 5,400 ft field would otherwise be placed
+    /// a mile below the viewer instead of on the airfield.
+    var hasValidAltitude: Bool = true
+
+    /// False when the source reported no usable direction, in which case the position must
+    /// not be dead-reckoned along `track`.
+    var hasValidTrack: Bool = true
+
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+
+    /// Whether this aircraft should be treated as ground traffic for display filtering.
+    /// Prefers the source's own on-ground flag and falls back to the altitude heuristic,
+    /// which is only meaningful for aircraft that actually reported an altitude.
+    var isGroundTraffic: Bool {
+        if isOnGround { return true }
+        return hasValidAltitude && altitude <= 50
     }
 }
 
@@ -59,6 +80,12 @@ class ConnectionLogic: ObservableObject {
     @Published var connectionStatus: ConnectionStatus = .disconnected
     @Published var detectedAircraft: [String: Aircraft] = [:]
     @Published var ownshipData: Aircraft?           // GPS/altitude from ADS-B ownship report
+    /// Receiver GNSS altitude above the WGS-84 ellipsoid, from GDL90 message 0x0B.
+    @Published var ownshipGeometricAltitudeFt: Double?
+
+    /// Set by the owner so ADS-B ownship reports feed the single ownship estimator directly,
+    /// carrying their own timestamps instead of being resampled by the 4 Hz UI tick.
+    weak var ownshipEstimator: OwnshipEstimator?
     @Published var isInternetAvailable: Bool = false
     @Published var internetAircraftCount: Int = 0
 
@@ -176,10 +203,12 @@ class ConnectionLogic: ObservableObject {
     func stopListening() {
         listener?.cancel()
         listener = nil
+        ownshipEstimator?.clearADSB()
         DispatchQueue.main.async {
             self.connectionStatus = .disconnected
             self.detectedAircraft.removeAll()
             self.ownshipData = nil
+            self.ownshipGeometricAltitudeFt = nil
         }
     }
 
@@ -221,6 +250,10 @@ class ConnectionLogic: ObservableObject {
             guard let self = self else { return }
             guard self.connectionStatus == .receiving else { return }
             if let last = self.lastPacketReceived, Date().timeIntervalSince(last) > 10.0 {
+                // Drop the receiver's ownship state as well, so a position frozen ten seconds
+                // ago cannot keep winning source selection over the phone's live GPS.
+                self.ownshipEstimator?.clearADSB()
+                FlightRecorder.shared.record(event: "adsb_signal_lost")
                 DispatchQueue.main.async {
                     self.connectionStatus = .searching
                     print("⚠️ ADS-B signal lost")
@@ -230,115 +263,92 @@ class ConnectionLogic: ObservableObject {
     }
 
     private func processGDL90Data(_ data: Data) {
-        // Scan for 0x7E frame boundaries without copying the Data into [UInt8].
-        // Iterating Data directly avoids a heap allocation per UDP packet (which
-        // arrives up to ~10 times/second from an ADS-B receiver).
-        var i = data.startIndex
-        while i < data.endIndex {
-            guard data[i] == 0x7E else { i = data.index(after: i); continue }
-            let payloadStart = data.index(after: i)
-            guard payloadStart < data.endIndex else { break }
-            if let end = data[payloadStart...].firstIndex(of: 0x7E) {
-                handleGDL90Message(data[payloadStart..<end])
-                i = data.index(after: end)
-            } else {
-                break
-            }
+        // Framing, byte-unstuffing and CRC verification all live in GDL90.extractMessages.
+        // Only messages that pass CRC reach the parser, so a corrupted datagram can no longer
+        // surface as an aircraft that jumps across the sky.
+        let extraction = GDL90.extractMessages(from: data)
+        FlightRecorder.shared.recordGDL90(
+            valid: extraction.messages.count,
+            crcFailures: extraction.crcFailures,
+            malformed: extraction.malformed
+        )
+        for message in extraction.messages {
+            handleGDL90Message(message)
         }
     }
 
-    private func handleGDL90Message(_ payload: Data.SubSequence) {
-        guard let msgType = payload.first else { return }
-        switch msgType {
-        case 0x00: break  // Heartbeat
-        case 0x0A:        // Ownship
-            if let ac = parseTrafficPayload(payload, isOwnship: true) {
-                DispatchQueue.main.async { self.ownshipData = ac }
+    private func handleGDL90Message(_ message: [UInt8]) {
+        guard let messageID = message.first else { return }
+        let receivedAt = Date()
+
+        switch messageID {
+        case GDL90.MessageID.ownshipReport.rawValue:
+            guard let report = GDL90.parseTrafficReport(message) else { return }
+            let hasPosition = report.latitude != 0 || report.longitude != 0
+            // Feed the estimator straight from the receiver queue, with this report's own
+            // arrival time and its own velocity, so coasting between the ~1 Hz reports does
+            // not borrow the phone's timestamp or course.
+            ownshipEstimator?.ingestADSBOwnship(
+                coordinate: hasPosition
+                    ? CLLocationCoordinate2D(latitude: report.latitude, longitude: report.longitude)
+                    : nil,
+                pressureAltitudeFt: report.pressureAltitudeFt,
+                groundSpeedKt: report.groundSpeedKt,
+                trackDeg: report.track,
+                verticalRateFpm: report.verticalRateFpm,
+                timestamp: receivedAt
+            )
+            let aircraft = makeAircraft(from: report, isOwnship: true, receivedAt: receivedAt)
+            DispatchQueue.main.async { self.ownshipData = aircraft }
+
+        case GDL90.MessageID.ownshipGeometricAltitude.rawValue:
+            // Previously discarded. This is the receiver's GNSS altitude, which is the only
+            // ownship vertical reference that stays valid in a pressurized cabin.
+            guard let geometric = GDL90.parseOwnshipGeometricAltitude(message) else { return }
+            ownshipEstimator?.ingestADSBGeometricAltitude(
+                heightAboveEllipsoidFt: geometric.heightAboveEllipsoidFt,
+                timestamp: receivedAt
+            )
+            DispatchQueue.main.async {
+                self.ownshipGeometricAltitudeFt = geometric.heightAboveEllipsoidFt
             }
-        case 0x14:        // Traffic
-            if let ac = parseTrafficPayload(payload, isOwnship: false) {
-                DispatchQueue.main.async { self.detectedAircraft[ac.id] = ac }
-            }
-        case 0x0B: break  // Ownship geometric alt
-        default: break
+
+        case GDL90.MessageID.trafficReport.rawValue:
+            guard let report = GDL90.parseTrafficReport(message) else { return }
+            let aircraft = makeAircraft(from: report, isOwnship: false, receivedAt: receivedAt)
+            DispatchQueue.main.async { self.detectedAircraft[aircraft.id] = aircraft }
+
+        default:
+            break
         }
     }
 
-    /// Parse a GDL90 traffic/ownship payload. Operates directly on a Data.SubSequence
-    /// so no heap copy is required — the indices are absolute within the original Data.
-    private func parseTrafficPayload(_ payload: Data.SubSequence, isOwnship: Bool) -> Aircraft? {
-        guard payload.count >= 28 else { return nil }
-
-        // Use an index cursor relative to the slice start.
-        var idx = payload.startIndex
-
-        func advance(_ n: Int) { idx = payload.index(idx, offsetBy: n) }
-        func remaining() -> Int { payload.distance(from: idx, to: payload.endIndex) }
-        func byte(_ offset: Int) -> UInt8 { payload[payload.index(idx, offsetBy: offset)] }
-
-        advance(1) // skip message ID
-        advance(1) // traffic alert status (bits 7:4) | address type (bits 3:0) — single combined byte per GDL90 spec
-
-        guard remaining() >= 3 else { return nil }
-        let icao = String(format: "%02X%02X%02X", byte(0), byte(1), byte(2))
-        advance(3)
-
-        guard remaining() >= 3 else { return nil }
-        var latRaw = Int32(byte(0)) << 16 | Int32(byte(1)) << 8 | Int32(byte(2))
-        if latRaw & 0x800000 != 0 { latRaw |= Int32(bitPattern: 0xFF000000) }
-        let latitude = Double(latRaw) * (180.0 / 8_388_608.0)
-        advance(3)
-
-        guard remaining() >= 3 else { return nil }
-        var lonRaw = Int32(byte(0)) << 16 | Int32(byte(1)) << 8 | Int32(byte(2))
-        if lonRaw & 0x800000 != 0 { lonRaw |= Int32(bitPattern: 0xFF000000) }
-        let longitude = Double(lonRaw) * (180.0 / 8_388_608.0)
-        advance(3)
-
-        guard remaining() >= 2 else { return nil }
-        let altCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
-        let altitude = altCode == 0xFFF ? 0.0 : Double(altCode) * 25.0 - 1000.0
-        advance(2)
-
-        advance(1) // NIC | NACp (byte 13 — single byte; HVel starts at byte 14)
-
-        guard remaining() >= 2 else { return nil }
-        let hvCode = (UInt16(byte(0)) << 4) | (UInt16(byte(1)) >> 4)
-        let groundSpeed = hvCode == 0xFFF ? 0.0 : Double(hvCode)
-        advance(1)
-
-        guard remaining() >= 2 else { return nil }
-        let vvRaw = (Int16(byte(0) & 0x0F) << 8) | Int16(byte(1))
-        let vvSigned = vvRaw > 2047 ? vvRaw - 4096 : vvRaw
-        let verticalRate = Double(vvSigned) * 64.0
-        advance(2)
-
-        guard remaining() >= 1 else { return nil }
-        let track = Double(byte(0)) * (360.0 / 256.0)
-        advance(1)
-
-        advance(1) // emitter category
-
-        var callsign = icao
-        if remaining() >= 8 {
-            let csEnd = payload.index(idx, offsetBy: 8)
-            if let raw = String(bytes: payload[idx..<csEnd], encoding: .ascii) {
-                let trimmed = raw.trimmingCharacters(in: .init(charactersIn: " \0"))
-                if !trimmed.isEmpty { callsign = trimmed }
-            }
-        }
-
-        return Aircraft(
-            id: isOwnship ? "OWNSHIP" : icao,
-            callsign: callsign,
-            latitude: latitude,
-            longitude: longitude,
-            altitude: altitude,
-            track: track,
-            groundSpeed: groundSpeed,
-            verticalRate: verticalRate,
-            lastUpdate: Date(),
-            source: .adsb
+    /// Convert a decoded GDL90 report into the app's aircraft model, preserving the
+    /// "value not available" cases rather than collapsing them to zero.
+    ///
+    /// Note on direction: GDL90 allows the track field to carry a magnetic heading instead of
+    /// a true track (Misc bits 1-0). ADS-B Out installations report true track for airborne
+    /// targets, so this is rare; when it happens the value is used as reported, which costs at
+    /// most a declination-sized error over the few seconds a target is coasted.
+    private func makeAircraft(
+        from report: GDL90.TrafficReport,
+        isOwnship: Bool,
+        receivedAt: Date
+    ) -> Aircraft {
+        Aircraft(
+            id:           isOwnship ? "OWNSHIP" : report.icaoAddress,
+            callsign:     report.callsign,
+            latitude:     report.latitude,
+            longitude:    report.longitude,
+            altitude:     report.pressureAltitudeFt ?? 0,
+            track:        report.track ?? 0,
+            groundSpeed:  report.groundSpeedKt ?? 0,
+            verticalRate: report.verticalRateFpm ?? 0,
+            lastUpdate:   receivedAt,
+            source:       .adsb,
+            isOnGround:       !report.isAirborne,
+            hasValidAltitude: report.pressureAltitudeFt != nil,
+            hasValidTrack:    report.track != nil
         )
     }
 

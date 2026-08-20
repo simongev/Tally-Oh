@@ -42,6 +42,23 @@ class CalculationsLogic {
     static let nauticalMileToMeters: Double = 1852.0
     static let knotsToMetersPerSecond: Double = 0.514444
 
+    // MARK: - Atmosphere
+
+    /// Standard sea-level pressure of the ISA atmosphere, in hectopascals (29.92 inHg).
+    static let isaSeaLevelPressureHPa: Double = 1013.25
+
+    /// Convert an absolute static pressure to a pressure altitude in feet, against the
+    /// standard 29.92 inHg datum — the same datum ADS-B targets report `alt_baro` against.
+    ///
+    /// Uses the ISA troposphere relation, valid to ~36,000 ft; above the tropopause it drifts
+    /// from the true standard atmosphere, which is acceptable here because the value is used
+    /// to compare two altitudes in the same datum rather than as an absolute reference.
+    static func pressureAltitudeFeet(hectopascals: Double) -> Double? {
+        guard hectopascals > 0, hectopascals.isFinite else { return nil }
+        let ratio = hectopascals / isaSeaLevelPressureHPa
+        return 145_366.45 * (1.0 - pow(ratio, 0.190284))
+    }
+
     // MARK: - Distance Calculations
 
     /// Calculate distance between two coordinates in metres using the Haversine formula
@@ -204,7 +221,9 @@ class CalculationsLogic {
     ) -> (coordinate: CLLocationCoordinate2D, altitude: Double) {
         let age = -aircraft.lastUpdate.timeIntervalSinceNow  // seconds since last report
         let total = min(age + aheadSeconds, maxCoastSeconds)
-        guard total > 0, aircraft.groundSpeed > 0 else {
+        // A report with no usable direction must not be coasted: extrapolating along a
+        // placeholder track of 0 would march the target due north at its ground speed.
+        guard total > 0, aircraft.groundSpeed > 0, aircraft.hasValidTrack else {
             return (aircraft.coordinate, aircraft.altitude)
         }
         return predictPosition(
@@ -212,9 +231,21 @@ class CalculationsLogic {
             currentAltitude: aircraft.altitude,
             track:           aircraft.track,
             groundSpeed:     aircraft.groundSpeed,
-            verticalRate:    aircraft.verticalRate,
+            // Applying a climb rate to an altitude the source never reported would invent
+            // vertical motion from a placeholder zero.
+            verticalRate:    aircraft.hasValidAltitude ? aircraft.verticalRate : 0,
             timeSeconds:     total
         )
+    }
+
+    /// Altitude to draw a target at, in feet.
+    ///
+    /// When the source reported no usable altitude the target is placed at the viewer's own
+    /// altitude, so it appears on the horizon in the correct direction rather than being sunk
+    /// to 0 ft MSL — which at a high-elevation airport would put ground traffic far below the
+    /// viewer's feet, in a direction no one is looking.
+    static func placementAltitude(for aircraft: Aircraft, targetAltitude: Double, userAltitudeFt: Double) -> Double {
+        aircraft.hasValidAltitude ? targetAltitude : userAltitudeFt
     }
 
     /// Calculate position for airport marker

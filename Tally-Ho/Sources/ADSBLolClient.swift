@@ -50,15 +50,28 @@ class ADSBLolClient {
         }
     }
 
-    /// Decodes a JSON value that may be either an Int or a Double.
+    /// Decodes a JSON value that may be an Int, a Double, or the string "ground".
+    ///
+    /// adsb.lol sends `"alt_baro": "ground"` for an aircraft on the surface. Reading that as
+    /// 0 ft MSL is wrong everywhere the field is not at sea level — at a 5,400 ft airport it
+    /// places parked traffic a mile underground — so the sentinel is preserved as its own case
+    /// and the altitude is reported as absent rather than zero.
     private struct FlexDouble: Decodable {
-        let value: Double
+        let value: Double?
+        let isGround: Bool
+
         init(from decoder: Decoder) throws {
             let c = try decoder.singleValueContainer()
-            if let d = try? c.decode(Double.self) { value = d; return }
-            if let i = try? c.decode(Int.self)    { value = Double(i); return }
-            // "ground" or other string sentinel — treat as 0
-            value = 0
+            if let d = try? c.decode(Double.self) { value = d; isGround = false; return }
+            if let i = try? c.decode(Int.self)    { value = Double(i); isGround = false; return }
+            if let s = try? c.decode(String.self) {
+                let normalized = s.trimmingCharacters(in: .whitespaces).lowercased()
+                value = nil
+                isGround = (normalized == "ground")
+                return
+            }
+            value = nil
+            isGround = false
         }
     }
 
@@ -140,7 +153,11 @@ class ADSBLolClient {
         let icao = e.hex.uppercased()
         guard !icao.isEmpty, let lat = e.lat, let lon = e.lon else { return nil }
 
-        let altitude: Double = e.altBaro?.value ?? e.altGeom?.value ?? 0
+        // "ground" in alt_baro means on the surface, not at 0 ft. Fall back to alt_geom only
+        // when alt_baro carried no usable number at all.
+        let isOnGround = (e.altBaro?.isGround ?? false) || (e.altGeom?.isGround ?? false)
+        let reportedAltitude: Double? =
+            e.altBaro.flatMap({ $0.value }) ?? e.altGeom.flatMap({ $0.value })
 
         let callsign: String
         if let flight = e.flight?.trimmingCharacters(in: .whitespaces), !flight.isEmpty {
@@ -151,7 +168,8 @@ class ADSBLolClient {
             callsign = icao
         }
 
-        let verticalRate: Double = e.baroRate?.value ?? e.geomRate?.value ?? 0
+        let verticalRate: Double =
+            e.baroRate.flatMap({ $0.value }) ?? e.geomRate.flatMap({ $0.value }) ?? 0
 
         // adsb.lol reports "seen_pos": how many seconds old this aircraft's
         // position already was server-side when it was served to us. Without
@@ -166,12 +184,15 @@ class ADSBLolClient {
             aircraftType: e.t ?? "",
             latitude:     lat,
             longitude:    lon,
-            altitude:     altitude,
+            altitude:     reportedAltitude ?? 0,
             track:        e.track ?? 0,
             groundSpeed:  e.gs    ?? 0,
             verticalRate: verticalRate,
             lastUpdate:   Date().addingTimeInterval(-positionStaleness),
-            source:       .internet
+            source:       .internet,
+            isOnGround:       isOnGround,
+            hasValidAltitude: reportedAltitude != nil,
+            hasValidTrack:    e.track != nil
         )
     }
 }

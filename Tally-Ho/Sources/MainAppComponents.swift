@@ -846,13 +846,16 @@ class ARSceneManager {
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
 
-    /// Dead-reckoning inputs — written on the main thread at GPS-fix rate (1–5 Hz),
-    /// read on the SceneKit thread at 60 Hz. Swift Double and Date are 64-bit aligned
-    /// value types; reads are effectively atomic on ARM64. Follows the same pattern
-    /// as liveUserLocation / liveUserAltitude (no lock required for scalar values).
-    private var liveUserSpeedKt: Double = 0
-    private var liveUserCourse: Double = 0
-    private var liveUserLocationTimestamp: Date = .distantPast
+    /// Ownship position, velocity and altitude for the 60 Hz ticks.
+    ///
+    /// Dead reckoning used to run on state this class kept itself, which mixed the phone's
+    /// timestamp and course with an ADS-B position written by a different code path. The
+    /// estimator owns that state now, keeps each source's own timing, and is internally
+    /// locked, so the render thread can sample it directly.
+    weak var ownshipEstimator: OwnshipEstimator?
+
+    /// Number of aircraft nodes positioned on the most recent 4 Hz pass, for the flight log.
+    private(set) var renderedAircraftCount: Int = 0
 
     /// Airport node snapshot for the 60 Hz airport tick — analogous to tickNodeSnapshot.
     /// Protected by nodesLock: written on the main thread at 4 Hz (end of updateAirports),
@@ -883,8 +886,12 @@ class ARSceneManager {
         guard settings.showAircraft else { return }
 
         let aircraft = liveAircraft
-        let userLoc  = deadReckonedUserLocation()   // dead-reckoned from latest GPS fix
-        let userAlt  = liveUserAltitude
+        var userLoc = liveUserLocation
+        var userAlt = liveUserAltitude
+        if let ownship = ownshipEstimator?.snapshot(), ownship.hasPosition {
+            userLoc = ownship.coordinate
+            userAlt = ownship.displayAltitudeFt
+        }
 
         // Take the snapshot under the lock — the main thread writes tickNodeSnapshot
         // at 4 Hz and this runs at 60 Hz on the SceneKit thread; without the lock
@@ -898,9 +905,11 @@ class ARSceneManager {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
             if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
+            let targetAlt = CalculationsLogic.placementAltitude(
+                for: ac, targetAltitude: predAlt, userAltitudeFt: userAlt)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
-                targetAltitude: predAlt,
+                targetAltitude: targetAlt,
                 userCoord: userLoc,
                 userAltitude: userAlt,
                 userHeading: 0,
@@ -910,42 +919,6 @@ class ARSceneManager {
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
             node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
         }
-    }
-
-    // MARK: - User Velocity (dead reckoning support)
-
-    /// Push the latest iPhone GPS velocity state immediately when a valid fix arrives
-    /// (not throttled to the 4 Hz timer). Gives the SceneKit tick the freshest
-    /// possible baseline for dead reckoning.
-    func updateUserVelocity(speedKt: Double, course: Double,
-                            location: CLLocationCoordinate2D, timestamp: Date) {
-        liveUserSpeedKt           = speedKt
-        liveUserCourse            = course
-        liveUserLocation          = location
-        liveUserLocationTimestamp = timestamp
-    }
-
-    /// Best-estimate user position for the current frame.
-    /// Above 5 kt, dead-reckons from the last GPS fix using stored speed + course,
-    /// reducing the effective position staleness from ≤250 ms (4 Hz) to ≈0 ms.
-    /// At 500 kt this eliminates ≈62 m of positional error per 4 Hz interval,
-    /// preventing the bearing drift/snap cycle visible when panning the phone.
-    /// Capped at 5 s to cover brief GPS outages that are common inside aircraft
-    /// fuselages (engine/avionics interference can break lock for 2–4 s).
-    private func deadReckonedUserLocation() -> CLLocationCoordinate2D {
-        let elapsed = Date().timeIntervalSince(liveUserLocationTimestamp)
-        guard liveUserSpeedKt > 5.0, elapsed > 0, elapsed < 5.0 else {
-            return liveUserLocation
-        }
-        let (predCoord, _) = CalculationsLogic.predictPosition(
-            currentCoord:    liveUserLocation,
-            currentAltitude: liveUserAltitude,
-            track:           liveUserCourse,
-            groundSpeed:     liveUserSpeedKt,
-            verticalRate:    0,
-            timeSeconds:     elapsed
-        )
-        return predCoord
     }
 
     // MARK: - 60 Hz Airport Position Update
@@ -960,8 +933,12 @@ class ARSceneManager {
         let snapshot = tickAirportSnapshot
         nodesLock.unlock()
 
-        let userLoc         = deadReckonedUserLocation()
-        let userAlt         = liveUserAltitude
+        var userLoc = liveUserLocation
+        var userAlt = liveUserAltitude
+        if let ownship = ownshipEstimator?.snapshot(), ownship.hasPosition {
+            userLoc = ownship.coordinate
+            userAlt = ownship.displayAltitudeFt
+        }
 
         for entry in snapshot {
             let rawPos = CalculationsLogic.calculateAirportARPosition(
@@ -1012,8 +989,10 @@ class ARSceneManager {
         var newNodesThisTick   = 0
 
         for ac in aircraft {
-            // Filter out ground aircraft unless the user has enabled them
-            if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
+            // Filter out ground aircraft unless the user has enabled them. Uses the source's
+            // own on-ground flag where available; the altitude threshold alone misclassified
+            // traffic at high-elevation airports.
+            if !settings.showGroundAircraft && ac.isGroundTraffic { continue }
 
             // Cull/order/label using the same dead-reckoned position the marker is
             // actually drawn at — mixing the raw last-reported coordinate here with
@@ -1026,15 +1005,22 @@ class ARSceneManager {
             // While airborne, traffic more than 10,000ft above/below the user's own
             // altitude isn't relevant for visual traffic awareness — e.g. no reason to
             // show 5,000ft traffic while cruising at 40,000ft.
-            if !onGround && abs(predAlt - userAltitude) > 10_000 { continue }
+            //
+            // Only applied to targets that actually reported an altitude. A target whose
+            // altitude is unknown carries a placeholder zero, which at cruise would read as
+            // 35,000 ft of separation and cull it — hiding traffic precisely because the
+            // source said nothing about its altitude, rather than because it is far away.
+            if !onGround, ac.hasValidAltitude, abs(predAlt - userAltitude) > 10_000 { continue }
             let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
 
+            let targetAlt = CalculationsLogic.placementAltitude(
+                for: ac, targetAltitude: predAlt, userAltitudeFt: userAltitude)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
-                targetAltitude: predAlt,
+                targetAltitude: targetAlt,
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
@@ -1082,9 +1068,10 @@ class ARSceneManager {
             }
         }
 
-        liveAircraft     = visibleAircraft
-        liveUserLocation = userLocation
-        liveUserAltitude = userAltitude
+        liveAircraft          = visibleAircraft
+        liveUserLocation      = userLocation
+        liveUserAltitude      = userAltitude
+        renderedAircraftCount = visibleAircraft.count
 
         nodesLock.lock()
         let staleIDs = Set(aircraftNodes.keys).subtracting(currentIDs)

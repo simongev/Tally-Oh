@@ -112,6 +112,8 @@ class SettingsViewController: UITableViewController {
             getter: (ARVisualizationSettings) -> Int,
             setter: (inout ARVisualizationSettings, Int) -> Void
         )
+        /// A tappable row that performs an action rather than changing a setting.
+        case action(title: String, subtitle: String, handler: (SettingsViewController) -> Void)
     }
 
     private struct Section {
@@ -241,6 +243,21 @@ class SettingsViewController: UITableViewController {
                 setter: { $0.airportMaxDistance = $1 }
             ),
         ])]
+        result.append(Section(
+            header: "🛠  Diagnostics",
+            footer: "The flight log records every input that positions targets — both GPS " +
+                    "chains, both altitude references, compass, camera attitude and receiver " +
+                    "link health — once per second, plus a marker each time the app is opened. " +
+                    "Export it after a flight to see what the sensors were reporting.",
+            rows: [
+                .action(
+                    title: "Export Flight Log",
+                    subtitle: "Share the recorded CSV",
+                    handler: { $0.exportFlightLog() }
+                )
+            ]
+        ))
+
         if wifiInAir {
             result.append(Section(
                 header: "🛩️  My Airplane",
@@ -306,9 +323,38 @@ class SettingsViewController: UITableViewController {
         tableView.register(CallsignPickerCell.self,   forCellReuseIdentifier: "callsignPicker")
         tableView.register(SegmentedOptionCell.self,  forCellReuseIdentifier: "segmentedOption")
         tableView.register(ReadOnlyValueCell.self,    forCellReuseIdentifier: "readOnlyValue")
+        tableView.register(ActionCell.self,           forCellReuseIdentifier: "action")
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 60
         tableView.keyboardDismissMode = .onDrag
+    }
+
+    // MARK: Diagnostics
+
+    /// Write the recorded flight log to a file and offer it through the share sheet.
+    private func exportFlightLog() {
+        FlightRecorder.shared.exportLog { [weak self] url in
+            guard let self else { return }
+            guard let url else {
+                let alert = UIAlertController(
+                    title: "Export Failed",
+                    message: "The flight log could not be written.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(alert, animated: true)
+                return
+            }
+            let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+            // Required for iPad, where a popover needs an anchor.
+            if let popover = share.popoverPresentationController {
+                popover.sourceView = self.view
+                popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY,
+                                            width: 0, height: 0)
+                popover.permittedArrowDirections = []
+            }
+            self.present(share, animated: true)
+        }
     }
 
     @objc private func doneTapped() {
@@ -396,6 +442,11 @@ class SettingsViewController: UITableViewController {
                 }
             }
             return cell
+
+        case let .action(title, subtitle, _):
+            let cell = tableView.dequeueReusableCell(withIdentifier: "action", for: indexPath) as! ActionCell
+            cell.configure(title: title, subtitle: subtitle)
+            return cell
         }
     }
 
@@ -408,6 +459,11 @@ class SettingsViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         let row = sections[indexPath.section].rows[indexPath.row]
+
+        if case let .action(_, _, handler) = row {
+            handler(self)
+            return
+        }
 
         guard case let .callsignPicker(_, _, options, _, setter) = row else { return }
 
@@ -728,6 +784,28 @@ final class CallsignPickerCell: UITableViewCell {
 
 /// Non-interactive row that displays an auto-detected value (e.g. the ADS-B ownship callsign).
 /// Styled identically to CallsignPickerCell but without a disclosure indicator or selection.
+/// A tappable row that runs an action rather than editing a setting.
+final class ActionCell: UITableViewCell {
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
+        accessoryType  = .disclosureIndicator
+        selectionStyle = .default
+        textLabel?.font      = .systemFont(ofSize: 16, weight: .medium)
+        textLabel?.textColor = .tintColor
+        detailTextLabel?.textColor = .secondaryLabel
+        detailTextLabel?.font      = .systemFont(ofSize: 13)
+        detailTextLabel?.numberOfLines = 2
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(title: String, subtitle: String) {
+        textLabel?.text       = title
+        detailTextLabel?.text = subtitle
+    }
+}
+
 final class ReadOnlyValueCell: UITableViewCell {
 
     private let valueLabel = UILabel()
