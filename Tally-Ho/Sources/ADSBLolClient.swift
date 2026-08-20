@@ -192,7 +192,9 @@ class ADSBLolClient {
             source:       .internet,
             isOnGround:       isOnGround,
             hasValidAltitude: reportedAltitude != nil,
-            hasValidTrack:    e.track != nil
+            hasValidTrack:    e.track != nil,
+            pressureAltitudeFt:  e.altBaro.flatMap({ $0.value }),
+            geometricAltitudeFt: e.altGeom.flatMap({ $0.value })
         )
     }
 }

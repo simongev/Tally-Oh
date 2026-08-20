@@ -58,6 +58,15 @@ struct Aircraft: Identifiable {
     /// not be dead-reckoned along `track`.
     var hasValidTrack: Bool = true
 
+    /// The target's altitude as reported in each vertical datum, kept separately from
+    /// `altitude` (which is whichever one the app currently places against).
+    ///
+    /// Carrying both is what makes the local pressure-to-geometric conversion measurable:
+    /// every aircraft that reports both is measuring it for us at its own position. GDL90
+    /// traffic reports carry only pressure altitude, so `geometricAltitudeFt` is nil there.
+    var pressureAltitudeFt: Double?
+    var geometricAltitudeFt: Double?
+
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
@@ -348,7 +357,9 @@ class ConnectionLogic: ObservableObject {
             source:       .adsb,
             isOnGround:       !report.isAirborne,
             hasValidAltitude: report.pressureAltitudeFt != nil,
-            hasValidTrack:    report.track != nil
+            hasValidTrack:    report.track != nil,
+            pressureAltitudeFt:  report.pressureAltitudeFt,
+            geometricAltitudeFt: nil   // GDL90 traffic reports carry pressure altitude only
         )
     }
 

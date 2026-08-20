@@ -69,7 +69,9 @@ final class FlightRecorder {
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg", "interference_bias_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
-        "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered"
+        "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
+        "n_targets_press", "n_targets_geom",
+        "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -108,6 +110,13 @@ final class FlightRecorder {
         var internetAircraftCount: Int?
         var staleAircraftCount: Int?
         var renderedNodeCount: Int?
+
+        /// How many nearby targets reported each vertical datum, and the measured conversion
+        /// between them. This is the input the frame-aware vertical placement is built on:
+        /// without it the offset would have to be assumed rather than measured.
+        var targetsWithPressureAltitude: Int?
+        var targetsWithGeometricAltitude: Int?
+        var datumOffset: AltitudeDatumOffset.Estimate?
     }
 
     // MARK: - Recording
@@ -244,6 +253,13 @@ final class FlightRecorder {
         fields.append(sample.internetAircraftCount.map(String.init) ?? "")
         fields.append(sample.staleAircraftCount.map(String.init)    ?? "")
         fields.append(sample.renderedNodeCount.map(String.init)     ?? "")
+
+        fields.append(sample.targetsWithPressureAltitude.map(String.init)  ?? "")
+        fields.append(sample.targetsWithGeometricAltitude.map(String.init) ?? "")
+        fields.append(sample.datumOffset.map { String($0.sampleCount) } ?? "")
+        fields.append(format(sample.datumOffset?.medianFt,        decimals: 0))
+        fields.append(format(sample.datumOffset?.lowerQuartileFt, decimals: 0))
+        fields.append(format(sample.datumOffset?.upperQuartileFt, decimals: 0))
 
         return fields.joined(separator: ",")
     }

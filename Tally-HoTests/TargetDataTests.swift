@@ -21,7 +21,9 @@ struct TargetDataTests {
         groundSpeed: Double = 300,
         verticalRate: Double = 1000,
         isOnGround: Bool = false,
-        age: TimeInterval = 0
+        age: TimeInterval = 0,
+        pressureAltitudeFt: Double? = nil,
+        geometricAltitudeFt: Double? = nil
     ) -> Aircraft {
         Aircraft(
             id: "ABC123",
@@ -36,8 +38,18 @@ struct TargetDataTests {
             source: .internet,
             isOnGround: isOnGround,
             hasValidAltitude: hasValidAltitude,
-            hasValidTrack: hasValidTrack
+            hasValidTrack: hasValidTrack,
+            pressureAltitudeFt: pressureAltitudeFt,
+            geometricAltitudeFt: geometricAltitudeFt
         )
+    }
+
+    /// Traffic reporting both vertical datums, offset by a fixed amount.
+    private func trafficReportingBothDatums(offsetsFt: [Double]) -> [Aircraft] {
+        offsetsFt.map { offset in
+            aircraft(pressureAltitudeFt: 35_000,
+                     geometricAltitudeFt: 35_000 + offset)
+        }
     }
 
     // MARK: - Ground classification
@@ -145,5 +157,74 @@ struct TargetDataTests {
     @Test func invalidPressureIsRejected() {
         #expect(CalculationsLogic.pressureAltitudeFeet(hectopascals: 0) == nil)
         #expect(CalculationsLogic.pressureAltitudeFeet(hectopascals: -5) == nil)
+    }
+
+    // MARK: - Vertical datum offset
+
+    @Test func noTrafficReportingBothDatumsYieldsNoEstimate() {
+        let onlyPressure = [aircraft(pressureAltitudeFt: 35_000, geometricAltitudeFt: nil)]
+        #expect(AltitudeDatumOffset.estimate(from: onlyPressure) == nil)
+        #expect(AltitudeDatumOffset.estimate(from: []) == nil)
+    }
+
+    @Test func offsetIsGeometricMinusPressure() {
+        let traffic = trafficReportingBothDatums(offsetsFt: [-2_800])
+        let estimate = AltitudeDatumOffset.estimate(from: traffic)
+        #expect(estimate?.sampleCount == 1)
+        #expect(estimate?.medianFt == -2_800)
+    }
+
+    /// The realistic case: most aircraft agree, one reports something absurd. The median must
+    /// not follow the outlier the way a mean would.
+    @Test func medianIgnoresASingleWildOutlier() {
+        var traffic = trafficReportingBothDatums(offsetsFt: [-1_000, -1_100, -900, -1_050, -950])
+        traffic.append(contentsOf: trafficReportingBothDatums(offsetsFt: [4_800]))
+        let estimate = AltitudeDatumOffset.estimate(from: traffic)
+        #expect(estimate?.sampleCount == 6)
+        if let median = estimate?.medianFt {
+            #expect(median < -900 && median > -1_100)
+        }
+    }
+
+    @Test func implausibleOffsetsAreRejectedEntirely() {
+        // A mis-set or stale report: no atmosphere produces this.
+        let traffic = trafficReportingBothDatums(offsetsFt: [20_000])
+        #expect(AltitudeDatumOffset.estimate(from: traffic) == nil)
+    }
+
+    @Test func spreadReportsAgreementBetweenAircraft() {
+        let tight = trafficReportingBothDatums(offsetsFt: [-1_000, -1_010, -990, -1_005, -995])
+        let loose = trafficReportingBothDatums(offsetsFt: [-200, -1_800, -600, -1_400, -1_000])
+        let tightSpread = AltitudeDatumOffset.estimate(from: tight)?.spreadFt ?? 0
+        let looseSpread = AltitudeDatumOffset.estimate(from: loose)?.spreadFt ?? 0
+        #expect(tightSpread < looseSpread)
+    }
+
+    @Test func percentileHandlesBoundaries() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0]
+        #expect(AltitudeDatumOffset.percentile(values, 0.0) == 1.0)
+        #expect(AltitudeDatumOffset.percentile(values, 0.5) == 3.0)
+        #expect(AltitudeDatumOffset.percentile(values, 1.0) == 5.0)
+        // Out-of-range fractions clamp rather than trapping on an index.
+        #expect(AltitudeDatumOffset.percentile(values, -1.0) == 1.0)
+        #expect(AltitudeDatumOffset.percentile(values, 2.0) == 5.0)
+        #expect(AltitudeDatumOffset.percentile([], 0.5) == 0)
+    }
+
+    /// The error this whole measurement exists to remove, in the reporting user's aircraft:
+    /// pressurized, internet-sourced traffic, cold day at FL350.
+    @Test func offsetExplainsTheColdDayElevationError() {
+        // Aircraft indicating FL350 are geometrically ~2,800 ft lower on an ISA-20 day.
+        let traffic = trafficReportingBothDatums(offsetsFt: [-2_800, -2_750, -2_850])
+        let estimate = AltitudeDatumOffset.estimate(from: traffic)
+        #expect(estimate != nil)
+
+        // Applying the measured offset brings a co-altitude target back to co-altitude.
+        let ownGeometricFt = 32_200.0
+        let targetPressureFt = 35_000.0
+        if let median = estimate?.medianFt {
+            let correctedTargetGeometric = targetPressureFt + median
+            #expect(abs(correctedTargetGeometric - ownGeometricFt) < 100)
+        }
     }
 }

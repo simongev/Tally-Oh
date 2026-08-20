@@ -364,6 +364,72 @@ class CalculationsLogic {
     }
 }
 
+// MARK: - Vertical Datum Offset
+
+/// Measures the local conversion between pressure altitude and geometric altitude from the
+/// traffic picture itself.
+///
+/// Aircraft report `alt_baro` against the 29.92 inHg standard datum and `alt_geom` against the
+/// WGS-84 ellipsoid. Their difference is the local offset produced by the actual altimeter
+/// setting and by temperature deviation from standard — the same offset that applies to the
+/// viewer. Every aircraft nearby that reports both is therefore measuring it for us, which is
+/// a better local estimate than any single station's altimeter setting.
+///
+/// The median is used rather than the mean because a handful of aircraft report a stale or
+/// mis-set value, and the interquartile spread says how much the sample can be trusted: a
+/// tight spread means the aircraft agree, a wide one means the sample is contaminated.
+///
+/// Currently measured and logged only. Applying it to target placement is the next phase.
+enum AltitudeDatumOffset {
+
+    struct Estimate {
+        /// How many aircraft contributed a usable pair.
+        var sampleCount: Int
+        /// Geometric minus pressure altitude, in feet. Positive means geometric reads higher.
+        var medianFt: Double
+        var lowerQuartileFt: Double
+        var upperQuartileFt: Double
+
+        /// Interquartile spread. Small means the contributing aircraft agree with each other.
+        var spreadFt: Double { upperQuartileFt - lowerQuartileFt }
+    }
+
+    /// Per-aircraft geometric-minus-pressure differences, for aircraft reporting both.
+    static func offsets(from aircraft: [Aircraft]) -> [Double] {
+        aircraft.compactMap { ac in
+            guard let geometric = ac.geometricAltitudeFt,
+                  let pressure  = ac.pressureAltitudeFt else { return nil }
+            let difference = geometric - pressure
+            // Reject values no atmosphere could produce; those are mis-set or stale reports.
+            guard abs(difference) <= maxPlausibleOffsetFt else { return nil }
+            return difference
+        }
+    }
+
+    /// Widest offset attributable to altimeter setting plus temperature deviation. Beyond this
+    /// the pair is a data error rather than an atmosphere.
+    static let maxPlausibleOffsetFt: Double = 5_000.0
+
+    static func estimate(from aircraft: [Aircraft]) -> Estimate? {
+        let values = offsets(from: aircraft).sorted()
+        guard !values.isEmpty else { return nil }
+        return Estimate(
+            sampleCount: values.count,
+            medianFt: percentile(values, 0.50),
+            lowerQuartileFt: percentile(values, 0.25),
+            upperQuartileFt: percentile(values, 0.75)
+        )
+    }
+
+    /// Nearest-rank percentile of an already-sorted array.
+    static func percentile(_ sorted: [Double], _ fraction: Double) -> Double {
+        guard !sorted.isEmpty else { return 0 }
+        let clamped = max(0.0, min(1.0, fraction))
+        let index = Int((Double(sorted.count - 1) * clamped).rounded())
+        return sorted[index]
+    }
+}
+
 // MARK: - Airport Data Structure
 
 struct Airport: Identifiable {
