@@ -2923,9 +2923,15 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             // so that magnetometer noise doesn't shift every AR node on each callback.
             // Geographic declination changes only over tens of miles, so this lag is
             // imperceptible in practice.
-            arKitNorthCorrectionDeg = isFirstHeadingFix
+            // smoothAngle works in compass space and returns 0…360, which is wrong for a
+            // signed correction: a declination of −12.5° came back as 347.5° and was
+            // displayed that way. Placement is unaffected because the bearing arithmetic is
+            // modular, but anything that reasons about the size of the correction would be,
+            // so it is folded back to −180…180 here.
+            let smoothed = isFirstHeadingFix
                 ? decl
                 : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
+            arKitNorthCorrectionDeg = smoothed > 180 ? smoothed - 360 : smoothed
             sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         }
 

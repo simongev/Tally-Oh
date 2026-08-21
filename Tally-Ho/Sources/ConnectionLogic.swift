@@ -137,9 +137,9 @@ class ConnectionLogic: ObservableObject {
         internetQueryRadius = max(10, distanceNM * 1.25)
     }
 
-    /// Hard cap on total internet aircraft stored.  Only 200 nodes can ever be
-    /// rendered, and the closest 200 by distance are chosen, so storing more than
-    /// ~100 provides no visual benefit while inflating the dictionary copied every tick.
+    /// Hard cap on total internet aircraft stored, applied by distance so the set kept is
+    /// always the closest N. Bounds the dictionary that is copied on every update tick;
+    /// beyond this, additional distant traffic adds cost without adding awareness.
     private let maxInternetAircraft = 100
     /// Timestamp of the most recent internet fetch request — used to compute
     /// dynamic extrapolation latency in the dead-reckoning position predictor.
@@ -461,9 +461,6 @@ class ConnectionLogic: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
 
-                let existingCount     = currentAircraft.values.filter { $0.source == .internet }.count
-                var newSlotsRemaining = max(0, cap - existingCount)
-
                 var updates: [String: Aircraft] = [:]
                 for var ac in list {
                     // Pre-filter by distance — aircraft outside render range are never stored.
@@ -482,18 +479,12 @@ class ConnectionLogic: ObservableObject {
                         if CalculationsLogic.distanceInNauticalMiles(from: ownCoord, to: ac.coordinate) < 0.1 { continue }
                     }
 
-                    // Existing internet aircraft: always refresh position + timestamp so
-                    // the 4 Hz visualization loop sees current data every 8-second fetch.
-                    // New aircraft: only add while below the cap.
-                    // Use `continue` (not `break`) so the loop keeps scanning — existing
-                    // aircraft that appear later in the list still get their update even
-                    // when no new slots are available.
-                    let isUpdate = currentAircraft[ac.id]?.source == .internet
-                    if !isUpdate {
-                        guard newSlotsRemaining > 0 else { continue }
-                        newSlotsRemaining -= 1
-                    }
-
+                    // Every aircraft in range is taken here. The cap is applied afterwards,
+                    // by distance, rather than by refusing new arrivals: filling it in the
+                    // order the API happened to return meant that in dense airspace the
+                    // hundred stored aircraft were an arbitrary hundred, and once full no
+                    // new aircraft could enter for 90 seconds — so the nearest traffic, the
+                    // traffic that matters most, was routinely the traffic left out.
                     ac.lastUpdate = fetchTime
                     updates[ac.id] = ac
                 }
@@ -505,6 +496,24 @@ class ConnectionLogic: ObservableObject {
                     guard let self else { return }
                     var merged = self.detectedAircraft
                     for (id, ac) in updates { merged[id] = ac }
+
+                    // Enforce the cap by keeping the closest aircraft, so a nearer target can
+                    // always displace a more distant one. Aircraft received earlier that have
+                    // since flown away are the first to go.
+                    if let here = self.currentLocation {
+                        let internetIDs = merged.filter { $0.value.source == .internet }
+                        if internetIDs.count > cap {
+                            let byDistance = internetIDs
+                                .map { (id: $0.key,
+                                        distNM: CalculationsLogic.distanceInNauticalMiles(
+                                            from: here, to: $0.value.coordinate)) }
+                                .sorted { $0.distNM < $1.distNM }
+                            for entry in byDistance.dropFirst(cap) {
+                                merged.removeValue(forKey: entry.id)
+                            }
+                        }
+                    }
+
                     self.detectedAircraft = merged
                     self.internetAircraftCount = merged.values.filter { $0.source == .internet }.count
                 }

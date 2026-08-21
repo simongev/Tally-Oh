@@ -980,15 +980,31 @@ class ARSceneManager {
         var nodesAdded = false
         /// Hard ceiling on concurrent aircraft nodes. Each aircraft = 3 SceneKit nodes
         /// (cone + ring plane + label plane), each with a GPU texture.
-        /// On the ground with ADS-B connected we reduce this sharply — the user is
-        /// surrounded by ground traffic that burns VRAM and is irrelevant to flight safety.
-        let maxTotalNodes      = onGround ? 50 : 200
+        ///
+        /// The tight ceiling exists for one situation: parked on an airfield with ground
+        /// traffic switched on, where the user is surrounded by aircraft that burn VRAM and
+        /// carry no flight-safety value. It is scoped to exactly that, because applying it
+        /// whenever the user is on the ground also throttled the airborne traffic overhead,
+        /// which is the entire traffic picture from the ground.
+        let maxTotalNodes      = (onGround && settings.showGroundAircraft) ? 50 : 200
         /// Cap new node creation per tick to avoid a main-thread spike when a filter
         /// suddenly makes many aircraft visible at once (e.g. enabling ground traffic).
         let maxNewNodesPerTick = 20
         var newNodesThisTick   = 0
 
-        for ac in aircraft {
+        // Nearest first. Both the node ceiling and the per-tick creation limit stop partway
+        // through this loop, so whatever order it runs in decides which aircraft get drawn.
+        // Dictionary order is arbitrary, which in dense airspace meant the closest traffic
+        // could be dropped in favour of traffic twenty miles away.
+        let aircraftNearestFirst = aircraft
+            .map { (aircraft: $0,
+                    distNM: CalculationsLogic.distanceInNauticalMiles(
+                        from: userLocation,
+                        to: CalculationsLogic.predictedPosition(for: $0, aheadSeconds: 0).coordinate)) }
+            .sorted { $0.distNM < $1.distNM }
+            .map { $0.aircraft }
+
+        for ac in aircraftNearestFirst {
             // Filter out ground aircraft unless the user has enabled them. Uses the source's
             // own on-ground flag where available; the altitude threshold alone misclassified
             // traffic at high-elevation airports.

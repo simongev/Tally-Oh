@@ -250,4 +250,44 @@ struct TargetDataTests {
         let separation = abs(35_000.0 - 500.0)
         #expect(separation > 10_000)
     }
+
+    // MARK: - Nearest-first selection
+
+    /// Both the storage cap and the node ceiling stop partway through a list, so the order
+    /// they run in decides which aircraft survive. In dense airspace an arbitrary order
+    /// drops the nearest traffic, which is the traffic that matters most.
+    @Test func sortingByDistanceKeepsTheNearestWhenCapped() {
+        let here = CLLocationCoordinate2D(latitude: 40.7483, longitude: -74.0366)
+        // Deliberately built far-first, the way an unsorted API response can arrive.
+        let distancesNM: [Double] = [22, 18, 15, 9, 4, 1]
+        let traffic = distancesNM.map { nm -> Aircraft in
+            var ac = aircraft(altitude: 5_000)
+            // ~1 minute of latitude per nautical mile.
+            ac.latitude = here.latitude + nm / 60.0
+            ac.longitude = here.longitude
+            return ac
+        }
+
+        let nearestFirst = traffic
+            .map { (ac: $0, d: CalculationsLogic.distanceInNauticalMiles(from: here, to: $0.coordinate)) }
+            .sorted { $0.d < $1.d }
+
+        // A cap of three must retain the three closest, not the first three given.
+        let kept = nearestFirst.prefix(3).map { $0.d }
+        #expect(kept.count == 3)
+        if let farthestKept = kept.max(), let nearest = nearestFirst.first?.d {
+            #expect(farthestKept < 12.0)
+            #expect(abs(nearest - 1.0) < 0.3)
+        }
+    }
+
+    /// A signed correction folded into compass space reads as its complement: −12.5 becomes
+    /// 347.5. Placement is modular so it still lands correctly, but the value is nonsense to
+    /// display and to threshold on.
+    @Test func signedCorrectionFoldsBackBelowOneEighty() {
+        func signed(_ angle: Double) -> Double { angle > 180 ? angle - 360 : angle }
+        #expect(abs(signed(347.5) - (-12.5)) < 0.001)
+        #expect(abs(signed(12.5) - 12.5) < 0.001)
+        #expect(abs(signed(180.0) - 180.0) < 0.001)
+    }
 }
