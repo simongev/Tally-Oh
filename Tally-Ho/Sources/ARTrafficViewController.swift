@@ -720,6 +720,24 @@ private extension Double {
 /// run of poor fixes left the app dead-reckoning indefinitely from an increasingly old
 /// position. At cruise speed that grows error much faster than a degraded fix contributes, so
 /// past a staleness limit a worse fix is preferred to an older one.
+/// How the app decides whether the user is airborne.
+///
+/// MSL altitude cannot answer this on its own: an aircraft parked at a 5,400 ft field reads as
+/// 5,400 ft, so a bare "altitude > 200 ft" test calls it airborne while it is still on the
+/// stand. That mistake reaches further than it looks — it decided TCAS alerting, the GPS
+/// accuracy gate, and whether the ±10,000 ft altitude band culled traffic — so this is
+/// answered from height above the nearest known field instead, with motion as a fallback.
+private enum AirborneEstimate {
+    /// Only fields this close are treated as candidates for "the field we are at".
+    static let fieldSearchRadiusNM: Double = 5.0
+    /// Height above that field before the aircraft counts as flying. Comfortably above
+    /// terrain variation around an airfield, comfortably below a circuit altitude.
+    static let heightAboveFieldFt: Double = 500.0
+    /// Used when no known field is close enough to judge by — nothing on the ground sustains
+    /// this speed.
+    static let groundSpeedKt: Double = 40.0
+}
+
 private enum GPSGate {
     /// Once the last accepted fix is older than this, accept degraded fixes up to the ceiling.
     static let staleFixSeconds: TimeInterval = 10.0
@@ -887,6 +905,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// Throttle for the 1 Hz flight-recorder sample, driven off the existing 4 Hz tick.
     private var lastRecorderSampleTime: Date = .distantPast
+
+    /// Whether the user is currently judged to be flying, refreshed each 4 Hz tick.
+    /// Stored rather than computed on demand because the nearest-field search walks the
+    /// loaded airport list, and several call sites read it per fix.
+    private var isAirborneEstimate: Bool = false
+    private var airborneBasis: String = "unknown"
 
     /// Most recent measured pressure-to-geometric offset, for display. Not applied to
     /// placement — that is the next phase.
@@ -1392,14 +1416,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     @objc private func showSettings() {
         guard let settings = sceneManager?.settings else { return }
 
-        // Collect callsigns of aircraft within 2 NM so the picker offers meaningful
-        // options. We look at the raw (unfiltered) aircraft dictionary so the user
-        // can see their own aircraft even when the 2 NM exclusion zone hides it.
-        let wifiMode = wifiInAir
+        // Collect callsigns of nearby aircraft so the picker offers meaningful options.
+        // Offered whenever there is no ADS-B receiver to identify the aircraft for us,
+        // airborne or not: identifying your own aircraft is now the only thing that hides
+        // it, so it has to be possible to do that on the ramp before departure.
+        let wifiMode = !usingADSBGPS
         var nearbyCallsigns: [String] = []
         if wifiMode, let loc = activeLocation {
             nearbyCallsigns = connectionLogic.detectedAircraft.values
-                .filter { CalculationsLogic.distanceInNauticalMiles(from: loc, to: $0.coordinate) < 2.0 }
+                .filter { CalculationsLogic.distanceInNauticalMiles(from: loc, to: $0.coordinate) < 5.0 }
                 .map { $0.callsign }
                 .filter { !$0.isEmpty && $0 != "OWNSHIP" }
                 .sorted()
@@ -1413,7 +1438,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         let vc = SettingsViewController(
             settings: settings,
-            wifiInAir: wifiMode,
+            allowsOwnshipSelection: wifiMode,
             nearbyCallsigns: nearbyCallsigns,
             adsbOwnshipCallsign: adsbCallsign
         ) { [weak self] updated in
@@ -1493,12 +1518,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Returns the aircraft list to show on the 2D map.
     /// Applies the WiFi ownship callsign filter (same as the AR view) so the user's
     /// own aircraft is not shown on the map once they have identified it in Settings.
-    /// The 2 NM exclusion zone is intentionally NOT applied here — the map is used
-    /// specifically to identify nearby aircraft, and hiding close traffic would defeat
-    /// that purpose.
+    /// Nothing else is hidden here: the map is used specifically to identify nearby
+    /// aircraft, so close traffic always appears.
     private func mapFilteredAircraft() -> [Aircraft] {
         var list = Array(connectionLogic.detectedAircraft.values)
-        if wifiInAir, let ownCallsign = sceneManager?.settings.wifiOwnshipCallsign {
+        if let ownCallsign = sceneManager?.settings.wifiOwnshipCallsign {
             list = list.filter { $0.callsign != ownCallsign }
         }
         return list
@@ -1849,14 +1873,38 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// false alerts from ground traffic and to reduce memory pressure on the ground.
     /// Uses ADS-B ownship altitude when connected, iPhone GPS altitude otherwise.
     private var tcasEnabled: Bool {
-        activeAltitude > 200
+        isAirborneEstimate
     }
 
-    /// True when the user is airborne on a WiFi-only connection (no ADS-B device).
-    /// In this mode the app cannot auto-identify the user's aircraft, so we either
-    /// hide all traffic within 2 NM (default) or hide only the chosen callsign.
-    private var wifiInAir: Bool {
-        tcasEnabled && !usingADSBGPS
+    /// Height above the nearest known airfield, when one is close enough to plausibly be the
+    /// field we are at. Nil when no field is near enough to judge by.
+    private var heightAboveNearestFieldFt: Double? {
+        guard let loc = activeLocation else { return nil }
+        var nearestDistNM = Double.greatestFiniteMagnitude
+        var nearestElevationFt: Double?
+        for airport in airports {
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: airport.coordinate)
+            guard distNM <= AirborneEstimate.fieldSearchRadiusNM, distNM < nearestDistNM else { continue }
+            nearestDistNM = distNM
+            nearestElevationFt = airport.elevation
+        }
+        guard let elevation = nearestElevationFt else { return nil }
+        return activeAltitude - elevation
+    }
+
+    /// Best available answer to "are we flying", recomputed each tick.
+    private func computeIsAirborne() -> (airborne: Bool, basis: String) {
+        // A receiver states it outright, in the GDL90 Misc airborne bit.
+        if usingADSBGPS, let report = connectionLogic.ownshipData {
+            return (!report.isOnGround, "adsb")
+        }
+        if let heightAboveField = heightAboveNearestFieldFt {
+            return (heightAboveField > AirborneEstimate.heightAboveFieldFt,
+                    String(format: "agl%.0f", heightAboveField))
+        }
+        // Nowhere near a known field, so judge by motion instead.
+        let speedKt = activeGroundSpeedKt
+        return (speedKt > AirborneEstimate.groundSpeedKt, String(format: "gs%.0f", speedKt))
     }
 
     private func updateVisualization() {
@@ -1866,8 +1914,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard state.hasPosition else { return }
         let loc = state.coordinate
         let altitude = state.displayAltitudeFt
-        let airborne = altitude > 200
-        let onGroundWithADSB = (state.source == .adsb) && altitude <= 200
+
+        // Refreshed here so every consumer this tick — culling, TCAS, the node cap and the
+        // GPS gate — agrees on whether we are flying.
+        let previousAirborne = isAirborneEstimate
+        let estimate = computeIsAirborne()
+        isAirborneEstimate = estimate.airborne
+        airborneBasis      = estimate.basis
+        if previousAirborne != estimate.airborne {
+            FlightRecorder.shared.record(
+                event: "airborne_changed",
+                detail: String(format: "%@ basis=%@ alt=%.0f",
+                               estimate.airborne ? "airborne" : "ground", estimate.basis, altitude)
+            )
+        }
+        let airborne = isAirborneEstimate
 
         // Pre-filter by distance and basic visibility before touching SceneKit.
         // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
@@ -1875,21 +1936,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
         let maxDist = currentSettings.aircraftMaxDistance
         let showGround = currentSettings.showGroundAircraft
-        let wifiMode = airborne && state.source != .adsb
-        let wifiOwnshipCallsign = currentSettings.wifiOwnshipCallsign
+        // Only the user's own aircraft is ever hidden, and only once they have identified it.
+        // Blanket-hiding everything within 2 NM used to stand in for that, but nearby traffic
+        // is the traffic that matters most — suppressing it to mask one aircraft costs far
+        // more than it saves, and it hid close targets before the user had any way to choose.
+        let ownCallsign = currentSettings.wifiOwnshipCallsign
         let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
             guard showGround || !ac.isGroundTraffic else { return false }
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate)
             guard distNM <= maxDist else { return false }
-            if wifiMode {
-                if let selected = wifiOwnshipCallsign {
-                    // User identified their plane: hide only that callsign, show everything else.
-                    if ac.callsign == selected { return false }
-                } else {
-                    // No plane identified: hide all traffic within 2 NM to mask own aircraft.
-                    if distNM < 2.0 { return false }
-                }
-            }
+            if let ownCallsign, ac.callsign == ownCallsign { return false }
             return true
         }
 
@@ -1929,7 +1985,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userHeading: userHeading,
             cameraWorldPosition: cameraPos,
             tcasEvaluation: tcas,
-            onGround: onGroundWithADSB
+            onGround: !airborne
         )
         sceneManager?.updateAirports(
             airports,
@@ -2009,6 +2065,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             sample.cameraRollDeg  = Double(angles.z) * 180.0 / .pi
         }
         sample.arTrackingState = arTrackingStateDescription
+        sample.airborne        = isAirborneEstimate
+        sample.airborneBasis   = airborneBasis
 
         // Always recorded, including zero: an empty sky at the start of a lift is precisely
         // the readiness signal worth capturing, not a missing value.
@@ -2688,7 +2746,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
 
         let hAcc = loc.horizontalAccuracy
-        let airborne = activeAltitude > 200
+        let airborne = isAirborneEstimate
 
         // Ground-only: prompt recalibration if GPS accuracy crosses from good to
         // bad (same threshold as the status-bar ⚠️ warning), before it's overwritten

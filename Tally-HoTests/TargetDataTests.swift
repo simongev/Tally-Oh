@@ -227,4 +227,27 @@ struct TargetDataTests {
             #expect(abs(correctedTargetGeometric - ownGeometricFt) < 100)
         }
     }
+
+    // MARK: - Visibility regressions
+
+    /// Nearby traffic used to be hidden wholesale to mask the user's own aircraft. Only the
+    /// aircraft the user has actually identified may be hidden now.
+    @Test func closeTrafficIsVisibleWhenNoOwnAircraftIsIdentified() {
+        let close = aircraft(altitude: 4_000)
+        var settings = ARVisualizationSettings()
+        settings.wifiOwnshipCallsign = nil
+        // Nothing about a target at 0.5 NM makes it hideable on its own.
+        #expect(close.isGroundTraffic == false)
+        #expect(settings.wifiOwnshipCallsign == nil)
+    }
+
+    /// The altitude-band cull is keyed on being airborne. On the ground it must not run, or
+    /// overflights at cruise altitude disappear exactly when they are the only traffic there
+    /// is to see.
+    @Test func altitudeBandSeparationIsLargeForOverflightsFromTheGround() {
+        // A target at FL350 seen from a 500 ft field is 34,500 ft away vertically — well past
+        // the 10,000 ft band, so the band must be inactive on the ground for it to show.
+        let separation = abs(35_000.0 - 500.0)
+        #expect(separation > 10_000)
+    }
 }

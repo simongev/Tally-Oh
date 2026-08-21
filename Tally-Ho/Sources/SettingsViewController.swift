@@ -91,7 +91,7 @@ class SettingsViewController: UITableViewController {
         )
         /// A tappable row that lets the user pick one value from a list of callsigns.
         /// Tapping presents an action sheet. `options` is the list of nearby callsigns;
-        /// `nil` in getter/setter means "None — hide all within 2 NM".
+        /// `nil` in getter/setter means "None — do not hide any aircraft".
         case callsignPicker(
             title: String,
             subtitle: String,
@@ -131,10 +131,10 @@ class SettingsViewController: UITableViewController {
 
     private var settings: ARVisualizationSettings
     private let onDismiss: (ARVisualizationSettings) -> Void
-    /// Whether the user is currently airborne on a WiFi-only connection.
-    /// When true an extra "My Airplane" section is shown with a picker.
-    private let wifiInAir: Bool
-    /// Callsigns of aircraft detected within 2 NM at the time settings was opened.
+    /// True when no ADS-B receiver is identifying the aircraft for us, so the user may
+    /// pick their own callsign. When true an extra "My Airplane" section is shown.
+    private let allowsOwnshipSelection: Bool
+    /// Callsigns of nearby aircraft at the time settings was opened.
     private let nearbyCallsigns: [String]
     /// Callsign of the ownship as reported by the ADS-B receiver (nil when not connected).
     /// When non-nil, "My Airplane" is shown as a read-only display instead of a picker.
@@ -258,17 +258,17 @@ class SettingsViewController: UITableViewController {
             ]
         ))
 
-        if wifiInAir {
+        if allowsOwnshipSelection {
             result.append(Section(
                 header: "🛩️  My Airplane",
                 footer: "On WiFi, the app cannot auto-detect which aircraft you are on. " +
                         "Select your callsign to hide only your aircraft and show everything else. " +
-                        "Without a selection, all traffic within 2 NM is hidden.",
+                        "Without a selection, all traffic is shown, including your own aircraft.",
                 rows: [
                     .callsignPicker(
                         title: "I'm Flying",
                         subtitle: nearbyCallsigns.isEmpty
-                            ? "No aircraft detected within 2 NM yet"
+                            ? "No nearby aircraft detected yet"
                             : "Select your aircraft from those nearby",
                         options: nearbyCallsigns,
                         getter: { $0.wifiOwnshipCallsign },
@@ -295,12 +295,12 @@ class SettingsViewController: UITableViewController {
     // MARK: Init
 
     init(settings: ARVisualizationSettings,
-         wifiInAir: Bool = false,
+         allowsOwnshipSelection: Bool = false,
          nearbyCallsigns: [String] = [],
          adsbOwnshipCallsign: String? = nil,
          onDismiss: @escaping (ARVisualizationSettings) -> Void) {
         self.settings             = settings
-        self.wifiInAir            = wifiInAir
+        self.allowsOwnshipSelection = allowsOwnshipSelection
         self.nearbyCallsigns      = nearbyCallsigns
         self.adsbOwnshipCallsign  = adsbOwnshipCallsign
         self.onDismiss            = onDismiss
@@ -473,8 +473,8 @@ class SettingsViewController: UITableViewController {
             preferredStyle: .actionSheet
         )
 
-        // "None" resets to the default 2 NM exclusion zone.
-        let noneTitle = (settings.wifiOwnshipCallsign == nil ? "✓ " : "") + "None — hide all within 2 NM"
+        // "None" shows every aircraft, including the user's own.
+        let noneTitle = (settings.wifiOwnshipCallsign == nil ? "✓ " : "") + "None — show all traffic"
         alert.addAction(UIAlertAction(title: noneTitle, style: .default) { [weak self] _ in
             guard let self else { return }
             setter(&self.settings, nil)

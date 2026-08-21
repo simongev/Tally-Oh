@@ -67,7 +67,7 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg", "interference_bias_deg",
-        "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state",
+        "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
         "n_targets_press", "n_targets_geom",
@@ -104,6 +104,10 @@ final class FlightRecorder {
         var cameraPitchDeg: Double?
         var cameraRollDeg: Double?
         var arTrackingState: String?
+        /// Whether the app judged the user to be flying, and what it judged that from —
+        /// the input that decides TCAS, the altitude-band cull and the GPS accuracy gate.
+        var airborne: Bool?
+        var airborneBasis: String?
 
         var aircraftCount: Int?
         var adsbAircraftCount: Int?
@@ -242,6 +246,8 @@ final class FlightRecorder {
         fields.append(format(sample.cameraPitchDeg, decimals: 1))
         fields.append(format(sample.cameraRollDeg,  decimals: 1))
         fields.append(escape(sample.arTrackingState ?? ""))
+        fields.append(sample.airborne.map { $0 ? "1" : "0" } ?? "")
+        fields.append(escape(sample.airborneBasis ?? ""))
 
         let counters = gdl90Counters()
         fields.append(String(counters.valid))
