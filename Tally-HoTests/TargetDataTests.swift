@@ -306,6 +306,51 @@ struct TargetDataTests {
         #expect(abs(angleDifferenceDeg(from: 150, to: 160) - 10) < 0.001)
     }
 
+    // MARK: - AR frame convention
+
+    /// Pins the frame convention in a test rather than a comment, which is what this repo has
+    /// been relying on. ARKit's `.gravityAndHeading` world is TRUE-north aligned: −Z is true
+    /// north, +X is east. A GPS bearing is already a true bearing, so it maps across with no
+    /// declination term — applying one rotated every marker by the local declination.
+    @Test func trueBearingsMapDirectlyOntoTheARWorldAxes() {
+        let here = CLLocationCoordinate2D(latitude: 40.0, longitude: -74.0)
+        let oneDegreeOfLatitudeNM = 60.0
+
+        // Due north of the viewer: must land on −Z, with X essentially zero.
+        let north = CLLocationCoordinate2D(latitude: 41.0, longitude: -74.0)
+        let northPos = CalculationsLogic.calculateARPosition(
+            targetCoord: north, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0)
+        #expect(northPos.z < 0)
+        #expect(abs(northPos.x) < abs(northPos.z) * 0.05)
+
+        // Due east: must land on +X, with Z essentially zero.
+        let east = CLLocationCoordinate2D(latitude: 40.0, longitude: -73.0)
+        let eastPos = CalculationsLogic.calculateARPosition(
+            targetCoord: east, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0)
+        #expect(eastPos.x > 0)
+        #expect(abs(eastPos.z) < abs(eastPos.x) * 0.05)
+
+        // And the distance is sane: one degree of latitude is 60 NM.
+        let northDistNM = CalculationsLogic.distanceInNauticalMiles(from: here, to: north)
+        #expect(abs(northDistNM - oneDegreeOfLatitudeNM) < 1.0)
+    }
+
+    /// The regression this guards: with a westerly declination subtracted from the bearing, a
+    /// due-north target acquired a positive X component and drifted clockwise. Nothing may
+    /// rotate a target off its true bearing any more.
+    @Test func dueNorthTargetHasNoEastwardComponent() {
+        let here  = CLLocationCoordinate2D(latitude: 40.7483, longitude: -74.0366)
+        let north = CLLocationCoordinate2D(latitude: 40.9483, longitude: -74.0366)
+        let pos = CalculationsLogic.calculateARPosition(
+            targetCoord: north, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0)
+        // A 12.5 degree rotation of a 12 NM target would put roughly 2.6 NM on the X axis;
+        // the scaled scene units differ but the ratio is what matters.
+        #expect(abs(pos.x) < abs(pos.z) * 0.02)
+    }
+
     @Test func headingDeltaIsZeroWhenFramesAgree() {
         #expect(abs(angleDifferenceDeg(from: 217, to: 217)) < 0.001)
     }

@@ -53,11 +53,27 @@ result **persists across lifts**, so the second and later glances start already 
 
 - Camera-relative positioning (markers don't drift to the AR origin as the aircraft flies).
 - Dead reckoning of targets (with `seen_pos` server-side age) and of ownship, 60 Hz tick.
-- Magnetic-declination correction for ARKit's `.gravityAndHeading` magnetic-north alignment
-  — **field-tested and confirmed** (~10–15° improvement, build 271).
+- ~~Magnetic-declination correction~~ — **REMOVED in build 7, and the "field-tested and
+  confirmed" claim here was wrong.** It rested on one sentence in `b729cf9`: targets were
+  "displaced laterally by the local magnetic declination". That observation is *symmetric* —
+  equally consistent with the correction being missing and with it being wrongly present — and
+  the discriminating datum, the **direction** of the displacement, was never recorded. Build 6
+  flight data settled it: with the compass reading 175.5° magnetic / 163.1° true, ARKit's own
+  raw world azimuth was 162.9°, i.e. **true** heading. `.gravityAndHeading` is true-north
+  aligned, and subtracting declination was rotating every target ~12.5° clockwise.
 - No ARKit session restarts *from heading-accuracy changes* in flight; ground-only recalibration
   popups. (Foreground/appear still resets — see F6.)
 - Relaxed in-flight GPS accuracy gate (500 m), stale-target dashed rings, coast caps.
+
+### How to evidence an alignment change (learned the hard way)
+
+Three separate azimuth corrections have been added and reverted here, each on a field
+observation of the form "the target was off by roughly N degrees". That form of observation
+**cannot establish which way to correct**: an offset the size of the declination is equally
+consistent with the correction being absent and with it being wrongly applied. Record the
+**direction** of the error, or measure a quantity that has a known correct value — which is what
+`heading_delta_deg` now is. It must read near zero; any other value names both the size and the
+sign of what is wrong.
 
 ### What was already tried and failed (do NOT repeat)
 
@@ -250,7 +266,8 @@ The lift-and-look usage pattern reshapes this problem. Today every foreground re
 dominant azimuth error is whatever the compass reads at that instant, and nothing learned earlier
 in the flight survives. The fixes are all automatic:
 
-1. **Keep** `.gravityAndHeading` + declination (the only field-validated alignment).
+1. **Keep** `.gravityAndHeading`, with **no declination term** — its world is true-north
+   aligned, so GPS bearings map across directly (build 7).
 2. **Heading readout & 2D map** *(F5)*: in flight, display/orient by GPS or ADS-B track when moving
    (> 40 kt), else by AR camera azimuth + declination — never the raw cockpit compass. Label the
    source in the HUD.

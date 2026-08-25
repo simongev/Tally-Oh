@@ -871,11 +871,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var selectionState: SelectionState = .none
     private let gpsAccuracyThreshold: CLLocationAccuracy = 30.0
 
-    private var arKitNorthCorrectionDeg: Double = 0
+    /// Local magnetic declination (trueHeading − magneticHeading), recorded and displayed
+    /// but deliberately NOT applied to anything.
+    ///
+    /// It used to be subtracted from every GPS bearing, on the premise that ARKit's
+    /// `.gravityAndHeading` world is magnetic-north aligned. Flight-log measurement disproved
+    /// that: ARKit's raw world azimuth tracks *true* heading, so the subtraction was rotating
+    /// every marker clockwise by the declination — about 12.5° in New York. Kept as a
+    /// diagnostic because it is still the right number to see next to the compass readings.
+    private var magneticDeclinationDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
 
     // Second, independent heading correction layered on top of
-    // arKitNorthCorrectionDeg (which only covers geographic magnetic
+    // magneticDeclinationDeg (which is now diagnostic-only, and only ever covered
     // declination). Cockpit magnetic interference can bias ARKit's own
     // world-alignment heading by tens of degrees at session start, and
     // declination correction can't touch that (it cancels out of the
@@ -998,9 +1006,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// pressure altitude and GPS geometric altitude is what identifies a pressurized cabin,
     /// and it is one of the inputs the frame-aware vertical work is being built on.
     private func setupDiagnosticAltimeter() {
-        guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
+        // Both failure paths below used to return in silence, which is why a whole session
+        // logged an empty pressure column with no indication whether the sensor was absent,
+        // unauthorised, or simply never called. The Motion usage description is declared, so
+        // a denial surfaces here as CMErrorNotAuthorized rather than as a missing key.
+        guard CMAltimeter.isRelativeAltitudeAvailable() else {
+            FlightRecorder.shared.record(
+                event: "altimeter_unavailable",
+                detail: "isRelativeAltitudeAvailable=false"
+            )
+            return
+        }
         diagnosticAltimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
-            guard let self, let data, error == nil else { return }
+            guard let self else { return }
+            if let error {
+                let nsError = error as NSError
+                FlightRecorder.shared.record(
+                    event: "altimeter_error",
+                    detail: "domain=\(nsError.domain) code=\(nsError.code)"
+                )
+                return
+            }
+            guard let data else { return }
             let hectopascals = data.pressure.doubleValue * 10.0   // CoreMotion reports kPa
             self.cabinPressureAltitudeFeet =
                 CalculationsLogic.pressureAltitudeFeet(hectopascals: hectopascals)
@@ -1026,7 +1053,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         super.viewWillAppear(animated)
 
         startARSession(reason: "viewWillAppear")
-        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         beginLiftSession(reason: "viewWillAppear")
 
         // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
@@ -1434,7 +1460,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         FlightRecorder.shared.record(
             event: "ar_session_start",
             detail: String(format: "reason=%@ heading_acc=%.0f north_corr=%.1f bias=%.1f",
-                           reason, lastHeadingAccuracy, arKitNorthCorrectionDeg,
+                           reason, lastHeadingAccuracy, magneticDeclinationDeg,
                            interferenceBiasCorrectionDeg)
         )
 
@@ -1580,7 +1606,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private func resumeARIfPaused() {
         guard !(updateTimer?.isValid ?? false) else { return }
         startARSession(reason: "resumeAfterModal")
-        sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
@@ -2124,7 +2149,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.headingMagneticDeg = lastMagneticHeading >= 0 ? lastMagneticHeading : nil
         sample.headingTrueDeg     = lastTrueHeading     >= 0 ? lastTrueHeading     : nil
         sample.headingAccuracyDeg = lastHeadingAccuracy >= 0 ? lastHeadingAccuracy : nil
-        sample.declinationDeg     = arKitNorthCorrectionDeg
+        sample.declinationDeg     = magneticDeclinationDeg
         // The HUD's learned cockpit-interference term, recorded alongside declination so the
         // two corrections can be told apart when reviewing a flight.
         sample.interferenceBiasDeg = interferenceBiasCorrectionDeg
@@ -2177,10 +2202,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     ///
     /// Shared by the HUD rose and the flight recorder so the two cannot diverge.
     private func arFrameHeadingDeg(forward: SIMD3<Float>) -> Double {
-        // World −Z is ARKit's raw magnetic north, matching calculateARPosition's convention;
-        // adding the declination yields true heading.
+        // World −Z is TRUE north, matching calculateARPosition, so the raw azimuth is already
+        // a true heading and no declination term belongs here. Only the learned cockpit-
+        // interference offset is applied, and that is display-only.
         let rawDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-        let trueDeg = rawDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
+        let trueDeg = rawDeg + interferenceBiasCorrectionDeg
         return (trueDeg + 360).truncatingRemainder(dividingBy: 360)
     }
 
@@ -2192,6 +2218,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// than `eulerAngles.y`, since Euler yaw degenerates at steep pitch, which is exactly the
     /// attitude someone holds the phone at to look at traffic.
     private var currentARFrameHeadingDeg: Double? {
+        // Before tracking starts the camera transform is still identity, whose forward vector
+        // is (0, 0, −1): a perfectly plausible-looking due-north reading that sails through the
+        // horizontal-magnitude check below at magnitude 1.0. Recording that would contaminate
+        // the alignment measurement with rows that mean nothing, so an untracked frame yields
+        // no value at all — a blank column is honest, a confident wrong number is not.
+        guard case .normal = arTrackingState else { return nil }
         guard let transform = arSceneView.session.currentFrame?.camera.transform else { return nil }
         let forward = SIMD3<Float>(-transform.columns.2.x, -transform.columns.2.y, -transform.columns.2.z)
         // Near-vertical camera: the horizontal component vanishes and the azimuth is noise.
@@ -2272,8 +2304,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos,
-                northCorrectionDeg:  arKitNorthCorrectionDeg
+                cameraWorldPosition: cameraPos
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -2529,7 +2560,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = String(format: "%+.1f°/%+.1f°", arKitNorthCorrectionDeg, interferenceBiasCorrectionDeg)
+            let corrStr = String(format: "%+.1f°/%+.1f°", magneticDeclinationDeg, interferenceBiasCorrectionDeg)
             let altAccStr = lastVerticalAccuracy > 0
                 ? String(format: "±%.0fft", lastVerticalAccuracy * CalculationsLogic.metersToFeet)
                 : "?"
@@ -2754,15 +2785,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         // Heading, for the bottom-of-screen compass rose — a 2D screen
         // instrument like the bank rose above, computed from the same
-        // forward vector as the pitch ladder. Same world-frame
-        // convention as CalculationsLogic.calculateARPosition's bearing
-        // math (world -Z = ARKit's raw-magnetic north); add back the
-        // declination correction so the rose reads *true* heading,
-        // consistent with how aircraft bearings are corrected elsewhere.
+        // forward vector as the pitch ladder. Same world-frame convention
+        // as CalculationsLogic.calculateARPosition's bearing math: world
+        // −Z is TRUE north, so this is already a true heading and needs no
+        // declination term.
         let rawHeadingDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
 
         // Learn and cancel out cockpit magnetic interference in ARKit's own
-        // world-alignment heading (arKitNorthCorrectionDeg only covers
+        // world-alignment heading (declination is diagnostic-only now, and covered
         // geographic declination, which is a different, EMF-immune
         // correction — see the property doc comment). Always-on, no
         // "hold the phone still" gate: fed continuously whenever GPS
@@ -2787,7 +2817,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // entirely. Ramp it out gradually instead — a degraded-but-not-
             // terrible reading still contributes a little, just discounted.
             let accuracyWeight = max(0, min(1, 1 - lastGPSCourseAccuracy / 90))  // 1 at 0°, 0 by 90°
-            let currentEstimate = rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
+            let currentEstimate = rawHeadingDeg + interferenceBiasCorrectionDeg
             let residual = angleDifferenceDeg(from: currentEstimate, to: lastGPSCourseDeg)
             interferenceBiasCorrectionDeg = max(-60, min(60,
                 interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight * accuracyWeight))
@@ -3044,9 +3074,8 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             // so it is folded back to −180…180 here.
             let smoothed = isFirstHeadingFix
                 ? decl
-                : smoothAngle(current: arKitNorthCorrectionDeg, new: decl, alpha: 0.15)
-            arKitNorthCorrectionDeg = smoothed > 180 ? smoothed - 360 : smoothed
-            sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
+                : smoothAngle(current: magneticDeclinationDeg, new: decl, alpha: 0.15)
+            magneticDeclinationDeg = smoothed > 180 ? smoothed - 360 : smoothed
         }
 
         isFirstHeadingFix = false
