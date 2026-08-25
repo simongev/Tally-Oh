@@ -1017,18 +1017,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         liftStartTime = Date()
         hasLoggedFirstTargetThisLift = false
         FlightRecorder.shared.beginLift(reason: reason)
-        FlightRecorder.shared.record(
-            event: "ar_session_start",
-            detail: String(format: "heading_acc=%.0f north_corr=%.1f bias=%.1f",
-                           lastHeadingAccuracy, arKitNorthCorrectionDeg,
-                           interferenceBiasCorrectionDeg)
-        )
+        // The world reset itself is logged by startARSession(), which records every reset
+        // whatever triggered it. Marking the glance and resetting the world are different
+        // events and no longer share one log line.
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
-        startARSession()
+        startARSession(reason: "viewWillAppear")
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         beginLiftSession(reason: "viewWillAppear")
 
@@ -1055,7 +1052,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        arSceneView.session.pause()
+        pauseARSession()
         updateTimer?.invalidate()
         FlightRecorder.shared.endLift(reason: "viewWillDisappear")
     }
@@ -1289,7 +1286,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         NotificationCenter.default.addObserver(
             forName: .appDidBackground, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.arSceneView.session.pause()
+            self?.pauseARSession()
             self?.updateTimer?.fireDate = .distantFuture   // suspend the 4 Hz tick too
             FlightRecorder.shared.endLift(reason: "background")
         }
@@ -1297,7 +1294,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             forName: .appWillForeground, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.isViewLoaded, self.view.window != nil else { return }
-            self.startARSession()
+            self.startARSession(reason: "foreground")
             self.updateTimer?.fireDate = Date()            // resume immediately
             self.beginLiftSession(reason: "foreground")
         }
@@ -1391,7 +1388,56 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
-    private func startARSession() {
+    /// Shortest gap allowed between world resets.
+    ///
+    /// A reset takes ARKit a second or more to work through: tracking drops to
+    /// `.limited(.initializing)` and the camera feed stalls until it recovers. Called faster
+    /// than it can complete, the session never finishes initialising and the feed simply stops
+    /// — the UI keeps running, so it presents as a frozen camera rather than a hung app. That
+    /// is what a heading callback firing resets at CoreLocation's ~10 Hz did.
+    private static let minARSessionRestartInterval: TimeInterval = 3.0
+    private var lastARSessionStart: Date = .distantPast
+
+    /// Whether the session is currently paused. A paused session only resumes by being run
+    /// again, so the rate limit must never suppress that call — the app pauses whenever the
+    /// map or Settings is shown, and returning from either within the interval would otherwise
+    /// leave the camera stopped: the very failure this limit exists to prevent.
+    private var isARSessionPaused = true
+
+    /// Pause the session, recording that it is paused so the next `startARSession(reason:)`
+    /// is never throttled away and left stopped.
+    private func pauseARSession() {
+        arSceneView.session.pause()
+        isARSessionPaused = true
+    }
+
+    /// Reset the ARKit world. Rate-limited in here rather than at the call sites, so no future
+    /// caller can reintroduce a reset storm.
+    private func startARSession(reason: String) {
+        let now = Date()
+        let sinceLast = now.timeIntervalSince(lastARSessionStart)
+        // A paused session always gets its run: throttling that would strand the camera.
+        guard isARSessionPaused
+                || sinceLast >= ARTrafficViewController.minARSessionRestartInterval else {
+            FlightRecorder.shared.record(
+                event: "ar_session_reset_suppressed",
+                detail: String(format: "reason=%@ since_last=%.2fs", reason, sinceLast)
+            )
+            return
+        }
+        lastARSessionStart = now
+        isARSessionPaused = false
+
+        // Logged here rather than at any one call site, so every world reset is recorded
+        // whatever triggered it. Without this the reset storm that froze the camera left no
+        // trace in the flight log at all.
+        FlightRecorder.shared.record(
+            event: "ar_session_start",
+            detail: String(format: "reason=%@ heading_acc=%.0f north_corr=%.1f bias=%.1f",
+                           reason, lastHeadingAccuracy, arKitNorthCorrectionDeg,
+                           interferenceBiasCorrectionDeg)
+        )
+
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
@@ -1515,7 +1561,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // keep running full tilt underneath the sheet. Pause explicitly here
         // and resume in presentationControllerDidDismiss(_:), which fires for
         // both the Done button and an interactive swipe-down dismiss.
-        arSceneView.session.pause()
+        pauseARSession()
         updateTimer?.invalidate()
         nav.presentationController?.delegate = self
         present(nav, animated: true)
@@ -1533,7 +1579,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// (startARSession() just resets tracking again).
     private func resumeARIfPaused() {
         guard !(updateTimer?.isValid ?? false) else { return }
-        startARSession()
+        startARSession(reason: "resumeAfterModal")
         sceneManager?.arKitNorthCorrectionDeg = arKitNorthCorrectionDeg
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
@@ -2797,7 +2843,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         print("AR error: \(error.localizedDescription)")
     }
     func sessionWasInterrupted(_ session: ARSession) { }
-    func sessionInterruptionEnded(_ session: ARSession) { startARSession() }
+    func sessionInterruptionEnded(_ session: ARSession) {
+        startARSession(reason: "interruptionEnded")
+    }
 }
 
 // MARK: - CLLocationManagerDelegate
@@ -2947,16 +2995,20 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         let accuracy = newHeading.headingAccuracy
 
-        // Only restart ARKit when on the ground. In flight, compass accuracy commonly
-        // degrades due to aircraft magnetic interference and can bounce around the 20°
-        // threshold, triggering repeated ARKit world resets that disrupt AR tracking.
-        // Since target positions are recalculated every frame from GPS relative to the
-        // camera, a session restart doesn't improve accuracy — it only causes disruption.
+        // Degraded compass accuracy prompts recalibration on the ground, but deliberately
+        // does NOT reset the ARKit world any more.
+        //
+        // Resetting cannot improve compass accuracy: it re-anchors ARKit's north to the
+        // current sample, which this very condition has just established is a bad one. It also
+        // discards the learned interference correction and drops tracking back to
+        // initialising. And because this is an edge detector re-armed every time accuracy dips
+        // back under the threshold, a compass wobbling around 20° — the exact state that makes
+        // a user reach for Skip — fired it at CoreLocation's ~10 Hz. ARKit could never finish
+        // initialising between resets, so the camera feed stalled while the UI kept running.
         if !tcasEnabled
             && lastHeadingAccuracy >= 0
             && lastHeadingAccuracy <= 20
             && accuracy > 20 {
-            startARSession()
             presentCalibrationPopupIfNeeded()
         }
 
