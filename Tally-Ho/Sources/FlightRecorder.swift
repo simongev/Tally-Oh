@@ -67,6 +67,7 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg", "interference_bias_deg",
+        "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
@@ -99,6 +100,16 @@ final class FlightRecorder {
         var declinationDeg: Double?
         /// The HUD's learned cockpit-magnetic-interference term, separate from declination.
         var interferenceBiasDeg: Double?
+
+        /// Heading of the AR world frame — the frame targets are actually placed in.
+        var arHeadingDeg: Double?
+        /// Compass heading minus AR frame heading, signed, −180…180.
+        ///
+        /// This is ARKit's world-alignment error: its north was fixed from one compass sample
+        /// at session start and drifts by visual-inertial tracking thereafter. It is the
+        /// dominant azimuth error and the quantity the alignment work has to reduce, so it is
+        /// recorded on every sample rather than inferred after the fact.
+        var headingDeltaDeg: Double?
 
         var cameraYawDeg: Double?
         var cameraPitchDeg: Double?
@@ -241,6 +252,8 @@ final class FlightRecorder {
         fields.append(format(sample.headingAccuracyDeg, decimals: 1))
         fields.append(format(sample.declinationDeg,     decimals: 2))
         fields.append(format(sample.interferenceBiasDeg, decimals: 2))
+        fields.append(format(sample.arHeadingDeg,   decimals: 1))
+        fields.append(format(sample.headingDeltaDeg, decimals: 1))
 
         fields.append(format(sample.cameraYawDeg,   decimals: 1))
         fields.append(format(sample.cameraPitchDeg, decimals: 1))

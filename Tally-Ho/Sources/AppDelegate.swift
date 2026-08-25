@@ -81,10 +81,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             }
         }
 
-        calibration.onComplete = { [weak self] seedLocation in
+        calibration.onComplete = { [weak self] seedLocation, wasSkipped in
             guard let window = self?.window else { return }
             let arVC = ARTrafficViewController()
             arVC.seedLocation = seedLocation
+            // Carried through so the AR view does not immediately re-present a calibration
+            // screen the user has just declined.
+            arVC.calibrationWasSkipped = wasSkipped
             arVC.preloadedAirports = self?.preloadedAirports
             arVC.preloadedAircraft = self?.preloadedAircraft
             // Crossfade from calibration to AR

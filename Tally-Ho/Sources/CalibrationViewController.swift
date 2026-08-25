@@ -42,6 +42,9 @@ class CalibrationViewController: UIViewController {
     private var gpsReady     = false
     private var compassReady = false
     private var dismissed    = false   // prevent double-dismiss
+    /// True when the user dismissed this screen with Skip rather than the sensors converging.
+    /// Reported to the caller so it can stop re-presenting a screen the user has declined.
+    private var wasSkipped   = false
 
     private var bestGPSAccuracy:     CLLocationAccuracy         = -1
     private var bestCompassAccuracy: CLLocationDirectionAccuracy = -1
@@ -50,7 +53,11 @@ class CalibrationViewController: UIViewController {
 
     // MARK: - Callback
 
-    var onComplete: ((CLLocation?) -> Void)?
+    /// Called once when the screen is finished with. The flag reports whether the user chose
+    /// Skip: the caller needs that to avoid re-presenting a screen the user just dismissed,
+    /// since skipping means the sensors never reached the thresholds and will keep failing
+    /// whatever check the caller applies next.
+    var onComplete: ((CLLocation?, _ wasSkipped: Bool) -> Void)?
 
     /// Fired once, the first time any location update arrives — well before
     /// gpsAccuracyThreshold is met and the screen actually dismisses. Lets the
@@ -175,12 +182,13 @@ class CalibrationViewController: UIViewController {
         dismissed = true
         locationManager.stopUpdatingLocation()
         locationManager.stopUpdatingHeading()
-        onComplete?(lastValidLocation)
+        onComplete?(lastValidLocation, wasSkipped)
     }
 
     // MARK: - Actions
 
     @objc private func skipTapped() {
+        wasSkipped = true
         completeDismiss()
     }
 }

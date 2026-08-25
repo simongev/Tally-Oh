@@ -738,6 +738,18 @@ private enum AirborneEstimate {
     static let groundSpeedKt: Double = 40.0
 }
 
+/// Signed difference between two compass angles, in −180…180.
+///
+/// Distinct from `smoothAngle`, which works in 0…360 compass space and is wrong for anything
+/// signed — folding a −12.5° correction to 347.5° is what produced the misleading declination
+/// readout fixed in build 4.
+func angleDifferenceDeg(from: Double, to: Double) -> Double {
+    var delta = to - from
+    while delta >  180 { delta -= 360 }
+    while delta < -180 { delta += 360 }
+    return delta
+}
+
 private enum GPSGate {
     /// Once the last accepted fix is older than this, accept degraded fixes up to the ceiling.
     static let staleFixSeconds: TimeInterval = 10.0
@@ -816,6 +828,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var currentTCASEvaluation: TCASEvaluation = .clear
 
     var seedLocation: CLLocation?
+
+    /// Set by whoever presented the launch calibration screen when the user chose Skip.
+    /// Suppresses the automatic calibration popup for the rest of this launch.
+    var calibrationWasSkipped: Bool = false
     /// Airport CSV data parsed ahead of time during the calibration screen (see
     /// AppDelegate). Pure background-thread data — no ConnectionLogic/network
     /// involvement — kept deliberately isolated from ARSession/view-lifecycle
@@ -1399,14 +1415,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// ground. Ground-only (see call sites): recalibrating can't fix compass/GPS
     /// degradation that's normal in flight, and a full-screen popup would block
     /// the live AR traffic view exactly when it's needed most.
+    /// Never re-presented once the user has skipped a calibration screen this launch.
+    /// Skipping means the sensors never reached calibration's thresholds (GPS ≤ 10 m,
+    /// compass ≤ 13°) — and the triggers here fire on *looser* ones (30 m, 20°) detected as
+    /// edges, so accuracy that merely wobbles across 20° re-presents the screen the user just
+    /// dismissed, over and over.
     private func presentCalibrationPopupIfNeeded() {
+        guard !calibrationWasSkipped else { return }
         guard !isCalibrationPopupShowing, presentedViewController == nil else { return }
         isCalibrationPopupShowing = true
         let calibration = CalibrationViewController()
         calibration.modalPresentationStyle = .fullScreen
-        calibration.onComplete = { [weak self, weak calibration] _ in
+        calibration.onComplete = { [weak self, weak calibration] _, wasSkipped in
             calibration?.dismiss(animated: true)
             self?.isCalibrationPopupShowing = false
+            // Skipping the popup suppresses later ones too, or the same loop just repeats
+            // inside the AR session instead of across the launch transition.
+            if wasSkipped { self?.calibrationWasSkipped = true }
         }
         present(calibration, animated: true)
     }
@@ -2058,6 +2083,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // two corrections can be told apart when reviewing a flight.
         sample.interferenceBiasDeg = interferenceBiasCorrectionDeg
 
+        // The gap between the live compass and the frame the AR scene is drawing in. Both
+        // numbers are visible in the app — the info panel shows the first, the HUD rose the
+        // second — and their difference is ARKit's world-alignment error.
+        if let arHeading = currentARFrameHeadingDeg {
+            sample.arHeadingDeg = arHeading
+            if lastTrueHeading >= 0 {
+                sample.headingDeltaDeg = angleDifferenceDeg(from: arHeading, to: lastTrueHeading)
+            }
+        }
+
         if let frame = arSceneView.session.currentFrame {
             let angles = frame.camera.eulerAngles
             sample.cameraPitchDeg = Double(angles.x) * 180.0 / .pi
@@ -2084,6 +2119,38 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         latestDatumOffset  = sample.datumOffset
 
         return sample
+    }
+
+    /// Heading the AR world is actually working in, in degrees true.
+    ///
+    /// This is the frame targets are placed in — `calculateARPosition` maps GPS bearings into
+    /// ARKit's world axes using the same declination term — so it is the heading the scene
+    /// believes, as distinct from `userHeading`, which is the live magnetometer. The two differ
+    /// by ARKit's world-alignment error: its north was locked from a single compass sample at
+    /// session start and has drifted by visual-inertial tracking since.
+    ///
+    /// Shared by the HUD rose and the flight recorder so the two cannot diverge.
+    private func arFrameHeadingDeg(forward: SIMD3<Float>) -> Double {
+        // World −Z is ARKit's raw magnetic north, matching calculateARPosition's convention;
+        // adding the declination yields true heading.
+        let rawDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
+        let trueDeg = rawDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
+        return (trueDeg + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    /// The AR frame's heading taken straight from the current ARKit frame.
+    ///
+    /// Computed here rather than read from a value the HUD caches, because `updateHUDLadder`
+    /// returns early when the HUD is switched off — reading its cache would silently stop
+    /// recording this whenever the user hides the HUD. Uses the camera's forward vector rather
+    /// than `eulerAngles.y`, since Euler yaw degenerates at steep pitch, which is exactly the
+    /// attitude someone holds the phone at to look at traffic.
+    private var currentARFrameHeadingDeg: Double? {
+        guard let transform = arSceneView.session.currentFrame?.camera.transform else { return nil }
+        let forward = SIMD3<Float>(-transform.columns.2.x, -transform.columns.2.y, -transform.columns.2.z)
+        // Near-vertical camera: the horizontal component vanishes and the azimuth is noise.
+        guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return nil }
+        return arFrameHeadingDeg(forward: forward)
     }
 
     /// Short label for the current ARKit tracking state, shared by the log and the info panel.
@@ -2661,12 +2728,6 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // has in common. This keeps rawHeadingDeg's display fully
         // responsive (matches on-ground behavior) while the correction
         // drifts smoothly toward the right value in the background.
-        func angleDiff(_ a: Double, _ b: Double) -> Double {
-            var d = b - a
-            while d >  180 { d -= 360 }
-            while d < -180 { d += 360 }
-            return d
-        }
         let confidentCourseFix = lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0
         if confidentCourseFix {
             // GPS course is a shakier estimate of true track at low
@@ -2681,13 +2742,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // terrible reading still contributes a little, just discounted.
             let accuracyWeight = max(0, min(1, 1 - lastGPSCourseAccuracy / 90))  // 1 at 0°, 0 by 90°
             let currentEstimate = rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg
-            let residual = angleDiff(currentEstimate, lastGPSCourseDeg)
+            let residual = angleDifferenceDeg(from: currentEstimate, to: lastGPSCourseDeg)
             interferenceBiasCorrectionDeg = max(-60, min(60,
                 interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight * accuracyWeight))
         }
 
-        let trueHeadingDeg = (rawHeadingDeg + arKitNorthCorrectionDeg + interferenceBiasCorrectionDeg + 360)
-            .truncatingRemainder(dividingBy: 360)
+        // Same formula the flight recorder logs, via the shared helper, so the rose and the
+        // recorded value can never drift apart.
+        let trueHeadingDeg = arFrameHeadingDeg(forward: forward)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

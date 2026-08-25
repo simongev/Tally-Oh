@@ -290,4 +290,32 @@ struct TargetDataTests {
         #expect(abs(signed(12.5) - 12.5) < 0.001)
         #expect(abs(signed(180.0) - 180.0) < 0.001)
     }
+
+    // MARK: - Heading delta
+
+    /// The compass-versus-AR-frame gap is the alignment error, and it has to survive the
+    /// 0°/360° seam: a naive subtraction reports 10° of error as 350°.
+    @Test func headingDeltaWrapsAcrossNorth() {
+        // AR frame reads 5°, compass reads 355°: the compass is 10° anticlockwise of it.
+        #expect(abs(angleDifferenceDeg(from: 5, to: 355) - (-10)) < 0.001)
+        #expect(abs(angleDifferenceDeg(from: 355, to: 5) - 10) < 0.001)
+    }
+
+    /// The case from the ground test: panel 160°, HUD rose 150°.
+    @Test func headingDeltaMatchesTheObservedGroundTest() {
+        #expect(abs(angleDifferenceDeg(from: 150, to: 160) - 10) < 0.001)
+    }
+
+    @Test func headingDeltaIsZeroWhenFramesAgree() {
+        #expect(abs(angleDifferenceDeg(from: 217, to: 217)) < 0.001)
+    }
+
+    @Test func headingDeltaStaysWithinHalfTurn() {
+        for from in stride(from: 0.0, to: 360.0, by: 17.0) {
+            for to in stride(from: 0.0, to: 360.0, by: 23.0) {
+                let delta = angleDifferenceDeg(from: from, to: to)
+                #expect(delta > -180.001 && delta <= 180.001)
+            }
+        }
+    }
 }
