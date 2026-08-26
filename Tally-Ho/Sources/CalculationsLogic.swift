@@ -141,46 +141,44 @@ class CalculationsLogic {
     /// (passed in as `cameraWorldPosition`) so that all markers stay correctly
     /// placed even as the aircraft flies kilometres from the AR origin.
     ///
-    /// ARKit *intends* −Z to be true north, but only approximates it: `.gravityAndHeading`
-    /// locks world yaw from a magnetometer snapshot at session start and refines it slowly
-    /// afterwards. A flight log at FL272 measured that snapshot 17.7° off true 2.5 s into the
-    /// session, still 12.7° off at 15 s, and only within ~3° after 35 s — while the compass
-    /// agreed with GPS ground track to within 1° from the first second. So the frame's error is
-    /// large exactly during the seconds someone actually looks at the screen.
+    /// **No rotation is applied to the bearing, and two attempts to apply one have now failed.**
     ///
-    /// `worldYawErrorDeg` is that error, measured live rather than modelled:
-    /// `angleDifference(from: ARKit's raw camera azimuth, to: the compass's true heading)`.
-    /// Subtracting it converts a true bearing into the ARKit world azimuth that currently
-    /// points that way. On the log row above, a target dead ahead at true 273.4° is placed at
-    /// 273.4 − 17.67 = 255.73°, which is where ARKit says the camera is looking — so it lands
-    /// in the centre of frame, on the real aircraft. Uncorrected it lands 17.67° to the right.
+    /// The first subtracted the local magnetic declination, on the premise that
+    /// `.gravityAndHeading` aligns −Z to magnetic north. Measurement disproved it: ARKit's raw
+    /// world azimuth tracks *true* heading, so the term rotated every marker clockwise by ~12.5°
+    /// while correcting nothing.
     ///
-    /// This is not the magnetic-declination term returning. That one was a constant taken from
-    /// a model and was wrong in principle: measurement showed ARKit tracks true heading, not
-    /// magnetic, so subtracting declination rotated every marker clockwise by ~12.5° while
-    /// correcting nothing. This one is a live measurement of a discrepancy ARKit's own frame
-    /// demonstrably has, and it cannot import compass bias — ARKit seeds its yaw from the same
-    /// magnetometer CoreLocation reads, so any shared bias cancels in the difference.
+    /// The second subtracted `compass − ARKit azimuth`, on the premise that `CLHeading`
+    /// reports where the phone is pointing. In a cockpit it does not. Across 55 samples of one
+    /// flight the phone rotated 704.8° while the compass rotated 273.3°, the correlation between
+    /// the two was +0.29, and the median gap between compass and GPS ground track was 0.00° —
+    /// the compass was echoing the aircraft's track. Individual pans are starker still: the
+    /// phone swinging 70° left moved the compass 0.3°. Subtracting that "error" counter-rotated
+    /// the scene against every pan, so the traffic slid back toward the nose whenever the user
+    /// turned to look sideways.
     ///
-    /// The parameter is deliberately **not** defaulted: a call site that forgets it must fail to
-    /// compile rather than silently placing at zero correction, which is precisely how the
-    /// declination term survived unexamined across so many builds.
+    /// Both premises shared a failure mode worth naming, since it has now cost two builds: the
+    /// evidence offered for each was equally consistent with its opposite. "Targets displaced by
+    /// about the declination" does not say whether the correction is missing or wrongly present
+    /// — only the *direction* does. "The compass agrees with ground track" does not say whether
+    /// the compass is accurate or merely reporting the track — only whether it *moves when the
+    /// phone moves* does. Before any future term is added here, state the observation that would
+    /// distinguish it from its opposite, and go and measure that.
+    ///
+    /// So a true GPS bearing maps straight across. ARKit's own world alignment carries a real
+    /// error — 17.7° early in a session at FL272, decaying to ~3° over 35 s — which remains
+    /// uncorrected, and is a smaller harm than a scene that will not hold still.
     static func calculateARPosition(
         targetCoord: CLLocationCoordinate2D,
         targetAltitude: Double,
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,                        // unused — kept for API compat
-        cameraWorldPosition: SCNVector3 = .init(),  // camera's current position in the AR scene
-        worldYawErrorDeg: Double
+        cameraWorldPosition: SCNVector3 = .init()   // camera's current position in the AR scene
     ) -> SCNVector3 {
 
         let horizontalDistanceM = distance(from: userCoord, to: targetCoord)
-        // The GPS bearing is a true bearing; rotate it into ARKit's world frame, whose north is
-        // off by worldYawErrorDeg.
-        let trueBearing = self.bearing(from: userCoord, to: targetCoord)
-        let worldBearing = (trueBearing - worldYawErrorDeg).truncatingRemainder(dividingBy: 360)
-        let bearingRad = worldBearing.toRadians()
+        let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
 
         // Horizontal offsets in world space (metres)
         let dx = Float(horizontalDistanceM * sin(bearingRad))   // East
@@ -278,8 +276,7 @@ class CalculationsLogic {
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,
-        cameraWorldPosition: SCNVector3 = .init(),
-        worldYawErrorDeg: Double
+        cameraWorldPosition: SCNVector3 = .init()
     ) -> SCNVector3 {
         return calculateARPosition(
             targetCoord: airportCoord,
@@ -287,8 +284,7 @@ class CalculationsLogic {
             userCoord: userCoord,
             userAltitude: userAltitude,
             userHeading: userHeading,
-            cameraWorldPosition: cameraWorldPosition,
-            worldYawErrorDeg: worldYawErrorDeg
+            cameraWorldPosition: cameraWorldPosition
         )
     }
 

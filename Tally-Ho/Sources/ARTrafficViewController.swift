@@ -882,36 +882,47 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var magneticDeclinationDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
 
-    /// How far ARKit's world frame is rotated away from true north right now, in degrees:
-    /// `angleDifference(from: ARKit's raw camera azimuth, to: the compass's true heading)`.
-    /// Subtracted from every true bearing before placement.
+    /// Gap between ARKit's raw camera azimuth and the compass's true heading, in degrees.
+    /// **Diagnostic only — never applied to placement.**
     ///
-    /// `.gravityAndHeading` only approximates true north. It locks world yaw from a
-    /// magnetometer snapshot at session start and refines it slowly afterwards: a flight log at
-    /// FL272 measured that snapshot 17.7° off 2.5 s in, 12.7° off at 15 s, and within ~3° only
-    /// after 35 s, while the compass matched GPS ground track to within 1° from the first
-    /// second. Since every target is drawn in ARKit's frame, that error rotated the entire
-    /// traffic picture — and it was largest during exactly the few seconds anyone looks.
+    /// It was applied, in build 8, and it had to be taken straight back out. The premise was
+    /// that `CLHeading` reports where the phone points, so the gap is ARKit's alignment error.
+    /// In a cockpit `CLHeading` reports the aircraft's ground track instead: across one flight
+    /// the phone rotated 704.8° while the compass rotated 273.3°, their correlation was +0.29,
+    /// and the median gap between compass and GPS course was 0.00°. So the "error" this measures
+    /// is mostly just the angle between the phone and the nose, and subtracting it swung the
+    /// whole scene back toward the nose every time the user looked out of a side window.
     ///
-    /// This cannot import compass error: ARKit seeds its own yaw from the same magnetometer
-    /// CoreLocation reads, so a bias shared by both cancels in the difference. What it removes
-    /// is ARKit's staleness and visual-inertial drift relative to the live compass.
+    /// Still recorded, because ARKit's alignment error is real and unsolved — 17.7° early in a
+    /// session, decaying to ~3° over 35 s — and this is the only number that tracks it. It is
+    /// simply not a correction until `compassResponse` says the compass is measuring the phone.
     private var worldYawErrorDeg: Double = 0
-    /// Whether `worldYawErrorDeg` holds a real measurement yet. The first valid sample snaps
-    /// rather than easing in — a smoothing ramp here would reintroduce the slow convergence
-    /// this whole correction exists to remove.
+    /// Whether `worldYawErrorDeg` holds a real measurement yet, as opposed to a default zero.
     private var hasSeededWorldYawError = false
-    /// Compass accuracy past which the heading is too poor to align the world against. Kept
-    /// deliberately loose: this log ran at a constant ±10°, and a tight gate inside a fuselage
-    /// silently disables the correction altogether — the failure mode the GPS-course ramp was
-    /// written to avoid.
+    /// Compass accuracy past which the heading is too poor to measure against. Deliberately
+    /// loose: these logs run at a constant ±10°, and a tight gate inside a fuselage would
+    /// silently record nothing at all.
     private let maxHeadingAccuracyForYawFix: Double = 25.0
-    /// Smoothing time constant for `worldYawErrorDeg`, in seconds, once seeded. See the blend
-    /// in `updateWorldYawError` for why it sits where it does.
-    private let worldYawTimeConstant: TimeInterval = 2.0
-    /// Render-loop timestamp of the last blend, so the filter is time-based rather than
-    /// frame-rate dependent.
-    private var lastWorldYawUpdateTime: TimeInterval = 0
+
+    /// **The test build 8 should have run before trusting the compass.**
+    ///
+    /// Ratio of how far the compass turned to how far the phone actually turned, over a short
+    /// rolling window. Near 1 means the compass is measuring the phone's azimuth and an
+    /// alignment correction built on it would be sound. Near 0 means it is slaved to something
+    /// else — the aircraft's track, in the flight that produced this code — and any such
+    /// correction is actively harmful.
+    ///
+    /// Recorded, applied to nothing. The next term added to the placement path gets built only
+    /// once this column has said which regime the app is actually in.
+    private var compassResponse: Double = .nan
+    /// Rolling window of (timestamp, ARKit azimuth, compass heading) backing `compassResponse`.
+    private var headingResponseSamples: [(t: TimeInterval, arDeg: Double, compassDeg: Double)] = []
+    /// Window length. Long enough to contain a deliberate pan, short enough that the ratio
+    /// reflects what the user is doing now.
+    private let headingResponseWindow: TimeInterval = 3.0
+    /// Below this much phone rotation in the window the ratio is dominated by sensor noise and
+    /// says nothing, so it is not published.
+    private let headingResponseMinRotationDeg: Double = 20.0
 
     /// Diagnostic only, never applied. ARKit's corrected azimuth minus GPS ground track, which
     /// is meaningful solely when the phone happens to point along the aircraft's nose. It is
@@ -1567,13 +1578,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
         panOffset = .zero
-        // A reset re-anchors ARKit's world to a fresh compass snapshot, so the previous
-        // alignment's yaw error no longer describes anything. Clearing the seed makes the next
-        // valid sample snap instead of easing in from a stale value.
+        // A restart re-anchors ARKit's world to a fresh compass snapshot, so the previous
+        // alignment's measurements describe nothing. Tracking state is cleared with them: it is
+        // only ever written from the delegate callback, so without this it keeps reporting the
+        // dead session's .normal until ARKit gets round to saying otherwise — which is how a
+        // world-yaw sample was once taken 0.32 s before ARKit reported "unavailable".
+        arTrackingState = .notAvailable
         hasSeededWorldYawError = false
         worldYawErrorDeg = 0
-        sceneManager?.worldYawErrorDeg = 0
         courseResidualDeg = .nan
+        compassResponse = .nan
+        headingResponseSamples.removeAll()
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2247,6 +2262,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // The correction actually being applied to placement this tick, and the GPS-course
         // residual that would expose a cabin bias shared by the compass and ARKit.
         sample.worldYawCorrectionDeg = hasSeededWorldYawError ? worldYawErrorDeg : nil
+        sample.compassResponse       = compassResponse.isNaN ? nil : compassResponse
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
@@ -2287,29 +2303,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         return sample
     }
 
-    /// Heading the AR world is actually working in, in degrees true.
+    /// The heading ARKit's world frame is working in, for a camera forward vector.
     ///
-    /// This is the frame targets are placed in — `calculateARPosition` maps GPS bearings into
-    /// ARKit's world axes using the same declination term — so it is the heading the scene
-    /// believes, as distinct from `userHeading`, which is the live magnetometer. The two differ
-    /// by ARKit's world-alignment error: its north was locked from a single compass sample at
-    /// session start and has drifted by visual-inertial tracking since.
+    /// This is the frame targets are actually placed in, so it is what the HUD rose shows and
+    /// what the flight recorder logs — one function for both, so the rose and the traffic can
+    /// never disagree about north.
     ///
-    /// Shared by the HUD rose and the flight recorder so the two cannot diverge.
-    private func arFrameHeadingDeg(forward: SIMD3<Float>) -> Double {
-        // Adding the world-yaw error converts ARKit's world azimuth back to a true heading —
-        // the inverse of the subtraction calculateARPosition applies to bearings, so the rose
-        // and the markers cannot disagree about north.
-        let rawDeg = arFrameRawAzimuthDeg(forward: forward)
-        return (rawDeg + worldYawErrorDeg + 360).truncatingRemainder(dividingBy: 360)
-    }
-
-    /// ARKit's own world azimuth for a camera forward vector, with no correction applied.
-    ///
-    /// Kept separate from `arFrameHeadingDeg` because the flight log needs the *uncorrected*
-    /// number: once the correction is applied, a corrected heading equals the compass by
-    /// construction and `heading_delta_deg` would read identically zero — destroying the one
-    /// column that made this whole problem diagnosable.
+    /// No correction is applied, and that is deliberate twice over. It keeps the rose honest
+    /// about the frame the markers really live in, including ARKit's own world-alignment error;
+    /// and it keeps `heading_delta_deg` measuring something. A corrected heading would equal the
+    /// compass by construction, so that column would read zero forever and the alignment error
+    /// would become invisible in exactly the log used to diagnose it.
     private func arFrameRawAzimuthDeg(forward: SIMD3<Float>) -> Double {
         let deg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
         return (deg + 360).truncatingRemainder(dividingBy: 360)
@@ -2412,8 +2416,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos,
-                worldYawErrorDeg: worldYawErrorDeg
+                cameraWorldPosition: cameraPos
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -2669,8 +2672,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            // Declination (diagnostic) and the world-yaw correction actually applied to
-            // placement. "—" means no valid sample yet, which is different from a measured 0.
+            // Declination and ARKit's measured alignment error. Both diagnostic — neither is
+            // applied. "—" means no valid sample yet, which differs from a measured 0.
             let yawStr = hasSeededWorldYawError
                 ? String(format: "%+.1f°", worldYawErrorDeg)
                 : "—"
@@ -2691,8 +2694,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let residualStr = courseResidualDeg.isNaN
                 ? "—"
                 : String(format: "%+.0f°", courseResidualDeg)
-            lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@",
-                                lastGPSSpeedKt, courseStr, residualStr))
+            // How much the compass turns per degree the phone turns. ~1 means it is measuring
+            // the phone; ~0 means it is reporting something else and no alignment correction
+            // may be built on it. "—" until the phone has been turned enough to tell.
+            let responseStr = compassResponse.isNaN
+                ? "—"
+                : String(format: "%.2f", compassResponse)
+            lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@  cmp %@",
+                                lastGPSSpeedKt, courseStr, residualStr, responseStr))
 
             // ── Vertical datums ───────────────────────────────────────────────────────
             // The gap between cabin pressure altitude and GPS geometric altitude is the
@@ -2814,16 +2823,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         updateHUDLadder(pov: pov)
     }
 
-    /// Measure ARKit's world-frame yaw error against the compass and hand it to the scene
-    /// manager for placement.
+    /// Measure how far ARKit's world frame sits from the compass, and whether the compass is
+    /// measuring the phone at all. **Both are recorded; neither is applied.**
     ///
     /// Runs on the SceneKit rendering thread, like the position ticks it precedes.
     private func updateWorldYawError(pov: SCNNode, at time: TimeInterval) {
-        // ARKit's azimuth is only meaningful while tracking is healthy. Outside that, hold the
-        // last estimate rather than zeroing it: this session spent only ~40% of its time in
-        // .normal — 14 state transitions in 38 seconds — because visual-inertial tracking in a
-        // cruising aircraft sees a stationary cabin and a moving world. A slightly stale
-        // alignment beats no alignment by a wide margin.
+        // ARKit's azimuth is meaningless outside healthy tracking.
         guard case .normal = arTrackingState else { return }
         guard lastTrueHeading >= 0,
               lastHeadingAccuracy >= 0,
@@ -2837,45 +2842,38 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return }
 
         let rawAzimuthDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-        let measured = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
+        worldYawErrorDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
+        hasSeededWorldYawError = true
 
-        if hasSeededWorldYawError {
-            // Time-based rather than per-frame, so the response does not change with frame
-            // rate — and the frame rate here is not a constant, since ARKit drops frames
-            // exactly when tracking is struggling.
-            //
-            // The time constant is chosen to sit between two timescales. The signal is ARKit's
-            // own convergence: 17.7° → 3.3° over 35 seconds in the FL272 log, so anything up to
-            // a few seconds tracks it comfortably. The noise is sensor lag during a pan —
-            // ARKit's azimuth follows the camera at frame rate while CoreLocation's heading
-            // arrives at ~10 Hz behind it, so `measured` swings by several degrees whenever the
-            // phone is swept sideways, and a fast filter would chase that and make the markers
-            // swim. Which is the exact complaint that started this work: "the accuracy got
-            // changed when I was moving the phone to the sides."
-            let dt = max(0, min(0.5, time - lastWorldYawUpdateTime))
-            let alpha = 1 - exp(-dt / worldYawTimeConstant)
-            // Signed values, so smoothAngle's 0–360 wrap is the wrong tool here; blend the
-            // signed difference directly.
-            worldYawErrorDeg += angleDifferenceDeg(from: worldYawErrorDeg, to: measured) * alpha
-        } else {
-            // Snap on the first valid sample. The whole point is to be right immediately.
-            worldYawErrorDeg = measured
-            hasSeededWorldYawError = true
-            FlightRecorder.shared.record(
-                event: "world_yaw_seeded",
-                detail: String(format: "err=%.1f hdg_acc=%.0f", measured, lastHeadingAccuracy)
-            )
-        }
-        lastWorldYawUpdateTime = time
-        sceneManager?.worldYawErrorDeg = worldYawErrorDeg
+        updateCompassResponse(arDeg: rawAzimuthDeg, compassDeg: lastTrueHeading, at: time)
 
         // Diagnostic only — see courseResidualDeg.
         if lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0 && lastGPSCourseDeg >= 0 {
-            courseResidualDeg = angleDifferenceDeg(
-                from: rawAzimuthDeg + worldYawErrorDeg, to: lastGPSCourseDeg)
+            courseResidualDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastGPSCourseDeg)
         } else {
             courseResidualDeg = .nan
         }
+    }
+
+    /// Compare how far the compass turned against how far the phone actually turned.
+    ///
+    /// Both totals are sums of absolute per-sample changes rather than start-to-end differences,
+    /// so panning out and back still counts as rotation instead of cancelling to zero.
+    private func updateCompassResponse(arDeg: Double, compassDeg: Double, at time: TimeInterval) {
+        headingResponseSamples.append((t: time, arDeg: arDeg, compassDeg: compassDeg))
+        headingResponseSamples.removeAll { time - $0.t > headingResponseWindow }
+        guard headingResponseSamples.count >= 2 else { return }
+
+        var arRotation = 0.0
+        var compassRotation = 0.0
+        for (previous, current) in zip(headingResponseSamples, headingResponseSamples.dropFirst()) {
+            arRotation      += abs(angleDifferenceDeg(from: previous.arDeg,      to: current.arDeg))
+            compassRotation += abs(angleDifferenceDeg(from: previous.compassDeg, to: current.compassDeg))
+        }
+        // Below the threshold the phone is essentially still and the ratio is noise over noise.
+        // Leave the previous value standing rather than publishing a meaningless one.
+        guard arRotation >= headingResponseMinRotationDeg else { return }
+        compassResponse = compassRotation / arRotation
     }
 
     /// Compute and push the HUD horizon/pitch-ladder geometry for this frame.
@@ -2990,7 +2988,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // 0 → +6.1° → −1.7° in 38 seconds, chasing ARKit's own convergence. worldYawErrorDeg
         // now measures that convergence error directly instead of learning around it; the
         // course residual survives as a diagnostic in the flight log.
-        let trueHeadingDeg = arFrameHeadingDeg(forward: forward)
+        let trueHeadingDeg = arFrameRawAzimuthDeg(forward: forward)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

@@ -831,10 +831,6 @@ class ARSceneManager {
     /// rendering thread (reader). Also guards aircraftNodes during stale-node removal.
     private let nodesLock = NSLock()
     var settings = ARVisualizationSettings()
-    /// How far ARKit's world frame is rotated from true north right now, in degrees, measured
-    /// against the compass and written by ARTrafficViewController each frame. Subtracted from
-    /// every true bearing before placement — see `CalculationsLogic.calculateARPosition`.
-    var worldYawErrorDeg: Double = 0
 
     // MARK: Selection
     private(set) var selectedNodeID: String? = nil
@@ -912,8 +908,7 @@ class ARSceneManager {
                 userCoord: userLoc,
                 userAltitude: userAlt,
                 userHeading: 0,
-                cameraWorldPosition: cameraWorldPosition,
-                worldYawErrorDeg: worldYawErrorDeg
+                cameraWorldPosition: cameraWorldPosition
             )
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
             node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -946,8 +941,7 @@ class ARSceneManager {
                 userCoord:           userLoc,
                 userAltitude:        userAlt,
                 userHeading:         0,
-                cameraWorldPosition: cameraWorldPosition,
-                worldYawErrorDeg:    worldYawErrorDeg
+                cameraWorldPosition: cameraWorldPosition
             )
             let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
             entry.node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -1039,8 +1033,7 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition,
-                worldYawErrorDeg: worldYawErrorDeg
+                cameraWorldPosition: cameraWorldPosition
             )
 
             let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
@@ -1182,8 +1175,7 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition,
-                worldYawErrorDeg: worldYawErrorDeg
+                cameraWorldPosition: cameraWorldPosition
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,

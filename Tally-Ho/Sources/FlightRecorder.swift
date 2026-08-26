@@ -67,7 +67,7 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
-        "world_yaw_corr_deg", "course_residual_deg",
+        "world_yaw_corr_deg", "course_residual_deg", "compass_response",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
@@ -99,24 +99,34 @@ final class FlightRecorder {
         var headingTrueDeg: Double?
         var headingAccuracyDeg: Double?
         var declinationDeg: Double?
-        /// The world-yaw correction actually applied to placement this tick, or nil before the
-        /// first valid measurement — which is a different thing from a measured zero.
+        /// Gap between ARKit's raw azimuth and the compass, or nil before the first valid
+        /// measurement — a different thing from a measured zero. Diagnostic only; nothing is
+        /// rotated by it. See ARTrafficViewController.worldYawErrorDeg for why not.
         var worldYawCorrectionDeg: Double?
-        /// Corrected AR heading minus GPS ground track. Diagnostic only, and only meaningful
-        /// while the phone points near the aircraft's nose: a large residual persisting across
-        /// many camera orientations is the signature of a cabin magnetic bias shared by the
-        /// compass and ARKit, which the world-yaw correction is blind to by construction.
+        /// How far the compass turned per degree the phone turned, over a rolling window.
+        ///
+        /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
+        /// built on it would be sound. Near 0: it is slaved to something else — in the flight
+        /// that prompted this column, the aircraft's ground track, where the phone rotated
+        /// 704.8 degrees while the compass rotated 273.3 and their correlation was +0.29.
+        /// Empty when the phone has not turned enough for the ratio to mean anything.
+        var compassResponse: Double?
+        /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
+        /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
+        /// where the compass is track-slaved, this and heading_delta_deg carry the same
+        /// information, and that agreement is itself the evidence for it.
         var courseResidualDeg: Double?
 
         /// ARKit's raw, uncorrected world azimuth — what the AR world believes north is.
         var arHeadingDeg: Double?
         /// Compass heading minus ARKit's raw azimuth, signed, −180…180.
         ///
-        /// This is ARKit's world-alignment error: its north is fixed from one compass sample at
-        /// session start and refines only slowly thereafter. Recorded uncorrected on purpose —
-        /// placement now compensates for this, and logging the compensated heading instead
-        /// would make the column read zero by construction and measure nothing. Expect it to be
-        /// large early in a session and to decay; that is the error being cancelled, not a bug.
+        /// Where the compass is genuinely measuring the phone, this is ARKit's world-alignment
+        /// error: its north is fixed from one compass sample at session start and refines only
+        /// slowly thereafter, so expect it large early and decaying. Where the compass is
+        /// track-slaved — see compassResponse — it is instead mostly the angle between the phone
+        /// and the aircraft's nose, and says nothing about ARKit at all. That ambiguity is why
+        /// nothing may be rotated by this number until compassResponse says which case applies.
         var headingDeltaDeg: Double?
 
         var cameraYawDeg: Double?
@@ -261,6 +271,7 @@ final class FlightRecorder {
         fields.append(format(sample.declinationDeg,        decimals: 2))
         fields.append(format(sample.worldYawCorrectionDeg, decimals: 2))
         fields.append(format(sample.courseResidualDeg,     decimals: 1))
+        fields.append(format(sample.compassResponse,       decimals: 2))
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 
