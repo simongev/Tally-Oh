@@ -882,21 +882,48 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var magneticDeclinationDeg: Double = 0
     private var isFirstHeadingFix: Bool = true
 
-    // Second, independent heading correction layered on top of
-    // magneticDeclinationDeg (which is now diagnostic-only, and only ever covered
-    // declination). Cockpit magnetic interference can bias ARKit's own
-    // world-alignment heading by tens of degrees at session start, and
-    // declination correction can't touch that (it cancels out of the
-    // raw-magnetometer terms by construction). This term instead learns
-    // that bias continuously from GPS ground track, at a very slow rate,
-    // regardless of which way the camera currently points — no "hold the
-    // phone still" gate. The premise: the user's camera-pointing angle
-    // relative to the nose averages toward zero over many samples across
-    // a flight (no persistent directional bias in how they look around),
-    // so a slow enough average converges on the one thing every sample
-    // has in common — the constant interference bias — without ever
-    // needing to freeze or delay the displayed heading.
-    private var interferenceBiasCorrectionDeg: Double = 0
+    /// How far ARKit's world frame is rotated away from true north right now, in degrees:
+    /// `angleDifference(from: ARKit's raw camera azimuth, to: the compass's true heading)`.
+    /// Subtracted from every true bearing before placement.
+    ///
+    /// `.gravityAndHeading` only approximates true north. It locks world yaw from a
+    /// magnetometer snapshot at session start and refines it slowly afterwards: a flight log at
+    /// FL272 measured that snapshot 17.7° off 2.5 s in, 12.7° off at 15 s, and within ~3° only
+    /// after 35 s, while the compass matched GPS ground track to within 1° from the first
+    /// second. Since every target is drawn in ARKit's frame, that error rotated the entire
+    /// traffic picture — and it was largest during exactly the few seconds anyone looks.
+    ///
+    /// This cannot import compass error: ARKit seeds its own yaw from the same magnetometer
+    /// CoreLocation reads, so a bias shared by both cancels in the difference. What it removes
+    /// is ARKit's staleness and visual-inertial drift relative to the live compass.
+    private var worldYawErrorDeg: Double = 0
+    /// Whether `worldYawErrorDeg` holds a real measurement yet. The first valid sample snaps
+    /// rather than easing in — a smoothing ramp here would reintroduce the slow convergence
+    /// this whole correction exists to remove.
+    private var hasSeededWorldYawError = false
+    /// Compass accuracy past which the heading is too poor to align the world against. Kept
+    /// deliberately loose: this log ran at a constant ±10°, and a tight gate inside a fuselage
+    /// silently disables the correction altogether — the failure mode the GPS-course ramp was
+    /// written to avoid.
+    private let maxHeadingAccuracyForYawFix: Double = 25.0
+    /// Smoothing time constant for `worldYawErrorDeg`, in seconds, once seeded. See the blend
+    /// in `updateWorldYawError` for why it sits where it does.
+    private let worldYawTimeConstant: TimeInterval = 2.0
+    /// Render-loop timestamp of the last blend, so the filter is time-based rather than
+    /// frame-rate dependent.
+    private var lastWorldYawUpdateTime: TimeInterval = 0
+
+    /// Diagnostic only, never applied. ARKit's corrected azimuth minus GPS ground track, which
+    /// is meaningful solely when the phone happens to point along the aircraft's nose. It is
+    /// the one error `worldYawErrorDeg` is blind to — a cockpit whose magnetic field biases the
+    /// compass and ARKit together, leaving their difference at zero while both are wrong.
+    /// Recorded so that case is visible in a future log rather than invisible.
+    ///
+    /// A plain `Double` carrying `.nan` for "no reading", not an `Optional<Double>`: this is
+    /// written on the SceneKit render thread and read on main, and an Optional is two words, so
+    /// a torn read could yield a payload that never existed. One word matches what the
+    /// heading terms here have always done across that boundary.
+    private var courseResidualDeg: Double = .nan
     private var lastGPSCourseDeg: Double = -1
     private var lastGPSCourseAccuracy: Double = -1
     private var lastGPSSpeedKt: Double = 0
@@ -1459,9 +1486,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // trace in the flight log at all.
         FlightRecorder.shared.record(
             event: "ar_session_start",
-            detail: String(format: "reason=%@ heading_acc=%.0f north_corr=%.1f bias=%.1f",
-                           reason, lastHeadingAccuracy, magneticDeclinationDeg,
-                           interferenceBiasCorrectionDeg)
+            detail: String(format: "reason=%@ heading_acc=%.0f declination=%.1f",
+                           reason, lastHeadingAccuracy, magneticDeclinationDeg)
         )
 
         let config = ARWorldTrackingConfiguration()
@@ -1476,10 +1502,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hudOverlayView.transform = .identity
         currentZoomScale = 1.0
         panOffset = .zero
-        // A fresh ARKit world alignment needs its own interference-bias
-        // learning restarted — a value learned for the previous alignment
-        // isn't valid for this one.
-        interferenceBiasCorrectionDeg = 0
+        // A reset re-anchors ARKit's world to a fresh compass snapshot, so the previous
+        // alignment's yaw error no longer describes anything. Clearing the seed makes the next
+        // valid sample snap instead of easing in from a stale value.
+        hasSeededWorldYawError = false
+        worldYawErrorDeg = 0
+        sceneManager?.worldYawErrorDeg = 0
+        courseResidualDeg = .nan
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2150,17 +2179,18 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.headingTrueDeg     = lastTrueHeading     >= 0 ? lastTrueHeading     : nil
         sample.headingAccuracyDeg = lastHeadingAccuracy >= 0 ? lastHeadingAccuracy : nil
         sample.declinationDeg     = magneticDeclinationDeg
-        // The HUD's learned cockpit-interference term, recorded alongside declination so the
-        // two corrections can be told apart when reviewing a flight.
-        sample.interferenceBiasDeg = interferenceBiasCorrectionDeg
+        // The correction actually being applied to placement this tick, and the GPS-course
+        // residual that would expose a cabin bias shared by the compass and ARKit.
+        sample.worldYawCorrectionDeg = hasSeededWorldYawError ? worldYawErrorDeg : nil
+        sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
 
-        // The gap between the live compass and the frame the AR scene is drawing in. Both
-        // numbers are visible in the app — the info panel shows the first, the HUD rose the
-        // second — and their difference is ARKit's world-alignment error.
-        if let arHeading = currentARFrameHeadingDeg {
-            sample.arHeadingDeg = arHeading
+        // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
+        // live compass, before correction. Deliberately uncorrected — a corrected heading would
+        // match the compass by construction and this column would always read zero.
+        if let rawAzimuth = currentARFrameRawAzimuthDeg {
+            sample.arHeadingDeg = rawAzimuth
             if lastTrueHeading >= 0 {
-                sample.headingDeltaDeg = angleDifferenceDeg(from: arHeading, to: lastTrueHeading)
+                sample.headingDeltaDeg = angleDifferenceDeg(from: rawAzimuth, to: lastTrueHeading)
             }
         }
 
@@ -2202,22 +2232,35 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     ///
     /// Shared by the HUD rose and the flight recorder so the two cannot diverge.
     private func arFrameHeadingDeg(forward: SIMD3<Float>) -> Double {
-        // World −Z is TRUE north, matching calculateARPosition, so the raw azimuth is already
-        // a true heading and no declination term belongs here. Only the learned cockpit-
-        // interference offset is applied, and that is display-only.
-        let rawDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-        let trueDeg = rawDeg + interferenceBiasCorrectionDeg
-        return (trueDeg + 360).truncatingRemainder(dividingBy: 360)
+        // Adding the world-yaw error converts ARKit's world azimuth back to a true heading —
+        // the inverse of the subtraction calculateARPosition applies to bearings, so the rose
+        // and the markers cannot disagree about north.
+        let rawDeg = arFrameRawAzimuthDeg(forward: forward)
+        return (rawDeg + worldYawErrorDeg + 360).truncatingRemainder(dividingBy: 360)
     }
 
-    /// The AR frame's heading taken straight from the current ARKit frame.
+    /// ARKit's own world azimuth for a camera forward vector, with no correction applied.
+    ///
+    /// Kept separate from `arFrameHeadingDeg` because the flight log needs the *uncorrected*
+    /// number: once the correction is applied, a corrected heading equals the compass by
+    /// construction and `heading_delta_deg` would read identically zero — destroying the one
+    /// column that made this whole problem diagnosable.
+    private func arFrameRawAzimuthDeg(forward: SIMD3<Float>) -> Double {
+        let deg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
+        return (deg + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    /// ARKit's raw, uncorrected world azimuth for the current frame — what the AR world thinks
+    /// north is, before `worldYawErrorDeg` is applied. Logged as `ar_heading_deg`, and against
+    /// the compass as `heading_delta_deg`, so a flight log still shows how far off ARKit's own
+    /// alignment was even though placement now compensates for it.
     ///
     /// Computed here rather than read from a value the HUD caches, because `updateHUDLadder`
     /// returns early when the HUD is switched off — reading its cache would silently stop
     /// recording this whenever the user hides the HUD. Uses the camera's forward vector rather
     /// than `eulerAngles.y`, since Euler yaw degenerates at steep pitch, which is exactly the
     /// attitude someone holds the phone at to look at traffic.
-    private var currentARFrameHeadingDeg: Double? {
+    private var currentARFrameRawAzimuthDeg: Double? {
         // Before tracking starts the camera transform is still identity, whose forward vector
         // is (0, 0, −1): a perfectly plausible-looking due-north reading that sails through the
         // horizontal-magnitude check below at magnitude 1.0. Recording that would contaminate
@@ -2228,7 +2271,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let forward = SIMD3<Float>(-transform.columns.2.x, -transform.columns.2.y, -transform.columns.2.z)
         // Near-vertical camera: the horizontal component vanishes and the azimuth is noise.
         guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return nil }
-        return arFrameHeadingDeg(forward: forward)
+        return arFrameRawAzimuthDeg(forward: forward)
     }
 
     /// Short label for the current ARKit tracking state, shared by the log and the info panel.
@@ -2304,7 +2347,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos
+                cameraWorldPosition: cameraPos,
+                worldYawErrorDeg: worldYawErrorDeg
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -2560,20 +2604,30 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             } else {
                 compassAccStr = String(format: "±%.0f°", lastHeadingAccuracy)
             }
-            let corrStr = String(format: "%+.1f°/%+.1f°", magneticDeclinationDeg, interferenceBiasCorrectionDeg)
+            // Declination (diagnostic) and the world-yaw correction actually applied to
+            // placement. "—" means no valid sample yet, which is different from a measured 0.
+            let yawStr = hasSeededWorldYawError
+                ? String(format: "%+.1f°", worldYawErrorDeg)
+                : "—"
+            let corrStr = String(format: "%+.1f°/%@", magneticDeclinationDeg, yawStr)
             let altAccStr = lastVerticalAccuracy > 0
                 ? String(format: "±%.0fft", lastVerticalAccuracy * CalculationsLogic.metersToFeet)
                 : "?"
             lines.append(String(format: "✈️ %.0f ft (GPS %@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altAccStr, userHeading, compassAccStr, corrStr))
 
-            // GPS course/speed feeding the interference-bias learner above —
-            // surfaced so a "compass still off" report can be diagnosed
-            // directly instead of guessing whether confidentCourseFix is
-            // ever actually true for this device/flight.
+            // GPS course/speed, and the residual between the corrected AR heading and that
+            // course. The residual is only meaningful while the phone points near the nose, but
+            // a large one that persists across many orientations is the signature of a cabin
+            // magnetic bias shared by the compass and ARKit — the one error the world-yaw
+            // correction cannot see, because a shared bias cancels out of it.
             let courseStr = lastGPSCourseAccuracy >= 0
                 ? String(format: "%.0f°±%.0f°", lastGPSCourseDeg, lastGPSCourseAccuracy)
                 : "invalid"
-            lines.append(String(format: "🛩️ %.0fkt  course %@", lastGPSSpeedKt, courseStr))
+            let residualStr = courseResidualDeg.isNaN
+                ? "—"
+                : String(format: "%+.0f°", courseResidualDeg)
+            lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@",
+                                lastGPSSpeedKt, courseStr, residualStr))
 
             // ── Vertical datums ───────────────────────────────────────────────────────
             // The gap between cabin pressure altitude and GPS geometric altitude is the
@@ -2680,9 +2734,78 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard let pov = arSceneView.pointOfView else { return }
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
+        // Before the position ticks, so this frame's markers are placed with this frame's
+        // alignment. Deliberately not inside updateHUDLadder: that returns early when the HUD
+        // is switched off, which would silently disable placement correction for anyone who
+        // hides the HUD.
+        updateWorldYawError(pov: pov, at: time)
         sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
         sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
         updateHUDLadder(pov: pov)
+    }
+
+    /// Measure ARKit's world-frame yaw error against the compass and hand it to the scene
+    /// manager for placement.
+    ///
+    /// Runs on the SceneKit rendering thread, like the position ticks it precedes.
+    private func updateWorldYawError(pov: SCNNode, at time: TimeInterval) {
+        // ARKit's azimuth is only meaningful while tracking is healthy. Outside that, hold the
+        // last estimate rather than zeroing it: this session spent only ~40% of its time in
+        // .normal — 14 state transitions in 38 seconds — because visual-inertial tracking in a
+        // cruising aircraft sees a stationary cabin and a moving world. A slightly stale
+        // alignment beats no alignment by a wide margin.
+        guard case .normal = arTrackingState else { return }
+        guard lastTrueHeading >= 0,
+              lastHeadingAccuracy >= 0,
+              lastHeadingAccuracy <= maxHeadingAccuracyForYawFix else { return }
+
+        let camTransform = simd_float4x4(pov.worldTransform)
+        let forward = SIMD3<Float>(-camTransform.columns.2.x,
+                                   -camTransform.columns.2.y,
+                                   -camTransform.columns.2.z)
+        // Near-vertical camera: the horizontal component vanishes and the azimuth is noise.
+        guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return }
+
+        let rawAzimuthDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
+        let measured = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
+
+        if hasSeededWorldYawError {
+            // Time-based rather than per-frame, so the response does not change with frame
+            // rate — and the frame rate here is not a constant, since ARKit drops frames
+            // exactly when tracking is struggling.
+            //
+            // The time constant is chosen to sit between two timescales. The signal is ARKit's
+            // own convergence: 17.7° → 3.3° over 35 seconds in the FL272 log, so anything up to
+            // a few seconds tracks it comfortably. The noise is sensor lag during a pan —
+            // ARKit's azimuth follows the camera at frame rate while CoreLocation's heading
+            // arrives at ~10 Hz behind it, so `measured` swings by several degrees whenever the
+            // phone is swept sideways, and a fast filter would chase that and make the markers
+            // swim. Which is the exact complaint that started this work: "the accuracy got
+            // changed when I was moving the phone to the sides."
+            let dt = max(0, min(0.5, time - lastWorldYawUpdateTime))
+            let alpha = 1 - exp(-dt / worldYawTimeConstant)
+            // Signed values, so smoothAngle's 0–360 wrap is the wrong tool here; blend the
+            // signed difference directly.
+            worldYawErrorDeg += angleDifferenceDeg(from: worldYawErrorDeg, to: measured) * alpha
+        } else {
+            // Snap on the first valid sample. The whole point is to be right immediately.
+            worldYawErrorDeg = measured
+            hasSeededWorldYawError = true
+            FlightRecorder.shared.record(
+                event: "world_yaw_seeded",
+                detail: String(format: "err=%.1f hdg_acc=%.0f", measured, lastHeadingAccuracy)
+            )
+        }
+        lastWorldYawUpdateTime = time
+        sceneManager?.worldYawErrorDeg = worldYawErrorDeg
+
+        // Diagnostic only — see courseResidualDeg.
+        if lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0 && lastGPSCourseDeg >= 0 {
+            courseResidualDeg = angleDifferenceDeg(
+                from: rawAzimuthDeg + worldYawErrorDeg, to: lastGPSCourseDeg)
+        } else {
+            courseResidualDeg = .nan
+        }
     }
 
     /// Compute and push the HUD horizon/pitch-ladder geometry for this frame.
@@ -2783,48 +2906,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // wing down" convention.
         let rollDeg = Double(atan2(horizon.1.y - horizon.0.y, horizon.1.x - horizon.0.x)) * 180.0 / Double.pi
 
-        // Heading, for the bottom-of-screen compass rose — a 2D screen
-        // instrument like the bank rose above, computed from the same
-        // forward vector as the pitch ladder. Same world-frame convention
-        // as CalculationsLogic.calculateARPosition's bearing math: world
-        // −Z is TRUE north, so this is already a true heading and needs no
-        // declination term.
-        let rawHeadingDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-
-        // Learn and cancel out cockpit magnetic interference in ARKit's own
-        // world-alignment heading (declination is diagnostic-only now, and covered
-        // geographic declination, which is a different, EMF-immune
-        // correction — see the property doc comment). Always-on, no
-        // "hold the phone still" gate: fed continuously whenever GPS
-        // course is trustworthy, at a per-frame gain small enough that no
-        // single sample (regardless of which way the camera happens to be
-        // pointed at that instant) meaningfully moves the estimate — only
-        // the average over many minutes and many camera orientations does,
-        // and the constant interference bias is the one thing every sample
-        // has in common. This keeps rawHeadingDeg's display fully
-        // responsive (matches on-ground behavior) while the correction
-        // drifts smoothly toward the right value in the background.
-        let confidentCourseFix = lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0
-        if confidentCourseFix {
-            // GPS course is a shakier estimate of true track at low
-            // groundspeed, more reliable as speed increases — ramp the
-            // correction's influence smoothly rather than a hard cutoff.
-            let speedWeight = max(0, min(1, (lastGPSSpeedKt - 20) / 60))  // 0 at 20kt, 1 by 80kt
-            // Same reasoning for course accuracy: a passenger's phone deep in
-            // a pressurized fuselage (away from a window's sky view) may
-            // rarely or never get a course reading tight enough for a hard
-            // cutoff at 30° to ever pass, silently disabling this correction
-            // entirely. Ramp it out gradually instead — a degraded-but-not-
-            // terrible reading still contributes a little, just discounted.
-            let accuracyWeight = max(0, min(1, 1 - lastGPSCourseAccuracy / 90))  // 1 at 0°, 0 by 90°
-            let currentEstimate = rawHeadingDeg + interferenceBiasCorrectionDeg
-            let residual = angleDifferenceDeg(from: currentEstimate, to: lastGPSCourseDeg)
-            interferenceBiasCorrectionDeg = max(-60, min(60,
-                interferenceBiasCorrectionDeg + residual * 0.0006 * speedWeight * accuracyWeight))
-        }
-
-        // Same formula the flight recorder logs, via the shared helper, so the rose and the
-        // recorded value can never drift apart.
+        // Heading, for the bottom-of-screen compass rose — a 2D screen instrument like the bank
+        // rose above, computed from the same forward vector as the pitch ladder, and corrected
+        // by the same world-yaw term the markers are placed with, so the rose and the traffic
+        // agree about which way is north.
+        //
+        // The GPS-course interference learner that used to sit here is gone. It drove the
+        // *camera's* azimuth toward the *aircraft's* ground track, which only holds when the
+        // phone points along the nose — looking out a side window it is ~90° wrong. Its own
+        // premise was that camera pointing averages onto the nose "over many minutes", but it
+        // was reset to zero at every session start and this app is built for a five-second
+        // glance, so that average never had a chance to form. In the FL272 log it wandered
+        // 0 → +6.1° → −1.7° in 38 seconds, chasing ARKit's own convergence. worldYawErrorDeg
+        // now measures that convergence error directly instead of learning around it; the
+        // course residual survives as a diagnostic in the flight log.
         let trueHeadingDeg = arFrameHeadingDeg(forward: forward)
 
         DispatchQueue.main.async { [weak self] in

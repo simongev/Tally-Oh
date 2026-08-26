@@ -9,6 +9,7 @@
 import Testing
 import Foundation
 import CoreLocation
+import SceneKit
 @testable import Tally_Ho
 
 struct TargetDataTests {
@@ -308,10 +309,17 @@ struct TargetDataTests {
 
     // MARK: - AR frame convention
 
+    /// The world azimuth a position vector sits at, in 0…360 — the inverse of the mapping
+    /// `calculateARPosition` performs, so a test can state where a target landed in the same
+    /// units the bearing went in as.
+    private func worldAzimuthDeg(_ p: SCNVector3) -> Double {
+        let deg = atan2(Double(p.x), Double(-p.z)) * 180.0 / Double.pi
+        return (deg + 360).truncatingRemainder(dividingBy: 360)
+    }
+
     /// Pins the frame convention in a test rather than a comment, which is what this repo has
-    /// been relying on. ARKit's `.gravityAndHeading` world is TRUE-north aligned: −Z is true
-    /// north, +X is east. A GPS bearing is already a true bearing, so it maps across with no
-    /// declination term — applying one rotated every marker by the local declination.
+    /// been relying on. ARKit's `.gravityAndHeading` world nominally puts true north on −Z and
+    /// east on +X, so with no yaw error a true bearing maps straight across.
     @Test func trueBearingsMapDirectlyOntoTheARWorldAxes() {
         let here = CLLocationCoordinate2D(latitude: 40.0, longitude: -74.0)
         let oneDegreeOfLatitudeNM = 60.0
@@ -320,7 +328,8 @@ struct TargetDataTests {
         let north = CLLocationCoordinate2D(latitude: 41.0, longitude: -74.0)
         let northPos = CalculationsLogic.calculateARPosition(
             targetCoord: north, targetAltitude: 0,
-            userCoord: here, userAltitude: 0, userHeading: 0)
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: 0)
         #expect(northPos.z < 0)
         #expect(abs(northPos.x) < abs(northPos.z) * 0.05)
 
@@ -328,7 +337,8 @@ struct TargetDataTests {
         let east = CLLocationCoordinate2D(latitude: 40.0, longitude: -73.0)
         let eastPos = CalculationsLogic.calculateARPosition(
             targetCoord: east, targetAltitude: 0,
-            userCoord: here, userAltitude: 0, userHeading: 0)
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: 0)
         #expect(eastPos.x > 0)
         #expect(abs(eastPos.z) < abs(eastPos.x) * 0.05)
 
@@ -338,17 +348,79 @@ struct TargetDataTests {
     }
 
     /// The regression this guards: with a westerly declination subtracted from the bearing, a
-    /// due-north target acquired a positive X component and drifted clockwise. Nothing may
-    /// rotate a target off its true bearing any more.
+    /// due-north target acquired a positive X component and drifted clockwise. With no yaw
+    /// error nothing may rotate a target off its true bearing.
     @Test func dueNorthTargetHasNoEastwardComponent() {
         let here  = CLLocationCoordinate2D(latitude: 40.7483, longitude: -74.0366)
         let north = CLLocationCoordinate2D(latitude: 40.9483, longitude: -74.0366)
         let pos = CalculationsLogic.calculateARPosition(
             targetCoord: north, targetAltitude: 0,
-            userCoord: here, userAltitude: 0, userHeading: 0)
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: 0)
         // A 12.5 degree rotation of a 12 NM target would put roughly 2.6 NM on the X axis;
         // the scaled scene units differ but the ratio is what matters.
         #expect(abs(pos.x) < abs(pos.z) * 0.02)
+    }
+
+    // MARK: - World-yaw correction
+
+    /// **The sign test.** Getting this backwards doubles the azimuth error instead of removing
+    /// it, which is exactly what this branch shipped once already with the declination term —
+    /// there the discriminating evidence was the *direction* of the displacement, and nobody
+    /// had recorded it. So the direction is asserted here, against a measured flight-log row.
+    ///
+    /// From the FL272 log at t=2.53 s: ARKit's raw camera azimuth read 255.73° while the
+    /// compass said the camera pointed at true 273.4°, so
+    /// `worldYawErrorDeg = angleDifference(from: 255.73, to: 273.4) = +17.67`.
+    ///
+    /// A target dead ahead — true bearing 273.4° — must therefore be placed at world azimuth
+    /// 255.73°, where ARKit believes the camera is looking, so the marker lands on the real
+    /// aircraft in the centre of frame. If the sign were inverted it would land at 291.07°:
+    /// 35° away, on the wrong side, and worse than doing nothing.
+    @Test func worldYawCorrectionRotatesTargetsOntoTheARFrame() {
+        let here = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.3)
+        // Due west of the viewer, i.e. true bearing 270°.
+        let west = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.5)
+        let yawError = 17.67
+
+        let corrected = CalculationsLogic.calculateARPosition(
+            targetCoord: west, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: yawError)
+
+        // 270 − 17.67 = 252.33, not 287.67.
+        #expect(abs(worldAzimuthDeg(corrected) - 252.33) < 0.5)
+    }
+
+    /// A zero correction must leave placement exactly where it was, so the term can never
+    /// perturb the on-ground case where ARKit's alignment is already good.
+    @Test func zeroWorldYawErrorLeavesBearingsUntouched() {
+        let here   = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.3)
+        let target = CLLocationCoordinate2D(latitude: 41.2, longitude: -79.1)
+
+        let trueBearing = CalculationsLogic.bearing(from: here, to: target)
+        let pos = CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: 0)
+
+        #expect(abs(worldAzimuthDeg(pos) - trueBearing) < 0.5)
+    }
+
+    /// The correction must wrap rather than producing a negative or >360 azimuth, since a
+    /// target just east of north with a westerly yaw error crosses zero.
+    @Test func worldYawCorrectionWrapsAcrossNorth() {
+        let here  = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.3)
+        // Due north, true bearing 0°.
+        let north = CLLocationCoordinate2D(latitude: 41.2, longitude: -79.3)
+
+        let pos = CalculationsLogic.calculateARPosition(
+            targetCoord: north, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            worldYawErrorDeg: 17.67)
+
+        // 0 − 17.67 wraps to 342.33.
+        #expect(abs(worldAzimuthDeg(pos) - 342.33) < 0.5)
     }
 
     @Test func headingDeltaIsZeroWhenFramesAgree() {

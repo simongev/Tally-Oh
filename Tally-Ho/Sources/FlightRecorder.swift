@@ -66,7 +66,8 @@ final class FlightRecorder {
         "gps_msl_ft", "gps_hae_ft", "v_acc_m", "gps_course_deg", "gps_course_acc_deg",
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
-        "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg", "interference_bias_deg",
+        "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
+        "world_yaw_corr_deg", "course_residual_deg",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
@@ -98,17 +99,24 @@ final class FlightRecorder {
         var headingTrueDeg: Double?
         var headingAccuracyDeg: Double?
         var declinationDeg: Double?
-        /// The HUD's learned cockpit-magnetic-interference term, separate from declination.
-        var interferenceBiasDeg: Double?
+        /// The world-yaw correction actually applied to placement this tick, or nil before the
+        /// first valid measurement — which is a different thing from a measured zero.
+        var worldYawCorrectionDeg: Double?
+        /// Corrected AR heading minus GPS ground track. Diagnostic only, and only meaningful
+        /// while the phone points near the aircraft's nose: a large residual persisting across
+        /// many camera orientations is the signature of a cabin magnetic bias shared by the
+        /// compass and ARKit, which the world-yaw correction is blind to by construction.
+        var courseResidualDeg: Double?
 
-        /// Heading of the AR world frame — the frame targets are actually placed in.
+        /// ARKit's raw, uncorrected world azimuth — what the AR world believes north is.
         var arHeadingDeg: Double?
-        /// Compass heading minus AR frame heading, signed, −180…180.
+        /// Compass heading minus ARKit's raw azimuth, signed, −180…180.
         ///
-        /// This is ARKit's world-alignment error: its north was fixed from one compass sample
-        /// at session start and drifts by visual-inertial tracking thereafter. It is the
-        /// dominant azimuth error and the quantity the alignment work has to reduce, so it is
-        /// recorded on every sample rather than inferred after the fact.
+        /// This is ARKit's world-alignment error: its north is fixed from one compass sample at
+        /// session start and refines only slowly thereafter. Recorded uncorrected on purpose —
+        /// placement now compensates for this, and logging the compensated heading instead
+        /// would make the column read zero by construction and measure nothing. Expect it to be
+        /// large early in a session and to decay; that is the error being cancelled, not a bug.
         var headingDeltaDeg: Double?
 
         var cameraYawDeg: Double?
@@ -250,8 +258,9 @@ final class FlightRecorder {
         fields.append(format(sample.headingMagneticDeg, decimals: 1))
         fields.append(format(sample.headingTrueDeg,     decimals: 1))
         fields.append(format(sample.headingAccuracyDeg, decimals: 1))
-        fields.append(format(sample.declinationDeg,     decimals: 2))
-        fields.append(format(sample.interferenceBiasDeg, decimals: 2))
+        fields.append(format(sample.declinationDeg,        decimals: 2))
+        fields.append(format(sample.worldYawCorrectionDeg, decimals: 2))
+        fields.append(format(sample.courseResidualDeg,     decimals: 1))
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 
