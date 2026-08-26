@@ -417,6 +417,23 @@ class CalculationsLogic {
 /// `correlation` is published beside the slope deliberately. A slope alone can be large and
 /// meaningless when the driver barely moved, and this project has been burned repeatedly by
 /// single numbers that could not distinguish a case from its opposite.
+///
+/// **Sample slowly.** The instinct is that more samples give a better estimate; here the
+/// opposite holds, and getting it wrong cost a build. The estimator is unbiased at any rate,
+/// but for a fixed total rotation `R` split into `n` steps each of size `R/n`,
+///
+///     Σ(Δdriver²) = n · (R/n)² = R²/n
+///
+/// and the slope's variance goes as `σ²/Σ(Δdriver²)` — so **variance grows linearly with
+/// sampling rate**. Sensor noise arrives per *sample* while the signal arrives per *degree of
+/// rotation*, so sampling faster piles up noise against a shrinking denominator. Simulated over
+/// a 90° pan against a non-following sensor with ±2° of jitter: 10 Hz gives a standard deviation
+/// of 0.071 and worst case 0.274; 1 Hz gives 0.022 and 0.062.
+///
+/// That is exactly what the first deployment showed. Sampled at ~10 Hz over 3 seconds it read a
+/// median of +0.161 with excursions to +0.709 on a flight whose true slope was −0.039, because
+/// a single brief compass jump that happened to coincide with a pan dominated the window. Prefer
+/// roughly 1 Hz over tens of seconds: enough pairs to average, each carrying real rotation.
 struct AngularResponse {
 
     struct Estimate {
@@ -459,6 +476,16 @@ struct AngularResponse {
         while d >  180 { d -= 360 }
         while d < -180 { d += 360 }
         return d
+    }
+
+    /// True when samples are accumulating but the driver has not rotated enough to publish.
+    ///
+    /// Distinct from having no data at all: an empty column looks identical whether the estimator
+    /// is broken or simply waiting for the aircraft to turn, and only one of those is worth
+    /// investigating.
+    var isWaitingForRotation: Bool {
+        guard samples.count >= minPairs + 1 else { return false }
+        return estimate == nil
     }
 
     /// The current estimate, or nil when the window holds too little rotation to mean anything.

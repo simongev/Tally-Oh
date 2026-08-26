@@ -914,12 +914,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// measured so far — and any such correction is actively harmful.
     ///
     /// Driver is the phone (ARKit azimuth), response is the compass.
-    private var compassResponseEstimator = AngularResponse(window: 3.0, minDriverRotationDeg: 20.0)
+    /// 25 s at ~1 Hz. Sampled slowly on purpose — see AngularResponse: the slope's variance grows
+    /// linearly with sampling rate, so the 10 Hz / 3 s version of this read a median +0.161 with
+    /// excursions to +0.709 on a flight whose true slope was −0.039.
+    private var compassResponseEstimator = AngularResponse(
+        window: 25.0, minDriverRotationDeg: 40.0, minPairs: 15)
     private var compassResponse: Double = .nan
     private var compassResponseR: Double = .nan
-    /// Compass reading at the last sample fed to the estimator, so samples can be gated on the
-    /// compass actually having produced a new value.
-    private var lastSampledCompassDeg: Double = .nan
     private var lastCompassSampleTime: TimeInterval = 0
 
     /// **Is ARKit's world Earth-referenced, or does it ride with the cabin?**
@@ -939,7 +940,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// leg holding one heading will never populate it.
     ///
     /// Driver is the aircraft (GPS ground track), response is ARKit's azimuth.
-    private var frameLockEstimator = AngularResponse(window: 30.0, minDriverRotationDeg: 10.0)
+    /// 45 s at ~1 Hz, matching GPS course's own update rate. Sampling faster than the driver
+    /// updates just fills the window with exactly-zero driver changes.
+    private var frameLockEstimator = AngularResponse(
+        window: 45.0, minDriverRotationDeg: 8.0, minPairs: 15)
+    /// True when the estimator is collecting but the aircraft has not turned enough to publish —
+    /// the normal state in cruise, and worth distinguishing from a broken measurement.
+    private var frameLockAwaitingTurn = false
     private var frameLock: Double = .nan
     private var frameLockR: Double = .nan
     private var lastFrameLockSampleTime: TimeInterval = 0
@@ -1610,10 +1617,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         compassResponse = .nan
         compassResponseR = .nan
         compassResponseEstimator.reset()
-        lastSampledCompassDeg = .nan
-        // frameLock deliberately survives a session restart: it describes ARKit's frame across
-        // the flight, and turns are scarce enough that throwing the window away on every
-        // foreground would mean it never accumulates enough rotation to publish.
+        // The frame-lock *window* is cleared but its published value is kept. A restart re-seeds
+        // ARKit's world yaw, so its azimuth jumps arbitrarily while the ground track does not; a
+        // window spanning that discontinuity pairs a large response change against a near-zero
+        // driver change, and if the restart lands during a turn it feeds a spurious term straight
+        // into the numerator of the one measurement this build exists to get right. Keeping the
+        // value means a reading earned before a foreground still shows, which was the real reason
+        // for not resetting it at all — that reason applies to the answer, not to the window.
+        frameLockEstimator.reset()
+        frameLockAwaitingTurn = false
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2728,11 +2740,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let responseStr = compassResponse.isNaN
                 ? "—"
                 : String(format: "%.2f", compassResponse)
-            // Degrees ARKit's azimuth turns per degree the aircraft turns. Only populates once
-            // the aircraft has actually turned, so it stays "—" through a cruise leg.
-            let lockStr = frameLock.isNaN
-                ? "—"
-                : String(format: "%.2f", frameLock)
+            // Degrees ARKit's azimuth turns per degree the aircraft turns. A cruise leg never
+            // populates it, so say which kind of nothing this is: waiting on the aircraft to
+            // turn reads differently from no data at all, and only one is worth chasing.
+            let lockStr: String
+            if !frameLock.isNaN {
+                lockStr = String(format: "%.2f", frameLock)
+            } else if frameLockAwaitingTurn {
+                lockStr = "—(no turn)"
+            } else {
+                lockStr = "—"
+            }
             lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@  cmp %@  lock %@",
                                 lastGPSSpeedKt, courseStr, residualStr, responseStr, lockStr))
 
@@ -2900,18 +2918,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// which alignment fixes are possible before one is written.
     private func updateResponseEstimators(arDeg: Double, compassUsable: Bool, at time: TimeInterval) {
 
-        // Compass vs phone. Sampled when the compass produces a genuinely new reading rather
-        // than once per rendered frame: CoreLocation delivers at ~10 Hz while this runs at frame
-        // rate, so frame-rate sampling pairs ARKit motion against five-sixths stale compass data.
+        // Both estimators sample at roughly 1 Hz, deliberately far below the rate either sensor
+        // can supply. Sensor noise arrives per sample while the rotation being measured arrives
+        // per degree, so oversampling piles up jitter against a shrinking Σ(Δdriver²) and widens
+        // the estimate — see AngularResponse for the derivation and the numbers. Gating on "the
+        // compass produced a new reading" is what pushed the first version to ~10 Hz, which is
+        // precisely the wrong end of that trade.
         //
-        // The staleness escape hatch matters more than it looks. Gating purely on "the value
-        // changed" means a compass frozen solid never produces a pair at all, and the column
-        // reads empty — reporting "no data" for precisely the case being hunted, where the
-        // honest answer is "response = 0". Sampling anyway after a beat lets a frozen compass
-        // generate real pairs with zero response and drive the slope to zero, which is true.
-        let compassChanged = lastSampledCompassDeg.isNaN || lastTrueHeading != lastSampledCompassDeg
-        if compassUsable, compassChanged || time - lastCompassSampleTime > 0.3 {
-            lastSampledCompassDeg = lastTrueHeading
+        // A compass frozen solid still produces pairs here, with zero response, and correctly
+        // drives the slope to zero. That matters: it is the case being hunted, and a version
+        // that published nothing for it would report "no data" where the honest answer is zero.
+        if compassUsable, time - lastCompassSampleTime >= 1.0 {
             lastCompassSampleTime = time
             compassResponseEstimator.add(driver: arDeg, response: lastTrueHeading, at: time)
         }
@@ -2920,16 +2937,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             compassResponseR = estimate.correlation
         }
 
-        // ARKit vs the aircraft's ground track. Sampled a few times a second: GPS course arrives
-        // at about 1 Hz, and the window spans half a minute because a standard-rate turn takes
-        // ten seconds to cover 30°.
+        // ARKit vs the aircraft's ground track. Same 1 Hz, which is also what GPS course itself
+        // updates at; anything faster only adds pairs whose driver change is exactly zero.
         if lastGPSCourseDeg >= 0, lastGPSCourseAccuracy >= 0, lastGPSSpeedKt >= 20,
-           time - lastFrameLockSampleTime > 0.25 {
+           time - lastFrameLockSampleTime >= 1.0 {
             lastFrameLockSampleTime = time
             frameLockEstimator.add(driver: lastGPSCourseDeg, response: arDeg, at: time)
             if let estimate = frameLockEstimator.estimate {
                 frameLock  = estimate.slope
                 frameLockR = estimate.correlation
+                frameLockAwaitingTurn = false
+            } else {
+                // Inside the 1 Hz gate rather than every frame: the check walks the whole window,
+                // and this runs on the render thread.
+                frameLockAwaitingTurn = frameLockEstimator.isWaitingForRotation
             }
         }
     }

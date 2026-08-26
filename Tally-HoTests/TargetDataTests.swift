@@ -371,6 +371,45 @@ struct TargetDataTests {
         if let estimate { #expect(abs(estimate.slope - 1.0) < 0.2) }
     }
 
+    /// **The build 12 regression.** The estimator is unbiased at any sampling rate, so a mean-only
+    /// test passes even when the rate is badly wrong. What breaks is the *spread*: for a fixed
+    /// total rotation R split into n steps, Σ(Δdriver²) = R²/n, so the slope's variance grows
+    /// linearly with sampling rate. Sampled at ~10 Hz over 3 s this read a median +0.161 with
+    /// excursions to +0.709 on a flight whose true slope was −0.039.
+    ///
+    /// Same rotation, same jitter, same true slope of zero — only the sample count differs. The
+    /// coarse estimate must not be worse than the fine one.
+    @Test func samplingSlowerGivesATighterEstimate() {
+        // Deterministic pseudo-noise, so the test cannot flake.
+        func jitter(_ i: Int) -> Double {
+            let x = sin(Double(i) * 12.9898) * 43758.5453
+            return (x - x.rounded(.down) - 0.5) * 4.0      // ±2 degrees
+        }
+        /// Worst-case |slope| over a sweep, for a sensor that does not follow at all.
+        func worstSlope(steps: Int) -> Double {
+            var worst = 0.0
+            for offset in 0..<25 {
+                var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20, minPairs: 2)
+                let step = 90.0 / Double(steps)          // 90 degrees of pan, however divided
+                for i in 0...steps {
+                    estimator.add(driver: Double(i) * step,
+                                  response: (jitter(i + offset * 100) + 360)
+                                      .truncatingRemainder(dividingBy: 360),
+                                  at: TimeInterval(i))
+                }
+                if let estimate = estimator.estimate {
+                    worst = max(worst, abs(estimate.slope))
+                }
+            }
+            return worst
+        }
+        let fine   = worstSlope(steps: 30)   // ~10 Hz over 3 s
+        let coarse = worstSlope(steps: 3)    // ~1 Hz over 3 s
+        #expect(coarse <= fine)
+        // And the coarse one must actually be usable, not merely better.
+        #expect(coarse < 0.2)
+    }
+
     /// Too little rotation must publish nothing rather than a confident-looking ratio.
     @Test func tooLittleRotationYieldsNoEstimate() {
         #expect(response(driverStep: 0.05, responseRatio: 1.0, samples: 30) == nil)
