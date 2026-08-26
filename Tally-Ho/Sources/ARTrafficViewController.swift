@@ -887,15 +887,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     ///
     /// It was applied, in build 8, and it had to be taken straight back out. The premise was
     /// that `CLHeading` reports where the phone points, so the gap is ARKit's alignment error.
-    /// In a cockpit `CLHeading` reports the aircraft's ground track instead: across one flight
-    /// the phone rotated 704.8° while the compass rotated 273.3°, their correlation was +0.29,
-    /// and the median gap between compass and GPS course was 0.00°. So the "error" this measures
-    /// is mostly just the angle between the phone and the nose, and subtracting it swung the
+    /// In a cockpit `CLHeading` reports the aircraft's ground track instead: measured on two
+    /// flights the phone rotated 523.6° while the compass rotated 59.9°, a regression slope of
+    /// +0.018, with the median gap between compass and GPS course at 0.00°. So the "error" this
+    /// measures is mostly the angle between the phone and the nose, and subtracting it swung the
     /// whole scene back toward the nose every time the user looked out of a side window.
     ///
-    /// Still recorded, because ARKit's alignment error is real and unsolved — 17.7° early in a
-    /// session, decaying to ~3° over 35 s — and this is the only number that tracks it. It is
-    /// simply not a correction until `compassResponse` says the compass is measuring the phone.
+    /// Which means this number does **not** measure ARKit's alignment error on its own, and the
+    /// "17.7° at FL272" once quoted from it was really that error plus the phone-to-nose angle.
+    /// ARKit's in-flight azimuth error is currently unmeasured. Still recorded, because paired
+    /// with `compassResponse` it becomes interpretable: where the compass tracks the phone this
+    /// is ARKit's error, and where it does not, it is not.
     private var worldYawErrorDeg: Double = 0
     /// Whether `worldYawErrorDeg` holds a real measurement yet, as opposed to a default zero.
     private var hasSeededWorldYawError = false
@@ -906,23 +908,41 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// **The test build 8 should have run before trusting the compass.**
     ///
-    /// Ratio of how far the compass turned to how far the phone actually turned, over a short
-    /// rolling window. Near 1 means the compass is measuring the phone's azimuth and an
-    /// alignment correction built on it would be sound. Near 0 means it is slaved to something
-    /// else — the aircraft's track, in the flight that produced this code — and any such
-    /// correction is actively harmful.
+    /// Degrees the compass turns per degree the phone turns. Near 1 means the compass is
+    /// measuring device azimuth and an alignment correction built on it would be sound; near 0
+    /// means it is slaved to something else — the aircraft's ground track, in both flights
+    /// measured so far — and any such correction is actively harmful.
     ///
-    /// Recorded, applied to nothing. The next term added to the placement path gets built only
-    /// once this column has said which regime the app is actually in.
+    /// Driver is the phone (ARKit azimuth), response is the compass.
+    private var compassResponseEstimator = AngularResponse(window: 3.0, minDriverRotationDeg: 20.0)
     private var compassResponse: Double = .nan
-    /// Rolling window of (timestamp, ARKit azimuth, compass heading) backing `compassResponse`.
-    private var headingResponseSamples: [(t: TimeInterval, arDeg: Double, compassDeg: Double)] = []
-    /// Window length. Long enough to contain a deliberate pan, short enough that the ratio
-    /// reflects what the user is doing now.
-    private let headingResponseWindow: TimeInterval = 3.0
-    /// Below this much phone rotation in the window the ratio is dominated by sensor noise and
-    /// says nothing, so it is not published.
-    private let headingResponseMinRotationDeg: Double = 20.0
+    private var compassResponseR: Double = .nan
+    /// Compass reading at the last sample fed to the estimator, so samples can be gated on the
+    /// compass actually having produced a new value.
+    private var lastSampledCompassDeg: Double = .nan
+    private var lastCompassSampleTime: TimeInterval = 0
+
+    /// **Is ARKit's world Earth-referenced, or does it ride with the cabin?**
+    ///
+    /// Degrees ARKit's azimuth turns per degree the aircraft's ground track turns. Inside a
+    /// fuselage every visual feature ARKit tracks is cabin interior, which is aircraft-fixed,
+    /// so this is genuinely open and the two answers demand different fixes:
+    ///
+    /// - **≈ 1, Earth-locked.** The gyro carries ARKit through the aircraft's turns, so its only
+    ///   azimuth error is the seed taken at session start: one constant per session. A constant
+    ///   is correctable, and cannot chase a pan the way build 8's term did.
+    /// - **≈ 0, cabin-locked.** The frame rides with the aircraft and its error grows by every
+    ///   degree flown after session start. No fixed offset can fix that.
+    ///
+    /// The user's panning is uncorrelated with the aircraft's turn rate, so it averages out of
+    /// the regression rather than needing the phone held still. Needs an actual turn: a cruise
+    /// leg holding one heading will never populate it.
+    ///
+    /// Driver is the aircraft (GPS ground track), response is ARKit's azimuth.
+    private var frameLockEstimator = AngularResponse(window: 30.0, minDriverRotationDeg: 10.0)
+    private var frameLock: Double = .nan
+    private var frameLockR: Double = .nan
+    private var lastFrameLockSampleTime: TimeInterval = 0
 
     /// Diagnostic only, never applied. ARKit's corrected azimuth minus GPS ground track, which
     /// is meaningful solely when the phone happens to point along the aircraft's nose. It is
@@ -1588,7 +1608,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         worldYawErrorDeg = 0
         courseResidualDeg = .nan
         compassResponse = .nan
-        headingResponseSamples.removeAll()
+        compassResponseR = .nan
+        compassResponseEstimator.reset()
+        lastSampledCompassDeg = .nan
+        // frameLock deliberately survives a session restart: it describes ARKit's frame across
+        // the flight, and turns are scarce enough that throwing the window away on every
+        // foreground would mean it never accumulates enough rotation to publish.
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2262,7 +2287,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // The correction actually being applied to placement this tick, and the GPS-course
         // residual that would expose a cabin bias shared by the compass and ARKit.
         sample.worldYawCorrectionDeg = hasSeededWorldYawError ? worldYawErrorDeg : nil
-        sample.compassResponse       = compassResponse.isNaN ? nil : compassResponse
+        sample.compassResponse       = compassResponse.isNaN  ? nil : compassResponse
+        sample.compassResponseR      = compassResponseR.isNaN ? nil : compassResponseR
+        sample.frameLock             = frameLock.isNaN        ? nil : frameLock
+        sample.frameLockR            = frameLockR.isNaN       ? nil : frameLockR
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
@@ -2700,8 +2728,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let responseStr = compassResponse.isNaN
                 ? "—"
                 : String(format: "%.2f", compassResponse)
-            lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@  cmp %@",
-                                lastGPSSpeedKt, courseStr, residualStr, responseStr))
+            // Degrees ARKit's azimuth turns per degree the aircraft turns. Only populates once
+            // the aircraft has actually turned, so it stays "—" through a cruise leg.
+            let lockStr = frameLock.isNaN
+                ? "—"
+                : String(format: "%.2f", frameLock)
+            lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@  cmp %@  lock %@",
+                                lastGPSSpeedKt, courseStr, residualStr, responseStr, lockStr))
 
             // ── Vertical datums ───────────────────────────────────────────────────────
             // The gap between cabin pressure altitude and GPS geometric altitude is the
@@ -2828,11 +2861,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     ///
     /// Runs on the SceneKit rendering thread, like the position ticks it precedes.
     private func updateWorldYawError(pov: SCNNode, at time: TimeInterval) {
-        // ARKit's azimuth is meaningless outside healthy tracking.
+        // ARKit's azimuth is meaningless outside healthy tracking. This gate is common to
+        // everything below, because everything below is measured against that azimuth.
         guard case .normal = arTrackingState else { return }
-        guard lastTrueHeading >= 0,
-              lastHeadingAccuracy >= 0,
-              lastHeadingAccuracy <= maxHeadingAccuracyForYawFix else { return }
 
         let camTransform = simd_float4x4(pov.worldTransform)
         let forward = SIMD3<Float>(-camTransform.columns.2.x,
@@ -2842,10 +2873,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return }
 
         let rawAzimuthDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
-        worldYawErrorDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
-        hasSeededWorldYawError = true
 
-        updateCompassResponse(arDeg: rawAzimuthDeg, compassDeg: lastTrueHeading, at: time)
+        // The compass gate applies only to the compass-derived values. frame_lock compares ARKit
+        // against GPS ground track and never touches the compass, so gating it on compass health
+        // would be able to starve the one measurement that does not depend on the compass —
+        // exactly when a bad compass makes it most worth having.
+        let compassUsable = lastTrueHeading >= 0
+            && lastHeadingAccuracy >= 0
+            && lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        if compassUsable {
+            worldYawErrorDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
+            hasSeededWorldYawError = true
+        }
+
+        updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)
 
         // Diagnostic only — see courseResidualDeg.
         if lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0 && lastGPSCourseDeg >= 0 {
@@ -2855,25 +2896,42 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
-    /// Compare how far the compass turned against how far the phone actually turned.
-    ///
-    /// Both totals are sums of absolute per-sample changes rather than start-to-end differences,
-    /// so panning out and back still counts as rotation instead of cancelling to zero.
-    private func updateCompassResponse(arDeg: Double, compassDeg: Double, at time: TimeInterval) {
-        headingResponseSamples.append((t: time, arDeg: arDeg, compassDeg: compassDeg))
-        headingResponseSamples.removeAll { time - $0.t > headingResponseWindow }
-        guard headingResponseSamples.count >= 2 else { return }
+    /// Feed both response estimators. Neither result is applied to anything; both exist to say
+    /// which alignment fixes are possible before one is written.
+    private func updateResponseEstimators(arDeg: Double, compassUsable: Bool, at time: TimeInterval) {
 
-        var arRotation = 0.0
-        var compassRotation = 0.0
-        for (previous, current) in zip(headingResponseSamples, headingResponseSamples.dropFirst()) {
-            arRotation      += abs(angleDifferenceDeg(from: previous.arDeg,      to: current.arDeg))
-            compassRotation += abs(angleDifferenceDeg(from: previous.compassDeg, to: current.compassDeg))
+        // Compass vs phone. Sampled when the compass produces a genuinely new reading rather
+        // than once per rendered frame: CoreLocation delivers at ~10 Hz while this runs at frame
+        // rate, so frame-rate sampling pairs ARKit motion against five-sixths stale compass data.
+        //
+        // The staleness escape hatch matters more than it looks. Gating purely on "the value
+        // changed" means a compass frozen solid never produces a pair at all, and the column
+        // reads empty — reporting "no data" for precisely the case being hunted, where the
+        // honest answer is "response = 0". Sampling anyway after a beat lets a frozen compass
+        // generate real pairs with zero response and drive the slope to zero, which is true.
+        let compassChanged = lastSampledCompassDeg.isNaN || lastTrueHeading != lastSampledCompassDeg
+        if compassUsable, compassChanged || time - lastCompassSampleTime > 0.3 {
+            lastSampledCompassDeg = lastTrueHeading
+            lastCompassSampleTime = time
+            compassResponseEstimator.add(driver: arDeg, response: lastTrueHeading, at: time)
         }
-        // Below the threshold the phone is essentially still and the ratio is noise over noise.
-        // Leave the previous value standing rather than publishing a meaningless one.
-        guard arRotation >= headingResponseMinRotationDeg else { return }
-        compassResponse = compassRotation / arRotation
+        if let estimate = compassResponseEstimator.estimate {
+            compassResponse  = estimate.slope
+            compassResponseR = estimate.correlation
+        }
+
+        // ARKit vs the aircraft's ground track. Sampled a few times a second: GPS course arrives
+        // at about 1 Hz, and the window spans half a minute because a standard-rate turn takes
+        // ten seconds to cover 30°.
+        if lastGPSCourseDeg >= 0, lastGPSCourseAccuracy >= 0, lastGPSSpeedKt >= 20,
+           time - lastFrameLockSampleTime > 0.25 {
+            lastFrameLockSampleTime = time
+            frameLockEstimator.add(driver: lastGPSCourseDeg, response: arDeg, at: time)
+            if let estimate = frameLockEstimator.estimate {
+                frameLock  = estimate.slope
+                frameLockR = estimate.correlation
+            }
+        }
     }
 
     /// Compute and push the HUD horizon/pitch-ladder geometry for this frame.

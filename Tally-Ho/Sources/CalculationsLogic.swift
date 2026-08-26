@@ -149,13 +149,19 @@ class CalculationsLogic {
     /// while correcting nothing.
     ///
     /// The second subtracted `compass − ARKit azimuth`, on the premise that `CLHeading`
-    /// reports where the phone is pointing. In a cockpit it does not. Across 55 samples of one
-    /// flight the phone rotated 704.8° while the compass rotated 273.3°, the correlation between
-    /// the two was +0.29, and the median gap between compass and GPS ground track was 0.00° —
-    /// the compass was echoing the aircraft's track. Individual pans are starker still: the
-    /// phone swinging 70° left moved the compass 0.3°. Subtracting that "error" counter-rotated
-    /// the scene against every pan, so the traffic slid back toward the nose whenever the user
-    /// turned to look sideways.
+    /// reports where the phone is pointing. In a cockpit it does not. Measured on two flights,
+    /// at FL270 and FL450 on different headings: the phone rotated 523.6° while the compass
+    /// rotated 59.9°, the regression slope of one on the other was +0.018, and the median gap
+    /// between compass and GPS ground track was 0.00°. The compass was echoing the aircraft's
+    /// track. Individual pans are starker still — the phone swinging 58° moved the compass 0.6°.
+    /// Subtracting that "error" counter-rotated the scene against every pan, so the traffic slid
+    /// back toward the nose whenever the user turned to look sideways.
+    ///
+    /// A consequence worth stating, because it is easy to quote the wrong number: **ARKit's own
+    /// in-flight alignment error has never been measured.** `heading_delta_deg` is
+    /// `compass − ARKit`, so where the compass reports the track that difference is the
+    /// phone-to-nose angle plus ARKit's error, not ARKit's error. Earlier claims of "17.7° off,
+    /// decaying to 3°" conflated the two and should not be repeated.
     ///
     /// Both premises shared a failure mode worth naming, since it has now cost two builds: the
     /// evidence offered for each was equally consistent with its opposite. "Targets displaced by
@@ -165,9 +171,10 @@ class CalculationsLogic {
     /// phone moves* does. Before any future term is added here, state the observation that would
     /// distinguish it from its opposite, and go and measure that.
     ///
-    /// So a true GPS bearing maps straight across. ARKit's own world alignment carries a real
-    /// error — 17.7° early in a session at FL272, decaying to ~3° over 35 s — which remains
-    /// uncorrected, and is a smaller harm than a scene that will not hold still.
+    /// So a true GPS bearing maps straight across, and ARKit's world alignment error — whatever
+    /// its true size — remains uncorrected. That is a smaller harm than a scene that will not
+    /// hold still, and until `compass_response` and `frame_lock` say which regime the app is in,
+    /// it is the only honest option.
     static func calculateARPosition(
         targetCoord: CLLocationCoordinate2D,
         targetAltitude: Double,
@@ -387,6 +394,116 @@ class CalculationsLogic {
 
 /// Measures the local conversion between pressure altitude and geometric altitude from the
 /// traffic picture itself.
+/// Measures how many degrees one angle turns per degree another turns, over a rolling window.
+///
+/// Two questions in this app reduce to exactly this, and both have to be answered before any
+/// azimuth correction can be trusted again:
+///
+/// - Does the **compass** follow the **phone**? Slope 1 means it is measuring device azimuth;
+///   slope 0 means it is reporting something else (in a cockpit, the aircraft's ground track)
+///   and no alignment correction may be built on it.
+/// - Does **ARKit's azimuth** follow the **aircraft's ground track** through a turn? Slope 1
+///   means ARKit's world is Earth-referenced and its error is one constant per session; slope 0
+///   means the world rides with the cabin and grows by every degree the aircraft turns.
+///
+/// **Why a least-squares slope and not a ratio of absolute changes.** The first version of this
+/// summed `|Δresponse|` over `|Δdriver|`, which rectifies noise into apparent signal: sensor
+/// jitter adds to the numerator on every sample whether or not the driver moved, and never
+/// cancels. On a flight where the true slope was 0.018 that estimator reported 0.61 — it would
+/// have certified a compass that was not tracking the phone at all as tracking it perfectly.
+/// Regressing signed changes through the origin fixes it, because jitter is uncorrelated with
+/// the driver and averages toward zero in the numerator instead of accumulating.
+///
+/// `correlation` is published beside the slope deliberately. A slope alone can be large and
+/// meaningless when the driver barely moved, and this project has been burned repeatedly by
+/// single numbers that could not distinguish a case from its opposite.
+struct AngularResponse {
+
+    struct Estimate {
+        /// Degrees the response angle turns per degree the driver turns.
+        var slope: Double
+        /// Pearson correlation of the per-sample changes, −1…1. Near zero means the slope is
+        /// describing noise rather than a relationship.
+        var correlation: Double
+        /// Total absolute driver rotation the estimate is drawn from, in degrees.
+        var driverRotationDeg: Double
+        var pairCount: Int
+    }
+
+    /// How long a span the estimate is drawn from.
+    let window: TimeInterval
+    /// Minimum total driver rotation before an estimate is published at all. Below this the
+    /// ratio is noise over noise and says nothing.
+    let minDriverRotationDeg: Double
+    /// Minimum number of change pairs, so a single jump cannot produce a confident-looking slope.
+    let minPairs: Int
+
+    private var samples: [(t: TimeInterval, driver: Double, response: Double)] = []
+
+    init(window: TimeInterval, minDriverRotationDeg: Double, minPairs: Int = 8) {
+        self.window = window
+        self.minDriverRotationDeg = minDriverRotationDeg
+        self.minPairs = minPairs
+    }
+
+    mutating func add(driver: Double, response: Double, at time: TimeInterval) {
+        samples.append((t: time, driver: driver, response: response))
+        samples.removeAll { time - $0.t > window }
+    }
+
+    mutating func reset() { samples.removeAll() }
+
+    /// Signed shortest angular difference, −180…180. Local to keep this type free-standing.
+    private static func delta(_ from: Double, _ to: Double) -> Double {
+        var d = to - from
+        while d >  180 { d -= 360 }
+        while d < -180 { d += 360 }
+        return d
+    }
+
+    /// The current estimate, or nil when the window holds too little rotation to mean anything.
+    var estimate: Estimate? {
+        guard samples.count >= minPairs + 1 else { return nil }
+
+        var dDriver: [Double] = []
+        var dResponse: [Double] = []
+        dDriver.reserveCapacity(samples.count - 1)
+        dResponse.reserveCapacity(samples.count - 1)
+        for (previous, current) in zip(samples, samples.dropFirst()) {
+            dDriver.append(AngularResponse.delta(previous.driver, current.driver))
+            dResponse.append(AngularResponse.delta(previous.response, current.response))
+        }
+
+        let rotation = dDriver.reduce(0) { $0 + abs($1) }
+        guard rotation >= minDriverRotationDeg else { return nil }
+
+        // Slope through the origin: no intercept term, because zero driver rotation must mean
+        // zero response rotation for this to be the quantity it claims to be.
+        let denominator = dDriver.reduce(0) { $0 + $1 * $1 }
+        guard denominator > 0 else { return nil }
+        let slope = zip(dDriver, dResponse).reduce(0) { $0 + $1.0 * $1.1 } / denominator
+
+        return Estimate(slope: slope,
+                        correlation: AngularResponse.correlation(dDriver, dResponse),
+                        driverRotationDeg: rotation,
+                        pairCount: dDriver.count)
+    }
+
+    static func correlation(_ x: [Double], _ y: [Double]) -> Double {
+        guard x.count == y.count, x.count > 1 else { return .nan }
+        let n = Double(x.count)
+        let meanX = x.reduce(0, +) / n
+        let meanY = y.reduce(0, +) / n
+        var sxy = 0.0, sxx = 0.0, syy = 0.0
+        for (a, b) in zip(x, y) {
+            let dx = a - meanX, dy = b - meanY
+            sxy += dx * dy; sxx += dx * dx; syy += dy * dy
+        }
+        let denominator = (sxx * syy).squareRoot()
+        return denominator > 0 ? sxy / denominator : .nan
+    }
+}
+
 ///
 /// Aircraft report `alt_baro` against the 29.92 inHg standard datum and `alt_geom` against the
 /// WGS-84 ellipsoid. Their difference is the local offset produced by the actual altimeter

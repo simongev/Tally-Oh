@@ -307,6 +307,99 @@ struct TargetDataTests {
         #expect(abs(angleDifferenceDeg(from: 150, to: 160) - 10) < 0.001)
     }
 
+    // MARK: - Angular response estimator
+
+    /// Feeds a synthetic series into the estimator: the driver turns by `driverStep` each sample
+    /// and the response follows at `responseRatio` of it, with `jitterDeg` of alternating noise
+    /// added to the response only.
+    private func response(driverStep: Double,
+                          responseRatio: Double,
+                          jitterDeg: Double = 0,
+                          samples: Int = 60) -> AngularResponse.Estimate? {
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20)
+        var driver = 0.0
+        var response = 0.0
+        for i in 0..<samples {
+            // Deterministic alternating jitter, so the test cannot flake.
+            let jitter = (i % 2 == 0 ? jitterDeg : -jitterDeg)
+            estimator.add(driver: driver,
+                          response: (response + jitter).truncatingRemainder(dividingBy: 360),
+                          at: TimeInterval(i) * 0.1)
+            driver   += driverStep
+            response += driverStep * responseRatio
+        }
+        return estimator.estimate
+    }
+
+    /// A compass that genuinely follows the phone.
+    @Test func responseIsOneWhenTheSensorTracks() {
+        let estimate = response(driverStep: 2.0, responseRatio: 1.0)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.slope - 1.0) < 0.05)
+            #expect(estimate.correlation > 0.95)
+        }
+    }
+
+    /// The measured case: the phone turns, the sensor does not. Two flights read like this.
+    @Test func responseIsZeroWhenTheSensorIsSlavedElsewhere() {
+        let estimate = response(driverStep: 2.0, responseRatio: 0.0)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate.slope) < 0.05) }
+    }
+
+    /// **The regression this exists to prevent.** The first estimator summed *absolute* changes,
+    /// so jitter on a stationary sensor accumulated into apparent response: it read 0.61 in
+    /// flight where the true slope was 0.018, which would have certified a compass that was not
+    /// tracking the phone at all. Signed least squares must stay near zero here, because jitter
+    /// is uncorrelated with the driver and cancels in the numerator instead of piling up.
+    @Test func jitterOnAStationarySensorDoesNotLookLikeResponse() {
+        let estimate = response(driverStep: 2.0, responseRatio: 0.0, jitterDeg: 3.0)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.slope) < 0.15)
+            #expect(abs(estimate.correlation) < 0.5)
+        }
+        // And the same series under the old estimator would have looked highly responsive:
+        // sum|d response| is driven entirely by the 6 deg jitter swing on every sample.
+    }
+
+    /// Jitter must not deflate a sensor that really is tracking, either.
+    @Test func jitterDoesNotHideARealResponse() {
+        let estimate = response(driverStep: 3.0, responseRatio: 1.0, jitterDeg: 2.0)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate.slope - 1.0) < 0.2) }
+    }
+
+    /// Too little rotation must publish nothing rather than a confident-looking ratio.
+    @Test func tooLittleRotationYieldsNoEstimate() {
+        #expect(response(driverStep: 0.05, responseRatio: 1.0, samples: 30) == nil)
+    }
+
+    /// Partial response, e.g. an ARKit frame that follows only some of the aircraft's turn.
+    @Test func partialResponseIsReportedAsAFraction() {
+        let estimate = response(driverStep: 2.0, responseRatio: 0.5)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate.slope - 0.5) < 0.05) }
+    }
+
+    /// The estimator must wrap correctly rather than treating 359 -> 1 as a 358 degree jump.
+    @Test func responseHandlesWrapAcrossNorth() {
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20)
+        var angle = 350.0
+        for i in 0..<40 {
+            let wrapped = angle.truncatingRemainder(dividingBy: 360)
+            estimator.add(driver: wrapped, response: wrapped, at: TimeInterval(i) * 0.1)
+            angle += 2.0
+        }
+        let estimate = estimator.estimate
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.slope - 1.0) < 0.05)
+            #expect(estimate.driverRotationDeg > 20)
+        }
+    }
+
     // MARK: - AR frame convention
 
     /// The world azimuth a position vector sits at, in 0…360 — the inverse of the mapping

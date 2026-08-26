@@ -67,7 +67,8 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
-        "world_yaw_corr_deg", "course_residual_deg", "compass_response",
+        "world_yaw_corr_deg", "course_residual_deg",
+        "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
@@ -106,11 +107,30 @@ final class FlightRecorder {
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
         /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
-        /// built on it would be sound. Near 0: it is slaved to something else — in the flight
-        /// that prompted this column, the aircraft's ground track, where the phone rotated
-        /// 704.8 degrees while the compass rotated 273.3 and their correlation was +0.29.
+        /// built on it would be sound. Near 0: it is slaved to something else — in both flights
+        /// measured so far, the aircraft's ground track. At FL450 the phone rotated 523.6 degrees
+        /// while the compass rotated 59.9, a slope of +0.018.
         /// Empty when the phone has not turned enough for the ratio to mean anything.
+        ///
+        /// This is a least-squares slope of signed changes, not a ratio of absolute ones. The
+        /// first version summed absolute changes, which rectified sensor jitter into apparent
+        /// response and read 0.61 on a flight whose true slope was 0.018 — certifying a compass
+        /// that was not tracking the phone at all.
         var compassResponse: Double?
+        /// Correlation behind compassResponse. A slope is only meaningful when this is not near
+        /// zero; the pair together is what makes the verdict unambiguous.
+        var compassResponseR: Double?
+        /// How many degrees ARKit's azimuth turns per degree the aircraft's ground track turns.
+        ///
+        /// Near 1: ARKit's world is Earth-referenced, and its azimuth error is a single constant
+        /// fixed at session start — correctable, and constant enough that correcting it cannot
+        /// fight the user's panning. Near 0: the world rides with the cabin and the error grows
+        /// with every degree the aircraft turns, which no fixed offset can repair.
+        ///
+        /// Only populates once the aircraft has actually turned, so a cruise leg leaves it empty.
+        var frameLock: Double?
+        /// Correlation behind frameLock, read the same way as compassResponseR.
+        var frameLockR: Double?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
         /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
         /// where the compass is track-slaved, this and heading_delta_deg carry the same
@@ -271,7 +291,10 @@ final class FlightRecorder {
         fields.append(format(sample.declinationDeg,        decimals: 2))
         fields.append(format(sample.worldYawCorrectionDeg, decimals: 2))
         fields.append(format(sample.courseResidualDeg,     decimals: 1))
-        fields.append(format(sample.compassResponse,       decimals: 2))
+        fields.append(format(sample.compassResponse,  decimals: 3))
+        fields.append(format(sample.compassResponseR, decimals: 2))
+        fields.append(format(sample.frameLock,        decimals: 3))
+        fields.append(format(sample.frameLockR,       decimals: 2))
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 

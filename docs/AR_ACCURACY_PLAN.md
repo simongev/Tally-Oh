@@ -65,15 +65,39 @@ result **persists across lifts**, so the second and later glances start already 
   popups. (Foreground/appear still resets — see F6.)
 - Relaxed in-flight GPS accuracy gate (500 m), stale-target dashed rings, coast caps.
 
-### How to evidence an alignment change (learned the hard way)
+### How to evidence an alignment change (learned the hard way, four times)
 
-Three separate azimuth corrections have been added and reverted here, each on a field
-observation of the form "the target was off by roughly N degrees". That form of observation
-**cannot establish which way to correct**: an offset the size of the declination is equally
-consistent with the correction being absent and with it being wrongly applied. Record the
-**direction** of the error, or measure a quantity that has a known correct value — which is what
-`heading_delta_deg` now is. It must read near zero; any other value names both the size and the
-sign of what is wrong.
+Four azimuth corrections have now been added and reverted here. Every one of them was justified
+by an observation that was **equally consistent with its own opposite**:
+
+| correction | evidence offered | what it could not distinguish |
+|---|---|---|
+| magnetic declination | "targets displaced by about the declination" | correction missing vs. wrongly present — only the *direction* separates them |
+| compass world-yaw (build 8) | "the compass agrees with GPS ground track to within a degree" | compass accurate vs. compass merely *reporting* the track — only whether it *moves when the phone moves* separates them |
+
+Before adding any term to the placement path, write down the observation that would distinguish
+your hypothesis from its opposite, and go and measure **that**.
+
+**`heading_delta_deg` is not that measurement, despite an earlier claim here that it was.** It is
+`compass − ARKit azimuth`, so where the compass reports the aircraft's track — which it does in
+this airframe at both FL270 and FL450 — it returns the phone-to-nose angle plus ARKit's error,
+not ARKit's error. It does not have a known correct value, and it must not be driven to zero.
+Any figure quoted from it for "ARKit's alignment error", including the 17.7° once cited from the
+FL272 flight, conflates the two. **ARKit's in-flight azimuth error remains unmeasured.**
+
+The two columns that *are* discriminating, both added in build 11 and both applied to nothing:
+
+- `compass_response` — degrees the compass turns per degree the phone turns. ~1 licenses a
+  compass-based correction; ~0 forbids one. Measured at **+0.018** in flight.
+- `frame_lock` — degrees ARKit's azimuth turns per degree the aircraft's ground track turns.
+  ~1 means ARKit is Earth-referenced and its error is one constant per session; ~0 means its
+  frame rides with the cabin and grows with every turn. Still unmeasured — it needs a log
+  covering a turn, and both flights so far held one heading.
+
+Note also that the first version of `compass_response` was itself non-discriminating: it summed
+*absolute* changes, which rectifies sensor jitter into apparent response, and read 0.61 where the
+true slope was 0.018. A ratio of absolute changes cannot tell a tracking sensor from a jittering
+stationary one. Regress signed changes.
 
 ### What was already tried and failed (do NOT repeat)
 
