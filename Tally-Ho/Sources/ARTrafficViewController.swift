@@ -1033,6 +1033,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// pressure altitude and GPS geometric altitude is what identifies a pressurized cabin,
     /// and it is one of the inputs the frame-aware vertical work is being built on.
     private func setupDiagnosticAltimeter() {
+        // Record the authorisation state up front, because the error code alone does not
+        // distinguish the cases. A flight log showed CMErrorDomain 105 while the app did not
+        // appear in Settings → Privacy & Security → Motion & Fitness at all — and an app is
+        // only listed there once iOS has recorded a decision for it. So "denied for this app"
+        // and "never asked" and "Fitness Tracking switched off system-wide, which denies every
+        // app and hides the list" all look identical from the callback. authorizationStatus()
+        // separates them outright.
+        let authDescription: String
+        switch CMAltimeter.authorizationStatus() {
+        case .notDetermined: authDescription = "notDetermined"
+        case .restricted:    authDescription = "restricted"
+        case .denied:        authDescription = "denied"
+        case .authorized:    authDescription = "authorized"
+        @unknown default:    authDescription = "unknown"
+        }
+        FlightRecorder.shared.record(
+            event: "altimeter_auth",
+            detail: "status=\(authDescription) available=\(CMAltimeter.isRelativeAltitudeAvailable())"
+        )
+
         // Both failure paths below used to return in silence, which is why a whole session
         // logged an empty pressure column with no indication whether the sensor was absent,
         // unauthorised, or simply never called. The Motion usage description is declared, so
