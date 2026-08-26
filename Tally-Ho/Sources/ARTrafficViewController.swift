@@ -940,7 +940,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var gpsEllipsoidalAltitudeFeet: Double = 0
     private var geoidSeparationFeet: Double?
     /// Cabin pressure altitude from the phone's barometer. Diagnostic only — it never feeds
-    /// `userAltitude`, which stays GPS-derived (see setupDiagnosticAltimeter).
+    /// `userAltitude`, which stays GPS-derived (see startDiagnosticAltimeterIfNeeded).
     private var cabinPressureAltitudeFeet: Double?
 
     /// Timestamp of the last position fix that passed the accuracy gate.
@@ -971,6 +971,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Deliberately not part of the altitude chain: build 28 removed barometric fusion
     /// because a cabin barometer measures cabin pressure, and that decision stands.
     private let diagnosticAltimeter = CMAltimeter()
+    /// Whether a barometer subscription is live, so the start can be attempted from several
+    /// points without stacking subscriptions. Cleared again if the stream errors.
+    private var altimeterStarted = false
+    /// Last Motion authorisation state written to the log, so a repeated start attempt records
+    /// only genuine changes rather than one row per attempt.
+    private var lastLoggedMotionAuth: String?
 
     // MARK: - Lifecycle
 
@@ -993,7 +999,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // Both collaborators read and write the one ownship estimate.
         connectionLogic.ownshipEstimator = ownshipEstimator
         sceneManager?.ownshipEstimator   = ownshipEstimator
-        setupDiagnosticAltimeter()
+        // The barometer is deliberately not started here — see
+        // startDiagnosticAltimeterIfNeeded for why requesting Motion during launch loses the
+        // race against the camera and location prompts.
 
         if let seed = seedLocation {
             userLocation        = seed.coordinate
@@ -1024,54 +1032,86 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
+    /// Human-readable CoreMotion authorisation state, for the log and the info panel.
+    ///
+    /// The error code alone does not distinguish the cases: a flight log showed CMErrorDomain
+    /// 105 while the app did not appear in Settings → Privacy & Security → Motion & Fitness at
+    /// all — and an app is listed there only once iOS has recorded a decision for it. So
+    /// "denied for this app", "never actually asked", and "Fitness Tracking switched off
+    /// system-wide, which denies every app and hides the list" all look identical from the
+    /// callback. This separates them outright.
+    private var motionAuthDescription: String {
+        switch CMAltimeter.authorizationStatus() {
+        case .notDetermined: return "notDetermined"
+        case .restricted:    return "restricted"
+        case .denied:        return "denied"
+        case .authorized:    return "authorized"
+        @unknown default:    return "unknown"
+        }
+    }
+
     /// Subscribe to the barometer purely to record cabin pressure altitude.
     ///
     /// Barometric fusion was removed from the altitude chain deliberately: inside a
     /// pressurized cabin the sensor measures cabin pressure, not outside static, so GPS is the
     /// only meaningful altitude source. That stands — nothing here touches `userAltitude`.
     /// What the reading is still good for is the comparison itself: the gap between cabin
-    /// pressure altitude and GPS geometric altitude is what identifies a pressurized cabin,
-    /// and it is one of the inputs the frame-aware vertical work is being built on.
-    private func setupDiagnosticAltimeter() {
-        // Record the authorisation state up front, because the error code alone does not
-        // distinguish the cases. A flight log showed CMErrorDomain 105 while the app did not
-        // appear in Settings → Privacy & Security → Motion & Fitness at all — and an app is
-        // only listed there once iOS has recorded a decision for it. So "denied for this app"
-        // and "never asked" and "Fitness Tracking switched off system-wide, which denies every
-        // app and hides the list" all look identical from the callback. authorizationStatus()
-        // separates them outright.
-        let authDescription: String
-        switch CMAltimeter.authorizationStatus() {
-        case .notDetermined: authDescription = "notDetermined"
-        case .restricted:    authDescription = "restricted"
-        case .denied:        authDescription = "denied"
-        case .authorized:    authDescription = "authorized"
-        @unknown default:    authDescription = "unknown"
-        }
-        FlightRecorder.shared.record(
-            event: "altimeter_auth",
-            detail: "status=\(authDescription) available=\(CMAltimeter.isRelativeAltitudeAvailable())"
-        )
+    /// pressure altitude and GPS geometric altitude is what identifies a pressurized cabin.
+    /// It also matters more than it looks: in an *unpressurized* aircraft with no receiver, the
+    /// phone's barometer is the only source of ownship pressure altitude there is, and so the
+    /// only way to place traffic against the same alt_baro datum the targets report.
+    ///
+    /// Deliberately **not** called from `viewDidLoad`. Doing so put the Motion request into the
+    /// same launch window as the camera prompt and two location prompts (the calibration screen
+    /// raises one, `setupLocation` another). iOS presents privacy alerts one at a time, and a
+    /// CoreMotion request made while another alert is already up can fail to register at all —
+    /// which is exactly the state the FL272 flight ended in: an error reading as "denied" with
+    /// no Settings entry to correct it. It is now started from points where the competing
+    /// prompts have already resolved.
+    ///
+    /// Safe to call repeatedly; `altimeterStarted` keeps it to one live subscription.
+    private func startDiagnosticAltimeterIfNeeded(trigger: String) {
+        guard !altimeterStarted else { return }
 
-        // Both failure paths below used to return in silence, which is why a whole session
-        // logged an empty pressure column with no indication whether the sensor was absent,
-        // unauthorised, or simply never called. The Motion usage description is declared, so
-        // a denial surfaces here as CMErrorNotAuthorized rather than as a missing key.
-        guard CMAltimeter.isRelativeAltitudeAvailable() else {
+        let status = CMAltimeter.authorizationStatus()
+        // Only on a change. This is reached from every transition to .normal tracking and from
+        // every foreground — the FL272 flight alone had 14 tracking transitions in 38 seconds —
+        // and an unchanged status logged each time would flood the 10,000-row ring buffer and
+        // push out the placement data it exists to hold.
+        let description = motionAuthDescription
+        if description != lastLoggedMotionAuth {
+            lastLoggedMotionAuth = description
             FlightRecorder.shared.record(
-                event: "altimeter_unavailable",
-                detail: "isRelativeAltitudeAvailable=false"
+                event: "altimeter_auth",
+                detail: "trigger=\(trigger) status=\(description) "
+                      + "available=\(CMAltimeter.isRelativeAltitudeAvailable())"
             )
-            return
         }
+
+        guard CMAltimeter.isRelativeAltitudeAvailable() else { return }
+        // Only these two states can lead anywhere. A denied or restricted request can produce
+        // nothing but another 105, so don't burn one — and don't re-nag a user who genuinely
+        // said no every time they foreground the app. Leaving altimeterStarted false means a
+        // later foreground re-checks, which is what lets a permission granted in Settings take
+        // effect without reinstalling.
+        guard status == .notDetermined || status == .authorized else { return }
+
+        altimeterStarted = true
         diagnosticAltimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, error in
             guard let self else { return }
             if let error {
                 let nsError = error as NSError
                 FlightRecorder.shared.record(
                     event: "altimeter_error",
-                    detail: "domain=\(nsError.domain) code=\(nsError.code)"
+                    detail: "domain=\(nsError.domain) code=\(nsError.code) "
+                          + "status=\(self.motionAuthDescription)"
                 )
+                // Tear the dead subscription down and clear the flag, so a later foreground
+                // re-evaluates instead of the app holding a stream that only ever errors. The
+                // status guard above is what stops that becoming a retry loop: after a denial
+                // the status is no longer .notDetermined, so the retry returns immediately.
+                self.diagnosticAltimeter.stopRelativeAltitudeUpdates()
+                self.altimeterStarted = false
                 return
             }
             guard let data else { return }
@@ -1370,6 +1410,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             self.startARSession(reason: "foreground")
             self.updateTimer?.fireDate = Date()            // resume immediately
             self.beginLiftSession(reason: "foreground")
+            // Returning from Settings is the moment a Motion permission just granted there
+            // becomes usable, and the moment a user who switched the system-wide Fitness
+            // Tracking toggle on comes back expecting it to work. Without this the column
+            // stays empty until the app is reinstalled.
+            self.startDiagnosticAltimeterIfNeeded(trigger: "foreground")
         }
     }
 
@@ -2661,6 +2706,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                     : "ambient"
                 lines.append(String(format: "🎚 cabin %.0f ft  geo %.0f ft  Δ%+.0f ft (%@)",
                                     cabin, state.geometricAltitudeFt, delta, verdict))
+            } else {
+                // Say *why* there is no cabin reading. A blank line here cost three rounds of
+                // guessing after the FL272 flight: an empty column looks the same whether the
+                // sensor is missing, the permission was refused, or the request never landed.
+                lines.append("🎚 cabin — (motion: \(motionAuthDescription))")
             }
 
             // Measured pressure-to-geometric conversion from nearby traffic. Displayed only;
@@ -2981,7 +3031,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             event: "ar_tracking_state",
             detail: String(format: "%@ t=%.2fs", arTrackingStateDescription, elapsedSinceLift)
         )
-        DispatchQueue.main.async { self.updateStatusLabel() }
+        DispatchQueue.main.async {
+            self.updateStatusLabel()
+            // The best serialization point available for the Motion request. Tracking reaching
+            // .normal proves the camera permission was granted and its alert is gone, and by
+            // then the launch screen's location prompt has been answered too — so the Motion
+            // alert gets the screen to itself instead of being raised behind another one.
+            if case .normal = camera.trackingState {
+                self.startDiagnosticAltimeterIfNeeded(trigger: "tracking_normal")
+            }
+        }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
