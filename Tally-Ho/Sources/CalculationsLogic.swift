@@ -619,6 +619,10 @@ struct YawDriftAccumulator {
         var degreesPerSecond: Double
         /// Total still time the estimate is drawn from. A thin estimate should look thin.
         var totalStillSeconds: TimeInterval
+        /// Largest net rotation the gyro saw across any banked run, in degrees. Near zero means
+        /// the phone really did end up where it started and the drift figure is clean; a large
+        /// value means a run was contaminated and the number should not be trusted.
+        var worstGyroNetDeg: Double
         var runCount: Int
     }
 
@@ -626,31 +630,58 @@ struct YawDriftAccumulator {
     let minRunSeconds: TimeInterval
     /// Total still time required before an estimate is published at all.
     let minTotalSeconds: TimeInterval
+    /// Largest net rotation, per the gyro, that a run may end with and still be banked.
+    ///
+    /// Gating on *integrated* rotation rather than instantaneous rate is what makes this usable
+    /// in an aircraft. The first version required the instantaneous yaw rate to stay under a
+    /// threshold at every single 60 Hz sample for five continuous seconds, so one vibration spike
+    /// ended a run: it collected 51 seconds in smooth cruise at FL415 and nothing at all in a
+    /// descent through FL340.
+    ///
+    /// The integral is the right quantity anyway, because drift is measured as the **net** change
+    /// across a run. What disqualifies a run is the phone having ended up rotated, not having
+    /// jittered on the way. Vibration integrates to zero by construction, and a run where the
+    /// phone swung out and came back stays valid because both sides of the comparison are nets.
+    let maxGyroNetDeg: Double
 
     private var runStartTime: TimeInterval?
     private var runStartAzimuth: Double = 0
     private var runLastTime: TimeInterval = 0
     private var runLastAzimuth: Double = 0
+    /// Gyro-integrated net rotation across the run in progress, in degrees.
+    private var runGyroNetDeg: Double = 0
 
     private var weightedRateSum: Double = 0      // Σ(rate · duration) = Σ(net change)
     private var totalSeconds: TimeInterval = 0
     private var runs: Int = 0
+    private var worstGyroNet: Double = 0
 
-    init(minRunSeconds: TimeInterval = 5.0, minTotalSeconds: TimeInterval = 10.0) {
+    init(minRunSeconds: TimeInterval = 5.0,
+         minTotalSeconds: TimeInterval = 10.0,
+         maxGyroNetDeg: Double = 2.0) {
         self.minRunSeconds = minRunSeconds
         self.minTotalSeconds = minTotalSeconds
+        self.maxGyroNetDeg = maxGyroNetDeg
     }
 
-    /// Feed one sample. `isStill` must come from an independent yaw-rate source — see the type
-    /// comment for why ARKit's own attitude will not do.
-    mutating func add(azimuthDeg: Double, isStill: Bool, at time: TimeInterval) {
-        guard isStill else { closeRun(); return }
+    /// Feed one sample.
+    ///
+    /// `gyroYawRateDps` must come from a source independent of ARKit — see the type comment for
+    /// why ARKit's own attitude will not do. It is integrated across the run, and the run is
+    /// banked only if that integral stays small. `isTracking` false ends the current run, since
+    /// ARKit's azimuth means nothing then.
+    mutating func add(azimuthDeg: Double,
+                      gyroYawRateDps: Double,
+                      isTracking: Bool,
+                      at time: TimeInterval) {
+        guard isTracking, gyroYawRateDps.isFinite else { closeRun(); return }
 
         guard let start = runStartTime else {
             runStartTime = time
             runStartAzimuth = azimuthDeg
             runLastTime = time
             runLastAzimuth = azimuthDeg
+            runGyroNetDeg = 0
             return
         }
         // A gap means samples stopped arriving — tracking dropped, or the app was backgrounded.
@@ -661,30 +692,43 @@ struct YawDriftAccumulator {
             runStartAzimuth = azimuthDeg
             runLastTime = time
             runLastAzimuth = azimuthDeg
+            runGyroNetDeg = 0
             return
         }
         _ = start
+        // Trapezoid over the interval since the last sample. Signed, so vibration cancels.
+        runGyroNetDeg += gyroYawRateDps * (time - runLastTime)
         runLastTime = time
         runLastAzimuth = azimuthDeg
+        // A run that has already rotated too far cannot be rescued by continuing, and letting it
+        // run on would bank a contaminated stretch the moment it passed the duration minimum.
+        if abs(runGyroNetDeg) > maxGyroNetDeg {
+            runStartTime = nil
+            runGyroNetDeg = 0
+        }
     }
 
     /// End the current run, banking it if it lasted long enough to mean anything.
     mutating func closeRun() {
-        defer { runStartTime = nil }
+        defer { runStartTime = nil; runGyroNetDeg = 0 }
         guard let start = runStartTime else { return }
         let duration = runLastTime - start
         guard duration >= minRunSeconds else { return }
+        guard abs(runGyroNetDeg) <= maxGyroNetDeg else { return }
         // Net change across the run, not a sum of per-sample changes.
         weightedRateSum += AngularResponse.signedDelta(runStartAzimuth, runLastAzimuth)
         totalSeconds += duration
         runs += 1
+        worstGyroNet = max(worstGyroNet, abs(runGyroNetDeg))
     }
 
     mutating func reset() {
         runStartTime = nil
+        runGyroNetDeg = 0
         weightedRateSum = 0
         totalSeconds = 0
         runs = 0
+        worstGyroNet = 0
     }
 
     /// Includes the run in progress, so a long steady hold shows up without waiting for it to end.
@@ -692,17 +736,20 @@ struct YawDriftAccumulator {
         var sum = weightedRateSum
         var seconds = totalSeconds
         var count = runs
+        var worst = worstGyroNet
         if let start = runStartTime {
             let duration = runLastTime - start
-            if duration >= minRunSeconds {
+            if duration >= minRunSeconds, abs(runGyroNetDeg) <= maxGyroNetDeg {
                 sum += AngularResponse.signedDelta(runStartAzimuth, runLastAzimuth)
                 seconds += duration
                 count += 1
+                worst = max(worst, abs(runGyroNetDeg))
             }
         }
         guard seconds >= minTotalSeconds, count > 0 else { return nil }
         return Estimate(degreesPerSecond: sum / seconds,
                         totalStillSeconds: seconds,
+                        worstGyroNetDeg: worst,
                         runCount: count)
     }
 }

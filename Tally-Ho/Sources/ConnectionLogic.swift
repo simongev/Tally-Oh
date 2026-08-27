@@ -373,7 +373,9 @@ class ConnectionLogic: ObservableObject {
                 if connected {
                     self?.ensureInternetFetchRunning()
                 } else {
-                    self?.stopInternetFetching()
+                    // The path really is gone, so stored internet traffic cannot be refreshed
+                    // and will only get older. This is the case the discard was written for.
+                    self?.stopInternetFetching(discardingStoredTraffic: true)
                 }
             }
             .store(in: &cancellables)
@@ -392,11 +394,27 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
-    private func stopInternetFetching() {
+    /// Stop polling adsb.lol.
+    ///
+    /// `discardingStoredTraffic` exists because these are two very different things and
+    /// conflating them cost a flight's worth of traffic. Dropping the stored aircraft is right
+    /// when the network path itself has gone away, and wrong when a few HTTP requests failed:
+    /// ninety-second-old traffic beats an empty sky, and the app already draws stale targets
+    /// honestly — `isStale` dashes their rings and `n_stale` records them.
+    private func stopInternetFetching(discardingStoredTraffic: Bool) {
         internetFetchTimer?.invalidate()
         internetFetchTimer = nil
+        guard discardingStoredTraffic else { return }
         DispatchQueue.main.async {
+            let before = self.detectedAircraft.count
             self.detectedAircraft = self.detectedAircraft.filter { $0.value.source == .adsb }
+            let removed = before - self.detectedAircraft.count
+            if removed > 0 {
+                FlightRecorder.shared.record(
+                    event: "traffic_purged",
+                    detail: "removed=\(removed) reason=network_path_down"
+                )
+            }
             self.internetAircraftCount = 0
         }
     }
@@ -418,14 +436,29 @@ class ConnectionLogic: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.consecutiveInternetFailures += 1
+                    FlightRecorder.shared.record(
+                        event: "internet_fetch_failed",
+                        detail: "consecutive=\(self.consecutiveInternetFailures) stored=\(self.detectedAircraft.count)"
+                    )
                     if self.consecutiveInternetFailures >= self.maxInternetFailuresBeforeOffline {
-                        // Treat the path as having no real internet (e.g. Sentry WiFi hotspot).
-                        // stopInternetFetching() is safe here: no internet aircraft were stored
-                        // (all fetches failed), so the filter inside it is a no-op. NWPathMonitor
-                        // remains active and will call ensureInternetFetchRunning() if the path
-                        // genuinely becomes internet-capable later.
-                        self.isInternetAvailable = false
-                        self.stopInternetFetching()
+                        // Back off polling — but keep every aircraft already stored.
+                        //
+                        // This used to also wipe them, justified by a comment claiming no
+                        // internet aircraft could be stored because all fetches had failed.
+                        // That is only true of a cold start on a hotspot with no internet.
+                        // The counter resets on every success, so reaching three says nothing
+                        // about what is in the store: one flight ran for 85 seconds holding five
+                        // aircraft, hit a momentary cabin-wifi glitch, and had all five deleted
+                        // in a single tick, leaving an empty sky at FL350.
+                        //
+                        // isInternetAvailable is also deliberately left alone. HTTP failing is
+                        // not the network path being down, and forcing the flag false made
+                        // recovery wait on a path change that never came, because the path had
+                        // never actually dropped. NWPathMonitor owns that flag.
+                        //
+                        // The 30 s cleanup timer ages these out on aircraftTimeout, which is its
+                        // job, and ensureInternetFetchRunning restarts polling on the next fix.
+                        self.stopInternetFetching(discardingStoredTraffic: false)
                     }
                 }
             }

@@ -494,7 +494,9 @@ struct TargetDataTests {
     /// Feed a still run of `seconds` at 5 Hz, drifting at `driftDps`, with optional jitter on the
     /// azimuth that must not be mistaken for drift.
     private func drift(driftDps: Double, seconds: Double,
-                       jitterDeg: Double = 0, still: Bool = true) -> YawDriftAccumulator.Estimate? {
+                       jitterDeg: Double = 0,
+                       gyroRateDps: Double = 0,
+                       gyroVibrationDps: Double = 0) -> YawDriftAccumulator.Estimate? {
         var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
         let dt = 0.2
         var t = 0.0
@@ -502,8 +504,12 @@ struct TargetDataTests {
         while t <= seconds {
             // Deterministic alternating jitter, so the test cannot flake.
             let jitter = (i % 2 == 0 ? jitterDeg : -jitterDeg)
+            let vibration = (i % 2 == 0 ? gyroVibrationDps : -gyroVibrationDps)
             let azimuth = (driftDps * t + jitter + 360).truncatingRemainder(dividingBy: 360)
-            accumulator.add(azimuthDeg: azimuth, isStill: still, at: t)
+            accumulator.add(azimuthDeg: azimuth,
+                            gyroYawRateDps: gyroRateDps + vibration,
+                            isTracking: true,
+                            at: t)
             t += dt
             i += 1
         }
@@ -534,9 +540,30 @@ struct TargetDataTests {
         if let estimate { #expect(abs(estimate.degreesPerSecond - 0.5) < 0.1) }
     }
 
-    /// Time when the phone was being turned must never be credited as still.
-    @Test func movingTimeIsNotCountedAsDrift() {
-        #expect(drift(driftDps: 5.0, seconds: 20, still: false) == nil)
+    /// Time when the phone was being turned must never be credited as drift.
+    @Test func realRotationIsNotCountedAsDrift() {
+        #expect(drift(driftDps: 5.0, seconds: 20, gyroRateDps: 2.0) == nil)
+    }
+
+    /// **The build 14 regression.** The gate used to require the *instantaneous* gyro rate to stay
+    /// under a threshold at every 60 Hz sample for five continuous seconds, so a single vibration
+    /// spike ended the run: it collected 51 seconds of still time in smooth cruise at FL415 and
+    /// nothing at all in a descent through FL340. Vibration is zero-mean, so gating on the
+    /// integral accepts it — which is correct, because drift is measured as the net change across
+    /// a run and vibration contributes nothing to a net.
+    @Test func vibrationDoesNotPreventARunFromBanking() {
+        let estimate = drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 30.0)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.degreesPerSecond - 0.1) < 0.05)
+            #expect(estimate.worstGyroNetDeg < 2.0)
+        }
+    }
+
+    /// A run that ends rotated must be refused even if it never rotated fast: 0.5 deg/s for
+    /// 20 s is 10 degrees of net rotation, and the phone's azimuth change over that is not drift.
+    @Test func aSlowSustainedTurnIsRefused() {
+        #expect(drift(driftDps: 0.5, seconds: 20, gyroRateDps: 0.5) == nil)
     }
 
     /// A run cut short by motion is discarded rather than averaged through.
@@ -544,8 +571,11 @@ struct TargetDataTests {
         var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
         var t = 0.0
         for _ in 0..<10 {                       // ten runs of 2 s each, none long enough
-            for _ in 0..<10 { accumulator.add(azimuthDeg: t * 3.0, isStill: true, at: t); t += 0.2 }
-            accumulator.add(azimuthDeg: t * 3.0, isStill: false, at: t)
+            for _ in 0..<10 {
+                accumulator.add(azimuthDeg: t * 3.0, gyroYawRateDps: 0, isTracking: true, at: t)
+                t += 0.2
+            }
+            accumulator.add(azimuthDeg: t * 3.0, gyroYawRateDps: 0, isTracking: false, at: t)
             t += 0.2
         }
         #expect(accumulator.estimate == nil)
@@ -555,9 +585,15 @@ struct TargetDataTests {
     /// time, or a minute in someone's pocket would read as a minute of rock-steady holding.
     @Test func gapsInSamplingBreakTheRun() {
         var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
-        for i in 0..<15 { accumulator.add(azimuthDeg: 100, isStill: true, at: Double(i) * 0.2) }
+        for i in 0..<15 {
+            accumulator.add(azimuthDeg: 100, gyroYawRateDps: 0, isTracking: true,
+                            at: Double(i) * 0.2)
+        }
         // 60 s of nothing, then samples resume.
-        for i in 0..<15 { accumulator.add(azimuthDeg: 100, isStill: true, at: 63 + Double(i) * 0.2) }
+        for i in 0..<15 {
+            accumulator.add(azimuthDeg: 100, gyroYawRateDps: 0, isTracking: true,
+                            at: 63 + Double(i) * 0.2)
+        }
         let estimate = accumulator.estimate
         // Both runs are under the 5 s minimum, so nothing banks: the gap must not have bridged
         // them into one 66-second run.

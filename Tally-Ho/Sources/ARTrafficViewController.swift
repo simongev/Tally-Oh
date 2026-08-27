@@ -992,6 +992,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Whether any GPS altitude has been accepted yet. Until one has, a fix is taken even if
     /// its vertical accuracy is poor — an approximate altitude beats none.
     private var hasAcceptedGPSAltitude = false
+    /// Time constant for the ownship altitude blend, in seconds. Chosen to reproduce the old
+    /// 0.15-per-fix behaviour at the nominal 1 Hz fix rate, without inheriting its dependence on
+    /// how often fixes actually arrive.
+    private let altitudeSmoothingTimeConstant: TimeInterval = 6.7
 
     /// Per-lift markers: the app is used in seconds-long glances, so time-to-first-target is
     /// measured from each foreground rather than once per launch.
@@ -1028,15 +1032,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Written on the motion queue, read on the render thread — one word, matching what the
     /// other cross-thread scalars here do.
     private var verticalYawRateDps: Double = .nan
-    /// Below this the phone counts as not being turned. Loose enough to survive hand tremor and
-    /// airframe vibration, tight enough that a deliberate scan never passes.
-    private let stillYawRateDps: Double = 2.0
 
     /// How fast ARKit's azimuth drifts while the phone is genuinely still — the one alignment
     /// measurement obtainable in cruise, needing neither a compass nor a turn.
     private var yawDrift = YawDriftAccumulator()
     private var yawDriftDps: Double = .nan
     private var yawDriftSeconds: Double = .nan
+    /// Largest gyro-measured net rotation across any banked run. Near zero means the phone really
+    /// did end up where it started, so the drift figure beside it is clean.
+    private var yawDriftGyroDeg: Double = .nan
     /// Whether a barometer subscription is live, so the start can be attempted from several
     /// points without stacking subscriptions. Cleared again if the stream errors.
     private var altimeterStarted = false
@@ -1695,6 +1699,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         yawDrift.reset()
         yawDriftDps = .nan
         yawDriftSeconds = .nan
+        yawDriftGyroDeg = .nan
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2374,6 +2379,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.frameLockR            = frameLockR.isNaN       ? nil : frameLockR
         sample.yawDriftDps           = yawDriftDps.isNaN      ? nil : yawDriftDps
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
+        sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
@@ -2986,12 +2992,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         // ARKit's drift while the phone is not being turned. Gated on the gyro, never on ARKit's
         // own attitude — see YawDriftAccumulator. A NaN rate means device motion has not reported
-        // yet, which must count as "not known to be still" rather than as still.
-        let isStill = !verticalYawRateDps.isNaN && abs(verticalYawRateDps) < stillYawRateDps
-        yawDrift.add(azimuthDeg: rawAzimuthDeg, isStill: isStill, at: time)
+        // yet; passing it through lets the accumulator end the run rather than guess.
+        yawDrift.add(azimuthDeg: rawAzimuthDeg,
+                     gyroYawRateDps: verticalYawRateDps,
+                     isTracking: true,
+                     at: time)
         if let drift = yawDrift.estimate {
-            yawDriftDps     = drift.degreesPerSecond
-            yawDriftSeconds = drift.totalStillSeconds
+            yawDriftDps      = drift.degreesPerSecond
+            yawDriftSeconds  = drift.totalStillSeconds
+            yawDriftGyroDeg  = drift.worstGyroNetDeg
         }
 
         // Diagnostic only — see courseResidualDeg.
@@ -3262,6 +3271,9 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             )
         }
 
+        // Captured before lastAcceptedFixTime is overwritten: how long the app went without an
+        // accepted fix is what decides whether the altitude it is holding still means anything.
+        let gapSinceLastFix = staleFixAge
         lastAcceptedFixTime = loc.timestamp
         lastHorizontalAccuracy = hAcc
         if bestHorizontalAccuracy < 0 || hAcc < bestHorizontalAccuracy {
@@ -3310,7 +3322,37 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             // (worse satellite geometry on the vertical axis, further degraded by reduced sky
             // visibility inside a fuselage), so a single fix can swing the displayed altitude
             // by a large amount.
-            userAltitude = isFirstFix ? newGPSFeet : userAltitude + (newGPSFeet - userAltitude) * 0.15
+            //
+            // But a held altitude only deserves smoothing while it is still roughly true. After a
+            // gap it is not: one log resumed after 5.7 minutes during which the aircraft had
+            // descended 2,131 ft, and because fixes had been received earlier in the session this
+            // blended a five-minute-stale value toward truth at 0.15 per fix — twenty seconds of a
+            // 2,131 ft error, which at 5 NM is 4° of vertical misplacement across the whole
+            // glance. A stale value has to be replaced, not eased into; the same snap-versus-blend
+            // distinction the world-yaw seeding makes.
+            let staleAltitude = gapSinceLastFix > GPSGate.staleFixSeconds
+            if isFirstFix || staleAltitude {
+                if !isFirstFix {
+                    FlightRecorder.shared.record(
+                        event: "altitude_snapped",
+                        detail: String(format: "gap=%.0fs from=%.0fft to=%.0fft",
+                                       gapSinceLastFix, userAltitude, newGPSFeet)
+                    )
+                }
+                userAltitude = newGPSFeet
+            } else {
+                // Time-based rather than per-fix. At the nominal ~1 Hz these agree, but a
+                // coefficient per *sample* makes the response depend on how often fixes happen to
+                // arrive — the same frame-rate dependence already fixed once in the yaw filter.
+                //
+                // Note this lags a sustained climb or descent by rate x tau: at 1,200 fpm and the
+                // ~6.7 s time constant below that is about 130 ft, which matched the 113 ft
+                // plateau measured in descent. Worth knowing; small enough (0.2° at 5 NM) to
+                // leave, since shortening it trades that for more vertical noise.
+                let dt = max(0.1, min(5.0, gapSinceLastFix))
+                let alpha = 1 - exp(-dt / altitudeSmoothingTimeConstant)
+                userAltitude += (newGPSFeet - userAltitude) * alpha
+            }
 
             ownshipEstimator.ingestPhoneAltitude(fusedMSLFt: userAltitude)
             ownshipEstimator.ingestPhoneVerticalReferences(
