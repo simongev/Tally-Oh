@@ -442,8 +442,13 @@ struct AngularResponse {
         /// Pearson correlation of the per-sample changes, −1…1. Near zero means the slope is
         /// describing noise rather than a relationship.
         var correlation: Double
-        /// Total absolute driver rotation the estimate is drawn from, in degrees.
+        /// Total absolute driver rotation the estimate is drawn from, in degrees. Sums every
+        /// per-sample change, so panning out and back counts as rotation rather than cancelling.
         var driverRotationDeg: Double
+        /// How far the driver actually got from where it started, at its widest — max minus min
+        /// of the unwrapped angle. A signal that dithers in place has a tiny excursion however
+        /// large its summed changes, which is what tells real motion from quantisation noise.
+        var driverExcursionDeg: Double
         var pairCount: Int
     }
 
@@ -454,12 +459,31 @@ struct AngularResponse {
     let minDriverRotationDeg: Double
     /// Minimum number of change pairs, so a single jump cannot produce a confident-looking slope.
     let minPairs: Int
+    /// Minimum driver *excursion* before publishing — how far it actually travelled from where it
+    /// started, not how much it jiggled.
+    ///
+    /// This gate exists because the rotation gate above sums absolute changes, and summing
+    /// absolute changes rectifies noise into apparent signal. That is the same error that made
+    /// the first compass-response estimator read 0.61 where the truth was 0.018; fixing the
+    /// estimator and leaving the gate alone simply moved it. On one flight the GPS ground track
+    /// dithered between 263.3° and 263.7° — an excursion of 0.4°, no turn at all — and 128
+    /// samples of that quantisation flutter summed to 12.4°, clearing an 8° rotation gate and
+    /// publishing slopes from −0.770 to +0.321 for an aircraft flying dead straight.
+    ///
+    /// Note that the correlation cannot be used as this guard instead. When a sensor genuinely
+    /// does not respond, the honest answer is slope ≈ 0 *and* r ≈ 0 — which is exactly what noise
+    /// looks like. Only the driver having really moved separates the two.
+    let minDriverExcursionDeg: Double
 
     private var samples: [(t: TimeInterval, driver: Double, response: Double)] = []
 
-    init(window: TimeInterval, minDriverRotationDeg: Double, minPairs: Int = 8) {
+    init(window: TimeInterval,
+         minDriverRotationDeg: Double,
+         minDriverExcursionDeg: Double,
+         minPairs: Int = 8) {
         self.window = window
         self.minDriverRotationDeg = minDriverRotationDeg
+        self.minDriverExcursionDeg = minDriverExcursionDeg
         self.minPairs = minPairs
     }
 
@@ -490,6 +514,22 @@ struct AngularResponse {
         return total
     }
 
+    /// How far the driver travelled from its starting point at the widest, in degrees.
+    ///
+    /// Built by unwrapping — accumulating signed deltas — so a sweep across north reads as a few
+    /// degrees rather than 358, and then taking the span of that walk. Dither stays near zero
+    /// no matter how many samples it contains; a real turn spans its full size.
+    var driverExcursionDeg: Double {
+        guard samples.count >= 2 else { return 0 }
+        var cumulative = 0.0, lowest = 0.0, highest = 0.0
+        for (previous, current) in zip(samples, samples.dropFirst()) {
+            cumulative += AngularResponse.signedDelta(previous.driver, current.driver)
+            lowest  = min(lowest, cumulative)
+            highest = max(highest, cumulative)
+        }
+        return highest - lowest
+    }
+
     /// True when samples are accumulating but the driver has not rotated enough to publish.
     ///
     /// Distinct from having no data at all: an empty column looks identical whether the estimator
@@ -515,6 +555,10 @@ struct AngularResponse {
 
         let rotation = dDriver.reduce(0) { $0 + abs($1) }
         guard rotation >= minDriverRotationDeg else { return nil }
+        // Both gates, because they catch different things: rotation keeps a back-and-forth pan
+        // counting as the real motion it is, excursion refuses a signal that only jiggled.
+        let excursion = driverExcursionDeg
+        guard excursion >= minDriverExcursionDeg else { return nil }
 
         // Slope through the origin: no intercept term, because zero driver rotation must mean
         // zero response rotation for this to be the quantity it claims to be.
@@ -525,6 +569,7 @@ struct AngularResponse {
         return Estimate(slope: slope,
                         correlation: AngularResponse.correlation(dDriver, dResponse),
                         driverRotationDeg: rotation,
+                        driverExcursionDeg: excursion,
                         pairCount: dDriver.count)
     }
 

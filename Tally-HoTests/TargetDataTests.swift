@@ -316,7 +316,7 @@ struct TargetDataTests {
                           responseRatio: Double,
                           jitterDeg: Double = 0,
                           samples: Int = 60) -> AngularResponse.Estimate? {
-        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20)
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20, minDriverExcursionDeg: 10)
         var driver = 0.0
         var response = 0.0
         for i in 0..<samples {
@@ -389,7 +389,7 @@ struct TargetDataTests {
         func worstSlope(steps: Int) -> Double {
             var worst = 0.0
             for offset in 0..<25 {
-                var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20, minPairs: 2)
+                var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20, minDriverExcursionDeg: 10, minPairs: 2)
                 let step = 90.0 / Double(steps)          // 90 degrees of pan, however divided
                 for i in 0...steps {
                     estimator.add(driver: Double(i) * step,
@@ -410,6 +410,56 @@ struct TargetDataTests {
         #expect(coarse < 0.2)
     }
 
+    /// **The build 13 regression, and the same rectification error in a third place.** Fixing the
+    /// estimator to use signed least squares left the *publish gate* summing absolute changes, so
+    /// a driver that only dithered still cleared it. On one flight the GPS ground track stayed
+    /// inside a 0.4° band — the aircraft flew dead straight — yet 128 samples of quantisation
+    /// flutter summed to 12.4°, passed an 8° gate, and published slopes from −0.770 to +0.321.
+    ///
+    /// A dithering driver must publish nothing, however many samples it contains.
+    @Test func aDitheringDriverPublishesNothing() {
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 8,
+                                        minDriverExcursionDeg: 8, minPairs: 15)
+        // 128 samples flicking between 263.3 and 263.7, as the real log did.
+        for i in 0..<128 {
+            estimator.add(driver: (i % 2 == 0) ? 263.3 : 263.7,
+                          response: Double(i) * 3.0,        // response swinging wildly meanwhile
+                          at: TimeInterval(i))
+        }
+        #expect(estimator.driverRotationDeg > 8)      // the old gate would have passed this
+        #expect(estimator.driverExcursionDeg < 1)     // the new one sees 0.4 degrees
+        #expect(estimator.estimate == nil)
+    }
+
+    /// And a real turn of the same duration must still publish.
+    @Test func aRealTurnStillPublishes() {
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 8,
+                                        minDriverExcursionDeg: 8, minPairs: 15)
+        for i in 0..<30 {
+            let track = 263.3 + Double(i) * 3.0       // a 90 degree turn at 3 deg/s
+            estimator.add(driver: track, response: track, at: TimeInterval(i))
+        }
+        let estimate = estimator.estimate
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(estimate.driverExcursionDeg > 80)
+            #expect(abs(estimate.slope - 1.0) < 0.05)
+        }
+    }
+
+    /// Panning out and back is real motion and must keep counting, which is why excursion is an
+    /// additional gate rather than a replacement for summed rotation.
+    @Test func panningOutAndBackStillCounts() {
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 40,
+                                        minDriverExcursionDeg: 25, minPairs: 15)
+        var angle = 0.0
+        for i in 0..<40 {
+            angle += (i / 10) % 2 == 0 ? 4.0 : -4.0   // sweep 40 deg out, back, out, back
+            estimator.add(driver: angle, response: angle, at: TimeInterval(i))
+        }
+        #expect(estimator.estimate != nil)
+    }
+
     /// Too little rotation must publish nothing rather than a confident-looking ratio.
     @Test func tooLittleRotationYieldsNoEstimate() {
         #expect(response(driverStep: 0.05, responseRatio: 1.0, samples: 30) == nil)
@@ -424,7 +474,7 @@ struct TargetDataTests {
 
     /// The estimator must wrap correctly rather than treating 359 -> 1 as a 358 degree jump.
     @Test func responseHandlesWrapAcrossNorth() {
-        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20)
+        var estimator = AngularResponse(window: 1000, minDriverRotationDeg: 20, minDriverExcursionDeg: 10)
         var angle = 350.0
         for i in 0..<40 {
             let wrapped = angle.truncatingRemainder(dividingBy: 360)

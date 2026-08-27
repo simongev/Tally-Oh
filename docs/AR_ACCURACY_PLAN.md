@@ -75,6 +75,7 @@ by an observation that was **equally consistent with its own opposite**:
 | magnetic declination | "targets displaced by about the declination" | correction missing vs. wrongly present — only the *direction* separates them |
 | compass world-yaw (build 8) | "the compass agrees with GPS ground track to within a degree" | compass accurate vs. compass merely *reporting* the track — only whether it *moves when the phone moves* separates them |
 | ARKit yaw drift (caught before shipping) | "ARKit's pitch and roll were steady, so the phone was still" | drift vs. the user scanning — a pure yaw rotation of the wrist leaves pitch and roll untouched, and scanning for traffic *is* a pure yaw rotation. Only an independent yaw-rate source, the gyro, separates them |
+| frame_lock's publish gate (build 13, shipped) | "the summed driver rotation exceeded 8°, so the aircraft turned" | a real turn vs. quantisation dither — GPS track flicking between 263.3° and 263.7° sums to 12.4° across 128 samples while the aircraft flies dead straight. Only the driver's **excursion** separates them, and the correlation cannot stand in: a sensor that genuinely does not respond gives slope ≈ 0 *and* r ≈ 0, which is what noise looks like too |
 
 Before adding any term to the placement path, write down the observation that would distinguish
 your hypothesis from its opposite, and go and measure **that**.
@@ -96,10 +97,17 @@ The two columns that *are* discriminating, both added in build 11 and both appli
   every one of which held its heading: the app is used in cruise, and turns happen on departure
   and arrival.
 - `ar_yaw_drift_dps` — how fast ARKit's azimuth drifts while the phone is genuinely still,
-  gyro-gated. Added in build 13 precisely because it needs neither a compass nor a turn, so it
-  is obtainable in the conditions the app is actually used in. It bounds how long any one-time
-  alignment survives: near zero and a per-session offset is worth building, half a degree per
-  second and nothing captured once could survive a glance.
+  gyro-gated. **Measured, and it is good news: −0.067 °/s**, consistently signed, from 51 seconds
+  of accumulated still time at FL415. That is 0.3° over a five-second glance and 2° over thirty.
+  ARKit's frame holds still enough that an alignment captured once would survive a glance, so a
+  fixed per-session offset is worth building — *if* one can ever be determined.
+  Note the measurement is safe in the direction that matters: a stillness gate set too loose can
+  only make drift look **worse** than it is, so a small reading is a trustworthy small reading.
+
+**What drift does not say.** It establishes that ARKit's alignment is *stable*, not what that
+alignment *is*. The offset itself is still undetermined: the compass cannot supply it (slope
+0.003) and `frame_lock` remains unmeasured. Stability is necessary for a per-session offset and
+nowhere near sufficient.
 
 Note also that the first version of `compass_response` was itself non-discriminating: it summed
 *absolute* changes, which rectifies sensor jitter into apparent response, and read 0.61 where the

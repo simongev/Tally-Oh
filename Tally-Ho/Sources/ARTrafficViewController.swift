@@ -918,7 +918,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// linearly with sampling rate, so the 10 Hz / 3 s version of this read a median +0.161 with
     /// excursions to +0.709 on a flight whose true slope was −0.039.
     private var compassResponseEstimator = AngularResponse(
-        window: 25.0, minDriverRotationDeg: 40.0, minPairs: 15)
+        window: 25.0, minDriverRotationDeg: 40.0, minDriverExcursionDeg: 25.0, minPairs: 15)
     private var compassResponse: Double = .nan
     private var compassResponseR: Double = .nan
     private var lastCompassSampleTime: TimeInterval = 0
@@ -946,7 +946,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// is the tempting move and the wrong one, since Σ(Δdriver²) scales with rotation squared, so
     /// halving the required turn quadruples the estimate's variance.
     private var frameLockEstimator = AngularResponse(
-        window: 90.0, minDriverRotationDeg: 8.0, minPairs: 15)
+        window: 90.0, minDriverRotationDeg: 8.0, minDriverExcursionDeg: 8.0, minPairs: 15)
     /// Track rotation seen in the current window, so the panel can say how close a turn came
     /// rather than showing a bare dash.
     private var frameLockTrackSwingDeg: Double = 0
@@ -2818,7 +2818,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             if !frameLock.isNaN {
                 lockStr = String(format: "%.2f", frameLock)
             } else if frameLockAwaitingTurn {
-                lockStr = String(format: "—(no turn, %.0f°)", frameLockTrackSwingDeg)
+                lockStr = String(format: "—(no turn, %.1f°)", frameLockTrackSwingDeg)
             } else {
                 lockStr = "—"
             }
@@ -3035,12 +3035,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 frameLock  = estimate.slope
                 frameLockR = estimate.correlation
                 frameLockAwaitingTurn = false
-                frameLockTrackSwingDeg = estimate.driverRotationDeg
+                frameLockTrackSwingDeg = estimate.driverExcursionDeg
             } else {
                 // Inside the 1 Hz gate rather than every frame: these walk the whole window, and
                 // this runs on the render thread.
                 frameLockAwaitingTurn = frameLockEstimator.isWaitingForRotation
-                frameLockTrackSwingDeg = frameLockEstimator.driverRotationDeg
+                // Excursion, not summed rotation: the summed figure read 12° on a flight whose
+                // track never left a 0.4° band, which is exactly what made this publish garbage.
+                frameLockTrackSwingDeg = frameLockEstimator.driverExcursionDeg
             }
         }
     }
