@@ -471,11 +471,23 @@ struct AngularResponse {
     mutating func reset() { samples.removeAll() }
 
     /// Signed shortest angular difference, −180…180. Local to keep this type free-standing.
-    private static func delta(_ from: Double, _ to: Double) -> Double {
+    static func signedDelta(_ from: Double, _ to: Double) -> Double {
         var d = to - from
         while d >  180 { d -= 360 }
         while d < -180 { d += 360 }
         return d
+    }
+
+    /// Total absolute driver rotation currently in the window, regardless of whether that is
+    /// enough to publish an estimate. Lets a caller say how close it came rather than only that
+    /// it fell short.
+    var driverRotationDeg: Double {
+        guard samples.count >= 2 else { return 0 }
+        var total = 0.0
+        for (previous, current) in zip(samples, samples.dropFirst()) {
+            total += abs(AngularResponse.signedDelta(previous.driver, current.driver))
+        }
+        return total
     }
 
     /// True when samples are accumulating but the driver has not rotated enough to publish.
@@ -497,8 +509,8 @@ struct AngularResponse {
         dDriver.reserveCapacity(samples.count - 1)
         dResponse.reserveCapacity(samples.count - 1)
         for (previous, current) in zip(samples, samples.dropFirst()) {
-            dDriver.append(AngularResponse.delta(previous.driver, current.driver))
-            dResponse.append(AngularResponse.delta(previous.response, current.response))
+            dDriver.append(AngularResponse.signedDelta(previous.driver, current.driver))
+            dResponse.append(AngularResponse.signedDelta(previous.response, current.response))
         }
 
         let rotation = dDriver.reduce(0) { $0 + abs($1) }
@@ -528,6 +540,125 @@ struct AngularResponse {
         }
         let denominator = (sxx * syy).squareRoot()
         return denominator > 0 ? sxy / denominator : .nan
+    }
+}
+
+/// How fast ARKit's world azimuth drifts while the phone is genuinely not being turned.
+///
+/// This bounds how long a one-time alignment survives, which decides whether a fixed per-session
+/// azimuth offset is a real fix or a fantasy: near zero and an alignment captured once holds for
+/// a whole glance; at half a degree per second it is 15° adrift after thirty seconds and nothing
+/// captured once can help.
+///
+/// **Why the caller must gate this on the gyro, and not on ARKit's own attitude.** ARKit's yaw is
+/// the quantity under test, so it cannot also be the evidence that the phone is still. Pitch and
+/// roll are gravity-referenced and cannot drift, which makes them tempting — but a pure yaw
+/// rotation of the wrist leaves both completely unchanged, and scanning for traffic *is* a pure
+/// yaw rotation. A pitch/roll stillness gate therefore cannot tell drift from the user looking
+/// around: it is non-discriminating in exactly the way that has cost this project three builds.
+/// The gyro is the only independent source of true yaw rate.
+///
+/// A useful side effect of gating on the gyro: gyro-still means *inertially* still, so it also
+/// rules out the aircraft turning beneath a motionless phone. No separate GPS gate is needed.
+///
+/// **Net change per run, never a sum of per-sample changes.** Each still run contributes
+/// `(azimuth at end − azimuth at start) / duration`. Summing per-sample absolute changes would
+/// rectify ARKit's per-frame jitter into apparent drift — the precise error that made the first
+/// compass-response estimator read 0.61 where the truth was 0.018. A net difference across a run
+/// is immune to it.
+struct YawDriftAccumulator {
+
+    struct Estimate {
+        /// Duration-weighted mean drift, in degrees per second. Signed: a consistent sign across
+        /// runs indicates real bias, an inconsistent one indicates a random walk.
+        var degreesPerSecond: Double
+        /// Total still time the estimate is drawn from. A thin estimate should look thin.
+        var totalStillSeconds: TimeInterval
+        var runCount: Int
+    }
+
+    /// A run shorter than this cannot separate drift from the noise at its two endpoints.
+    let minRunSeconds: TimeInterval
+    /// Total still time required before an estimate is published at all.
+    let minTotalSeconds: TimeInterval
+
+    private var runStartTime: TimeInterval?
+    private var runStartAzimuth: Double = 0
+    private var runLastTime: TimeInterval = 0
+    private var runLastAzimuth: Double = 0
+
+    private var weightedRateSum: Double = 0      // Σ(rate · duration) = Σ(net change)
+    private var totalSeconds: TimeInterval = 0
+    private var runs: Int = 0
+
+    init(minRunSeconds: TimeInterval = 5.0, minTotalSeconds: TimeInterval = 10.0) {
+        self.minRunSeconds = minRunSeconds
+        self.minTotalSeconds = minTotalSeconds
+    }
+
+    /// Feed one sample. `isStill` must come from an independent yaw-rate source — see the type
+    /// comment for why ARKit's own attitude will not do.
+    mutating func add(azimuthDeg: Double, isStill: Bool, at time: TimeInterval) {
+        guard isStill else { closeRun(); return }
+
+        guard let start = runStartTime else {
+            runStartTime = time
+            runStartAzimuth = azimuthDeg
+            runLastTime = time
+            runLastAzimuth = azimuthDeg
+            return
+        }
+        // A gap means samples stopped arriving — tracking dropped, or the app was backgrounded.
+        // Bridging across it would credit unobserved time as still.
+        if time - runLastTime > 1.5 {
+            closeRun()
+            runStartTime = time
+            runStartAzimuth = azimuthDeg
+            runLastTime = time
+            runLastAzimuth = azimuthDeg
+            return
+        }
+        _ = start
+        runLastTime = time
+        runLastAzimuth = azimuthDeg
+    }
+
+    /// End the current run, banking it if it lasted long enough to mean anything.
+    mutating func closeRun() {
+        defer { runStartTime = nil }
+        guard let start = runStartTime else { return }
+        let duration = runLastTime - start
+        guard duration >= minRunSeconds else { return }
+        // Net change across the run, not a sum of per-sample changes.
+        weightedRateSum += AngularResponse.signedDelta(runStartAzimuth, runLastAzimuth)
+        totalSeconds += duration
+        runs += 1
+    }
+
+    mutating func reset() {
+        runStartTime = nil
+        weightedRateSum = 0
+        totalSeconds = 0
+        runs = 0
+    }
+
+    /// Includes the run in progress, so a long steady hold shows up without waiting for it to end.
+    var estimate: Estimate? {
+        var sum = weightedRateSum
+        var seconds = totalSeconds
+        var count = runs
+        if let start = runStartTime {
+            let duration = runLastTime - start
+            if duration >= minRunSeconds {
+                sum += AngularResponse.signedDelta(runStartAzimuth, runLastAzimuth)
+                seconds += duration
+                count += 1
+            }
+        }
+        guard seconds >= minTotalSeconds, count > 0 else { return nil }
+        return Estimate(degreesPerSecond: sum / seconds,
+                        totalStillSeconds: seconds,
+                        runCount: count)
     }
 }
 

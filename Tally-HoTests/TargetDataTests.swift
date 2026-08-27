@@ -439,6 +439,81 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - ARKit yaw drift
+
+    /// Feed a still run of `seconds` at 5 Hz, drifting at `driftDps`, with optional jitter on the
+    /// azimuth that must not be mistaken for drift.
+    private func drift(driftDps: Double, seconds: Double,
+                       jitterDeg: Double = 0, still: Bool = true) -> YawDriftAccumulator.Estimate? {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        let dt = 0.2
+        var t = 0.0
+        var i = 0
+        while t <= seconds {
+            // Deterministic alternating jitter, so the test cannot flake.
+            let jitter = (i % 2 == 0 ? jitterDeg : -jitterDeg)
+            let azimuth = (driftDps * t + jitter + 360).truncatingRemainder(dividingBy: 360)
+            accumulator.add(azimuthDeg: azimuth, isStill: still, at: t)
+            t += dt
+            i += 1
+        }
+        return accumulator.estimate
+    }
+
+    @Test func constantDriftIsReportedAsItsRate() {
+        let estimate = drift(driftDps: 0.25, seconds: 20)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.degreesPerSecond - 0.25) < 0.02)
+            #expect(estimate.totalStillSeconds > 15)
+        }
+    }
+
+    /// **The build 10 mistake, guarded in a new place.** Azimuth jitter with no underlying drift
+    /// must read as no drift. Summing per-sample absolute changes would turn ±2° of jitter at
+    /// 5 Hz into about 20°/s of phantom drift; a net change across the run is immune.
+    @Test func jitterWithoutDriftReadsAsNoDrift() {
+        let estimate = drift(driftDps: 0, seconds: 20, jitterDeg: 2.0)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate.degreesPerSecond) < 0.05) }
+    }
+
+    @Test func jitterDoesNotHideRealDrift() {
+        let estimate = drift(driftDps: 0.5, seconds: 20, jitterDeg: 2.0)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate.degreesPerSecond - 0.5) < 0.1) }
+    }
+
+    /// Time when the phone was being turned must never be credited as still.
+    @Test func movingTimeIsNotCountedAsDrift() {
+        #expect(drift(driftDps: 5.0, seconds: 20, still: false) == nil)
+    }
+
+    /// A run cut short by motion is discarded rather than averaged through.
+    @Test func shortRunsAreDiscarded() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        var t = 0.0
+        for _ in 0..<10 {                       // ten runs of 2 s each, none long enough
+            for _ in 0..<10 { accumulator.add(azimuthDeg: t * 3.0, isStill: true, at: t); t += 0.2 }
+            accumulator.add(azimuthDeg: t * 3.0, isStill: false, at: t)
+            t += 0.2
+        }
+        #expect(accumulator.estimate == nil)
+    }
+
+    /// A gap in samples — tracking lost, or the app backgrounded — must not be credited as still
+    /// time, or a minute in someone's pocket would read as a minute of rock-steady holding.
+    @Test func gapsInSamplingBreakTheRun() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        for i in 0..<15 { accumulator.add(azimuthDeg: 100, isStill: true, at: Double(i) * 0.2) }
+        // 60 s of nothing, then samples resume.
+        for i in 0..<15 { accumulator.add(azimuthDeg: 100, isStill: true, at: 63 + Double(i) * 0.2) }
+        let estimate = accumulator.estimate
+        // Both runs are under the 5 s minimum, so nothing banks: the gap must not have bridged
+        // them into one 66-second run.
+        #expect(estimate == nil)
+    }
+
     // MARK: - AR frame convention
 
     /// The world azimuth a position vector sits at, in 0…360 — the inverse of the mapping

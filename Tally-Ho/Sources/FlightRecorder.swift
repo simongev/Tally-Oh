@@ -69,6 +69,7 @@ final class FlightRecorder {
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
         "world_yaw_corr_deg", "course_residual_deg",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
+        "ar_yaw_drift_dps", "ar_drift_secs",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
@@ -131,6 +132,18 @@ final class FlightRecorder {
         var frameLock: Double?
         /// Correlation behind frameLock, read the same way as compassResponseR.
         var frameLockR: Double?
+        /// How fast ARKit's world azimuth drifts, in degrees per second, while the phone is
+        /// genuinely not being turned — established from the gyro, not from ARKit's own attitude,
+        /// since ARKit's yaw is the quantity under test and a pure wrist yaw leaves its pitch and
+        /// roll untouched.
+        ///
+        /// This is the alignment measurement obtainable in cruise: it needs neither a working
+        /// compass nor a turn. Near zero means an alignment captured once would still be good a
+        /// glance later, so a fixed per-session offset is worth building. Half a degree per
+        /// second is 15° after thirty seconds, and nothing captured once could survive that.
+        var yawDriftDps: Double?
+        /// Total still time behind yawDriftDps, so a thin estimate reads as thin.
+        var yawDriftSeconds: Double?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
         /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
         /// where the compass is track-slaved, this and heading_delta_deg carry the same
@@ -295,6 +308,8 @@ final class FlightRecorder {
         fields.append(format(sample.compassResponseR, decimals: 2))
         fields.append(format(sample.frameLock,        decimals: 3))
         fields.append(format(sample.frameLockR,       decimals: 2))
+        fields.append(format(sample.yawDriftDps,      decimals: 3))
+        fields.append(format(sample.yawDriftSeconds,  decimals: 0))
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 

@@ -74,6 +74,7 @@ by an observation that was **equally consistent with its own opposite**:
 |---|---|---|
 | magnetic declination | "targets displaced by about the declination" | correction missing vs. wrongly present — only the *direction* separates them |
 | compass world-yaw (build 8) | "the compass agrees with GPS ground track to within a degree" | compass accurate vs. compass merely *reporting* the track — only whether it *moves when the phone moves* separates them |
+| ARKit yaw drift (caught before shipping) | "ARKit's pitch and roll were steady, so the phone was still" | drift vs. the user scanning — a pure yaw rotation of the wrist leaves pitch and roll untouched, and scanning for traffic *is* a pure yaw rotation. Only an independent yaw-rate source, the gyro, separates them |
 
 Before adding any term to the placement path, write down the observation that would distinguish
 your hypothesis from its opposite, and go and measure **that**.
@@ -91,8 +92,14 @@ The two columns that *are* discriminating, both added in build 11 and both appli
   compass-based correction; ~0 forbids one. Measured at **+0.018** in flight.
 - `frame_lock` — degrees ARKit's azimuth turns per degree the aircraft's ground track turns.
   ~1 means ARKit is Earth-referenced and its error is one constant per session; ~0 means its
-  frame rides with the cabin and grows with every turn. Still unmeasured — it needs a log
-  covering a turn, and both flights so far held one heading.
+  frame rides with the cabin and grows with every turn. **Still unmeasured after four flights**,
+  every one of which held its heading: the app is used in cruise, and turns happen on departure
+  and arrival.
+- `ar_yaw_drift_dps` — how fast ARKit's azimuth drifts while the phone is genuinely still,
+  gyro-gated. Added in build 13 precisely because it needs neither a compass nor a turn, so it
+  is obtainable in the conditions the app is actually used in. It bounds how long any one-time
+  alignment survives: near zero and a per-session offset is worth building, half a degree per
+  second and nothing captured once could survive a glance.
 
 Note also that the first version of `compass_response` was itself non-discriminating: it summed
 *absolute* changes, which rectifies sensor jitter into apparent response, and read 0.61 where the

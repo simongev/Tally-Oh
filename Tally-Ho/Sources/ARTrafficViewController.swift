@@ -942,8 +942,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Driver is the aircraft (GPS ground track), response is ARKit's azimuth.
     /// 45 s at ~1 Hz, matching GPS course's own update rate. Sampling faster than the driver
     /// updates just fills the window with exactly-zero driver changes.
+    /// 90 s so a turn early in a lift still counts later in it. The 8° minimum stays: lowering it
+    /// is the tempting move and the wrong one, since Σ(Δdriver²) scales with rotation squared, so
+    /// halving the required turn quadruples the estimate's variance.
     private var frameLockEstimator = AngularResponse(
-        window: 45.0, minDriverRotationDeg: 8.0, minPairs: 15)
+        window: 90.0, minDriverRotationDeg: 8.0, minPairs: 15)
+    /// Track rotation seen in the current window, so the panel can say how close a turn came
+    /// rather than showing a bare dash.
+    private var frameLockTrackSwingDeg: Double = 0
     /// True when the estimator is collecting but the aircraft has not turned enough to publish —
     /// the normal state in cruise, and worth distinguishing from a broken measurement.
     private var frameLockAwaitingTurn = false
@@ -1009,6 +1015,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Deliberately not part of the altitude chain: build 28 removed barometric fusion
     /// because a cabin barometer measures cabin pressure, and that decision stands.
     private let diagnosticAltimeter = CMAltimeter()
+
+    /// Device motion, used for one thing only: an independent measure of the phone's true yaw
+    /// rate, so ARKit's drift can be told apart from the user turning the phone.
+    ///
+    /// It has to be independent, because ARKit's yaw is the quantity under test. Pitch and roll
+    /// are gravity-referenced and cannot drift, which makes them look like a free stillness test
+    /// — but a pure yaw rotation of the wrist leaves both unchanged, and scanning for traffic is
+    /// exactly that. Only the gyro sees it.
+    private let motionManager = CMMotionManager()
+    /// Latest yaw rate about the *vertical* axis, in degrees per second, or NaN when unknown.
+    /// Written on the motion queue, read on the render thread — one word, matching what the
+    /// other cross-thread scalars here do.
+    private var verticalYawRateDps: Double = .nan
+    /// Below this the phone counts as not being turned. Loose enough to survive hand tremor and
+    /// airframe vibration, tight enough that a deliberate scan never passes.
+    private let stillYawRateDps: Double = 2.0
+
+    /// How fast ARKit's azimuth drifts while the phone is genuinely still — the one alignment
+    /// measurement obtainable in cruise, needing neither a compass nor a turn.
+    private var yawDrift = YawDriftAccumulator()
+    private var yawDriftDps: Double = .nan
+    private var yawDriftSeconds: Double = .nan
     /// Whether a barometer subscription is live, so the start can be attempted from several
     /// points without stacking subscriptions. Cleared again if the stream errors.
     private var altimeterStarted = false
@@ -1039,7 +1067,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sceneManager?.ownshipEstimator   = ownshipEstimator
         // The barometer is deliberately not started here — see
         // startDiagnosticAltimeterIfNeeded for why requesting Motion during launch loses the
-        // race against the camera and location prompts.
+        // race against the camera and location prompts. Device motion is different: it needs no
+        // authorisation, so it raises no prompt to lose the race with.
+        startYawRateUpdates()
 
         if let seed = seedLocation {
             userLocation        = seed.coordinate
@@ -1067,6 +1097,34 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         sceneManager?.onSelectionInvalidated = { [weak self] in
             self?.clearSelection()
+        }
+    }
+
+    /// Start device motion, purely to sample the phone's true yaw rate.
+    ///
+    /// Device motion needs no Motion & Fitness authorisation — that gates CMAltimeter and the
+    /// activity APIs, not the raw gyro — so this is deliberately independent of the altimeter's
+    /// permission dance, and keeps working when that is denied.
+    ///
+    /// The yaw rate wanted is the one about the *vertical* axis, which is the component of the
+    /// rotation rate along gravity. Both come from CMDeviceMotion in the same device frame, so it
+    /// is a dot product. Using `rotationRate.z` instead would only be the vertical axis while the
+    /// phone lay flat, and this phone is held up at every attitude.
+    private func startYawRateUpdates() {
+        guard motionManager.isDeviceMotionAvailable else {
+            FlightRecorder.shared.record(event: "device_motion_unavailable")
+            return
+        }
+        guard !motionManager.isDeviceMotionActive else { return }
+        motionManager.deviceMotionUpdateInterval = 1.0 / 20.0
+        let queue = OperationQueue()
+        queue.qualityOfService = .utility
+        motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
+            guard let self, let motion else { return }
+            let rate = motion.rotationRate
+            let gravity = motion.gravity
+            let aboutVertical = rate.x * gravity.x + rate.y * gravity.y + rate.z * gravity.z
+            self.verticalYawRateDps = aboutVertical * 180.0 / Double.pi
         }
     }
 
@@ -1439,6 +1497,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         ) { [weak self] _ in
             self?.pauseARSession()
             self?.updateTimer?.fireDate = .distantFuture   // suspend the 4 Hz tick too
+            // No point running the gyro with no ARKit azimuth to compare it against, and an
+            // open drift run must not be credited with time spent backgrounded.
+            self?.motionManager.stopDeviceMotionUpdates()
+            self?.verticalYawRateDps = .nan
+            self?.yawDrift.closeRun()
             FlightRecorder.shared.endLift(reason: "background")
         }
         NotificationCenter.default.addObserver(
@@ -1453,6 +1516,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // Tracking toggle on comes back expecting it to work. Without this the column
             // stays empty until the app is reinstalled.
             self.startDiagnosticAltimeterIfNeeded(trigger: "foreground")
+            self.startYawRateUpdates()
         }
     }
 
@@ -1626,6 +1690,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // for not resetting it at all — that reason applies to the answer, not to the window.
         frameLockEstimator.reset()
         frameLockAwaitingTurn = false
+        frameLockTrackSwingDeg = 0
+        // Drift is a property of the ARKit frame that just ended, so its runs do not carry over.
+        yawDrift.reset()
+        yawDriftDps = .nan
+        yawDriftSeconds = .nan
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2303,6 +2372,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.compassResponseR      = compassResponseR.isNaN ? nil : compassResponseR
         sample.frameLock             = frameLock.isNaN        ? nil : frameLock
         sample.frameLockR            = frameLockR.isNaN       ? nil : frameLockR
+        sample.yawDriftDps           = yawDriftDps.isNaN      ? nil : yawDriftDps
+        sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
@@ -2747,12 +2818,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             if !frameLock.isNaN {
                 lockStr = String(format: "%.2f", frameLock)
             } else if frameLockAwaitingTurn {
-                lockStr = "—(no turn)"
+                lockStr = String(format: "—(no turn, %.0f°)", frameLockTrackSwingDeg)
             } else {
                 lockStr = "—"
             }
+            // ARKit's drift while the phone is still: the alignment measurement that needs
+            // neither a compass nor a turn, and the one that says whether a one-time alignment
+            // could survive a glance at all.
+            let driftStr = yawDriftDps.isNaN
+                ? "—"
+                : String(format: "%+.2f°/s over %.0fs", yawDriftDps, yawDriftSeconds)
             lines.append(String(format: "🛩️ %.0fkt  course %@  resid %@  cmp %@  lock %@",
                                 lastGPSSpeedKt, courseStr, residualStr, responseStr, lockStr))
+            lines.append(String(format: "🌀 ARKit drift %@", driftStr))
 
             // ── Vertical datums ───────────────────────────────────────────────────────
             // The gap between cabin pressure altitude and GPS geometric altitude is the
@@ -2906,6 +2984,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)
 
+        // ARKit's drift while the phone is not being turned. Gated on the gyro, never on ARKit's
+        // own attitude — see YawDriftAccumulator. A NaN rate means device motion has not reported
+        // yet, which must count as "not known to be still" rather than as still.
+        let isStill = !verticalYawRateDps.isNaN && abs(verticalYawRateDps) < stillYawRateDps
+        yawDrift.add(azimuthDeg: rawAzimuthDeg, isStill: isStill, at: time)
+        if let drift = yawDrift.estimate {
+            yawDriftDps     = drift.degreesPerSecond
+            yawDriftSeconds = drift.totalStillSeconds
+        }
+
         // Diagnostic only — see courseResidualDeg.
         if lastGPSSpeedKt >= 20 && lastGPSCourseAccuracy >= 0 && lastGPSCourseDeg >= 0 {
             courseResidualDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastGPSCourseDeg)
@@ -2947,10 +3035,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 frameLock  = estimate.slope
                 frameLockR = estimate.correlation
                 frameLockAwaitingTurn = false
+                frameLockTrackSwingDeg = estimate.driverRotationDeg
             } else {
-                // Inside the 1 Hz gate rather than every frame: the check walks the whole window,
-                // and this runs on the render thread.
+                // Inside the 1 Hz gate rather than every frame: these walk the whole window, and
+                // this runs on the render thread.
                 frameLockAwaitingTurn = frameLockEstimator.isWaitingForRotation
+                frameLockTrackSwingDeg = frameLockEstimator.driverRotationDeg
             }
         }
     }
