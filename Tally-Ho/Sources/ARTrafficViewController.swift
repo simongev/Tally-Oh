@@ -1041,6 +1041,24 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Largest gyro-measured net rotation across any banked run. Near zero means the phone really
     /// did end up where it started, so the drift figure beside it is clean.
     private var yawDriftGyroDeg: Double = .nan
+
+    /// Where world "up" sits in the camera image — the phone's physical roll about the viewing
+    /// axis. Written on the render thread, read when a sample is built. NaN when the phone is too
+    /// close to flat for the angle to mean anything.
+    private var imageRollDeg: Double = .nan
+    /// Follows the phone's physical orientation so the interface can be asked to match it, rather
+    /// than waiting for an iOS heuristic that a rotation lock switches off entirely.
+    private var orientationFollower = ScreenOrientationFollower()
+    /// Render-thread throttle: the decision touches UIKit and the reading changes far slower than
+    /// 60 Hz, so it is dispatched to main at about 5 Hz.
+    private var lastOrientationCheck: TimeInterval = 0
+    /// Main-thread throttle on the geometry request itself, so a request still in flight cannot
+    /// turn into a retry storm.
+    private var lastOrientationRequest: TimeInterval = 0
+    private var lastOrientationRequested: UIInterfaceOrientation = .unknown
+    /// How many geometry requests iOS has refused. After a few, asking again is pointless — the
+    /// answer will not change — and continuing would fill the log with the same line every second.
+    private var orientationRequestsRefused = 0
     /// Whether a barometer subscription is live, so the start can be attempted from several
     /// points without stacking subscriptions. Cleared again if the stream errors.
     private var altimeterStarted = false
@@ -1268,6 +1286,29 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         pauseARSession()
         updateTimer?.invalidate()
         FlightRecorder.shared.endLift(reason: "viewWillDisappear")
+    }
+
+    /// Rotation is not a routine layout pass here: both the AR view and the HUD carry a
+    /// `CGAffineTransform` whenever the user is zoomed in (see applyZoomAndPanTransform), and
+    /// autoresizing a transformed view across a bounds change is the one combination UIKit gets
+    /// wrong — it derives the new bounds by inverting the transform, so a zoomed view comes out of
+    /// a rotation the wrong size. Dropping to identity for the duration and re-applying afterwards
+    /// avoids the question entirely.
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        guard isViewLoaded else {
+            super.viewWillTransition(to: size, with: coordinator)
+            return
+        }
+        arSceneView.transform = .identity
+        hudOverlayView.transform = .identity
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            guard let self else { return }
+            self.arSceneView.frame = self.view.bounds
+            self.hudOverlayView.frame = self.view.bounds
+            self.clampPanOffset()
+            self.applyZoomAndPanTransform()
+        }
     }
 
     deinit {
@@ -2398,6 +2439,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             sample.cameraYawDeg   = Double(angles.y) * 180.0 / .pi
             sample.cameraRollDeg  = Double(angles.z) * 180.0 / .pi
         }
+        sample.imageRollDeg = imageRollDeg.isNaN ? nil : imageRollDeg
+        // Read from the window scene rather than from the follower's own idea of the orientation,
+        // so this column says what is actually on screen. The follower's belief matching reality
+        // is precisely what a refused geometry request would break, and a column sourced from the
+        // follower could not show it.
+        if let scene = view.window?.windowScene {
+            sample.interfaceOrientation = ScreenOrientationFollower.describe(scene.interfaceOrientation)
+        }
         sample.arTrackingState = arTrackingStateDescription
         sample.airborne        = isAirborneEstimate
         sample.airborneBasis   = airborneBasis
@@ -2406,7 +2455,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // the readiness signal worth capturing, not a missing value.
         sample.aircraftCount        = aircraft.count
         sample.adsbAircraftCount    = connectionLogic.detectedAircraft.values.filter { $0.source == .adsb }.count
-        sample.internetAircraftCount = connectionLogic.internetAircraftCount
+        // Counted from the store here rather than read from ConnectionLogic.internetAircraftCount,
+        // which is only recomputed inside the fetch *success* path. In the FL340 log every fetch
+        // failed for the last hundred seconds, so that counter froze at its last good value and
+        // this column reported 7 aircraft held while the store was demonstrably empty
+        // (internet_fetch_failed ... stored=0). A column that says traffic is held when it is not
+        // is worse than no column, and n_adsb on the line above already counts the honest way.
+        sample.internetAircraftCount = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
         sample.staleAircraftCount   = connectionLogic.detectedAircraft.values.filter { CalculationsLogic.isStale($0) }.count
         sample.renderedNodeCount    = sceneManager?.renderedAircraftCount
 
@@ -2968,6 +3023,26 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard case .normal = arTrackingState else { return }
 
         let camTransform = simd_float4x4(pov.worldTransform)
+
+        // Which way up the phone physically is. Deliberately ahead of the near-vertical guard
+        // below: a flat phone must feed the follower an explicit "unknown" so a half-served dwell
+        // is discarded, rather than the whole function returning and the follower resuming a
+        // decision the phone has since abandoned.
+        //
+        // World up is (0, 1, 0) under .gravityAndHeading, so its dot product with a camera axis is
+        // that axis's y component — columns 0 and 1 being the camera's right and up axes.
+        let screenRoll = ScreenOrientationFollower.imageRollDeg(
+            cameraRightY: Double(camTransform.columns.0.y),
+            cameraUpY:    Double(camTransform.columns.1.y)
+        )
+        imageRollDeg = screenRoll ?? .nan
+        if time - lastOrientationCheck >= 0.2 {
+            lastOrientationCheck = time
+            DispatchQueue.main.async { [weak self] in
+                self?.followScreenOrientation(imageRollDeg: screenRoll, at: time)
+            }
+        }
+
         let forward = SIMD3<Float>(-camTransform.columns.2.x,
                                    -camTransform.columns.2.y,
                                    -camTransform.columns.2.z)
@@ -3008,6 +3083,75 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             courseResidualDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastGPSCourseDeg)
         } else {
             courseResidualDeg = .nan
+        }
+    }
+
+    /// Ask the interface to match the way the phone is actually being held.
+    ///
+    /// `ARSCNView` builds both its projection matrix and its camera-background transform from the
+    /// *interface* orientation. When the phone is turned and the interface does not follow, the
+    /// entire scene — camera image, target markers, pitch ladder, bank rose — is drawn a quarter
+    /// turn off from the user's eyes. Out of an aircraft window the image is near-featureless sky,
+    /// so the only part that visibly reads wrong is the HUD, which is exactly how this was
+    /// reported: "after turning, the HUD showed like it was 90 degrees sideways".
+    ///
+    /// iOS would normally have rotated the interface itself. It did not, and the likeliest reason
+    /// is the phone's rotation lock — which the app cannot read, and which is not a reasonable
+    /// thing to ask a pilot to think about mid-glance. `requestGeometryUpdate` rotates regardless
+    /// of the lock, provided the target orientation is one the app declares; all three iPhone
+    /// orientations this asks for are in the Info.plist set.
+    ///
+    /// Runs on the main thread, dispatched from the render thread at about 5 Hz.
+    private func followScreenOrientation(imageRollDeg roll: Double?, at time: TimeInterval) {
+        guard let scene = view.window?.windowScene else { return }
+
+        // Adopt any rotation iOS managed on its own first, so the follower never fights a change
+        // it already agrees with — and so `current` is never a stale idea of what is on screen.
+        orientationFollower.sync(to: scene.interfaceOrientation)
+
+        // Three refusals in a row means iOS is not going to allow this, and asking once a second
+        // for the rest of the flight would bury the log under a line that says nothing new.
+        guard orientationRequestsRefused < 3 else { return }
+
+        guard let target = orientationFollower.update(imageRollDeg: roll, at: time),
+              target != scene.interfaceOrientation,
+              time - lastOrientationRequest >= 1.0
+        else { return }
+        // A request already in flight lands within a few tenths of a second, during which the
+        // follower still sees the old orientation and will happily re-decide. Repeating the *same*
+        // target that soon is that echo, not a new intent.
+        guard target != lastOrientationRequested || time - lastOrientationRequest >= 5.0 else { return }
+        lastOrientationRequest = time
+        lastOrientationRequested = target
+
+        let from = scene.interfaceOrientation
+        FlightRecorder.shared.record(
+            event: "orientation_changed",
+            detail: String(format: "from=%@ to=%@ img_roll=%.1f",
+                           ScreenOrientationFollower.describe(from),
+                           ScreenOrientationFollower.describe(target),
+                           roll ?? Double.nan)
+        )
+
+        // UIInterfaceOrientationMask is defined as 1 << orientation.rawValue. Building it that way
+        // rather than by name sidesteps the long-standing confusion between the device and
+        // interface senses of "landscape left" — getting that backwards would rotate the picture
+        // the wrong way, which is worse than not rotating it at all.
+        let mask = UIInterfaceOrientationMask(rawValue: 1 << UInt(target.rawValue))
+        let preferences = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: mask)
+        scene.requestGeometryUpdate(preferences) { [weak self] error in
+            guard let self else { return }
+            // A silently refused request looks identical, on screen and in the log, to the bug
+            // this exists to fix — so it is recorded, and the count says whether following has
+            // been abandoned for the rest of the session.
+            self.orientationRequestsRefused += 1
+            FlightRecorder.shared.record(
+                event: "orientation_request_failed",
+                detail: String(format: "to=%@ refused=%d error=%@",
+                               ScreenOrientationFollower.describe(target),
+                               self.orientationRequestsRefused,
+                               error.localizedDescription)
+            )
         }
     }
 

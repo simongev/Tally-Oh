@@ -10,6 +10,7 @@ import Testing
 import Foundation
 import CoreLocation
 import SceneKit
+import UIKit
 @testable import Tally_Ho
 
 struct TargetDataTests {
@@ -686,5 +687,122 @@ struct TargetDataTests {
                 #expect(delta > -180.001 && delta <= 180.001)
             }
         }
+    }
+
+    // MARK: - Screen orientation
+
+    // The mapping from ARKit's camera roll to an interface orientation, plus the hysteresis and
+    // dwell that stop a hand held at an angle from flip-flopping the interface. Written because
+    // getting the landscape sense backwards would rotate the picture the wrong way, which is worse
+    // than the sideways HUD it is meant to fix.
+
+    /// A phone held upright in portrait. ARKit's camera +x runs from the front camera toward the
+    /// home button (device *down*) and +y along the device's portrait right, so world up lands on
+    /// camera −x: right.y = −1, up.y = 0.
+    @Test func portraitReadsAsMinusNinety() {
+        let roll = ScreenOrientationFollower.imageRollDeg(cameraRightY: -1, cameraUpY: 0)
+        #expect(roll != nil)
+        #expect(abs(roll! - (-90)) < 0.001)
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: roll!, withinDeg: 30) == .portrait)
+    }
+
+    /// The four cardinal readings. The −90 → −180 step is the one the FL340 log recorded at the
+    /// moment the user reported the HUD going sideways: portrait to landscape-left.
+    @Test func cardinalRollsMapToTheirOrientations() {
+        let cases: [(Double, UIInterfaceOrientation)] = [
+            (0,    .landscapeRight),
+            (-90,  .portrait),
+            (180,  .landscapeLeft),
+            (-180, .landscapeLeft),
+            (90,   .portraitUpsideDown),
+        ]
+        for (roll, expected) in cases {
+            #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: roll, withinDeg: 30) == expected)
+        }
+    }
+
+    /// The reading wraps, so a roll just the other side of ±180 must still be landscape-left
+    /// rather than falling off the end of the table.
+    @Test func rollWrapsAcrossPlusMinus180() {
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: 175, withinDeg: 30) == .landscapeLeft)
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: -175, withinDeg: 30) == .landscapeLeft)
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: -155, withinDeg: 30) == .landscapeLeft)
+    }
+
+    /// Halfway between two orientations is genuinely ambiguous — the answer must be "no candidate",
+    /// not whichever one happens to sort first.
+    @Test func anAmbiguousAngleHasNoCandidate() {
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: -45, withinDeg: 30) == nil)
+        #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: 135, withinDeg: 30) == nil)
+    }
+
+    /// Pointed within about 11° of straight up or down, both components collapse and the angle is
+    /// noise. It must come back as unknown rather than as some confident direction.
+    @Test func aFlatPhoneReportsNoRoll() {
+        #expect(ScreenOrientationFollower.imageRollDeg(cameraRightY: 0.05, cameraUpY: 0.05) == nil)
+        #expect(ScreenOrientationFollower.imageRollDeg(cameraRightY: 0, cameraUpY: 0) == nil)
+        #expect(ScreenOrientationFollower.imageRollDeg(cameraRightY: 0, cameraUpY: -1) != nil)
+    }
+
+    @Test func aHeldRotationSwitchesAfterTheDwell() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)     // starts the clock
+        #expect(follower.update(imageRollDeg: -178, at: 0.2) == nil)     // not yet
+        #expect(follower.update(imageRollDeg: -179, at: 0.6) == .landscapeLeft)
+        #expect(follower.current == .landscapeLeft)
+        // Settled: no repeat request while it stays there.
+        #expect(follower.update(imageRollDeg: -179, at: 1.2) == nil)
+    }
+
+    /// Turbulence, or a hand passing through landscape on the way somewhere else, must not rotate
+    /// the interface.
+    @Test func aBriefRotationIsIgnored() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
+        #expect(follower.update(imageRollDeg: -90,  at: 0.2) == nil)     // back to portrait
+        #expect(follower.update(imageRollDeg: -180, at: 0.4) == nil)     // clock restarts here
+        #expect(follower.update(imageRollDeg: -180, at: 0.7) == nil)     // 0.3s served, not 0.7
+        #expect(follower.current == .portrait)
+    }
+
+    /// A phone held at 45° for a long time must sit still, not oscillate between neighbours.
+    @Test func anAngledHoldNeverSwitches() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        for step in 0..<40 {
+            #expect(follower.update(imageRollDeg: -45, at: Double(step) * 0.2) == nil)
+        }
+        #expect(follower.current == .portrait)
+    }
+
+    /// Upside-down portrait is not declared for iPhone, so a geometry request for it would be
+    /// refused. Holding is right; asking repeatedly would look exactly like the bug.
+    @Test func anUndeclaredOrientationIsHeldNotChased() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        for step in 0..<20 {
+            #expect(follower.update(imageRollDeg: 90, at: Double(step) * 0.2) == nil)
+        }
+        #expect(follower.current == .portrait)
+    }
+
+    /// Going flat mid-rotation must discard the part-served dwell rather than let it resume, so a
+    /// phone laid down and picked up differently does not switch on stale evidence.
+    @Test func goingFlatRestartsTheDwell() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
+        #expect(follower.update(imageRollDeg: nil,  at: 0.2) == nil)     // laid flat
+        #expect(follower.update(imageRollDeg: -180, at: 0.4) == nil)     // clock restarts
+        #expect(follower.update(imageRollDeg: -180, at: 0.7) == nil)
+        #expect(follower.current == .portrait)
+        #expect(follower.update(imageRollDeg: -180, at: 0.95) == .landscapeLeft)
+    }
+
+    /// iOS rotating the interface on its own (rotation lock off) must be adopted, not fought.
+    @Test func anExternalRotationIsAdopted() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        follower.sync(to: .landscapeLeft)
+        #expect(follower.current == .landscapeLeft)
+        // Already there, so no request is issued for the same orientation.
+        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
+        #expect(follower.update(imageRollDeg: -180, at: 1.0) == nil)
     }
 }

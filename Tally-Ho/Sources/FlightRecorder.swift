@@ -71,7 +71,8 @@ final class FlightRecorder {
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
         "ar_heading_deg", "heading_delta_deg",
-        "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "ar_state", "airborne", "airborne_basis",
+        "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "img_roll_deg", "ui_orient",
+        "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
         "n_targets_press", "n_targets_geom",
@@ -169,6 +170,13 @@ final class FlightRecorder {
         var cameraYawDeg: Double?
         var cameraPitchDeg: Double?
         var cameraRollDeg: Double?
+        /// Where world "up" sits in the camera image, in degrees — the phone's physical roll about
+        /// the viewing axis, from ARKit's gravity-aligned world.
+        var imageRollDeg: Double?
+        /// The interface orientation the app is actually rendering in, at the same instant.
+        /// Logged beside `imageRollDeg` precisely so the two can be compared: the pair being 90°
+        /// apart is the whole "HUD is sideways" fault, and nothing in the log could show it before.
+        var interfaceOrientation: String?
         var arTrackingState: String?
         /// Whether the app judged the user to be flying, and what it judged that from —
         /// the input that decides TCAS, the altitude-band cull and the GPS accuracy gate.
@@ -321,6 +329,8 @@ final class FlightRecorder {
         fields.append(format(sample.cameraYawDeg,   decimals: 1))
         fields.append(format(sample.cameraPitchDeg, decimals: 1))
         fields.append(format(sample.cameraRollDeg,  decimals: 1))
+        fields.append(format(sample.imageRollDeg,   decimals: 1))
+        fields.append(escape(sample.interfaceOrientation ?? ""))
         fields.append(escape(sample.arTrackingState ?? ""))
         fields.append(sample.airborne.map { $0 ? "1" : "0" } ?? "")
         fields.append(escape(sample.airborneBasis ?? ""))
