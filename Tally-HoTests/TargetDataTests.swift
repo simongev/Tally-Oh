@@ -857,6 +857,40 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - Staleness
+
+    /// The dashed ring and the dead-reckoning ceiling must stay the same number. Dashed is meant
+    /// to say "this has stopped being extrapolated"; if the two drift apart it says nothing.
+    @Test func staleMarkMatchesTheCoastCeiling() {
+        #expect(CalculationsLogic.staleAircraftAgeSeconds == CalculationsLogic.maxCoastSeconds)
+    }
+
+    /// Just inside the ceiling the target is still being projected forward and must not be dashed;
+    /// just outside, projection has frozen and it must be. The two have to flip together.
+    @Test func aTargetIsDashedExactlyWhenItStopsBeingExtrapolated() {
+        let ceiling = CalculationsLogic.maxCoastSeconds
+        let fresh = aircraft(age: ceiling - 1)
+        let frozen = aircraft(age: ceiling + 1)
+
+        #expect(!CalculationsLogic.isStale(fresh))
+        #expect(CalculationsLogic.isStale(frozen))
+
+        // The frozen one sits where the ceiling put it, not where its true age would coast it to.
+        let atCeiling = CalculationsLogic.predictPosition(
+            currentCoord: frozen.coordinate, currentAltitude: frozen.altitude,
+            track: frozen.track, groundSpeed: frozen.groundSpeed,
+            verticalRate: frozen.verticalRate, timeSeconds: ceiling)
+        let predicted = CalculationsLogic.predictedPosition(for: frozen, aheadSeconds: 0)
+        #expect(abs(predicted.coordinate.latitude  - atCeiling.coordinate.latitude)  < 1e-9)
+        #expect(abs(predicted.coordinate.longitude - atCeiling.coordinate.longitude) < 1e-9)
+    }
+
+    /// One missed fetch on an 8 s cadence must not dash the whole display. Every internet aircraft
+    /// shares a fetch timestamp, so this threshold applies to all hundred of them at once.
+    @Test func oneMissedFetchDoesNotMarkTrafficStale() {
+        #expect(!CalculationsLogic.isStale(aircraft(age: 16)))   // two fetch cycles missed
+    }
+
     // MARK: - Compass reference
 
     /// CoreLocation and UIKit name the two landscape positions oppositely: both define their cases

@@ -1701,8 +1701,36 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         isARSessionPaused = true
     }
 
-    /// Reset the ARKit world. Rate-limited in here rather than at the call sites, so no future
-    /// caller can reintroduce a reset storm.
+    /// Whether a world has ever been built in this view, so the very first start always resets.
+    private var hasStartedARSession = false
+
+    /// Whether this start should re-anchor the world, or resume the one already there.
+    ///
+    /// A reset re-asks the compass which way north is — and in the cabin the compass answers with
+    /// the *aircraft's ground track*, not with where the phone is pointing (`compass_response`
+    /// 0.018 across four flights, against 0.98–1.06 on the ground). So every airborne reset hands
+    /// the scene a fresh, arbitrary rotation equal to the angle between the phone and the nose at
+    /// that instant. The user confirmed both halves of this directly: the error is a single
+    /// constant shift of everything, and reopening the app changes it.
+    ///
+    /// On the ground a reset is harmless, because there the compass really is measuring the phone
+    /// and the new anchor is as good as the old. In the air it is pure loss: the alignment cannot
+    /// get better by being re-rolled, only different. So airborne, with a world already tracking,
+    /// resume it instead. This does not make the alignment correct — nothing here can yet — it
+    /// stops it changing under the user, which is the difference between an error that could be
+    /// corrected once per flight and an error that is new after every glance at the map.
+    ///
+    /// A world that ARKit has actually lost is worth rebuilding at any altitude: a wrong alignment
+    /// still beats no tracking.
+    private var shouldResetWorld: Bool {
+        guard hasStartedARSession, isAirborneEstimate else { return true }
+        guard arSceneView.session.currentFrame != nil else { return true }
+        if case .notAvailable = arTrackingState { return true }
+        return false
+    }
+
+    /// Start or resume the ARKit world. Rate-limited in here rather than at the call sites, so no
+    /// future caller can reintroduce a reset storm.
     private func startARSession(reason: String) {
         let now = Date()
         let sinceLast = now.timeIntervalSince(lastARSessionStart)
@@ -1718,19 +1746,37 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         lastARSessionStart = now
         isARSessionPaused = false
 
+        let resetting = shouldResetWorld
+        hasStartedARSession = true
+
         // Logged here rather than at any one call site, so every world reset is recorded
         // whatever triggered it. Without this the reset storm that froze the camera left no
         // trace in the flight log at all.
+        //
+        // The anchor's full context goes in the detail because a reset *is* the moment the scene's
+        // rotation is decided, and until now the only thing recorded about it was that it
+        // happened. Every log so far shows heading_acc=-1 here — the compass had no valid heading
+        // at all when the world was anchored — which is worth being able to see.
         FlightRecorder.shared.record(
             event: "ar_session_start",
-            detail: String(format: "reason=%@ heading_acc=%.0f declination=%.1f",
-                           reason, lastHeadingAccuracy, magneticDeclinationDeg)
+            detail: String(format: "reason=%@ reset=%d airborne=%d gs=%.0fkt track=%.0f hdg=%.0f heading_acc=%.0f declination=%.1f",
+                           reason, resetting ? 1 : 0, isAirborneEstimate ? 1 : 0,
+                           lastGPSSpeedKt, lastGPSCourseDeg, lastTrueHeading,
+                           lastHeadingAccuracy, magneticDeclinationDeg)
         )
 
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravityAndHeading
         config.providesAudioData = false
-        arSceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        let options: ARSession.RunOptions = resetting ? [.resetTracking, .removeExistingAnchors] : []
+        arSceneView.session.run(config, options: options)
+
+        // Everything below undoes state that only a *re-anchored* world invalidates. A resume
+        // keeps the same world, the same alignment and the same measurements, so none of it
+        // applies — clearing it would throw away readings that are still describing the frame the
+        // scene is actually drawn in.
+        guard resetting else { return }
+
         // After a session reset the ARKit world is re-anchored to the current
         // compass heading, so apply the next heading fix directly rather than
         // blending it in from the previous session's smoothed state.
@@ -1744,6 +1790,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // only ever written from the delegate callback, so without this it keeps reporting the
         // dead session's .normal until ARKit gets round to saying otherwise — which is how a
         // world-yaw sample was once taken 0.32 s before ARKit reported "unavailable".
+        //
+        // Deliberately not done on the resume path: the delegate only fires on a *change*, so a
+        // session paused at .normal and resumed at .normal may never call back, and a state forced
+        // to .notAvailable here would stay there — silently stopping placement correction, both
+        // response estimators and the orientation follower for the rest of the flight.
         arTrackingState = .notAvailable
         hasSeededWorldYawError = false
         worldYawErrorDeg = 0

@@ -222,16 +222,25 @@ class CalculationsLogic {
         )
     }
 
-    /// Beyond this report age, a target is flagged "stale" in the UI (dashed ring) —
-    /// still shown and dead-reckoned, but visually marked as not a fresh position fix.
-    /// Chosen to clear the internet-source 8s fetch cadence (ConnectionLogic.swift)
-    /// plus jitter, while still catching a genuinely stale report promptly.
-    static let staleAircraftAgeSeconds: Double = 10.0
-
     /// Hard ceiling on dead-reckoning extrapolation: beyond this age we stop projecting
     /// the aircraft further forward and freeze it at the 20s-extrapolated point, rather
     /// than coasting in a straight line indefinitely.
     static let maxCoastSeconds: Double = 20.0
+
+    /// Beyond this report age, a target is flagged "stale" in the UI (dashed ring) —
+    /// still shown, but visually marked as not a fresh position fix.
+    ///
+    /// Deliberately equal to `maxCoastSeconds`, so the dashed ring means something true: below it
+    /// the target is being dead-reckoned forward from its last report and its drawn position is a
+    /// live estimate; at exactly this age `predictedPosition` stops projecting and freezes it.
+    /// Dashed therefore reads as "this has stopped being extrapolated" rather than as an arbitrary
+    /// age. The two constants must move together — see the test that pins them.
+    ///
+    /// It was 10 s against an 8 s internet fetch cadence (ConnectionLogic.swift): two seconds of
+    /// margin. Every internet aircraft shares one fetch timestamp, so a single late or failed
+    /// fetch tipped all hundred past the threshold at once and the whole display went dashed and
+    /// snapped back — 11 rows out of 76 in one ground log. Two full fetch cycles of margin now.
+    static let staleAircraftAgeSeconds: Double = maxCoastSeconds
 
     /// Whether an aircraft's last report is old enough to be flagged as stale in the UI.
     static func isStale(_ aircraft: Aircraft) -> Bool {
