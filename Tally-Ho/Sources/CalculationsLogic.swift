@@ -773,9 +773,17 @@ struct ScreenOrientationFollower {
 
     // MARK: - Reading the phone's roll off an AR frame
 
-    /// The angle of world "up" within the camera image, in degrees, from the camera transform's
+    /// The angle of world "up" within the camera image, in degrees, from a camera transform's
     /// first two columns. `nil` when the phone is too close to flat for the angle to mean
     /// anything.
+    ///
+    /// **Feed this `ARFrame.camera.transform`, never `ARSCNView.pointOfView.worldTransform`.**
+    /// The two differ by exactly the interface rotation — which is the quantity being measured, so
+    /// using the node makes the whole thing circular. Build 16 used the node and oscillated
+    /// portrait/landscape once a second on a phone that never moved; the flight log showed the two
+    /// frames differing by exactly 90.000° in portrait and exactly 0.000° in landscape-right,
+    /// seventeen rows out of seventeen. The camera's own frame is fixed to the device and is the
+    /// only non-circular source.
     ///
     /// The world's up axis is (0, 1, 0) under `.gravityAndHeading`, so the dot product of world up
     /// with a camera axis is simply that axis's `y` component — which is why this takes two
@@ -853,21 +861,38 @@ struct ScreenOrientationFollower {
     /// chased: `requestGeometryUpdate` refuses an undeclared orientation, and repeatedly asking
     /// for one would look from the outside exactly like the bug this exists to fix.
     let supported: [UIInterfaceOrientation]
+    /// How many changes may happen inside `changeWindowSeconds` before following gives up.
+    ///
+    /// A screen flipping in the pilot's hand is far worse than a screen that fails to rotate, and
+    /// this feature has now produced that failure once. The cutoff exists so it cannot run for a
+    /// whole flight again whatever is wrong upstream: it does not need to know *why* the decisions
+    /// are oscillating, only that they are. Four changes in twenty seconds is well above anything
+    /// a person does deliberately and far below the fifteen-in-twenty-two that build 16 produced.
+    let maxChangesInWindow: Int
+    let changeWindowSeconds: TimeInterval
 
     // MARK: - State
 
     private(set) var current: UIInterfaceOrientation
     private var pending: UIInterfaceOrientation?
     private var pendingSince: TimeInterval = 0
+    private var changeTimes: [TimeInterval] = []
+    /// Why following stopped, or nil while it is still running.
+    private(set) var disabledReason: String?
+    var isFollowing: Bool { disabledReason == nil }
 
     init(current: UIInterfaceOrientation = .portrait,
          toleranceDeg: Double = 30,
          dwellSeconds: TimeInterval = 0.5,
-         supported: [UIInterfaceOrientation] = [.portrait, .landscapeLeft, .landscapeRight]) {
+         supported: [UIInterfaceOrientation] = [.portrait, .landscapeLeft, .landscapeRight],
+         maxChangesInWindow: Int = 4,
+         changeWindowSeconds: TimeInterval = 20) {
         self.current = current
         self.toleranceDeg = toleranceDeg
         self.dwellSeconds = dwellSeconds
         self.supported = supported
+        self.maxChangesInWindow = maxChangesInWindow
+        self.changeWindowSeconds = changeWindowSeconds
     }
 
     /// Adopt an orientation the interface reached without being asked — a normal iOS rotation with
@@ -881,6 +906,8 @@ struct ScreenOrientationFollower {
     /// Feed one reading. Returns the new orientation on the tick it changes, `nil` otherwise —
     /// so the caller issues a geometry request only on an actual transition.
     mutating func update(imageRollDeg roll: Double?, at time: TimeInterval) -> UIInterfaceOrientation? {
+        guard isFollowing else { return nil }
+
         // Too flat to mean anything: hold, and make the next candidate earn its dwell afresh
         // rather than resuming a half-served one from before the phone went level.
         guard let roll,
@@ -898,6 +925,16 @@ struct ScreenOrientationFollower {
             return nil
         }
         guard time - pendingSince >= dwellSeconds else { return nil }
+
+        // Count the change before making it, so the one that would tip the rate over the limit is
+        // refused rather than performed and then regretted.
+        changeTimes.removeAll { time - $0 > changeWindowSeconds }
+        changeTimes.append(time)
+        if changeTimes.count > maxChangesInWindow {
+            disabledReason = "thrash"
+            pending = nil
+            return nil
+        }
 
         current = candidate
         pending = nil

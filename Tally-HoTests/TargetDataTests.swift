@@ -805,4 +805,72 @@ struct TargetDataTests {
         #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
         #expect(follower.update(imageRollDeg: -180, at: 1.0) == nil)
     }
+
+    /// The values a phone lying still in portrait actually produced on the device, from the
+    /// build-16 log, read off frame.camera.transform. All of them must be portrait: this is the
+    /// case that oscillated, and it oscillated because the reading came from the wrong frame.
+    @Test func measuredPortraitRollsStayPortrait() {
+        for roll in [-90.7, -91.3, -91.4, -93.7, -95.9, -96.0, -100.5] {
+            #expect(ScreenOrientationFollower.nearestOrientation(toRollDeg: roll, withinDeg: 30) == .portrait)
+        }
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
+        for (i, roll) in [-91.4, -94.8, -96.0, -100.5, -93.3].enumerated() {
+            #expect(follower.update(imageRollDeg: roll, at: Double(i)) == nil)
+        }
+        #expect(follower.current == .portrait)
+        #expect(follower.isFollowing)
+    }
+
+    // MARK: - The thrash cutoff
+
+    /// A screen flipping in the pilot's hand is worse than one that fails to rotate, so following
+    /// gives up rather than run an oscillation for a whole flight. The fifth change inside the
+    /// window is refused, not performed.
+    @Test func rapidFlippingDisablesFollowing() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0,
+                                                 maxChangesInWindow: 4, changeWindowSeconds: 20)
+        var changes = 0
+        // Alternate between portrait and landscape-left as fast as the dwell allows.
+        for step in 0..<40 {
+            let roll = step % 2 == 0 ? -180.0 : -90.0
+            // Two ticks per target: the first starts the dwell, the second can commit.
+            _ = follower.update(imageRollDeg: roll, at: Double(step) * 0.5)
+            if follower.update(imageRollDeg: roll, at: Double(step) * 0.5 + 0.2) != nil { changes += 1 }
+        }
+        #expect(changes == 4)
+        #expect(!follower.isFollowing)
+        #expect(follower.disabledReason == "thrash")
+    }
+
+    /// Once it has given up it stays given up — no target is ever returned again, however well
+    /// behaved the readings become.
+    @Test func aDisabledFollowerNeverRotatesAgain() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0,
+                                                 maxChangesInWindow: 1, changeWindowSeconds: 20)
+        _ = follower.update(imageRollDeg: -180, at: 0.0)
+        #expect(follower.update(imageRollDeg: -180, at: 0.1) == .landscapeLeft)   // 1st change, allowed
+        _ = follower.update(imageRollDeg: -90, at: 1.0)
+        #expect(follower.update(imageRollDeg: -90, at: 1.1) == nil)               // 2nd, refused
+        #expect(!follower.isFollowing)
+        for step in 0..<20 {
+            #expect(follower.update(imageRollDeg: -90, at: 100 + Double(step)) == nil)
+        }
+    }
+
+    /// Someone genuinely turning the phone back and forth over a couple of minutes is not
+    /// thrashing, and must not be cut off.
+    @Test func changesSpreadOutDoNotDisableFollowing() {
+        var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0,
+                                                 maxChangesInWindow: 4, changeWindowSeconds: 20)
+        var changes = 0
+        // One deliberate flip every 15 s — inside the count, outside the window.
+        for step in 0..<8 {
+            let roll = step % 2 == 0 ? -180.0 : -90.0
+            let t = Double(step) * 15.0
+            _ = follower.update(imageRollDeg: roll, at: t)
+            if follower.update(imageRollDeg: roll, at: t + 0.2) != nil { changes += 1 }
+        }
+        #expect(changes == 8)
+        #expect(follower.isFollowing)
+    }
 }
