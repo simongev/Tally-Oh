@@ -834,6 +834,32 @@ struct ScreenOrientationFollower {
         }
     }
 
+    /// The CoreLocation device orientation matching an interface orientation.
+    ///
+    /// `CLLocationManager.headingOrientation` tells CoreLocation which physical axis of the device
+    /// to report a heading for. Leave it at `.portrait` while the app renders in landscape and the
+    /// compass comes back 90° out — measured on the ground at exactly −87° for twenty-five
+    /// consecutive samples in landscape-right, against −2° in portrait either side of it.
+    ///
+    /// The two enumerations are crossed for landscape, and that is not a naming quirk to route
+    /// around: `UIInterfaceOrientation.landscapeRight` is the *interface* rotated so the home
+    /// button sits on the right, and CoreLocation names that same physical position
+    /// `CLDeviceOrientation.landscapeLeft`. Both are defined by where the home button is, which is
+    /// the one unambiguous anchor, so that is what this maps on.
+    ///
+    /// Checkable in the log rather than taken on trust: `world_yaw_corr_deg` is the gap between
+    /// the compass and ARKit's azimuth, and it must stay near zero in landscape exactly as it does
+    /// in portrait. A wrong mapping here would leave it at ±90 or put it at 180.
+    static func headingOrientation(for orientation: UIInterfaceOrientation) -> CLDeviceOrientation {
+        switch orientation {
+        case .portrait:           return .portrait
+        case .portraitUpsideDown: return .portraitUpsideDown
+        case .landscapeLeft:      return .landscapeRight
+        case .landscapeRight:     return .landscapeLeft
+        default:                  return .portrait
+        }
+    }
+
     /// The orientation whose ideal roll is nearest, or `nil` if none is within `tolerance`.
     static func nearestOrientation(toRollDeg roll: Double, withinDeg tolerance: Double) -> UIInterfaceOrientation? {
         var best: UIInterfaceOrientation?

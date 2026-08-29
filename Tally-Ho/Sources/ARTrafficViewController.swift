@@ -1065,6 +1065,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var orientationRequestsRefused = 0
     /// So the follower giving up is recorded once rather than at 5 Hz for the rest of the flight.
     private var loggedOrientationDisabled = false
+    /// Which interface orientation CoreLocation's heading reference is currently set for, so it is
+    /// written only when it actually changes.
+    private var headingOrientationSetFor: UIInterfaceOrientation = .unknown
     /// Whether a barometer subscription is live, so the start can be attempted from several
     /// points without stacking subscriptions. Cleared again if the stream errors.
     private var altimeterStarted = false
@@ -1527,7 +1530,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         locationManager.activityType = .airborne
         locationManager.distanceFilter = kCLDistanceFilterNone
         locationManager.headingFilter = kCLHeadingFilterNone
-        locationManager.headingOrientation = .portrait   // fixes 90° offset in landscape: always report heading of physical top (camera axis)
+        // Seed only. It has to track the interface from here on — see followScreenOrientation.
+        // The comment that used to sit here claimed pinning this to .portrait "fixes 90° offset in
+        // landscape". That was true while the app only ever rendered portrait; once build 16 let
+        // the interface rotate, pinning it became the cause of exactly that offset.
+        locationManager.headingOrientation = .portrait
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
         locationManager.startUpdatingHeading()
@@ -3158,6 +3165,23 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Adopt any rotation iOS managed on its own first, so the follower never fights a change
         // it already agrees with — and so `current` is never a stale idea of what is on screen.
         orientationFollower.sync(to: scene.interfaceOrientation)
+
+        // Keep the compass referenced to the orientation actually on screen. Deliberately driven
+        // from the observed interface rather than from our own requests: the ground test rotated
+        // back to portrait without us asking — iOS did it, with no orientation_changed event — and
+        // a compass left pointing at the old reference would have gone unnoticed. This runs at
+        // 5 Hz, ahead of every guard below, so it keeps working even once following has given up.
+        if scene.interfaceOrientation != headingOrientationSetFor {
+            headingOrientationSetFor = scene.interfaceOrientation
+            let clOrientation = ScreenOrientationFollower.headingOrientation(for: scene.interfaceOrientation)
+            locationManager.headingOrientation = clOrientation
+            FlightRecorder.shared.record(
+                event: "heading_orientation",
+                detail: String(format: "ui=%@ cl_raw=%d",
+                               ScreenOrientationFollower.describe(scene.interfaceOrientation),
+                               clOrientation.rawValue)
+            )
+        }
 
         // Three refusals in a row means iOS is not going to allow this, and asking once a second
         // for the rest of the flight would bury the log under a line that says nothing new.

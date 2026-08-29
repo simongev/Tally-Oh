@@ -857,6 +857,25 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - Compass reference
+
+    /// CoreLocation and UIKit name the two landscape positions oppositely: both define their cases
+    /// by where the home button is, and interface-landscapeRight (home button right) is the same
+    /// physical position CoreLocation calls landscapeLeft. Getting this crossing wrong leaves the
+    /// compass 90 degrees out, which is the defect this mapping exists to fix.
+    @Test func headingOrientationCrossesForLandscape() {
+        #expect(ScreenOrientationFollower.headingOrientation(for: .portrait) == .portrait)
+        #expect(ScreenOrientationFollower.headingOrientation(for: .portraitUpsideDown) == .portraitUpsideDown)
+        #expect(ScreenOrientationFollower.headingOrientation(for: .landscapeLeft) == .landscapeRight)
+        #expect(ScreenOrientationFollower.headingOrientation(for: .landscapeRight) == .landscapeLeft)
+    }
+
+    /// An unknown interface orientation must fall back to portrait rather than to whatever the
+    /// enumeration's zero value happens to be.
+    @Test func headingOrientationFallsBackToPortrait() {
+        #expect(ScreenOrientationFollower.headingOrientation(for: .unknown) == .portrait)
+    }
+
     /// Someone genuinely turning the phone back and forth over a couple of minutes is not
     /// thrashing, and must not be cut off.
     @Test func changesSpreadOutDoNotDisableFollowing() {
