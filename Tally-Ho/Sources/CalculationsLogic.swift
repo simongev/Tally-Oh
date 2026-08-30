@@ -764,6 +764,70 @@ struct YawDriftAccumulator {
     }
 }
 
+/// How far ARKit's world azimuth has drifted from the compass, as a rolling median.
+///
+/// Used for exactly one decision: whether a world is worth re-anchoring when the user next returns
+/// to the AR view. ARKit's yaw drifts about 0.07 °/s — roughly 4° a minute — and re-anchoring
+/// clears that, at the cost of a second of stalled camera while tracking re-initialises. Worth
+/// paying occasionally, not on every return.
+///
+/// **Only meaningful on the ground.** The gap it measures is ARKit's azimuth minus the compass, and
+/// the compass only measures the phone outside a fuselage (`compass_response` ≈ 1.00 on the ground,
+/// 0.018 in the air). Airborne the compass reports the aircraft's ground track, so the gap grows
+/// with every degree the user pans and says nothing about drift: rolling 15 s medians run 85–126°
+/// across four flight logs, against 4.05° and 5.33° on two clean ground logs. A caller that fed
+/// this airborne would re-anchor almost continuously — the precise failure build 19 exists to stop.
+///
+/// A **median**, not a mean or a single sample, because the instantaneous gap is spiky: the ground
+/// log that medians 2.0° spans −31.6° to +19.4°, since a fast pan briefly outruns the compass.
+/// Signed, so that symmetric pan noise medians toward zero rather than rectifying into apparent
+/// drift — the same mistake that made the first compass-response estimator read 0.61 against a
+/// truth of 0.018. The sign is discarded only at the comparison.
+struct AlignmentDriftMonitor {
+
+    /// How far back the median looks.
+    let window: TimeInterval
+    /// Below this many samples nothing is published: a median of three readings is not a median.
+    let minSamples: Int
+    /// Caller-side rate limit. The feeding site runs at 60 Hz; re-sorting a 900-entry array every
+    /// frame to answer a question asked a few times a minute would be absurd.
+    let minSampleInterval: TimeInterval
+
+    private var samples: [(t: TimeInterval, deg: Double)] = []
+    private var lastSampleTime: TimeInterval = -.greatestFiniteMagnitude
+
+    init(window: TimeInterval = 15.0, minSamples: Int = 10, minSampleInterval: TimeInterval = 0.5) {
+        self.window = window
+        self.minSamples = minSamples
+        self.minSampleInterval = minSampleInterval
+    }
+
+    /// Feed one ARKit-minus-compass reading. Ignored if it arrives sooner than `minSampleInterval`
+    /// after the last one kept.
+    mutating func add(errorDeg: Double, at time: TimeInterval) {
+        guard errorDeg.isFinite else { return }
+        guard time - lastSampleTime >= minSampleInterval else { return }
+        lastSampleTime = time
+        samples.append((t: time, deg: errorDeg))
+        samples.removeAll { time - $0.t > window }
+    }
+
+    /// Signed median of the readings in the window, or nil until there are enough of them.
+    var medianErrorDeg: Double? {
+        guard samples.count >= minSamples else { return nil }
+        let sorted = samples.map(\.deg).sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+    }
+
+    /// Clear after a re-anchor. Without this the large readings that *caused* a reset would still
+    /// be in the window afterwards and would immediately demand another.
+    mutating func reset() {
+        samples.removeAll()
+        lastSampleTime = -.greatestFiniteMagnitude
+    }
+}
+
 /// Decides which way up the phone physically is, from ARKit's gravity-referenced camera attitude,
 /// so the interface can be asked to follow it.
 ///

@@ -1704,29 +1704,53 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Whether a world has ever been built in this view, so the very first start always resets.
     private var hasStartedARSession = false
 
-    /// Whether this start should re-anchor the world, or resume the one already there.
+    /// Rolling median of ARKit's azimuth minus the compass. Read only on the ground — see
+    /// AlignmentDriftMonitor for why it is meaningless in the air.
+    private var alignmentDrift = AlignmentDriftMonitor()
+
+    /// How far the ground alignment may drift before a return is worth spending a reset on.
+    ///
+    /// Rolling 15 s medians of `world_yaw_corr_deg` run to 4.05° and 5.33° on the two clean ground
+    /// logs, and 85–126° across four flights. 12° sits 2.4× above the worst clean ground reading
+    /// and an order of magnitude below anything airborne, so neither pan noise nor a cabin can
+    /// reach it by accident.
+    private static let maxGroundAlignmentErrorDeg: Double = 12.0
+
+    /// Why this start is re-anchoring, or nil if it is resuming — the reset decision itself, and
+    /// the reason recorded in the log so a reset is never just something that happened.
     ///
     /// A reset re-asks the compass which way north is — and in the cabin the compass answers with
     /// the *aircraft's ground track*, not with where the phone is pointing (`compass_response`
-    /// 0.018 across four flights, against 0.98–1.06 on the ground). So every airborne reset hands
-    /// the scene a fresh, arbitrary rotation equal to the angle between the phone and the nose at
-    /// that instant. The user confirmed both halves of this directly: the error is a single
-    /// constant shift of everything, and reopening the app changes it.
+    /// 0.018 across four flights, against 1.00 on the ground). So every airborne reset hands the
+    /// scene a fresh, arbitrary rotation equal to the angle between the phone and the nose at that
+    /// instant. The user confirmed both halves directly: the error is a single constant shift of
+    /// everything, and reopening the app changes it.
     ///
-    /// On the ground a reset is harmless, because there the compass really is measuring the phone
-    /// and the new anchor is as good as the old. In the air it is pure loss: the alignment cannot
-    /// get better by being re-rolled, only different. So airborne, with a world already tracking,
-    /// resume it instead. This does not make the alignment correct — nothing here can yet — it
-    /// stops it changing under the user, which is the difference between an error that could be
-    /// corrected once per flight and an error that is new after every glance at the map.
+    /// Resuming is now the default at any altitude, not just airborne. A reset costs about a
+    /// second of `limited:initializing` with the camera stalled — measured on all four returns in
+    /// the build-19 ground log — which is a real price in an app built around a five-second
+    /// glance. On the ground it buys back the ~4°/min ARKit yaw drift, so it is worth paying when
+    /// the compass says the alignment has actually gone off, and not otherwise. In the air it buys
+    /// nothing at all.
     ///
-    /// A world that ARKit has actually lost is worth rebuilding at any altitude: a wrong alignment
-    /// still beats no tracking.
-    private var shouldResetWorld: Bool {
-        guard hasStartedARSession, isAirborneEstimate else { return true }
-        guard arSceneView.session.currentFrame != nil else { return true }
-        if case .notAvailable = arTrackingState { return true }
-        return false
+    /// This decides only how the four existing lifecycle call sites behave; it never triggers a
+    /// reset by itself. A spontaneous reset path is what produced the reset storm that once froze
+    /// the camera, and `minARSessionRestartInterval` should not be the only thing preventing a
+    /// repeat.
+    private var resetReason: String? {
+        guard hasStartedARSession else { return "first_start" }
+        guard arSceneView.session.currentFrame != nil else { return "no_frame" }
+        if case .notAvailable = arTrackingState { return "tracking_lost" }
+        // Ground only. Airborne the compass reports the aircraft's ground track rather than the
+        // phone's azimuth, so this gap grows with every degree the user pans and has nothing to do
+        // with drift; re-anchoring on it would hand the scene a fresh arbitrary rotation on every
+        // return, which is the fault this whole path exists to avoid.
+        if !isAirborneEstimate,
+           let drift = alignmentDrift.medianErrorDeg,
+           abs(drift) >= ARTrafficViewController.maxGroundAlignmentErrorDeg {
+            return "ground_drift"
+        }
+        return nil
     }
 
     /// Start or resume the ARKit world. Rate-limited in here rather than at the call sites, so no
@@ -1746,7 +1770,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         lastARSessionStart = now
         isARSessionPaused = false
 
-        let resetting = shouldResetWorld
+        // Named to avoid shadowing the `reason` parameter, which names the *call site*, not the
+        // reset decision — the log carries both and they answer different questions.
+        let whyReset = resetReason
+        let resetting = whyReset != nil
+        let driftAtDecision = alignmentDrift.medianErrorDeg
         hasStartedARSession = true
 
         // Logged here rather than at any one call site, so every world reset is recorded
@@ -1759,8 +1787,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // at all when the world was anchored — which is worth being able to see.
         FlightRecorder.shared.record(
             event: "ar_session_start",
-            detail: String(format: "reason=%@ reset=%d airborne=%d gs=%.0fkt track=%.0f hdg=%.0f heading_acc=%.0f declination=%.1f",
-                           reason, resetting ? 1 : 0, isAirborneEstimate ? 1 : 0,
+            detail: String(format: "reason=%@ reset=%d why=%@ drift=%.1f airborne=%d gs=%.0fkt track=%.0f hdg=%.0f heading_acc=%.0f declination=%.1f",
+                           reason, resetting ? 1 : 0, whyReset ?? "resumed",
+                           driftAtDecision ?? Double.nan, isAirborneEstimate ? 1 : 0,
                            lastGPSSpeedKt, lastGPSCourseDeg, lastTrueHeading,
                            lastHeadingAccuracy, magneticDeclinationDeg)
         )
@@ -1798,6 +1827,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         arTrackingState = .notAvailable
         hasSeededWorldYawError = false
         worldYawErrorDeg = 0
+        // Without this the large readings that *caused* a ground re-anchor would still be in the
+        // window afterwards, and the very next return would re-anchor again on evidence describing
+        // a world that no longer exists.
+        alignmentDrift.reset()
         courseResidualDeg = .nan
         compassResponse = .nan
         compassResponseR = .nan
@@ -3165,6 +3198,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if compassUsable {
             worldYawErrorDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
             hasSeededWorldYawError = true
+            // Fed unconditionally, read only on the ground: the airborne gate belongs at the
+            // decision (see resetReason), not here, so a lift that lands still has a populated
+            // window instead of having to refill one.
+            alignmentDrift.add(errorDeg: worldYawErrorDeg, at: time)
         }
 
         updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)

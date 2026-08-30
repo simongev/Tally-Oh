@@ -689,6 +689,81 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - Alignment drift
+
+    /// The gap between ARKit and the compass is spiky — a fast pan briefly outruns the compass, and
+    /// the ground log that medians 2.0 degrees spans -31.6 to +19.4. One spike must never re-anchor
+    /// the world, which is why this is a median and not a mean or a single reading.
+    @Test func oneSpikeDoesNotMoveTheMedian() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<14 { monitor.add(errorDeg: 2.0, at: Double(i) * 0.5) }
+        monitor.add(errorDeg: -31.6, at: 7.0)
+        #expect(monitor.medianErrorDeg != nil)
+        #expect(abs(monitor.medianErrorDeg!) < 3)
+    }
+
+    /// The measured numbers this threshold was chosen against: clean ground logs peak at 4.05 and
+    /// 5.33 degrees on rolling medians and must not trigger; genuine drift must.
+    @Test func groundNoiseStaysBelowTheThresholdAndDriftDoesNot() {
+        let threshold = 12.0
+        var quiet = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<20 { quiet.add(errorDeg: i % 2 == 0 ? 4.05 : -1.0, at: Double(i) * 0.5) }
+        #expect(abs(quiet.medianErrorDeg ?? 0) < threshold)
+
+        var drifted = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<20 { drifted.add(errorDeg: 18.0, at: Double(i) * 0.5) }
+        #expect(abs(drifted.medianErrorDeg ?? 0) >= threshold)
+    }
+
+    /// A median of three readings is not a median. Nothing is published until the window is full
+    /// enough to mean something.
+    @Test func tooFewSamplesPublishNothing() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<9 { monitor.add(errorDeg: 40.0, at: Double(i) * 0.5) }
+        #expect(monitor.medianErrorDeg == nil)
+        monitor.add(errorDeg: 40.0, at: 4.5)
+        #expect(monitor.medianErrorDeg != nil)
+    }
+
+    /// Readings older than the window are dropped, so an alignment that has recovered stops
+    /// reporting the drift it used to have.
+    @Test func theWindowExpiresOldReadings() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<20 { monitor.add(errorDeg: 30.0, at: Double(i) * 0.5) }
+        #expect(abs(monitor.medianErrorDeg ?? 0) > 25)
+        // Twenty healthy readings, all more than a window after the drifted ones.
+        for i in 0..<20 { monitor.add(errorDeg: 1.0, at: 100.0 + Double(i) * 0.5) }
+        #expect(abs(monitor.medianErrorDeg ?? 99) < 2)
+    }
+
+    /// The feeding site runs at 60 Hz; the throttle is what stops the window becoming a
+    /// nine-hundred-entry array re-sorted every frame.
+    @Test func samplesArrivingTooFastAreDropped() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        // 60 Hz for a second: only two of these may be kept.
+        for i in 0..<60 { monitor.add(errorDeg: 5.0, at: Double(i) / 60.0) }
+        #expect(monitor.medianErrorDeg == nil)
+    }
+
+    /// After a re-anchor the readings that caused it describe a world that no longer exists.
+    @Test func resetClearsTheWindow() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<20 { monitor.add(errorDeg: 30.0, at: Double(i) * 0.5) }
+        #expect(monitor.medianErrorDeg != nil)
+        monitor.reset()
+        #expect(monitor.medianErrorDeg == nil)
+        // And it accepts a fresh sample immediately rather than waiting out the throttle.
+        for i in 0..<10 { monitor.add(errorDeg: 1.0, at: 10.0 + Double(i) * 0.5) }
+        #expect(abs(monitor.medianErrorDeg ?? 99) < 2)
+    }
+
+    /// A NaN reading (no compass fix yet) must not poison the window.
+    @Test func nonFiniteReadingsAreIgnored() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<10 { monitor.add(errorDeg: .nan, at: Double(i) * 0.5) }
+        #expect(monitor.medianErrorDeg == nil)
+    }
+
     // MARK: - Screen orientation
 
     // The mapping from ARKit's camera roll to an interface orientation, plus the hysteresis and
