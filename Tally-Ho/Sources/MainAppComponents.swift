@@ -852,6 +852,14 @@ class ARSceneManager {
     /// Number of aircraft nodes positioned on the most recent 4 Hz pass, for the flight log.
     private(set) var renderedAircraftCount: Int = 0
 
+    /// ARKit world north minus true north, in degrees, subtracted from every bearing at placement.
+    ///
+    /// Zero until a FlightDirectionAnchor capture succeeds, which can only happen airborne — on the
+    /// ground ARKit's own .gravityAndHeading anchor is already right. Written on the main thread
+    /// when a capture completes, read on both the 4 Hz update and the 60 Hz tick; a single Double,
+    /// matching how the other cross-thread scalars here are handled.
+    var worldYawOffsetDeg: Double = 0
+
     /// Airport node snapshot for the 60 Hz airport tick — analogous to tickNodeSnapshot.
     /// Protected by nodesLock: written on the main thread at 4 Hz (end of updateAirports),
     /// read on the SceneKit thread at 60 Hz (tickAirportPositions).
@@ -908,7 +916,8 @@ class ARSceneManager {
                 userCoord: userLoc,
                 userAltitude: userAlt,
                 userHeading: 0,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                worldYawOffsetDeg: worldYawOffsetDeg
             )
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
             node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -941,7 +950,8 @@ class ARSceneManager {
                 userCoord:           userLoc,
                 userAltitude:        userAlt,
                 userHeading:         0,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                worldYawOffsetDeg: worldYawOffsetDeg
             )
             let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
             entry.node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
@@ -1033,7 +1043,8 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                worldYawOffsetDeg: worldYawOffsetDeg
             )
 
             let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
@@ -1175,7 +1186,8 @@ class ARSceneManager {
                 userCoord: userLocation,
                 userAltitude: userAltitude,
                 userHeading: userHeading,
-                cameraWorldPosition: cameraWorldPosition
+                cameraWorldPosition: cameraWorldPosition,
+                worldYawOffsetDeg: worldYawOffsetDeg
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,

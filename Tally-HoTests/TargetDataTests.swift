@@ -690,6 +690,129 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - Flight-direction anchor
+
+    private func holdSamples(_ anchor: inout FlightDirectionAnchor,
+                             az: [Double], track: Double, dt: Double = 0.2) {
+        for (i, a) in az.enumerated() {
+            anchor.add(arAzimuthDeg: a, trackDeg: track, at: Double(i) * dt)
+        }
+    }
+
+    /// The offset is track minus ARKit azimuth — the same quantity and sign as world_yaw_corr_deg
+    /// measures against the compass on the ground, and what placement subtracts from each bearing.
+    @Test func aSteadyHoldPublishesTrackMinusAzimuth() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: Array(repeating: 100.0, count: 20), track: 130.0)
+        guard case .success(let e) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(abs(e.offsetDeg - 30) < 0.001)
+        #expect(e.sampleCount == 20)
+    }
+
+    /// Hand wobble is what the median is for. A hold that jitters either side of the true direction
+    /// must still land on it.
+    @Test func wobbleIsMedianedAway() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        let jitter = [-6.0, 4.0, -2.0, 7.0, -5.0, 1.0, 3.0, -4.0, 2.0, 0.0,
+                      5.0, -3.0, 1.0, -1.0, 6.0, -6.0, 2.0, 0.0, -2.0, 3.0]
+        holdSamples(&anchor, az: jitter.map { 100.0 + $0 }, track: 130.0)
+        guard case .success(let e) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(abs(e.offsetDeg - 30) < 3)
+    }
+
+    /// A pan is not a hold. The samples were taken pointing in different directions, so their
+    /// median means nothing and the capture must be refused rather than averaged.
+    @Test func aPanIsRefused() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8, maxAzimuthSpreadDeg: 25)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: (0..<20).map { 100.0 + Double($0) * 5 }, track: 130.0)
+        guard case .failure(let reason) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(reason == .phoneMoved)
+    }
+
+    /// If the aircraft turned during the hold, the samples were measured against different tracks.
+    @Test func aTurnDuringTheHoldIsRefused() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8, maxTrackSpreadDeg: 5)
+        anchor.begin(at: 0)
+        for i in 0..<20 {
+            anchor.add(arAzimuthDeg: 100, trackDeg: 130 + Double(i), at: Double(i) * 0.2)
+        }
+        guard case .failure(let reason) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(reason == .aircraftTurning)
+    }
+
+    @Test func aShortHoldIsRefused() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: Array(repeating: 100.0, count: 20), track: 130.0)
+        guard case .failure(let reason) = anchor.finish(at: 1.0) else { #expect(Bool(false)); return }
+        #expect(reason == .tooShort)
+    }
+
+    /// Tracking dropping out mid-hold leaves too little to median.
+    @Test func tooFewSamplesIsRefused() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: Array(repeating: 100.0, count: 3), track: 130.0)
+        guard case .failure(let reason) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(reason == .tooFewSamples)
+    }
+
+    /// A hold that straddles north must not read as 360 degrees of movement.
+    @Test func spreadUnwrapsAcrossNorth() {
+        #expect(FlightDirectionAnchor.spreadDeg([358, 359, 0, 1, 2]) < 5)
+        #expect(FlightDirectionAnchor.spreadDeg([10, 40, 70]) > 55)
+    }
+
+    /// A refused hold must not leak its samples into the next attempt.
+    @Test func aRefusedHoldClearsItself() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: (0..<20).map { 100.0 + Double($0) * 5 }, track: 130.0)
+        _ = anchor.finish(at: 4.0)
+        #expect(!anchor.isCapturing)
+        anchor.begin(at: 10)
+        holdSamples(&anchor, az: Array(repeating: 200.0, count: 20), track: 250.0)
+        // Times restart at 0 inside the helper, so only the count matters here.
+        guard case .success(let e) = anchor.finish(at: 14.0) else { #expect(Bool(false)); return }
+        #expect(abs(e.offsetDeg - 50) < 0.001)
+        #expect(e.sampleCount == 20)
+    }
+
+    // MARK: - Applying the offset
+
+    /// The offset rotates the whole scene by exactly its own size, in the direction that cancels
+    /// ARKit's error: a target on a true bearing is placed at bearing minus offset.
+    @Test func theOffsetRotatesPlacementByItsOwnSize() {
+        let here = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.3)
+        let target = CLLocationCoordinate2D(latitude: 41.2, longitude: -79.1)
+        let uncorrected = worldAzimuthDeg(CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0))
+        let corrected = worldAzimuthDeg(CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            cameraWorldPosition: .init(), worldYawOffsetDeg: 30))
+        #expect(abs(angleDifferenceDeg(from: corrected, to: uncorrected) - 30) < 0.5)
+    }
+
+    /// Zero must be exactly what shipped before, since that is what the ground and every
+    /// pre-anchor flight run on.
+    @Test func aZeroOffsetChangesNothing() {
+        let here = CLLocationCoordinate2D(latitude: 41.0, longitude: -79.3)
+        let target = CLLocationCoordinate2D(latitude: 40.8, longitude: -79.6)
+        let plain = worldAzimuthDeg(CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0))
+        let zero = worldAzimuthDeg(CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 0,
+            userCoord: here, userAltitude: 0, userHeading: 0,
+            cameraWorldPosition: .init(), worldYawOffsetDeg: 0))
+        #expect(abs(angleDifferenceDeg(from: plain, to: zero)) < 0.001)
+    }
+
     // MARK: - World usability
 
     /// The split that matters: "no world yet" hides the markers, "world of degraded quality" does

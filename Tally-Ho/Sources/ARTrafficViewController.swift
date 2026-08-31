@@ -1068,6 +1068,39 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Which interface orientation CoreLocation's heading reference is currently set for, so it is
     /// written only when it actually changes.
     private var headingOrientationSetFor: UIInterfaceOrientation = .unknown
+
+    // MARK: - Flight-direction anchor
+
+    /// The capture in progress, if any. See FlightDirectionAnchor for why this is airborne-only.
+    private var flightAnchor = FlightDirectionAnchor()
+    /// ARKit world north minus true north, applied to every bearing once captured. Zero means
+    /// uncorrected, which is what the app has always shipped and what the ground needs.
+    private(set) var appliedWorldYawOffsetDeg: Double = 0
+    private var hasFlightAnchor = false
+    /// Render-thread throttle for feeding the capture: hand wobble is correlated over about a
+    /// second, so 60 Hz would just be 60 copies of the same look.
+    private var lastAnchorSampleTime: TimeInterval = 0
+    /// Whether a capture is running, as one word the render thread can read. `flightAnchor` itself
+    /// holds an array that the main thread mutates, and the other cross-thread scalars in this
+    /// file are handled the same way.
+    private var anchorCaptureActive = false
+    private var alignButton: UIButton!
+    private var alignBannerLabel: UILabel!
+
+    /// Ground speed below which the anchor is refused even when the airborne estimate says
+    /// otherwise. The whole method rests on ground track being a real direction; taxiing at 20 kt
+    /// with `gps_course_acc_deg` in the tens of degrees is not that.
+    private static let minAnchorGroundSpeedKt: Double = 80
+
+    /// Whether the anchor may be offered at all. Airborne, moving properly, tracking healthy, and
+    /// with a GPS course accurate enough to be worth anchoring to.
+    private var canCaptureFlightAnchor: Bool {
+        isAirborneEstimate
+            && lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt
+            && lastGPSCourseDeg >= 0
+            && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy <= 5
+            && worldIsUsableForDisplay(arTrackingState)
+    }
     /// Whether a barometer subscription is live, so the start can be attempted from several
     /// points without stacking subscriptions. Cleared again if the stream errors.
     private var altimeterStarted = false
@@ -1448,6 +1481,46 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             infoButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             infoButton.widthAnchor.constraint(equalToConstant: 48),
             infoButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        // Align button — the flight-direction anchor. Hidden entirely unless the anchor is
+        // available, which is airborne only: on the ground ARKit is already anchored correctly by
+        // a compass that works there, so offering this would let the user replace a good reference
+        // with a worse one.
+        alignButton = UIButton(type: .system)
+        alignButton.translatesAutoresizingMaskIntoConstraints = false
+        alignButton.setImage(UIImage(systemName: "location.north.line.fill"), for: .normal)
+        alignButton.tintColor = .white
+        alignButton.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        alignButton.layer.cornerRadius = 24
+        alignButton.isHidden = true
+        alignButton.addTarget(self, action: #selector(alignButtonTapped), for: .touchUpInside)
+        view.addSubview(alignButton)
+
+        NSLayoutConstraint.activate([
+            alignButton.topAnchor.constraint(equalTo: infoButton.bottomAnchor, constant: 8),
+            alignButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            alignButton.widthAnchor.constraint(equalToConstant: 48),
+            alignButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        // Instruction banner shown only while a capture is running or reporting its result.
+        alignBannerLabel = UILabel()
+        alignBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        alignBannerLabel.numberOfLines = 0
+        alignBannerLabel.textAlignment = .center
+        alignBannerLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        alignBannerLabel.textColor = .white
+        alignBannerLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        alignBannerLabel.layer.cornerRadius = 10
+        alignBannerLabel.layer.masksToBounds = true
+        alignBannerLabel.isHidden = true
+        view.addSubview(alignBannerLabel)
+
+        NSLayoutConstraint.activate([
+            alignBannerLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            alignBannerLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -80),
+            alignBannerLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.8)
         ])
 
         // TCAS border overlay
@@ -1867,6 +1940,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // window afterwards, and the very next return would re-anchor again on evidence describing
         // a world that no longer exists.
         alignmentDrift.reset()
+        // The offset describes one ARKit world. A reset builds a different one, so carrying the
+        // number across would apply a correction measured against a frame that no longer exists.
+        if hasFlightAnchor {
+            FlightRecorder.shared.record(
+                event: "anchor_cleared",
+                detail: String(format: "offset=%.1f reason=world_reset", appliedWorldYawOffsetDeg)
+            )
+        }
+        hasFlightAnchor = false
+        appliedWorldYawOffsetDeg = 0
+        sceneManager?.worldYawOffsetDeg = 0
+        flightAnchor.cancel()
+        anchorCaptureActive = false
         courseResidualDeg = .nan
         compassResponse = .nan
         compassResponseR = .nan
@@ -2498,6 +2584,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         )
         connectionLogic.updateLocation(loc, altitudeFeet: altitude)
 
+        updateAlignButtonVisibility()
         noteFirstTargetIfNeeded(renderedCount: sceneManager?.renderedAircraftCount ?? 0)
         recordFlightSampleIfDue(state: state, aircraft: aircraftList)
 
@@ -2569,6 +2656,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
+        sample.anchorOffsetDeg       = hasFlightAnchor ? appliedWorldYawOffsetDeg : nil
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
         // live compass, before correction. Deliberately uncorrected — a corrected heading would
@@ -2736,7 +2824,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userCoord:        loc,
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
-                cameraWorldPosition: cameraPos
+                cameraWorldPosition: cameraPos,
+                worldYawOffsetDeg: appliedWorldYawOffsetDeg
             )
             worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
         } else {
@@ -3251,6 +3340,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)
 
+        // Feed a running anchor capture with the same *uncorrected* azimuth the estimators use.
+        // Uncorrected on purpose: the offset being captured is exactly the correction, so feeding
+        // a corrected azimuth would be measuring a correction against itself.
+        if anchorCaptureActive {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateFlightAnchorCapture(arAzimuthDeg: rawAzimuthDeg, at: time)
+            }
+        }
+
         // ARKit's drift while the phone is not being turned. Gated on the gyro, never on ARKit's
         // own attitude — see YawDriftAccumulator. A NaN rate means device motion has not reported
         // yet; passing it through lets the accumulator end the run rather than guess.
@@ -3270,6 +3368,103 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         } else {
             courseResidualDeg = .nan
         }
+    }
+
+    // MARK: - Flight-direction anchor
+
+    /// Start a capture. Refused unless the anchor is available at all — see canCaptureFlightAnchor.
+    @objc private func alignButtonTapped() {
+        guard canCaptureFlightAnchor else {
+            showAlignBanner("Not available — needs steady flight", clearAfter: 2.5)
+            return
+        }
+        guard !anchorCaptureActive else { return }
+        // The hold starts on the *render* clock, at the first sample, rather than from a wall clock
+        // here: begin() and add() must share one timebase or the progress fraction is nonsense, and
+        // the render callback's `time` is the only one both sides can see.
+        anchorCaptureActive = true
+        alignButton.tintColor = .systemYellow
+        showAlignBanner("Point the phone along the direction of flight and hold still", clearAfter: nil)
+        FlightRecorder.shared.record(
+            event: "anchor_capture_begin",
+            detail: String(format: "gs=%.0fkt track=%.0f course_acc=%.1f prior_offset=%.1f",
+                           lastGPSSpeedKt, lastGPSCourseDeg, lastGPSCourseAccuracy,
+                           hasFlightAnchor ? appliedWorldYawOffsetDeg : Double.nan)
+        )
+    }
+
+    /// Feed and close a running capture. Called on the main thread from the render dispatch.
+    ///
+    /// Samples at ~5 Hz rather than 60: hand wobble is correlated over about a second, so the extra
+    /// readings are copies of the same look and only make the median look better-founded than it is.
+    private func updateFlightAnchorCapture(arAzimuthDeg: Double, at time: TimeInterval) {
+        guard anchorCaptureActive else { return }
+        if !flightAnchor.isCapturing { flightAnchor.begin(at: time) }
+
+        // The conditions that made the capture available must hold for its whole duration. Losing
+        // tracking or having the aircraft slow down mid-hold invalidates the samples already taken.
+        guard canCaptureFlightAnchor else {
+            flightAnchor.cancel()
+            anchorCaptureActive = false
+            finishAlignUI(message: "Alignment cancelled — flight data unsteady")
+            FlightRecorder.shared.record(event: "anchor_capture_failed", detail: "reason=conditions_lost")
+            return
+        }
+
+        if time - lastAnchorSampleTime >= 0.2 {
+            lastAnchorSampleTime = time
+            flightAnchor.add(arAzimuthDeg: arAzimuthDeg, trackDeg: lastGPSCourseDeg, at: time)
+        }
+
+        guard flightAnchor.progress(at: time) >= 1.0 else { return }
+        anchorCaptureActive = false
+
+        switch flightAnchor.finish(at: time) {
+        case .success(let estimate):
+            appliedWorldYawOffsetDeg = estimate.offsetDeg
+            hasFlightAnchor = true
+            sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
+            finishAlignUI(message: String(format: "Aligned — traffic shifted %.0f°", estimate.offsetDeg))
+            FlightRecorder.shared.record(
+                event: "anchor_captured",
+                detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f",
+                               estimate.offsetDeg, estimate.sampleCount, estimate.seconds,
+                               estimate.azimuthSpreadDeg, estimate.trackSpreadDeg, worldYawErrorDeg)
+            )
+        case .failure(let reason):
+            let message: String
+            switch reason {
+            case .phoneMoved:      message = "Hold the phone steadier and try again"
+            case .aircraftTurning: message = "Wait until the turn is finished"
+            case .tooFewSamples:   message = "Tracking dropped out — try again"
+            case .tooShort:        message = "Hold a moment longer"
+            }
+            finishAlignUI(message: message)
+            FlightRecorder.shared.record(event: "anchor_capture_failed",
+                                         detail: "reason=\(reason.rawValue)")
+        }
+    }
+
+    private func finishAlignUI(message: String) {
+        alignButton.tintColor = hasFlightAnchor ? .systemGreen : .white
+        showAlignBanner(message, clearAfter: 3.0)
+    }
+
+    private func showAlignBanner(_ text: String, clearAfter: TimeInterval?) {
+        alignBannerLabel.text = "  \(text)  "
+        alignBannerLabel.isHidden = false
+        guard let clearAfter else { return }
+        let shown = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + clearAfter) { [weak self] in
+            guard let self, self.alignBannerLabel.text == "  \(shown)  " else { return }
+            self.alignBannerLabel.isHidden = true
+        }
+    }
+
+    /// Show or hide the button as the flight state changes. Called from the 4 Hz tick.
+    private func updateAlignButtonVisibility() {
+        let shouldShow = canCaptureFlightAnchor || anchorCaptureActive
+        if alignButton.isHidden == shouldShow { alignButton.isHidden = !shouldShow }
     }
 
     /// Ask the interface to match the way the phone is actually being held.

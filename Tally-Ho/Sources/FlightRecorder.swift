@@ -67,7 +67,7 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
-        "world_yaw_corr_deg", "course_residual_deg",
+        "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
         "ar_heading_deg", "heading_delta_deg",
@@ -106,6 +106,11 @@ final class FlightRecorder {
         /// measurement — a different thing from a measured zero. Diagnostic only; nothing is
         /// rotated by it. See ARTrafficViewController.worldYawErrorDeg for why not.
         var worldYawCorrectionDeg: Double?
+        /// The flight-direction anchor's offset, once captured, in degrees — what is actually
+        /// being subtracted from every bearing. Empty until a capture succeeds, which can only
+        /// happen airborne. Distinct from worldYawCorrectionDeg, which measures the compass gap
+        /// and is never applied.
+        var anchorOffsetDeg: Double?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
         /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
@@ -321,6 +326,7 @@ final class FlightRecorder {
         fields.append(format(sample.declinationDeg,        decimals: 2))
         fields.append(format(sample.worldYawCorrectionDeg, decimals: 2))
         fields.append(format(sample.courseResidualDeg,     decimals: 1))
+        fields.append(format(sample.anchorOffsetDeg,       decimals: 1))
         fields.append(format(sample.compassResponse,  decimals: 3))
         fields.append(format(sample.compassResponseR, decimals: 2))
         fields.append(format(sample.frameLock,        decimals: 3))

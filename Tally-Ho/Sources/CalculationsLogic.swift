@@ -182,11 +182,19 @@ class CalculationsLogic {
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,                        // unused — kept for API compat
-        cameraWorldPosition: SCNVector3 = .init()   // camera's current position in the AR scene
+        cameraWorldPosition: SCNVector3 = .init(),  // camera's current position in the AR scene
+        worldYawOffsetDeg: Double = 0               // ARKit world north minus true north
     ) -> SCNVector3 {
 
         let horizontalDistanceM = distance(from: userCoord, to: targetCoord)
-        let bearingRad = self.bearing(from: userCoord, to: targetCoord).toRadians()
+        // ARKit's world north is off true north by worldYawOffsetDeg, so a direction placed at
+        // angle d in ARKit coordinates appears in the real world at d + offset. To make the target
+        // appear on its true bearing, place it at bearing − offset.
+        //
+        // Zero until a FlightDirectionAnchor capture succeeds, which only happens in the air: on
+        // the ground ARKit's own .gravityAndHeading anchor is already correct, because there the
+        // compass genuinely measures the phone.
+        let bearingRad = (self.bearing(from: userCoord, to: targetCoord) - worldYawOffsetDeg).toRadians()
 
         // Horizontal offsets in world space (metres)
         let dx = Float(horizontalDistanceM * sin(bearingRad))   // East
@@ -293,7 +301,8 @@ class CalculationsLogic {
         userCoord: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,
-        cameraWorldPosition: SCNVector3 = .init()
+        cameraWorldPosition: SCNVector3 = .init(),
+        worldYawOffsetDeg: Double = 0
     ) -> SCNVector3 {
         return calculateARPosition(
             targetCoord: airportCoord,
@@ -301,7 +310,8 @@ class CalculationsLogic {
             userCoord: userCoord,
             userAltitude: userAltitude,
             userHeading: userHeading,
-            cameraWorldPosition: cameraWorldPosition
+            cameraWorldPosition: cameraWorldPosition,
+            worldYawOffsetDeg: worldYawOffsetDeg
         )
     }
 
@@ -761,6 +771,133 @@ struct YawDriftAccumulator {
                         totalStillSeconds: seconds,
                         worstGyroNetDeg: worst,
                         runCount: count)
+    }
+}
+
+/// Captures how far ARKit's world north is from true north, from a few seconds of the user
+/// pointing the phone along the direction of flight.
+///
+/// **In the air only.** On the ground the compass measures the phone properly
+/// (`compass_response` 1.00 against 0.018 in the cabin), so ARKit's own `.gravityAndHeading`
+/// anchor is already right and this would replace a good reference with a worse one.
+///
+/// While the phone points along the flight direction the phone's true azimuth equals the
+/// aircraft's ground track, so `offset = track − ARKit azimuth`. That is the same quantity
+/// `worldYawErrorDeg` measures against the compass on the ground, with the same sign, and it is
+/// what target placement must subtract from each bearing.
+///
+/// GPS ground course is an essentially exact reference here — `gps_course_acc_deg` medians 0.0–0.2°
+/// in flight across eight logs. The residual error is not the reference, it is two other things:
+/// the **drift angle** between ground track and where the nose points (5–10° at cruise in a
+/// crosswind) and the user's own pointing accuracy. So this replaces an error of up to 90° with one
+/// of 5–10°, and should be described that way rather than as exact.
+///
+/// Gated, not timed. Averaging only fights hand wobble, which is correlated over about a second, so
+/// beyond a few seconds it is polishing a term already smaller than the drift-angle bias. What
+/// matters is refusing a bad hold: the phone must have been held still and the aircraft must not
+/// have been turning.
+struct FlightDirectionAnchor {
+
+    struct Estimate {
+        /// Degrees to subtract from every bearing at placement time.
+        var offsetDeg: Double
+        var sampleCount: Int
+        var seconds: TimeInterval
+        /// How far the phone wandered during the hold, and how far the track moved. Both are
+        /// recorded because they are the reasons a hold is accepted or thrown away.
+        var azimuthSpreadDeg: Double
+        var trackSpreadDeg: Double
+    }
+
+    enum Failure: String {
+        case tooShort         // released before the minimum hold
+        case tooFewSamples    // tracking dropped out during the hold
+        case phoneMoved       // the user panned instead of holding
+        case aircraftTurning  // the track moved, so it was never one direction
+    }
+
+    let minSeconds: TimeInterval
+    let minSamples: Int
+    /// How far the phone may wander over the hold. Generous, because a handheld phone at arm's
+    /// length in turbulence will not sit still — and the median absorbs the wander anyway. This is
+    /// here to reject a *pan*, not to demand a tripod.
+    let maxAzimuthSpreadDeg: Double
+    /// How far the ground track may move. Tight: if the aircraft turned during the hold then the
+    /// samples were taken against different references and the median of them means nothing.
+    let maxTrackSpreadDeg: Double
+
+    private var startTime: TimeInterval?
+    private var samples: [(t: TimeInterval, offset: Double, az: Double, track: Double)] = []
+
+    init(minSeconds: TimeInterval = 3.0,
+         minSamples: Int = 8,
+         maxAzimuthSpreadDeg: Double = 25.0,
+         maxTrackSpreadDeg: Double = 5.0) {
+        self.minSeconds = minSeconds
+        self.minSamples = minSamples
+        self.maxAzimuthSpreadDeg = maxAzimuthSpreadDeg
+        self.maxTrackSpreadDeg = maxTrackSpreadDeg
+    }
+
+    var isCapturing: Bool { startTime != nil }
+
+    /// 0…1, for a progress ring. Reaches 1 when the hold is long enough to be finished.
+    func progress(at time: TimeInterval) -> Double {
+        guard let startTime else { return 0 }
+        return max(0, min(1, (time - startTime) / minSeconds))
+    }
+
+    mutating func begin(at time: TimeInterval) {
+        startTime = time
+        samples.removeAll()
+    }
+
+    mutating func cancel() {
+        startTime = nil
+        samples.removeAll()
+    }
+
+    /// Feed one reading. Ignored unless a hold is running.
+    mutating func add(arAzimuthDeg: Double, trackDeg: Double, at time: TimeInterval) {
+        guard startTime != nil, arAzimuthDeg.isFinite, trackDeg.isFinite else { return }
+        samples.append((t: time,
+                        offset: AngularResponse.signedDelta(arAzimuthDeg, trackDeg),
+                        az: arAzimuthDeg,
+                        track: trackDeg))
+    }
+
+    /// Close the hold and either publish an offset or say why not. Clears either way, so a refused
+    /// hold cannot leak samples into the next attempt.
+    mutating func finish(at time: TimeInterval) -> Result<Estimate, Failure> {
+        defer { cancel() }
+        guard let startTime else { return .failure(.tooShort) }
+        let seconds = time - startTime
+        guard seconds >= minSeconds else { return .failure(.tooShort) }
+        guard samples.count >= minSamples else { return .failure(.tooFewSamples) }
+
+        let azSpread = FlightDirectionAnchor.spreadDeg(samples.map(\.az))
+        let trackSpread = FlightDirectionAnchor.spreadDeg(samples.map(\.track))
+        guard trackSpread <= maxTrackSpreadDeg else { return .failure(.aircraftTurning) }
+        guard azSpread <= maxAzimuthSpreadDeg else { return .failure(.phoneMoved) }
+
+        let offsets = samples.map(\.offset).sorted()
+        let mid = offsets.count / 2
+        let median = offsets.count % 2 == 0 ? (offsets[mid - 1] + offsets[mid]) / 2 : offsets[mid]
+
+        return .success(Estimate(offsetDeg: median,
+                                 sampleCount: samples.count,
+                                 seconds: seconds,
+                                 azimuthSpreadDeg: azSpread,
+                                 trackSpreadDeg: trackSpread))
+    }
+
+    /// Max minus min of a wrapping angle series, unwrapped against the first sample so a hold that
+    /// straddles north is not read as 360° of movement.
+    static func spreadDeg(_ degrees: [Double]) -> Double {
+        guard let first = degrees.first else { return 0 }
+        let unwrapped = degrees.map { AngularResponse.signedDelta(first, $0) }
+        guard let lo = unwrapped.min(), let hi = unwrapped.max() else { return 0 }
+        return hi - lo
     }
 }
 
