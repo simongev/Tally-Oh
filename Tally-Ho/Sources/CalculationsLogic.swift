@@ -764,6 +764,38 @@ struct YawDriftAccumulator {
     }
 }
 
+/// Whether ARKit's world is established enough that a marker drawn in it means anything.
+///
+/// Target nodes are repositioned every frame from the live camera transform, which is what makes
+/// ARKit's translation error cancel out. The cost is that when the transform is *not* yet
+/// meaningful, the markers ride it: a build-20 relocalization had `cam_yaw_deg` swinging
+/// 176.9 → −108.3 → −65.3 → −74.1, and the user sees traffic swing with it for 1.4 s at every app
+/// open and about 5 s on an airborne resume.
+///
+/// The split is between "there is no world yet" and "there is a world, of degraded quality":
+///
+/// - `.initializing` and `.relocalizing` mean no usable world — nothing drawn in it is placed.
+/// - `.excessiveMotion` and `.insufficientFeatures` mean the world exists and tracking is noisy.
+///   Blanking the display every time the phone is moved briskly would be far worse than a marker
+///   that wobbles, so these stay usable.
+/// - `.notAvailable` has nothing at all.
+func worldIsUsableForDisplay(_ state: ARCamera.TrackingState) -> Bool {
+    switch state {
+    case .normal:
+        return true
+    case .notAvailable:
+        return false
+    case .limited(let reason):
+        switch reason {
+        case .initializing, .relocalizing:            return false
+        case .excessiveMotion, .insufficientFeatures: return true
+        @unknown default:                             return true
+        }
+    @unknown default:
+        return true
+    }
+}
+
 /// How far ARKit's world azimuth has drifted from the compass, as a rolling median.
 ///
 /// Used for exactly one decision: whether a world is worth re-anchoring when the user next returns

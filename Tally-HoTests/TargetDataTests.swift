@@ -11,6 +11,7 @@ import Foundation
 import CoreLocation
 import SceneKit
 import UIKit
+import ARKit
 @testable import Tally_Ho
 
 struct TargetDataTests {
@@ -687,6 +688,25 @@ struct TargetDataTests {
                 #expect(delta > -180.001 && delta <= 180.001)
             }
         }
+    }
+
+    // MARK: - World usability
+
+    /// The split that matters: "no world yet" hides the markers, "world of degraded quality" does
+    /// not. Blanking the display every time the phone moves briskly would be worse than a marker
+    /// that wobbles.
+    @Test func onlyMissingWorldsHideTheMarkers() {
+        #expect(worldIsUsableForDisplay(.normal))
+        #expect(!worldIsUsableForDisplay(.notAvailable))
+        #expect(!worldIsUsableForDisplay(.limited(.initializing)))
+        #expect(!worldIsUsableForDisplay(.limited(.relocalizing)))
+    }
+
+    /// The two cases that must keep drawing. `relocalizing` is the 5 s airborne-resume window and
+    /// hides; `excessiveMotion` is a bump and must not.
+    @Test func degradedTrackingKeepsDrawing() {
+        #expect(worldIsUsableForDisplay(.limited(.excessiveMotion)))
+        #expect(worldIsUsableForDisplay(.limited(.insufficientFeatures)))
     }
 
     // MARK: - Alignment drift

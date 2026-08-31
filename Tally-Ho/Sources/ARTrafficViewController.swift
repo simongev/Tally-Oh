@@ -1694,6 +1694,37 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// leave the camera stopped: the very failure this limit exists to prevent.
     private var isARSessionPaused = true
 
+    /// Opacity the AR content is held at while ARKit has no established world.
+    ///
+    /// A fade rather than a hide. Blanking the sky for the 1.4 s of `limited:initializing` at every
+    /// app open would undo the readiness work that got `first_target` down to 0.25 s, and a faded
+    /// marker still says "the traffic is there, the picture is settling" — which is true. What it
+    /// stops is the marker being read as a *position* while the transform it is drawn from is
+    /// meaningless.
+    private static let unusableWorldOpacity: CGFloat = 0.25
+
+    /// Fade the scene to match whether its world is usable. Runs from the tracking-state callback.
+    ///
+    /// `rootNode.opacity` propagates down the scene graph, so this covers aircraft and airports in
+    /// one line with no per-node bookkeeping — and deliberately does not touch `isHidden`, which
+    /// the TCAS RA filter and the label settings already own. It also cannot disturb
+    /// `renderedAircraftCount`, which is set in updateAircraft rather than in the tick.
+    ///
+    /// The HUD is a UIKit overlay and is untouched.
+    private func applyWorldUsabilityFade() {
+        let target: CGFloat = worldIsUsableForDisplay(arTrackingState)
+            ? 1.0 : ARTrafficViewController.unusableWorldOpacity
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isViewLoaded else { return }
+            let root = self.arSceneView.scene.rootNode
+            guard abs(root.opacity - target) > 0.001 else { return }
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.2
+            root.opacity = target
+            SCNTransaction.commit()
+        }
+    }
+
     /// Pause the session, recording that it is paused so the next `startARSession(reason:)`
     /// is never throttled away and left stopped.
     private func pauseARSession() {
@@ -1827,6 +1858,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // to .notAvailable here would stay there — silently stopping placement correction, both
         // response estimators and the orientation follower for the rest of the flight.
         arTrackingState = .notAvailable
+        // The delegate fires a moment later with .limited(.initializing), but the scene should not
+        // spend that moment drawing markers against a world that has just been thrown away.
+        applyWorldUsabilityFade()
         hasSeededWorldYawError = false
         worldYawErrorDeg = 0
         // Without this the large readings that *caused* a ground re-anchor would still be in the
@@ -2491,7 +2525,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             .filter { CalculationsLogic.isStale($0) }.count
         FlightRecorder.shared.record(
             event: "first_target",
-            detail: String(format: "t=%.2fs rendered=%d stale=%d", elapsed, renderedCount, staleCount)
+            detail: String(format: "t=%.2fs rendered=%d stale=%d ar=%@ faded=%d",
+                           elapsed, renderedCount, staleCount, arTrackingStateDescription,
+                           worldIsUsableForDisplay(arTrackingState) ? 0 : 1)
         )
     }
 
@@ -3120,8 +3156,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // is switched off, which would silently disable placement correction for anyone who
         // hides the HUD.
         updateWorldYawError(pov: pov, at: time)
-        sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
-        sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
+        // Frozen while ARKit has no established world, so no garbage positions are written during
+        // the window the markers are faded out for. At 60 Hz the first tick after recovery puts
+        // everything right within one frame.
+        if worldIsUsableForDisplay(arTrackingState) {
+            sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
+            sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
+        }
+        // Deliberately still runs: the ladder and bank rose are derived from gravity, which was
+        // never the thing ARKit gets wrong here, so they stay live and at full strength.
         updateHUDLadder(pov: pov)
     }
 
@@ -3529,6 +3572,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         arTrackingState = camera.trackingState
+        applyWorldUsabilityFade()
         // How long the world took to become usable after the last start, and whether that start
         // reset or resumed. This is the number that decided build 21: a ground resume relocalized
         // in 5.0 s against 1.4 s for a fresh reset. The airborne resume has never been measured,
@@ -3544,7 +3588,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let elapsedSinceLift = liftStartTime.map { Date().timeIntervalSince($0) } ?? -1
         FlightRecorder.shared.record(
             event: "ar_tracking_state",
-            detail: String(format: "%@ t=%.2fs%@", arTrackingStateDescription, elapsedSinceLift, recovery)
+            detail: String(format: "%@ t=%.2fs targets_faded=%d%@", arTrackingStateDescription,
+                           elapsedSinceLift,
+                           worldIsUsableForDisplay(camera.trackingState) ? 0 : 1, recovery)
         )
         DispatchQueue.main.async {
             self.updateStatusLabel()
