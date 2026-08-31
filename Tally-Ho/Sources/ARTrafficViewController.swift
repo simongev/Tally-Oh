@@ -1704,17 +1704,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Whether a world has ever been built in this view, so the very first start always resets.
     private var hasStartedARSession = false
 
-    /// Rolling median of ARKit's azimuth minus the compass. Read only on the ground — see
-    /// AlignmentDriftMonitor for why it is meaningless in the air.
-    private var alignmentDrift = AlignmentDriftMonitor()
+    /// When the last start ran and whether it reset, so the wait for tracking to come back is
+    /// attributable to one or the other. Cleared once `.normal` arrives.
+    private var lastRecoveryStart: Date?
+    private var lastStartWasReset = false
 
-    /// How far the ground alignment may drift before a return is worth spending a reset on.
-    ///
-    /// Rolling 15 s medians of `world_yaw_corr_deg` run to 4.05° and 5.33° on the two clean ground
-    /// logs, and 85–126° across four flights. 12° sits 2.4× above the worst clean ground reading
-    /// and an order of magnitude below anything airborne, so neither pan noise nor a cabin can
-    /// reach it by accident.
-    private static let maxGroundAlignmentErrorDeg: Double = 12.0
+    /// Rolling median of ARKit's azimuth minus the compass — the only continuous read there is on
+    /// the alignment error. Reported beside every reset decision as `drift=`, and no longer used to
+    /// make one: build 20 branched on it, and the measurement that motivated the branch turned out
+    /// to point the other way. See AlignmentDriftMonitor for why it means nothing in the air.
+    private var alignmentDrift = AlignmentDriftMonitor()
 
     /// Why this start is re-anchoring, or nil if it is resuming — the reset decision itself, and
     /// the reason recorded in the log so a reset is never just something that happened.
@@ -1741,15 +1740,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard hasStartedARSession else { return "first_start" }
         guard arSceneView.session.currentFrame != nil else { return "no_frame" }
         if case .notAvailable = arTrackingState { return "tracking_lost" }
-        // Ground only. Airborne the compass reports the aircraft's ground track rather than the
-        // phone's azimuth, so this gap grows with every degree the user pans and has nothing to do
-        // with drift; re-anchoring on it would hand the scene a fresh arbitrary rotation on every
-        // return, which is the fault this whole path exists to avoid.
-        if !isAirborneEstimate,
-           let drift = alignmentDrift.medianErrorDeg,
-           abs(drift) >= ARTrafficViewController.maxGroundAlignmentErrorDeg {
-            return "ground_drift"
-        }
+        // On the ground, always re-anchor. Build 20 tried deciding this from measured drift, on the
+        // assumption that resuming was the cheaper option; the ground log measured the opposite.
+        // Resuming makes ARKit relocalize against the world map it already had, which took 5.0 s
+        // against 1.4 s for a fresh reset, with cam_yaw swinging through 176.9 -> -108.3 -> -65.3
+        // while the transform settled. On the ground that is 3.5x slower for no benefit at all,
+        // because a ground reset re-anchors to a compass that genuinely measures the phone.
+        //
+        // In the air the same five seconds are worth paying: relocalizing preserves the alignment,
+        // where a reset would hand the scene a brand-new arbitrary rotation.
+        guard isAirborneEstimate else { return "ground" }
         return nil
     }
 
@@ -1776,6 +1776,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let resetting = whyReset != nil
         let driftAtDecision = alignmentDrift.medianErrorDeg
         hasStartedARSession = true
+        lastRecoveryStart = now
+        lastStartWasReset = resetting
 
         // Logged here rather than at any one call site, so every world reset is recorded
         // whatever triggered it. Without this the reset storm that froze the camera left no
@@ -3527,12 +3529,22 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         arTrackingState = camera.trackingState
+        // How long the world took to become usable after the last start, and whether that start
+        // reset or resumed. This is the number that decided build 21: a ground resume relocalized
+        // in 5.0 s against 1.4 s for a fresh reset. The airborne resume has never been measured,
+        // and it is the one whose cost is being defended, so record it rather than assume it.
+        var recovery = ""
+        if case .normal = camera.trackingState, let started = lastRecoveryStart {
+            recovery = String(format: " relocalize_secs=%.2f reset=%d",
+                              Date().timeIntervalSince(started), lastStartWasReset ? 1 : 0)
+            lastRecoveryStart = nil
+        }
         // Logged per transition: the first seconds of every lift are spent in a limited
         // state, and how long that lasts is the thing the readiness work has to move.
         let elapsedSinceLift = liftStartTime.map { Date().timeIntervalSince($0) } ?? -1
         FlightRecorder.shared.record(
             event: "ar_tracking_state",
-            detail: String(format: "%@ t=%.2fs", arTrackingStateDescription, elapsedSinceLift)
+            detail: String(format: "%@ t=%.2fs%@", arTrackingStateDescription, elapsedSinceLift, recovery)
         )
         DispatchQueue.main.async {
             self.updateStatusLabel()

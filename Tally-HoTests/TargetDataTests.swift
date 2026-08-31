@@ -702,17 +702,18 @@ struct TargetDataTests {
         #expect(abs(monitor.medianErrorDeg!) < 3)
     }
 
-    /// The measured numbers this threshold was chosen against: clean ground logs peak at 4.05 and
-    /// 5.33 degrees on rolling medians and must not trigger; genuine drift must.
-    @Test func groundNoiseStaysBelowTheThresholdAndDriftDoesNot() {
-        let threshold = 12.0
+    /// The monitor no longer decides anything — build 21 removed the branch — but it is still
+    /// reported beside every reset, so it must still separate a quiet ground alignment from a
+    /// drifted one. The numbers are the measured ones: clean ground logs peak at 4.05 and 5.33
+    /// degrees on rolling medians, flights run 85 to 126.
+    @Test func theMonitorSeparatesQuietFromDrifted() {
         var quiet = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
         for i in 0..<20 { quiet.add(errorDeg: i % 2 == 0 ? 4.05 : -1.0, at: Double(i) * 0.5) }
-        #expect(abs(quiet.medianErrorDeg ?? 0) < threshold)
+        #expect(abs(quiet.medianErrorDeg ?? 0) < 6)
 
         var drifted = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
         for i in 0..<20 { drifted.add(errorDeg: 18.0, at: Double(i) * 0.5) }
-        #expect(abs(drifted.medianErrorDeg ?? 0) >= threshold)
+        #expect(abs(drifted.medianErrorDeg ?? 0) > 15)
     }
 
     /// A median of three readings is not a median. Nothing is published until the window is full
