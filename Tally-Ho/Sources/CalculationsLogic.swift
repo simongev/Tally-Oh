@@ -809,7 +809,8 @@ struct FlightDirectionAnchor {
         var trackSpreadDeg: Double
     }
 
-    enum Failure: String {
+    /// `Error` because `Result`'s failure type requires it; the raw string is what the log records.
+    enum Failure: String, Error {
         case tooShort         // released before the minimum hold
         case tooFewSamples    // tracking dropped out during the hold
         case phoneMoved       // the user panned instead of holding
