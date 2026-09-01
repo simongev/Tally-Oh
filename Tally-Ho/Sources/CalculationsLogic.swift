@@ -998,6 +998,135 @@ struct AlignmentDriftMonitor {
     }
 }
 
+/// Turns `AlignmentDriftMonitor`'s median into an applied correction — **on the ground only**.
+///
+/// ARKit seeds its world azimuth from the compass once, at session start (`.gravityAndHeading`),
+/// and then leaves it to drift at about 0.07 °/s. On a ground log that showed up as a rolling
+/// `world_yaw_corr` median of about −2.5°, which is exactly the "close but not spot on" the user
+/// reported. Feeding that median back in re-slaves ARKit's azimuth to the *current* compass and
+/// removes the drift since the seed.
+///
+/// **What it cannot do:** remove the compass's own bias against true north. That same log reported
+/// `hdg_acc_deg` = 10° for its whole duration. This makes ARKit agree with the compass; it does not
+/// make the compass right.
+///
+/// **Why the gates are not negotiable.** Build 8 applied a compass-derived correction with no
+/// airborne gate and no check that the compass was measuring the *phone*. Inside a fuselage
+/// `CLHeading` reports the aircraft's ground track (`compass_response` 0.018 against 1.00 on the
+/// ground), so what it actually subtracted was the angle between the phone and the nose, swinging
+/// the whole scene back toward the nose every time the user looked out of a side window. Two gates
+/// here exist solely so that cannot recur: `airborne` refuses outright, and `compassResponse` must
+/// have just proved, by regression against ARKit's own azimuth, that the compass follows the phone.
+/// The second is the discriminating one — it would have caught build 8 even without the first.
+///
+/// The response estimator needs the phone to have been panned about 40° before it publishes
+/// anything, so on a phone held perfectly still from launch nothing is applied. That is the correct
+/// behaviour, not a gap: with no rotation there is no evidence about which sensor is measuring what.
+struct GroundYawCorrection {
+
+    /// Beyond this the compass and ARKit disagree by more than any plausible drift, so the reading
+    /// is more likely a broken sensor than a 40°-wrong world. Refuse rather than apply it.
+    let maxOffsetDeg: Double
+    /// How far `compassResponse` may sit from 1.0 and still count as "measuring the phone".
+    let responseToleranceFromOne: Double
+    /// Correlation floor behind that slope. A slope fitted through noise is not evidence.
+    let minResponseCorrelation: Double
+    /// Compass accuracy past which the heading is not worth correcting to.
+    let maxHeadingAccuracyDeg: Double
+    /// Minimum gap between applied updates.
+    let minUpdateInterval: TimeInterval
+    /// Changes smaller than this are not worth moving the scene for.
+    let deadbandDeg: Double
+    /// Most the applied offset may move in one update, so the correction converges over a few
+    /// seconds rather than stepping every marker at once.
+    let maxSlewPerUpdateDeg: Double
+
+    /// The correction currently in force, in the same sense as `worldYawOffsetDeg`: ARKit's world
+    /// north minus true north, subtracted from every bearing.
+    private(set) var appliedOffsetDeg: Double = 0
+    /// Whether anything has been applied yet, so a legitimate 0.0° reads differently from "never ran".
+    private(set) var hasOffset: Bool = false
+    private var lastUpdateTime: TimeInterval = -.greatestFiniteMagnitude
+
+    init(maxOffsetDeg: Double = 20.0,
+         responseToleranceFromOne: Double = 0.3,
+         minResponseCorrelation: Double = 0.8,
+         maxHeadingAccuracyDeg: Double = 25.0,
+         minUpdateInterval: TimeInterval = 1.0,
+         deadbandDeg: Double = 0.5,
+         maxSlewPerUpdateDeg: Double = 1.0) {
+        self.maxOffsetDeg = maxOffsetDeg
+        self.responseToleranceFromOne = responseToleranceFromOne
+        self.minResponseCorrelation = minResponseCorrelation
+        self.maxHeadingAccuracyDeg = maxHeadingAccuracyDeg
+        self.minUpdateInterval = minUpdateInterval
+        self.deadbandDeg = deadbandDeg
+        self.maxSlewPerUpdateDeg = maxSlewPerUpdateDeg
+    }
+
+    /// Why an update did nothing. Recorded rather than returned as a bare nil so a log can say which
+    /// gate is holding — "no correction" and "no correction *because the compass is track-slaved*"
+    /// are very different states to read back afterwards.
+    enum Refusal: String {
+        case airborne
+        case worldUnusable
+        case noMedian
+        case compassNotMeasuringPhone
+        case headingInaccurate
+        case implausibleOffset
+        case rateLimited
+        case withinDeadband
+    }
+
+    enum Outcome: Equatable {
+        case applied(Double)
+        case refused(Refusal)
+    }
+
+    /// Feed the current measurements and get back what was done. `appliedOffsetDeg` is unchanged on
+    /// every refusal — including `airborne`, which freezes the last ground value rather than
+    /// discarding it: the ARKit world survives takeoff, so a correction measured minutes ago is
+    /// still the better estimate, it just stops being updated by a sensor that no longer measures
+    /// the phone.
+    @discardableResult
+    mutating func update(medianErrorDeg: Double?,
+                         compassResponse: Double,
+                         compassResponseR: Double,
+                         headingAccuracyDeg: Double,
+                         airborne: Bool,
+                         worldUsable: Bool,
+                         at time: TimeInterval) -> Outcome {
+        guard !airborne else { return .refused(.airborne) }
+        guard worldUsable else { return .refused(.worldUnusable) }
+        guard let median = medianErrorDeg, median.isFinite else { return .refused(.noMedian) }
+        guard compassResponse.isFinite, compassResponseR.isFinite,
+              abs(compassResponse - 1.0) <= responseToleranceFromOne,
+              abs(compassResponseR) >= minResponseCorrelation
+        else { return .refused(.compassNotMeasuringPhone) }
+        guard headingAccuracyDeg >= 0, headingAccuracyDeg <= maxHeadingAccuracyDeg
+        else { return .refused(.headingInaccurate) }
+        guard abs(median) <= maxOffsetDeg else { return .refused(.implausibleOffset) }
+        guard time - lastUpdateTime >= minUpdateInterval else { return .refused(.rateLimited) }
+
+        let delta = median - appliedOffsetDeg
+        guard abs(delta) >= deadbandDeg || !hasOffset else { return .refused(.withinDeadband) }
+
+        lastUpdateTime = time
+        let step = min(abs(delta), maxSlewPerUpdateDeg) * (delta < 0 ? -1.0 : 1.0)
+        appliedOffsetDeg += step
+        hasOffset = true
+        return .applied(appliedOffsetDeg)
+    }
+
+    /// Clear with the world. The offset describes one ARKit session's frame and means nothing about
+    /// the next one.
+    mutating func reset() {
+        appliedOffsetDeg = 0
+        hasOffset = false
+        lastUpdateTime = -.greatestFiniteMagnitude
+    }
+}
+
 /// Decides which way up the phone physically is, from ARKit's gravity-referenced camera attitude,
 /// so the interface can be asked to follow it.
 ///

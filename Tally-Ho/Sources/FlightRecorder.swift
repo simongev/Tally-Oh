@@ -67,7 +67,7 @@ final class FlightRecorder {
         "baro_cabin_press_alt_ft",
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
-        "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg",
+        "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg", "yaw_src",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
         "ar_heading_deg", "heading_delta_deg",
@@ -106,11 +106,17 @@ final class FlightRecorder {
         /// measurement — a different thing from a measured zero. Diagnostic only; nothing is
         /// rotated by it. See ARTrafficViewController.worldYawErrorDeg for why not.
         var worldYawCorrectionDeg: Double?
-        /// The flight-direction anchor's offset, once captured, in degrees — what is actually
-        /// being subtracted from every bearing. Empty until a capture succeeds, which can only
-        /// happen airborne. Distinct from worldYawCorrectionDeg, which measures the compass gap
-        /// and is never applied.
+        /// The world-yaw offset actually in force, in degrees — what is being subtracted from
+        /// every bearing. Empty while nothing is applied. Distinct from worldYawCorrectionDeg,
+        /// which measures the raw compass gap and is never applied on its own.
+        ///
+        /// Read it with yawSource, which says where it came from: the airborne flight-direction
+        /// anchor, or the ground compass correction. Those two are mutually exclusive.
         var anchorOffsetDeg: Double?
+        /// "none", "ground" or "anchor" — see ARTrafficViewController.WorldYawSource. A "ground"
+        /// value while airborne is a frozen carry-over from before takeoff and is expected; a
+        /// "ground" value that keeps *changing* while airborne would be the build-8 failure.
+        var yawSource: String?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
         /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
@@ -327,6 +333,7 @@ final class FlightRecorder {
         fields.append(format(sample.worldYawCorrectionDeg, decimals: 2))
         fields.append(format(sample.courseResidualDeg,     decimals: 1))
         fields.append(format(sample.anchorOffsetDeg,       decimals: 1))
+        fields.append(escape(sample.yawSource ?? ""))
         fields.append(format(sample.compassResponse,  decimals: 3))
         fields.append(format(sample.compassResponseR, decimals: 2))
         fields.append(format(sample.frameLock,        decimals: 3))

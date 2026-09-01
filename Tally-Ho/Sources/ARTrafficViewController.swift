@@ -1073,10 +1073,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// The capture in progress, if any. See FlightDirectionAnchor for why this is airborne-only.
     private var flightAnchor = FlightDirectionAnchor()
-    /// ARKit world north minus true north, applied to every bearing once captured. Zero means
-    /// uncorrected, which is what the app has always shipped and what the ground needs.
+    /// ARKit world north minus true north, applied to every bearing. Written by exactly two
+    /// sources — the flight anchor below, and the ground compass correction — which are mutually
+    /// exclusive by construction: see `worldYawSource`.
     private(set) var appliedWorldYawOffsetDeg: Double = 0
     private var hasFlightAnchor = false
+
+    /// Which measurement the current offset came from, for the log and for the precedence rule.
+    enum WorldYawSource: String {
+        case none
+        case ground
+        case anchor
+    }
+    /// The anchor outranks the ground correction and is never overwritten by it: it is measured
+    /// airborne against ground track, which is the only azimuth reference that works in a cabin.
+    private var worldYawSource: WorldYawSource = .none
     /// Render-thread throttle for feeding the capture: hand wobble is correlated over about a
     /// second, so 60 Hz would just be 60 copies of the same look.
     private var lastAnchorSampleTime: TimeInterval = 0
@@ -1819,6 +1830,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// to point the other way. See AlignmentDriftMonitor for why it means nothing in the air.
     private var alignmentDrift = AlignmentDriftMonitor()
 
+    /// The same median, applied on the ground. See GroundYawCorrection for the gates.
+    private var groundYaw = GroundYawCorrection()
+    /// Render-thread throttle for handing that median to the main thread. The correction itself
+    /// updates at most once a second; checking faster than twice a second just queues work.
+    private var lastGroundYawCheck: TimeInterval = 0
+    /// So a refusal is logged when the reason *changes*, not at 2 Hz for the whole flight.
+    private var lastLoggedGroundYawRefusal: String?
+
     /// Why this start is re-anchoring, or nil if it is resuming — the reset decision itself, and
     /// the reason recorded in the log so a reset is never just something that happened.
     ///
@@ -1951,6 +1970,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hasFlightAnchor = false
         appliedWorldYawOffsetDeg = 0
         sceneManager?.worldYawOffsetDeg = 0
+        // Same reasoning for the ground correction: it describes the frame that just ended.
+        groundYaw.reset()
+        worldYawSource = .none
+        lastLoggedGroundYawRefusal = nil
         flightAnchor.cancel()
         anchorCaptureActive = false
         courseResidualDeg = .nan
@@ -2656,7 +2679,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
-        sample.anchorOffsetDeg       = hasFlightAnchor ? appliedWorldYawOffsetDeg : nil
+        sample.anchorOffsetDeg       = worldYawSource == .none ? nil : appliedWorldYawOffsetDeg
+        sample.yawSource             = worldYawSource.rawValue
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
         // live compass, before correction. Deliberately uncorrected — a corrected heading would
@@ -3340,6 +3364,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)
 
+        // Apply that median on the ground. Read here on the render thread, decided and applied on
+        // main, because the offset it writes is consumed by the position ticks.
+        if time - lastGroundYawCheck >= 0.5 {
+            lastGroundYawCheck = time
+            let median = alignmentDrift.medianErrorDeg
+            DispatchQueue.main.async { [weak self] in
+                self?.updateGroundYawCorrection(medianErrorDeg: median, at: time)
+            }
+        }
+
         // Feed a running anchor capture with the same *uncorrected* azimuth the estimators use.
         // Uncorrected on purpose: the offset being captured is exactly the correction, so feeding
         // a corrected azimuth would be measuring a correction against itself.
@@ -3370,6 +3404,61 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
+    // MARK: - Ground compass correction
+
+    /// Fold the ARKit-minus-compass median into the applied offset, on the ground only.
+    ///
+    /// The gates all live in `GroundYawCorrection`; this is the wiring plus the precedence rule.
+    /// The flight anchor outranks this outright: once one has been captured, this stops writing for
+    /// the life of that world, so the two can never fight over the same variable.
+    private func updateGroundYawCorrection(medianErrorDeg: Double?, at time: TimeInterval) {
+        guard !hasFlightAnchor else { return }
+
+        let outcome = groundYaw.update(
+            medianErrorDeg: medianErrorDeg,
+            compassResponse: compassResponse,
+            compassResponseR: compassResponseR,
+            headingAccuracyDeg: lastHeadingAccuracy,
+            airborne: isAirborneEstimate,
+            worldUsable: worldIsUsableForDisplay(arTrackingState),
+            at: time
+        )
+
+        switch outcome {
+        case .applied(let offset):
+            appliedWorldYawOffsetDeg = offset
+            sceneManager?.worldYawOffsetDeg = offset
+            worldYawSource = .ground
+            lastLoggedGroundYawRefusal = nil
+            FlightRecorder.shared.record(
+                event: "ground_yaw_applied",
+                detail: String(format: "offset=%.2f median=%.2f response=%.2f r=%.2f hdg_acc=%.1f",
+                               offset, medianErrorDeg ?? Double.nan,
+                               compassResponse, compassResponseR, lastHeadingAccuracy)
+            )
+
+        case .refused(let reason):
+            // The interesting refusals are the ones that mean the *sensor* is not trustworthy;
+            // rate limiting and the deadband are the correction working normally and are not worth
+            // a line. Logged on change only, so this reads as a state history rather than a stream.
+            switch reason {
+            case .rateLimited, .withinDeadband:
+                return
+            default:
+                break
+            }
+            guard lastLoggedGroundYawRefusal != reason.rawValue else { return }
+            lastLoggedGroundYawRefusal = reason.rawValue
+            FlightRecorder.shared.record(
+                event: "ground_yaw_refused",
+                detail: String(format: "reason=%@ median=%.2f response=%.2f r=%.2f hdg_acc=%.1f airborne=%d",
+                               reason.rawValue, medianErrorDeg ?? Double.nan,
+                               compassResponse, compassResponseR, lastHeadingAccuracy,
+                               isAirborneEstimate ? 1 : 0)
+            )
+        }
+    }
+
     // MARK: - Flight-direction anchor
 
     /// Start a capture. Refused unless the anchor is available at all — see canCaptureFlightAnchor.
@@ -3387,9 +3476,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         showAlignBanner("Point the phone along the direction of flight and hold still", clearAfter: nil)
         FlightRecorder.shared.record(
             event: "anchor_capture_begin",
-            detail: String(format: "gs=%.0fkt track=%.0f course_acc=%.1f prior_offset=%.1f",
+            detail: String(format: "gs=%.0fkt track=%.0f course_acc=%.1f prior_offset=%.1f prior_src=%@",
                            lastGPSSpeedKt, lastGPSCourseDeg, lastGPSCourseAccuracy,
-                           hasFlightAnchor ? appliedWorldYawOffsetDeg : Double.nan)
+                           worldYawSource == .none ? Double.nan : appliedWorldYawOffsetDeg,
+                           worldYawSource.rawValue)
         )
     }
 
@@ -3423,6 +3513,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         case .success(let estimate):
             appliedWorldYawOffsetDeg = estimate.offsetDeg
             hasFlightAnchor = true
+            // Takes over from any ground correction still in force and locks the ground path out
+            // for the life of this world — the anchor is the better measurement in the air.
+            worldYawSource = .anchor
+            groundYaw.reset()
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
             finishAlignUI(message: String(format: "Aligned — traffic shifted %.0f°", estimate.offsetDeg))
             FlightRecorder.shared.record(
