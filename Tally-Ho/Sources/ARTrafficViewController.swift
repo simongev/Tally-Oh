@@ -1107,6 +1107,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// AlignPromptScheduler: two flights offered it continuously and neither took it.
     private var alignPrompts = AlignPromptScheduler()
 
+    /// Whether the OS suspended the ARSession since the last start. Set when the app backgrounds and
+    /// consumed by the next `startARSession`, which withdraws the offset — a resumed session reports
+    /// `reset=0` but comes back with a different world yaw. See the FL403 measurement there.
+    private var sessionSuspendedByBackground = false
+
     /// Gyro-integrated azimuth, for measuring how much of the aircraft's turn ARKit actually
     /// follows. Logged only in build 25 — see GyroAzimuthIntegrator for why it beats frame_lock.
     private var gyroAzimuth = GyroAzimuthIntegrator()
@@ -1690,6 +1695,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             self?.motionManager.stopDeviceMotionUpdates()
             self?.verticalYawRateDps = .nan
             self?.yawDrift.closeRun()
+            // The world's yaw does not survive the suspension, so the offset measured against it
+            // must not either. Consumed by the next startARSession, whatever wakes it.
+            self?.sessionSuspendedByBackground = true
             FlightRecorder.shared.endLift(reason: "background")
         }
         NotificationCenter.default.addObserver(
@@ -1958,6 +1966,42 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         config.providesAudioData = false
         let options: ARSession.RunOptions = resetting ? [.resetTracking, .removeExistingAnchors] : []
         arSceneView.session.run(config, options: options)
+
+        // A session the OS suspended comes back with a different world yaw, even though it reports
+        // as a resume. Measured at FL403: the phone pointed down the nose sat at ARKit azimuth
+        // 244–247 before backgrounding and 339–343 after, and the two captures taken after it agree
+        // with each other to 4° across 65 s, so the 96° is the world moving and not a mis-aim. The
+        // resumed session re-establishes heading from the cabin compass, which read 266 against a
+        // track of 231 at that moment with its accuracy degraded to 19°.
+        //
+        // The same log is its own control for not widening this to every resume: a resumeAfterModal
+        // in the foreground, with a full 5.25 s relocalization, held ARKit's azimuth at 286.4 before
+        // and 286.7 after. Dropping a good offset every time a sheet closes would cost the user an
+        // alignment they had already given.
+        //
+        // Ahead of the `resetting` guard on purpose: the whole point is that this arrives on the
+        // resume path, where the log said `reset=0` and a 96°-wrong correction stayed applied.
+        if sessionSuspendedByBackground {
+            sessionSuspendedByBackground = false
+            if worldYawSource != .none {
+                FlightRecorder.shared.record(
+                    event: "world_yaw_dropped",
+                    detail: String(format: "reason=backgrounded offset=%.1f followed=%.1f src=%@",
+                                   appliedWorldYawOffsetDeg, yawFollower.followedDeg,
+                                   worldYawSource.rawValue)
+                )
+            }
+            clearYawFollower(reason: "backgrounded")
+            groundYaw.reset()
+            hasFlightAnchor = false
+            pendingGroundSeed = false
+            worldYawSource = .none
+            appliedWorldYawOffsetDeg = 0
+            sceneManager?.worldYawOffsetDeg = 0
+            // So the hint offers the alignment again rather than leaving the user to notice that
+            // the one they gave has been withdrawn.
+            alignPrompts.reset()
+        }
 
         // Everything below undoes state that only a *re-anchored* world invalidates. A resume
         // keeps the same world, the same alignment and the same measurements, so none of it
