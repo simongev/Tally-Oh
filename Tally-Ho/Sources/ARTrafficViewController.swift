@@ -1082,6 +1082,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Which measurement the current offset came from, for the log and for the precedence rule.
     enum WorldYawSource: String {
         case none
+        /// ARKit's own `.gravityAndHeading` seed, taken at world creation, with the offset left at
+        /// zero. **This is an alignment, not the absence of one.** In a cabin the compass reads the
+        /// aircraft's track (median `hdg_true − track` of 0.00° over 204 samples), so ARKit orients
+        /// its world assuming the phone points along the nose — which makes the seed exact when the
+        /// phone actually is pointed forward, and is why the one session that reported targets
+        /// landing on the traffic was a session with no correction applied at all.
+        case seed
         case ground
         case anchor
     }
@@ -1108,6 +1115,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// When to say out loud that the alignment is on offer and has not been taken. See
     /// AlignPromptScheduler: two flights offered it continuously and neither took it.
     private var alignPrompts = AlignPromptScheduler()
+
+    /// Whether the startup card is up waiting for the world to finish initialising. Cleared by the
+    /// first `.normal` tracking state, which is when the seed is established and the card has done
+    /// its job.
+    private var awaitingSeedConfirmation = false
 
     /// Whether the OS suspended the ARSession since the last start. Set when the app backgrounds and
     /// consumed by the next `startARSession`, which withdraws the offset — a resumed session reports
@@ -1885,19 +1897,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Why this start is re-anchoring, or nil if it is resuming — the reset decision itself, and
     /// the reason recorded in the log so a reset is never just something that happened.
     ///
-    /// A reset re-asks the compass which way north is — and in the cabin the compass answers with
-    /// the *aircraft's ground track*, not with where the phone is pointing (`compass_response`
-    /// 0.018 across four flights, against 1.00 on the ground). So every airborne reset hands the
-    /// scene a fresh, arbitrary rotation equal to the angle between the phone and the nose at that
-    /// instant. The user confirmed both halves directly: the error is a single constant shift of
-    /// everything, and reopening the app changes it.
+    /// **Always reset, at any altitude, from build 29.** A reset re-asks the compass which way north
+    /// is, and in the cabin the compass answers with the *aircraft's track* — measured at a median
+    /// `hdg_true − track` of **0.00° across 204 samples**, with `compass_response` −0.050, so it does
+    /// not follow the phone at all. Builds 21–28 read that as a reason to avoid airborne resets:
+    /// every one would hand the scene "a fresh, arbitrary rotation".
     ///
-    /// Resuming is now the default at any altitude, not just airborne. A reset costs about a
-    /// second of `limited:initializing` with the camera stalled — measured on all four returns in
-    /// the build-19 ground log — which is a real price in an app built around a five-second
-    /// glance. On the ground it buys back the ~4°/min ARKit yaw drift, so it is worth paying when
-    /// the compass says the alignment has actually gone off, and not otherwise. In the air it buys
-    /// nothing at all.
+    /// It is not arbitrary. ARKit orients its world by assuming the device points where the compass
+    /// says, so the rotation a reset produces is exactly **the phone's angle off the nose at that
+    /// instant** — which is zero when the phone is held forward, and which the startup card now asks
+    /// for. That is the alignment; there is nothing better available in a cabin.
+    ///
+    /// Both halves of the old reasoning measured false:
+    ///
+    /// - *Relocalizing preserves the alignment.* It does not. Three anchors taken across successive
+    ///   resumes on one flight read 6.3°, 16.6° and 18.4° with the aircraft's track unchanged —
+    ///   about 10° of world rotation across two resumes. 7.1° across one resume on another flight,
+    ///   and 96° across a background cycle.
+    /// - *Resuming is cheaper.* It is not. `relocalize_secs` on that flight was **2.25 s for the
+    ///   fresh reset** against **5.36, 5.26, 5.14 and 5.27 s** for the four resumes — the same
+    ///   3.5× the ground log measured, and in the same direction.
     ///
     /// This decides only how the four existing lifecycle call sites behave; it never triggers a
     /// reset by itself. A spontaneous reset path is what produced the reset storm that once froze
@@ -1907,17 +1926,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard hasStartedARSession else { return "first_start" }
         guard arSceneView.session.currentFrame != nil else { return "no_frame" }
         if case .notAvailable = arTrackingState { return "tracking_lost" }
-        // On the ground, always re-anchor. Build 20 tried deciding this from measured drift, on the
-        // assumption that resuming was the cheaper option; the ground log measured the opposite.
-        // Resuming makes ARKit relocalize against the world map it already had, which took 5.0 s
-        // against 1.4 s for a fresh reset, with cam_yaw swinging through 176.9 -> -108.3 -> -65.3
-        // while the transform settled. On the ground that is 3.5x slower for no benefit at all,
-        // because a ground reset re-anchors to a compass that genuinely measures the phone.
+        // Build 20 tried deciding this from measured drift, on the assumption that resuming was the
+        // cheaper option; the ground log measured the opposite. Resuming makes ARKit relocalize
+        // against the world map it already had, which took 5.0 s against 1.4 s for a fresh reset,
+        // with cam_yaw swinging through 176.9 -> -108.3 -> -65.3 while the transform settled. A
+        // ground reset then re-anchors to a compass that genuinely measures the phone.
         //
-        // In the air the same five seconds are worth paying: relocalizing preserves the alignment,
-        // where a reset would hand the scene a brand-new arbitrary rotation.
-        guard isAirborneEstimate else { return "ground" }
-        return nil
+        // The air is the same answer for a different reason — see the doc comment above. A reset is
+        // both faster (2.25 s against 5.1-5.4 s) and better aligned, because its "arbitrary"
+        // rotation is the phone's angle off the nose, which the startup card asks the user to make
+        // zero. Distinguished in the log so the two are still tellable apart.
+        return isAirborneEstimate ? "airborne_reseed" : "ground"
     }
 
     /// Start or resume the ARKit world. Rate-limited in here rather than at the call sites, so no
@@ -2056,10 +2075,42 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         groundYaw.reset()
         clearYawFollower(reason: "world_reset")
         pendingGroundSeed = false
-        // A new world needs its own alignment, so it gets its own asking.
         alignPrompts.reset()
-        worldYawSource = .none
         lastLoggedGroundYawRefusal = nil
+
+        // A fresh airborne world *is* aligned, by the seed ARKit just took: `.gravityAndHeading`
+        // orients it assuming the phone points where the compass says, and in a cabin the compass
+        // says the aircraft's track. So the world is correct to within the phone's angle off the
+        // nose at this instant — which is what the startup card is on screen asking the user to
+        // make zero, and which is why the one session that reported targets landing on the traffic
+        // was a session running at offset 0.
+        //
+        // Recorded as a real source rather than left at `.none`, so the pulse and the hint stop
+        // pushing the user toward a hand-aimed capture that measures the same quantity worse: three
+        // captures against an unchanging track read 6.3°, 16.6° and 18.4°, and the first of them
+        // took a world the user called accurate and moved it 6.3° off.
+        // Judged on ground speed rather than `isAirborneEstimate`, which is only recomputed in the
+        // visualisation tick and is therefore still false here on the session that matters most —
+        // the first one. `airborne_changed` lands about 0.25 s after `ar_session_start` in every
+        // flight log, while `gs` is already populated in the start line itself.
+        if lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt {
+            worldYawSource = .seed
+            // Bounded rather than left open: initialisation runs about 2 s, and a card that never
+            // clears because tracking never reached .normal would sit over the scene for the flight.
+            showAlignBanner("Hold the phone facing the direction of flight", clearAfter: 12.0)
+            awaitingSeedConfirmation = true
+            // hdg_acc is here because it is the one thing that could make this claim false: with no
+            // compass heading, .gravityAndHeading falls back to gravity alone and the world's yaw
+            // really is arbitrary. Every airborne log so far reports 10°.
+            FlightRecorder.shared.record(
+                event: "seed_alignment",
+                detail: String(format: "why=%@ hdg=%.0f track=%.0f hdg_acc=%.0f gs=%.0fkt",
+                               whyReset ?? "-", lastTrueHeading, lastGPSCourseDeg,
+                               lastHeadingAccuracy, lastGPSSpeedKt)
+            )
+        } else {
+            worldYawSource = .none
+        }
         // The gain regression pairs ARKit's azimuth against the gyro's. A reset jumps one and not
         // the other, so a window spanning it would fit that discontinuity as if it were a turn.
         gyroAzimuth.reset()
@@ -2784,7 +2835,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
-        sample.anchorOffsetDeg       = worldYawSource == .none ? nil : appliedWorldYawOffsetDeg
+        // Empty for both `none` and `seed`: neither applies an offset, and a logged 0.0 would read
+        // as a measured zero rather than as "nothing is being subtracted". yawSource distinguishes
+        // the two.
+        sample.anchorOffsetDeg       = (worldYawSource == .none || worldYawSource == .seed)
+            ? nil : appliedWorldYawOffsetDeg
         sample.yawSource             = worldYawSource.rawValue
         sample.yawFollowedDeg        = yawFollower.hasSeed ? yawFollower.followedDeg : nil
         sample.followGain            = followGain.isNaN  ? nil : followGain
@@ -3789,6 +3844,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     }
 
     private func showAlignBanner(_ text: String, clearAfter: TimeInterval?) {
+        // Optional-chained: the startup card is raised from startARSession, and the first of those
+        // runs from viewWillAppear, which can precede the banner existing.
+        guard let alignBannerLabel else { return }
         alignBannerLabel.text = "  \(text)  "
         alignBannerLabel.isHidden = false
         guard let clearAfter else { return }
@@ -4190,6 +4248,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // alert gets the screen to itself instead of being raised behind another one.
             if case .normal = camera.trackingState {
                 self.startDiagnosticAltimeterIfNeeded(trigger: "tracking_normal")
+                // The world is established, so the card has done its job. Confirmed rather than
+                // just cleared: the user held the phone still for a couple of seconds and deserves
+                // to be told that is what the app wanted.
+                if self.awaitingSeedConfirmation {
+                    self.awaitingSeedConfirmation = false
+                    self.showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
+                }
             }
         }
     }

@@ -114,9 +114,14 @@ final class FlightRecorder {
         /// Read it with yawSource, which says where it came from: the airborne flight-direction
         /// anchor, or the ground compass correction. Those two are mutually exclusive.
         var anchorOffsetDeg: Double?
-        /// "none", "ground" or "anchor" — see ARTrafficViewController.WorldYawSource. A "ground"
-        /// value while airborne is a carry-over seeded at takeoff and is expected; a "ground" value
-        /// whose *base* keeps being re-measured while airborne would be the build-8 failure.
+        /// "none", "seed", "ground" or "anchor" — see ARTrafficViewController.WorldYawSource.
+        ///
+        /// "seed" is the normal airborne state from build 29 and means anchorOffsetDeg is 0 *by
+        /// design*: ARKit oriented its world from the cabin compass, which reads the aircraft's
+        /// track, so the world is already correct to within the phone's angle off the nose when it
+        /// was created. A "ground" value while airborne is a carry-over seeded at takeoff and is
+        /// expected; a "ground" value whose base keeps being re-measured while airborne would be the
+        /// build-8 failure.
         var yawSource: String?
         /// Heading change accumulated since the offset was seeded — a **counterfactual**, not a
         /// component of anchorOffsetDeg.

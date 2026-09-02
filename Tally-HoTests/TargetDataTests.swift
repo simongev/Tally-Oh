@@ -710,22 +710,35 @@ struct TargetDataTests {
         #expect(e.sampleCount == 20)
     }
 
-    /// Hand wobble is what the median is for. A hold that jitters either side of the true direction
-    /// must still land on it.
+    /// Hand wobble is what the median is for. A hold that jitters either side of the true direction,
+    /// within the 5° gate, must still land on it.
     @Test func wobbleIsMedianedAway() {
         var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
         anchor.begin(at: 0)
-        let jitter = [-6.0, 4.0, -2.0, 7.0, -5.0, 1.0, 3.0, -4.0, 2.0, 0.0,
-                      5.0, -3.0, 1.0, -1.0, 6.0, -6.0, 2.0, 0.0, -2.0, 3.0]
+        let jitter = [-2.4, 1.6, -0.8, 2.4, -2.0, 0.4, 1.2, -1.6, 0.8, 0.0,
+                      2.0, -1.2, 0.4, -0.4, 2.4, -2.4, 0.8, 0.0, -0.8, 1.2]
         holdSamples(&anchor, az: jitter.map { 100.0 + $0 }, track: 130.0)
         guard case .success(let e) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
         #expect(abs(e.offsetDeg - 30) < 3)
     }
 
+    /// **Build 29's tightening.** A hold that wanders 13° used to be accepted, on the reasoning that
+    /// the median absorbs wander. It does — but the anchor's error is aim, not wander, and a capture
+    /// this loose has the least claim to be a considered aim.
+    @Test func aLooseHoldIsNowRefused() {
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        let jitter = [-6.0, 4.0, -2.0, 7.0, -5.0, 1.0, 3.0, -4.0, 2.0, 0.0,
+                      5.0, -3.0, 1.0, -1.0, 6.0, -6.0, 2.0, 0.0, -2.0, 3.0]
+        holdSamples(&anchor, az: jitter.map { 100.0 + $0 }, track: 130.0)
+        guard case .failure(let reason) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+        #expect(reason == .phoneMoved)
+    }
+
     /// A pan is not a hold. The samples were taken pointing in different directions, so their
     /// median means nothing and the capture must be refused rather than averaged.
     @Test func aPanIsRefused() {
-        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8, maxAzimuthSpreadDeg: 25)
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8, maxAzimuthSpreadDeg: 5)
         anchor.begin(at: 0)
         holdSamples(&anchor, az: (0..<20).map { 100.0 + Double($0) * 5 }, track: 130.0)
         guard case .failure(let reason) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }

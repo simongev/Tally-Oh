@@ -819,9 +819,15 @@ struct FlightDirectionAnchor {
 
     let minSeconds: TimeInterval
     let minSamples: Int
-    /// How far the phone may wander over the hold. Generous, because a handheld phone at arm's
-    /// length in turbulence will not sit still — and the median absorbs the wander anyway. This is
-    /// here to reject a *pan*, not to demand a tripod.
+    /// How far the phone may wander over the hold.
+    ///
+    /// Tightened from 25° to 5° in build 29. The old value was set to reject a pan rather than
+    /// demand a tripod, on the reasoning that the median absorbs hand wander — which is true, but
+    /// the anchor's error turned out not to be wander at all. It is *aim*: three captures against an
+    /// unchanging track read 6.3°, 16.6° and 18.4°, and the user's eyes said the uncorrected world
+    /// those replaced was the accurate one. Spread does not predict that error (the 8.2° capture and
+    /// the 4.2° capture landed 1.8° apart), so this gate cannot fix the anchor; it only refuses the
+    /// captures with least claim to be a considered aim.
     let maxAzimuthSpreadDeg: Double
     /// How far the ground track may move. Tight: if the aircraft turned during the hold then the
     /// samples were taken against different references and the median of them means nothing.
@@ -832,7 +838,7 @@ struct FlightDirectionAnchor {
 
     init(minSeconds: TimeInterval = 3.0,
          minSamples: Int = 8,
-         maxAzimuthSpreadDeg: Double = 25.0,
+         maxAzimuthSpreadDeg: Double = 5.0,
          maxTrackSpreadDeg: Double = 5.0) {
         self.minSeconds = minSeconds
         self.minSamples = minSamples
