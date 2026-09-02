@@ -1078,6 +1078,188 @@ struct TargetDataTests {
         #expect(slaved == .refused(.compassNotMeasuringPhone))
     }
 
+    // MARK: - Track-following offset
+
+    // The FL317 log: the aircraft turned 12.7° left while ARKit's azimuth moved +0.7°, so an offset
+    // measured once decays at exactly the aircraft's turn rate. These cover the accumulation and
+    // every guard that decides whether a heading sample is worth integrating.
+
+    /// Steady cruise: a fixed course accumulates nothing, so the offset stays where it was measured.
+    @Test func straightFlightDoesNotMoveTheOffset() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 1.5, trackDeg: 298, source: .anchor, at: 0)
+        for i in 1...60 {
+            follower.update(trackDeg: 298, courseAccuracyDeg: 0.1, groundSpeedKt: 440,
+                            at: Double(i))
+        }
+        #expect(abs(follower.followedDeg) < 0.001)
+        #expect(abs((follower.offsetDeg ?? 99) - 1.5) < 0.001)
+    }
+
+    /// The FL317 case itself: 12.7° of left turn must be added back to the offset.
+    @Test func offsetFollowsTheHeadingChange() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 1.5, trackDeg: 298.2, source: .anchor, at: 0)
+        // 12.7° left over 64 s, the rate the log actually flew.
+        for i in 1...64 {
+            follower.update(trackDeg: 298.2 - 12.7 * Double(i) / 64.0,
+                            courseAccuracyDeg: 0.1, groundSpeedKt: 440, at: Double(i))
+        }
+        #expect(abs(follower.followedDeg - (-12.7)) < 0.01)
+        #expect(abs((follower.offsetDeg ?? 99) - (1.5 - 12.7)) < 0.01)
+    }
+
+    /// **Accumulate, don't difference.** A flight that turns through more than 180° would wrap and
+    /// invert the correction if the offset were computed against the seed's heading.
+    @Test func followingSurvivesATurnPastOneEighty() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 0, trackDeg: 0, source: .anchor, at: 0)
+        // 270° right, at 2 °/s — a whole course reversal and then some.
+        for i in 1...135 {
+            follower.update(trackDeg: (2.0 * Double(i)).truncatingRemainder(dividingBy: 360),
+                            courseAccuracyDeg: 1, groundSpeedKt: 440, at: Double(i))
+        }
+        #expect(abs(follower.followedDeg - 270) < 0.01)
+        // The applied offset wraps to ±180, but the accumulation behind it does not.
+        #expect(abs((follower.offsetDeg ?? 999) - (-90)) < 0.01)
+    }
+
+    @Test func followingIgnoresAnInaccurateCourse() {
+        var follower = TrackFollowingYawOffset(maxCourseAccuracyDeg: 5)
+        follower.seed(offsetDeg: 0, trackDeg: 300, source: .anchor, at: 0)
+        for i in 1...30 {
+            follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 40,
+                            groundSpeedKt: 440, at: Double(i))
+        }
+        #expect(follower.followedDeg == 0)
+    }
+
+    /// Taxiing is not a direction. Below the speed gate nothing accumulates.
+    @Test func followingIgnoresSlowGroundSpeed() {
+        var follower = TrackFollowingYawOffset(minGroundSpeedKt: 80)
+        follower.seed(offsetDeg: 0, trackDeg: 300, source: .anchor, at: 0)
+        for i in 1...30 {
+            follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 0.5,
+                            groundSpeedKt: 15, at: Double(i))
+        }
+        #expect(follower.followedDeg == 0)
+    }
+
+    /// A course that jumps faster than an aircraft can turn is GPS noise, not a turn.
+    @Test func followingRejectsAnImpossibleTurnRate() {
+        var follower = TrackFollowingYawOffset(maxTurnRateDps: 6)
+        follower.seed(offsetDeg: 0, trackDeg: 0, source: .anchor, at: 0)
+        follower.update(trackDeg: 90, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 1)
+        #expect(follower.followedDeg == 0)
+        // And it re-baselines on the new value rather than pinning to a heading already left.
+        follower.update(trackDeg: 92, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 2)
+        #expect(abs(follower.followedDeg - 2) < 0.001)
+    }
+
+    /// After a long blackout the aircraft may have turned any amount; booking it as one step would
+    /// be worse than under-correcting.
+    @Test func followingReBaselinesAfterALongGap() {
+        var follower = TrackFollowingYawOffset(maxGapSeconds: 30)
+        follower.seed(offsetDeg: 5, trackDeg: 0, source: .anchor, at: 0)
+        follower.update(trackDeg: 120, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 600)
+        #expect(follower.followedDeg == 0)
+        #expect(abs((follower.offsetDeg ?? 99) - 5) < 0.001)
+        // Following resumes from the new heading.
+        follower.update(trackDeg: 123, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 601)
+        #expect(abs(follower.followedDeg - 3) < 0.001)
+    }
+
+    @Test func unseededFollowerAppliesNothing() {
+        var follower = TrackFollowingYawOffset()
+        follower.update(trackDeg: 300, courseAccuracyDeg: 0.1, groundSpeedKt: 440, at: 1)
+        #expect(follower.offsetDeg == nil)
+        #expect(!follower.hasSeed)
+    }
+
+    @Test func seedingResetsTheAccumulation() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 0, trackDeg: 300, source: .ground, at: 0)
+        for i in 1...10 {
+            follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 1,
+                            groundSpeedKt: 440, at: Double(i))
+        }
+        #expect(abs(follower.followedDeg - (-10)) < 0.001)
+        follower.seed(offsetDeg: 20, trackDeg: 290, source: .anchor, at: 11)
+        #expect(follower.followedDeg == 0)
+        #expect(abs((follower.offsetDeg ?? 99) - 20) < 0.001)
+        #expect(follower.source == .anchor)
+    }
+
+    @Test func clearStopsFollowing() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 3, trackDeg: 300, source: .ground, at: 0)
+        follower.clear()
+        #expect(follower.offsetDeg == nil)
+        follower.update(trackDeg: 250, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 1)
+        #expect(follower.followedDeg == 0)
+    }
+
+    /// **The FL317 mis-aim.** A capture 50° off the nose must read as a disagreement against what
+    /// following predicts, rather than being applied silently.
+    @Test func disagreementCatchesAMisaimedAnchor() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: 1.5, trackDeg: 297.8, source: .anchor, at: 0)
+        for i in 1...108 {
+            follower.update(trackDeg: 297.8 - 12.3 * Double(i) / 108.0,
+                            courseAccuracyDeg: 0.1, groundSpeedKt: 440, at: Double(i))
+        }
+        // Following says −10.8; the mis-aimed capture said +39.1.
+        #expect(abs((follower.offsetDeg ?? 99) - (-10.8)) < 0.05)
+        let delta = follower.disagreementDeg(with: 39.1)
+        #expect(delta != nil)
+        #expect(abs(delta! - 49.9) < 0.1)
+        // A good capture agrees.
+        #expect(abs(follower.disagreementDeg(with: -11.0) ?? 99) < 0.3)
+    }
+
+    @Test func disagreementIsNilWithoutASeed() {
+        let follower = TrackFollowingYawOffset()
+        #expect(follower.disagreementDeg(with: 39.1) == nil)
+    }
+
+    // MARK: - Gyro azimuth
+
+    @Test func gyroIntegratesASteadyRate() {
+        var gyro = GyroAzimuthIntegrator(deadbandDps: 0.05, maxGapSeconds: 1.0)
+        for i in 1...100 { gyro.add(yawRateDps: 3.0, at: Double(i) * 0.05) }
+        // 100 samples at 0.05 s of 3 °/s; the first has no predecessor to integrate against.
+        #expect(abs(gyro.azimuthDeg - 3.0 * 99 * 0.05) < 0.001)
+    }
+
+    /// Bias is what makes a gyro walk. Rates under the deadband contribute nothing.
+    @Test func gyroDeadbandsBias() {
+        var gyro = GyroAzimuthIntegrator(deadbandDps: 0.05)
+        for i in 1...1000 { gyro.add(yawRateDps: 0.01, at: Double(i) * 0.05) }
+        #expect(gyro.azimuthDeg == 0)
+        #expect(gyro.hasSamples)
+    }
+
+    /// Device motion dropping out must break the integration, not be integrated as zero — and not
+    /// be spanned by the next sample either.
+    @Test func gyroDoesNotIntegrateAcrossAGap() {
+        var gyro = GyroAzimuthIntegrator(maxGapSeconds: 1.0)
+        gyro.add(yawRateDps: 3.0, at: 0)
+        gyro.add(yawRateDps: 3.0, at: 0.05)
+        let before = gyro.azimuthDeg
+        gyro.add(yawRateDps: 3.0, at: 60)      // 60 s later: not integrated
+        #expect(gyro.azimuthDeg == before)
+        gyro.add(yawRateDps: 3.0, at: 60.05)   // resumes from there
+        #expect(abs(gyro.azimuthDeg - (before + 0.15)) < 0.001)
+    }
+
+    @Test func gyroIgnoresNonFiniteRates() {
+        var gyro = GyroAzimuthIntegrator()
+        gyro.add(yawRateDps: .nan, at: 0)
+        gyro.add(yawRateDps: .nan, at: 0.05)
+        #expect(gyro.azimuthDeg == 0)
+        #expect(!gyro.hasSamples)
+    }
+
     // MARK: - Screen orientation
 
     // The mapping from ARKit's camera roll to an interface orientation, plus the hysteresis and

@@ -1088,6 +1088,31 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// The anchor outranks the ground correction and is never overwritten by it: it is measured
     /// airborne against ground track, which is the only azimuth reference that works in a cabin.
     private var worldYawSource: WorldYawSource = .none
+
+    /// Carries whichever offset is in force through the aircraft's heading changes. See
+    /// TrackFollowingYawOffset: ARKit's world rides with the fuselage through slow turns, so an
+    /// offset measured once decays at exactly the rate the aircraft turns.
+    private var yawFollower = TrackFollowingYawOffset()
+    /// Set when the ground correction is ready to seed the follower but the track is not yet usable
+    /// — the airborne transition can fire a moment before GPS course settles.
+    private var pendingGroundSeed = false
+    /// The follower's state before the last anchor capture, so a mis-aimed capture is one tap away
+    /// from being undone. A value type, so this is the whole prior state and not a reference to it.
+    private var followerBeforeAnchor: TrackFollowingYawOffset?
+    /// Beyond this a new anchor and the followed offset are telling different stories, and the user
+    /// is shown the number rather than having it applied silently.
+    private static let anchorDisagreementDeg: Double = 15.0
+
+    /// Gyro-integrated azimuth, for measuring how much of the aircraft's turn ARKit actually
+    /// follows. Logged only in build 25 — see GyroAzimuthIntegrator for why it beats frame_lock.
+    private var gyroAzimuth = GyroAzimuthIntegrator()
+    /// Driver is the aircraft's track; response is (gyro azimuth − ARKit azimuth). The slope is the
+    /// share of the aircraft's turn that ARKit fails to follow: 1 = cabin-locked, 0 = Earth-locked.
+    /// Same window and thresholds as frameLockEstimator, since it consumes the same driver.
+    private var followGainEstimator = AngularResponse(
+        window: 90.0, minDriverRotationDeg: 8.0, minDriverExcursionDeg: 8.0, minPairs: 15)
+    private var followGain: Double = .nan
+    private var followGainR: Double = .nan
     /// Render-thread throttle for feeding the capture: hand wobble is correlated over about a
     /// second, so 60 Hz would just be 60 copies of the same look.
     private var lastAnchorSampleTime: TimeInterval = 0
@@ -1526,6 +1551,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         alignBannerLabel.layer.cornerRadius = 10
         alignBannerLabel.layer.masksToBounds = true
         alignBannerLabel.isHidden = true
+        // Tappable only while an undo is offered — see offerAnchorUndo. A banner that swallows taps
+        // the rest of the time would eat them over the scene for no reason.
+        alignBannerLabel.isUserInteractionEnabled = false
+        alignBannerLabel.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(alignBannerTapped)))
         view.addSubview(alignBannerLabel)
 
         NSLayoutConstraint.activate([
@@ -1970,10 +2000,20 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         hasFlightAnchor = false
         appliedWorldYawOffsetDeg = 0
         sceneManager?.worldYawOffsetDeg = 0
-        // Same reasoning for the ground correction: it describes the frame that just ended.
+        // Same reasoning for the ground correction and the followed offset: both describe the frame
+        // that just ended. The follower especially — its base was measured against ARKit's old
+        // azimuth, and following it into a freshly seeded world would carry that error forward.
         groundYaw.reset()
+        clearYawFollower(reason: "world_reset")
+        pendingGroundSeed = false
         worldYawSource = .none
         lastLoggedGroundYawRefusal = nil
+        // The gain regression pairs ARKit's azimuth against the gyro's. A reset jumps one and not
+        // the other, so a window spanning it would fit that discontinuity as if it were a turn.
+        gyroAzimuth.reset()
+        followGainEstimator.reset()
+        followGain = .nan
+        followGainR = .nan
         flightAnchor.cancel()
         anchorCaptureActive = false
         courseResidualDeg = .nan
@@ -2538,8 +2578,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 detail: String(format: "%@ basis=%@ alt=%.0f",
                                estimate.airborne ? "airborne" : "ground", estimate.basis, altitude)
             )
+            if estimate.airborne {
+                // The ARKit world survives takeoff (build 21 only resets on the ground), so the
+                // ground compass correction is a valid absolute anchor for the whole flight. This is
+                // what makes the correction automatic: a gate-to-gate flight needs no gesture.
+                pendingGroundSeed = true
+            } else {
+                // Landed. The ground correction takes over again, measuring rather than following.
+                clearYawFollower(reason: "landed")
+            }
         }
         let airborne = isAirborneEstimate
+
+        // Carry the offset through the aircraft's heading change. Ahead of the placement below so
+        // this tick's markers are drawn with the offset this tick's heading calls for.
+        updateYawFollowing()
 
         // Pre-filter by distance and basic visibility before touching SceneKit.
         // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
@@ -2681,6 +2734,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
         sample.anchorOffsetDeg       = worldYawSource == .none ? nil : appliedWorldYawOffsetDeg
         sample.yawSource             = worldYawSource.rawValue
+        sample.yawFollowedDeg        = yawFollower.hasSeed ? yawFollower.followedDeg : nil
+        sample.followGain            = followGain.isNaN  ? nil : followGain
+        sample.followGainR           = followGainR.isNaN ? nil : followGainR
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
         // live compass, before correction. Deliberately uncorrected — a corrected heading would
@@ -3386,6 +3442,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // ARKit's drift while the phone is not being turned. Gated on the gyro, never on ARKit's
         // own attitude — see YawDriftAccumulator. A NaN rate means device motion has not reported
         // yet; passing it through lets the accumulator end the run rather than guess.
+        // Integrated here rather than in the device-motion callback so it shares the render clock
+        // with the ARKit azimuth it is compared against. The rate itself updates at 20 Hz and is
+        // held between updates, which is more than enough resolution for a 90 s regression.
+        gyroAzimuth.add(yawRateDps: verticalYawRateDps, at: time)
+
         yawDrift.add(azimuthDeg: rawAzimuthDeg,
                      gyroYawRateDps: verticalYawRateDps,
                      isTracking: true,
@@ -3459,6 +3520,68 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
+    // MARK: - Track following
+
+    /// Whether the aircraft's course is a direction worth integrating right now. Same thresholds the
+    /// anchor uses, because the anchor rests on the same quantity.
+    private var trackIsUsableForFollowing: Bool {
+        lastGPSCourseDeg >= 0
+            && lastGPSCourseAccuracy >= 0 && lastGPSCourseAccuracy <= 5
+            && lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt
+    }
+
+    /// Advance the followed offset by the heading change since the last tick, and push the result to
+    /// placement. Called from the visualisation tick on the main thread.
+    private func updateYawFollowing() {
+        let now = CACurrentMediaTime()
+
+        if pendingGroundSeed { seedFollowerFromGroundCorrection(at: now) }
+
+        yawFollower.update(trackDeg: lastGPSCourseDeg,
+                           courseAccuracyDeg: lastGPSCourseAccuracy,
+                           groundSpeedKt: lastGPSSpeedKt,
+                           at: now)
+
+        guard let offset = yawFollower.offsetDeg else { return }
+        appliedWorldYawOffsetDeg = offset
+        sceneManager?.worldYawOffsetDeg = offset
+    }
+
+    /// Hand the ground correction to the follower at takeoff. Refused — and left pending — until the
+    /// track is a real direction, since the airborne transition can fire a moment before GPS course
+    /// settles at climb speed.
+    private func seedFollowerFromGroundCorrection(at time: TimeInterval) {
+        // An anchor is a better measurement than a ground correction carried through a takeoff, and
+        // must never be clobbered by one.
+        guard !hasFlightAnchor else { pendingGroundSeed = false; return }
+        guard groundYaw.hasOffset else { pendingGroundSeed = false; return }
+        guard isAirborneEstimate, trackIsUsableForFollowing else { return }
+
+        pendingGroundSeed = false
+        yawFollower.seed(offsetDeg: groundYaw.appliedOffsetDeg,
+                         trackDeg: lastGPSCourseDeg,
+                         source: .ground,
+                         at: time)
+        worldYawSource = .ground
+        FlightRecorder.shared.record(
+            event: "yaw_follow_seeded",
+            detail: String(format: "src=ground offset=%.1f track=%.0f gs=%.0fkt",
+                           groundYaw.appliedOffsetDeg, lastGPSCourseDeg, lastGPSSpeedKt)
+        )
+    }
+
+    private func clearYawFollower(reason: String) {
+        guard yawFollower.hasSeed else { return }
+        FlightRecorder.shared.record(
+            event: "yaw_follow_cleared",
+            detail: String(format: "reason=%@ offset=%.1f followed=%.1f",
+                           reason, yawFollower.offsetDeg ?? Double.nan, yawFollower.followedDeg)
+        )
+        yawFollower.clear()
+        followerBeforeAnchor = nil
+        hideAnchorUndo()
+    }
+
     // MARK: - Flight-direction anchor
 
     /// Start a capture. Refused unless the anchor is available at all — see canCaptureFlightAnchor.
@@ -3511,20 +3634,48 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         switch flightAnchor.finish(at: time) {
         case .success(let estimate):
+            // How far this capture sits from what following predicts, measured *before* the seed
+            // replaces the old state. Nil when nothing was being followed yet.
+            let disagreement = yawFollower.disagreementDeg(with: estimate.offsetDeg)
+            let predicted = yawFollower.offsetDeg
+            followerBeforeAnchor = yawFollower.hasSeed ? yawFollower : nil
+
             appliedWorldYawOffsetDeg = estimate.offsetDeg
             hasFlightAnchor = true
             // Takes over from any ground correction still in force and locks the ground path out
             // for the life of this world — the anchor is the better measurement in the air.
             worldYawSource = .anchor
             groundYaw.reset()
+            pendingGroundSeed = false
+            // Seeded, not just applied: an anchor is accurate at the moment it is taken and decays
+            // at the rate the aircraft turns. See TrackFollowingYawOffset.
+            yawFollower.seed(offsetDeg: estimate.offsetDeg,
+                             trackDeg: lastGPSCourseDeg,
+                             source: .anchor,
+                             at: CACurrentMediaTime())
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
-            finishAlignUI(message: String(format: "Aligned — traffic shifted %.0f°", estimate.offsetDeg))
             FlightRecorder.shared.record(
                 event: "anchor_captured",
                 detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f",
                                estimate.offsetDeg, estimate.sampleCount, estimate.seconds,
                                estimate.azimuthSpreadDeg, estimate.trackSpreadDeg, worldYawErrorDeg)
             )
+
+            // A capture the follower disagrees with is the shape of the FL317 mis-aim: the phone was
+            // held rock steady 50° off the nose, every gate passed, and 39° of pure error was
+            // applied. It is still applied — the user asked for it, and the *old* offset may be the
+            // wrong one — but the number is shown and one tap puts it back.
+            if let disagreement, abs(disagreement) > ARTrafficViewController.anchorDisagreementDeg {
+                FlightRecorder.shared.record(
+                    event: "anchor_disagrees",
+                    detail: String(format: "captured=%.1f predicted=%.1f delta=%.1f",
+                                   estimate.offsetDeg, predicted ?? Double.nan, disagreement)
+                )
+                offerAnchorUndo(shiftDeg: disagreement)
+            } else {
+                followerBeforeAnchor = nil
+                finishAlignUI(message: String(format: "Aligned — traffic shifted %.0f°", estimate.offsetDeg))
+            }
         case .failure(let reason):
             let message: String
             switch reason {
@@ -3542,6 +3693,47 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     private func finishAlignUI(message: String) {
         alignButton.tintColor = hasFlightAnchor ? .systemGreen : .white
         showAlignBanner(message, clearAfter: 3.0)
+    }
+
+    /// Show the disagreement and make the banner a one-tap undo for a while.
+    ///
+    /// Longer on screen than an ordinary message: this one is asking the user to judge something,
+    /// and three seconds is not enough to look up, compare against the window, and decide.
+    private func offerAnchorUndo(shiftDeg: Double) {
+        alignButton.tintColor = .systemGreen
+        alignBannerLabel.isUserInteractionEnabled = true
+        showAlignBanner(String(format: "Traffic shifted %.0f° — tap to undo", shiftDeg),
+                        clearAfter: 10.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+            self?.hideAnchorUndo()
+        }
+    }
+
+    private func hideAnchorUndo() {
+        // Optional-chained: a world reset clears the follower, and the first one runs from
+        // viewWillAppear, which can precede the banner existing.
+        alignBannerLabel?.isUserInteractionEnabled = false
+        followerBeforeAnchor = nil
+    }
+
+    /// Put the previous offset back. Only ever armed while `followerBeforeAnchor` holds one.
+    @objc private func alignBannerTapped() {
+        guard let prior = followerBeforeAnchor else { return }
+        yawFollower = prior
+        hasFlightAnchor = prior.source == .anchor
+        worldYawSource = prior.source == .anchor ? .anchor : .ground
+        if let offset = yawFollower.offsetDeg {
+            appliedWorldYawOffsetDeg = offset
+            sceneManager?.worldYawOffsetDeg = offset
+        }
+        FlightRecorder.shared.record(
+            event: "anchor_undone",
+            detail: String(format: "restored=%.1f src=%@",
+                           yawFollower.offsetDeg ?? Double.nan, prior.source?.rawValue ?? "none")
+        )
+        hideAnchorUndo()
+        alignButton.tintColor = hasFlightAnchor ? .systemGreen : .white
+        showAlignBanner("Previous alignment restored", clearAfter: 2.5)
     }
 
     private func showAlignBanner(_ text: String, clearAfter: TimeInterval?) {
@@ -3711,6 +3903,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 // Excursion, not summed rotation: the summed figure read 12° on a flight whose
                 // track never left a 0.4° band, which is exactly what made this publish garbage.
                 frameLockTrackSwingDeg = frameLockEstimator.driverExcursionDeg
+            }
+
+            // The same driver, against an inertial response instead of ARKit's own. A pan moves the
+            // gyro and ARKit together and cancels out of (gyro − ARKit), so unlike frame_lock this
+            // does not need the phone held still — which is why frame_lock read 0.225 at r=0.05 on
+            // the flight where the long baseline said 0.0. Logged only in build 25.
+            if gyroAzimuth.hasSamples {
+                followGainEstimator.add(driver: lastGPSCourseDeg,
+                                        response: gyroAzimuth.azimuthDeg - arDeg,
+                                        at: time)
+                if let gain = followGainEstimator.estimate {
+                    followGain  = gain.slope
+                    followGainR = gain.correlation
+                }
             }
         }
     }

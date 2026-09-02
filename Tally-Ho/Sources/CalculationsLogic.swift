@@ -1127,6 +1127,201 @@ struct GroundYawCorrection {
     }
 }
 
+/// Carries a world-yaw offset forward through the aircraft's heading changes.
+///
+/// **Why this exists.** Every anchor before build 25 assumed ARKit's in-flight azimuth error was one
+/// constant per session. The FL317 log killed that. Over 71 seconds the aircraft turned 12.7° left
+/// and ARKit's azimuth moved **+0.7°** — an Earth-locked frame would have moved −12.7°. The same
+/// thing off the other column: `course_residual` fell 13.2° while `track` fell 13.1°, one for one to
+/// a tenth of a degree. At cruise, through slow heading change, ARKit's world **rides with the
+/// fuselage**: every visual feature it tracks is cabin interior, and at 0.2 °/s the visual solution
+/// outvotes the gyro.
+///
+/// So an anchor is accurate at the moment it is taken and decays at exactly the rate the aircraft
+/// turns. In that log the anchor read 1.5° at t=20 s and the truth was −10.8° two minutes later.
+/// This adds the aircraft's heading change back in, which is the whole correction.
+///
+/// **Gain is 1.0.** That is what the log measured, in the cruise-and-look-around regime the app is
+/// actually used in. The known risk is a fast turn — an earlier log's `frame_lock` read +1.065
+/// through a real turn, where the gyro wins and ARKit *does* follow the aircraft, and full following
+/// would then double-count by the size of the turn. Rather than guess a crossover rate, build 25
+/// applies 1.0 and measures the gain independently (see GyroAzimuthIntegrator). The alternative
+/// available today is gain 0, which the same log shows is also wrong, and wrong in the regime that
+/// actually occurs.
+struct TrackFollowingYawOffset {
+
+    /// Where the base offset came from. Recorded so a log can tell an automatic seed from a
+    /// user-captured one without inferring it from timing.
+    enum Source: String {
+        case ground
+        case anchor
+    }
+
+    /// Course accuracy past which `course` is not a direction worth integrating.
+    let maxCourseAccuracyDeg: Double
+    /// Below this the aircraft is not going anywhere in particular and `course` is noise.
+    let minGroundSpeedKt: Double
+    /// Fastest plausible heading change. Anything above this in one increment is a GPS course
+    /// glitch, not a turn — a 737 rolled to 30° at 440 kt turns about 3 °/s.
+    let maxTurnRateDps: Double
+    /// After this long without a usable sample, re-baseline instead of accumulating. Swallowing an
+    /// unknown amount of turning as one step would be worse than under-correcting.
+    let maxGapSeconds: TimeInterval
+
+    private(set) var baseOffsetDeg: Double = 0
+    /// Heading change accumulated since the seed. Kept unwrapped and separate from the base so the
+    /// log can show how much of the applied offset is followed rather than measured.
+    private(set) var followedDeg: Double = 0
+    private(set) var source: Source?
+    private var lastTrackDeg: Double = -1
+    private var lastSampleTime: TimeInterval = -.greatestFiniteMagnitude
+
+    init(maxCourseAccuracyDeg: Double = 5.0,
+         minGroundSpeedKt: Double = 80.0,
+         maxTurnRateDps: Double = 6.0,
+         maxGapSeconds: TimeInterval = 30.0) {
+        self.maxCourseAccuracyDeg = maxCourseAccuracyDeg
+        self.minGroundSpeedKt = minGroundSpeedKt
+        self.maxTurnRateDps = maxTurnRateDps
+        self.maxGapSeconds = maxGapSeconds
+    }
+
+    /// The offset to apply, or nil while nothing has been seeded.
+    var offsetDeg: Double? {
+        guard source != nil else { return nil }
+        return TrackFollowingYawOffset.wrap180(baseOffsetDeg + followedDeg)
+    }
+
+    var hasSeed: Bool { source != nil }
+
+    /// Take a fresh absolute measurement as the new base and start following from this heading.
+    mutating func seed(offsetDeg: Double, trackDeg: Double, source: Source, at time: TimeInterval) {
+        baseOffsetDeg = offsetDeg
+        followedDeg = 0
+        self.source = source
+        lastTrackDeg = trackDeg
+        lastSampleTime = time
+    }
+
+    /// What the offset would be if a fresh measurement said `candidate` — used to compare a new
+    /// anchor against what following predicts, without disturbing the current state.
+    func disagreementDeg(with candidateOffsetDeg: Double) -> Double? {
+        guard let current = offsetDeg else { return nil }
+        return TrackFollowingYawOffset.wrap180(candidateOffsetDeg - current)
+    }
+
+    /// Feed the current GPS course. Accumulates the increment since the last accepted sample.
+    ///
+    /// Increments are accumulated, never differenced against the seed's heading: a flight that turns
+    /// through more than 180° would wrap and invert the correction. Each increment is small, so no
+    /// wrap ambiguity arises.
+    ///
+    /// Returns true when this sample was accumulated, false when it was rejected or re-baselined.
+    @discardableResult
+    mutating func update(trackDeg: Double,
+                         courseAccuracyDeg: Double,
+                         groundSpeedKt: Double,
+                         at time: TimeInterval) -> Bool {
+        guard source != nil else { return false }
+        guard trackDeg >= 0, trackDeg.isFinite,
+              courseAccuracyDeg >= 0, courseAccuracyDeg <= maxCourseAccuracyDeg,
+              groundSpeedKt >= minGroundSpeedKt
+        else { return false }
+
+        let dt = time - lastSampleTime
+        guard lastTrackDeg >= 0, dt > 0, dt <= maxGapSeconds else {
+            // First sample after a seed with no heading, or a long blackout: start from here rather
+            // than booking an unknown amount of turning as one step.
+            lastTrackDeg = trackDeg
+            lastSampleTime = time
+            return false
+        }
+
+        let delta = TrackFollowingYawOffset.wrap180(trackDeg - lastTrackDeg)
+        guard abs(delta) <= maxTurnRateDps * dt else {
+            // A jump no aircraft could fly. Re-baseline on it rather than accumulating it, and
+            // rather than pinning lastTrack to a value the aircraft has already left.
+            lastTrackDeg = trackDeg
+            lastSampleTime = time
+            return false
+        }
+
+        followedDeg += delta
+        lastTrackDeg = trackDeg
+        lastSampleTime = time
+        return true
+    }
+
+    /// Clear with the world, or when the offset it carries is withdrawn.
+    mutating func clear() {
+        baseOffsetDeg = 0
+        followedDeg = 0
+        source = nil
+        lastTrackDeg = -1
+        lastSampleTime = -.greatestFiniteMagnitude
+    }
+
+    static func wrap180(_ degrees: Double) -> Double {
+        var d = degrees.truncatingRemainder(dividingBy: 360)
+        if d > 180 { d -= 360 }
+        if d < -180 { d += 360 }
+        return d
+    }
+}
+
+/// Integrates the device gyro's vertical-axis rate into an azimuth, so ARKit's azimuth can be
+/// compared against an inertial one.
+///
+/// **What this buys.** The gyro is inertial: it senses the aircraft's turn whether or not ARKit
+/// does. So with ARKit's azimuth, the gyro's, and GPS track all in hand,
+///
+///     gain = (Δgyro − ΔARKit) / Δtrack
+///
+/// is 1 when ARKit rides with the cabin and 0 when it stays Earth-locked — and, unlike `frame_lock`,
+/// it assumes **nothing about the phone being held still**, because a pan moves Δgyro and ΔARKit
+/// together and cancels out of the numerator. That is what makes it worth adding: `frame_lock` on
+/// the FL317 log read 0.225 at r=0.05, no signal at all, in exactly the regime that mattered.
+///
+/// Absolute value is meaningless — gyro bias walks it away over minutes. Only differences over tens
+/// of seconds are used, which is what the regression consumes.
+struct GyroAzimuthIntegrator {
+
+    /// Rates below this are bias and vibration rather than rotation, and integrating them is what
+    /// makes a gyro walk. A cruise turn is 0.2 °/s, so the floor has to sit well under that.
+    let deadbandDps: Double
+    /// A gap longer than this means device motion stopped reporting; integrating across it would
+    /// invent rotation that may or may not have happened.
+    let maxGapSeconds: TimeInterval
+
+    private(set) var azimuthDeg: Double = 0
+    private(set) var hasSamples: Bool = false
+    private var lastTime: TimeInterval = -.greatestFiniteMagnitude
+
+    init(deadbandDps: Double = 0.05, maxGapSeconds: TimeInterval = 1.0) {
+        self.deadbandDps = deadbandDps
+        self.maxGapSeconds = maxGapSeconds
+    }
+
+    /// Feed one vertical-axis yaw rate, in degrees per second. NaN (device motion not reporting)
+    /// breaks the integration rather than contributing zero.
+    mutating func add(yawRateDps: Double, at time: TimeInterval) {
+        // The clock advances even when the sample is unusable, so the next interval starts here
+        // rather than spanning — and silently integrating across — the part we could not measure.
+        let dt = time - lastTime
+        lastTime = time
+        guard yawRateDps.isFinite, dt > 0, dt <= maxGapSeconds else { return }
+        hasSamples = true
+        guard abs(yawRateDps) >= deadbandDps else { return }
+        azimuthDeg += yawRateDps * dt
+    }
+
+    mutating func reset() {
+        azimuthDeg = 0
+        hasSamples = false
+        lastTime = -.greatestFiniteMagnitude
+    }
+}
+
 /// Decides which way up the phone physically is, from ARKit's gravity-referenced camera attitude,
 /// so the interface can be asked to follow it.
 ///

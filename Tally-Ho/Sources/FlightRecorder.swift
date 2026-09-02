@@ -68,6 +68,7 @@ final class FlightRecorder {
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
         "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg", "yaw_src",
+        "yaw_follow_deg", "follow_gain", "follow_gain_r",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
         "ar_heading_deg", "heading_delta_deg",
@@ -114,9 +115,24 @@ final class FlightRecorder {
         /// anchor, or the ground compass correction. Those two are mutually exclusive.
         var anchorOffsetDeg: Double?
         /// "none", "ground" or "anchor" — see ARTrafficViewController.WorldYawSource. A "ground"
-        /// value while airborne is a frozen carry-over from before takeoff and is expected; a
-        /// "ground" value that keeps *changing* while airborne would be the build-8 failure.
+        /// value while airborne is a carry-over seeded at takeoff and is expected; a "ground" value
+        /// whose *base* keeps being re-measured while airborne would be the build-8 failure.
         var yawSource: String?
+        /// How much of anchorOffsetDeg is accumulated heading change rather than measurement.
+        ///
+        /// ARKit's world rides with the fuselage through slow turns — measured at FL317 as the
+        /// aircraft turning 12.7° while ARKit's azimuth moved 0.7° — so an offset measured once
+        /// decays at exactly the aircraft's turn rate. This is the amount added back. It should
+        /// equal the heading change since the seed; if it does not, the follower is being starved
+        /// by its course-quality gate.
+        var yawFollowedDeg: Double?
+        /// Share of the aircraft's turn that ARKit fails to follow: 1 = rides with the cabin,
+        /// 0 = stays Earth-locked. Measured as (gyro azimuth change − ARKit azimuth change) per
+        /// degree of track change, so unlike frameLock it does not need the phone held still.
+        /// Logged only — build 25 applies a fixed gain of 1.0 and uses this to decide whether that
+        /// should become rate-dependent. Read it with followGainR, as with every slope here.
+        var followGain: Double?
+        var followGainR: Double?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
         /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
@@ -334,6 +350,9 @@ final class FlightRecorder {
         fields.append(format(sample.courseResidualDeg,     decimals: 1))
         fields.append(format(sample.anchorOffsetDeg,       decimals: 1))
         fields.append(escape(sample.yawSource ?? ""))
+        fields.append(format(sample.yawFollowedDeg, decimals: 1))
+        fields.append(format(sample.followGain,    decimals: 3))
+        fields.append(format(sample.followGainR,   decimals: 2))
         fields.append(format(sample.compassResponse,  decimals: 3))
         fields.append(format(sample.compassResponseR, decimals: 2))
         fields.append(format(sample.frameLock,        decimals: 3))
