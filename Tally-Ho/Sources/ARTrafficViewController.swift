@@ -1103,6 +1103,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// is shown the number rather than having it applied silently.
     private static let anchorDisagreementDeg: Double = 15.0
 
+    /// When to say out loud that the alignment is on offer and has not been taken. See
+    /// AlignPromptScheduler: two flights offered it continuously and neither took it.
+    private var alignPrompts = AlignPromptScheduler()
+
     /// Gyro-integrated azimuth, for measuring how much of the aircraft's turn ARKit actually
     /// follows. Logged only in build 25 — see GyroAzimuthIntegrator for why it beats frame_lock.
     private var gyroAzimuth = GyroAzimuthIntegrator()
@@ -2006,6 +2010,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         groundYaw.reset()
         clearYawFollower(reason: "world_reset")
         pendingGroundSeed = false
+        // A new world needs its own alignment, so it gets its own asking.
+        alignPrompts.reset()
         worldYawSource = .none
         lastLoggedGroundYawRefusal = nil
         // The gain regression pairs ARKit's azimuth against the gyro's. A reset jumps one and not
@@ -3747,10 +3753,53 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
-    /// Show or hide the button as the flight state changes. Called from the 4 Hz tick.
+    /// Show or hide the button as the flight state changes, draw attention to it while a flight is
+    /// unaligned, and occasionally say so in words. Called from the 4 Hz tick.
+    ///
+    /// Two flights offered this button on every healthy-tracking row and it was never tapped, so
+    /// both flew with `yaw_src=none` and no correction at all. Everything the app can do about
+    /// azimuth in the air depends on that one tap — see AlignPromptScheduler.
     private func updateAlignButtonVisibility() {
         let shouldShow = canCaptureFlightAnchor || anchorCaptureActive
         if alignButton.isHidden == shouldShow { alignButton.isHidden = !shouldShow }
+
+        let unaligned = shouldShow && worldYawSource == .none && !anchorCaptureActive
+        setAlignButtonPulsing(unaligned)
+
+        let now = CACurrentMediaTime()
+        guard alignPrompts.shouldPrompt(available: canCaptureFlightAnchor,
+                                        hasOffset: worldYawSource != .none,
+                                        capturing: anchorCaptureActive,
+                                        at: now)
+        else { return }
+        // Says what to do, not that something is wrong: the app is working, it just cannot know
+        // which way the nose points until it is told once.
+        showAlignBanner("Tap ➤ to line traffic up with the aircraft", clearAfter: 6.0)
+        FlightRecorder.shared.record(
+            event: "align_hint_shown",
+            detail: String(format: "n=%d secs_since_available=%.0f",
+                           alignPrompts.promptCount, alignPrompts.secondsAvailable(at: now))
+        )
+    }
+
+    /// Removed rather than left running at zero alpha, so an aligned flight has a completely still
+    /// button and the animation cannot survive as an invisible cost on every frame.
+    private func setAlignButtonPulsing(_ pulsing: Bool) {
+        guard alignButton != nil else { return }
+        let key = "alignPulse"
+        if pulsing {
+            guard alignButton.layer.animation(forKey: key) == nil else { return }
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.35
+            pulse.duration = 0.7
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            alignButton.layer.add(pulse, forKey: key)
+        } else {
+            alignButton.layer.removeAnimation(forKey: key)
+        }
     }
 
     /// Ask the interface to match the way the phone is actually being held.

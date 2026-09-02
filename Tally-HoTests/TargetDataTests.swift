@@ -1078,6 +1078,103 @@ struct TargetDataTests {
         #expect(slaved == .refused(.compassNotMeasuringPhone))
     }
 
+    // MARK: - Align prompt scheduling
+
+    // Two flights offered the align button on every healthy-tracking row and neither took it, so
+    // both flew uncorrected. These cover the one thing that must not happen in fixing that: the
+    // prompt becoming noise the user learns to dismiss.
+
+    /// Fires as soon as the opportunity appears — that is the moment it is worth saying.
+    @Test func promptsOnFirstAvailability() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 100))
+        #expect(s.promptCount == 1)
+    }
+
+    @Test func doesNotPromptWhileUnavailable() {
+        var s = AlignPromptScheduler()
+        for i in 0..<100 {
+            #expect(!s.shouldPrompt(available: false, hasOffset: false, capturing: false,
+                                    at: Double(i)))
+        }
+        #expect(s.promptCount == 0)
+    }
+
+    /// The 4 Hz tick asks constantly. It must be answered once, then not again for five minutes.
+    @Test func promptRespectsTheInterval() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        var fired = 0
+        // 4 Hz for four minutes: one prompt only.
+        for i in 0..<960 {
+            if s.shouldPrompt(available: true, hasOffset: false, capturing: false,
+                              at: Double(i) * 0.25) { fired += 1 }
+        }
+        #expect(fired == 1)
+        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 300))
+    }
+
+    /// After three the user has decided. A fourth is nagging.
+    @Test func promptStopsAtTheCap() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        var fired = 0
+        for i in 0..<20 {
+            if s.shouldPrompt(available: true, hasOffset: false, capturing: false,
+                              at: Double(i) * 300) { fired += 1 }
+        }
+        #expect(fired == 3)
+    }
+
+    /// Once an offset is in force there is nothing left to ask for.
+    @Test func promptGoesSilentOnceAligned() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 0))
+        for i in 1..<20 {
+            #expect(!s.shouldPrompt(available: true, hasOffset: true, capturing: false,
+                                    at: Double(i) * 300))
+        }
+        #expect(s.promptCount == 1)
+    }
+
+    /// Interrupting a running capture with a banner telling the user to start one would be absurd.
+    @Test func promptStaysQuietDuringACapture() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        #expect(!s.shouldPrompt(available: true, hasOffset: false, capturing: true, at: 0))
+        #expect(s.promptCount == 0)
+    }
+
+    /// A flight dipping in and out of usable tracking must not be owed a prompt each time it
+    /// returns; availability going away restarts the wait.
+    @Test func availabilityFlappingDoesNotBurstPrompts() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        var fired = 0
+        for i in 0..<200 {
+            let up = i % 2 == 0
+            if s.shouldPrompt(available: up, hasOffset: false, capturing: false,
+                              at: Double(i)) { fired += 1 }
+        }
+        #expect(fired == 1)
+    }
+
+    /// The log line's "how long has this been on offer" figure.
+    @Test func secondsAvailableCountsFromFirstOffer() {
+        var s = AlignPromptScheduler()
+        #expect(s.secondsAvailable(at: 500) == 0)
+        _ = s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 100)
+        #expect(abs(s.secondsAvailable(at: 160) - 60) < 0.001)
+    }
+
+    @Test func promptResetsWithTheWorld() {
+        var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
+        for i in 0..<3 {
+            _ = s.shouldPrompt(available: true, hasOffset: false, capturing: false,
+                               at: Double(i) * 300)
+        }
+        #expect(s.promptCount == 3)
+        s.reset()
+        #expect(s.promptCount == 0)
+        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 1000))
+    }
+
     // MARK: - Track-following offset
 
     // The FL317 log: the aircraft turned 12.7° left while ARKit's azimuth moved +0.7°, so an offset

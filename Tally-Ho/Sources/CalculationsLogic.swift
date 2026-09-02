@@ -1127,6 +1127,74 @@ struct GroundYawCorrection {
     }
 }
 
+/// Decides when to tell the user the alignment is available and has not been taken.
+///
+/// **Why this exists.** Across two flights the align button was offered on every healthy-tracking
+/// row — 154 of 154 at FL402 — and was never tapped once, so `yaw_src` read `none` for both entire
+/// flights. Every correction this app can make in the air depends on somebody saying which direction
+/// is the nose, and nothing on the phone can say it: the cabin compass measures the aircraft's track
+/// (`compass_response` 0.009 at FL402), and ARKit's own `.gravityAndHeading` seed inherits that same
+/// compass. So the button has to ask, and asking is a scheduling problem rather than a sensing one.
+///
+/// The whole design is about not becoming noise. A prompt the user learns to dismiss is worse than
+/// no prompt: it trains them past the one thing the app needs from them. So it fires when the
+/// opportunity first appears, then rarely, then stops — and it goes silent the moment an offset
+/// exists, because at that point there is nothing to ask for.
+struct AlignPromptScheduler {
+
+    /// Shortest gap between prompts. Five minutes is long enough that a declined prompt reads as
+    /// declined rather than as a bug.
+    let minIntervalSeconds: TimeInterval
+    /// After this many, the user has decided. Stop.
+    let maxPrompts: Int
+
+    private(set) var promptCount: Int = 0
+    private var lastPromptTime: TimeInterval = -.greatestFiniteMagnitude
+    /// When the opportunity first appeared, so the log can say how long it went untaken.
+    private(set) var firstAvailableTime: TimeInterval?
+
+    init(minIntervalSeconds: TimeInterval = 300, maxPrompts: Int = 3) {
+        self.minIntervalSeconds = minIntervalSeconds
+        self.maxPrompts = maxPrompts
+    }
+
+    /// How long the alignment has been on offer, for the prompt's log line.
+    func secondsAvailable(at time: TimeInterval) -> Double {
+        guard let first = firstAvailableTime else { return 0 }
+        return max(0, time - first)
+    }
+
+    /// Call from the display tick. True exactly on the ticks a prompt should be shown.
+    mutating func shouldPrompt(available: Bool,
+                               hasOffset: Bool,
+                               capturing: Bool,
+                               at time: TimeInterval) -> Bool {
+        guard available else {
+            // The opportunity going away resets the clock, so a prompt is not owed the instant it
+            // returns — a flight that dips in and out of usable tracking must not prompt each time.
+            firstAvailableTime = nil
+            return false
+        }
+        if firstAvailableTime == nil { firstAvailableTime = time }
+
+        // Nothing to ask for once an offset is in force, and nothing to ask for mid-capture.
+        guard !hasOffset, !capturing else { return false }
+        guard promptCount < maxPrompts else { return false }
+        guard time - lastPromptTime >= minIntervalSeconds else { return false }
+
+        lastPromptTime = time
+        promptCount += 1
+        return true
+    }
+
+    /// Clear with the world: a new ARKit session needs its own alignment, so it gets its own asking.
+    mutating func reset() {
+        promptCount = 0
+        lastPromptTime = -.greatestFiniteMagnitude
+        firstAvailableTime = nil
+    }
+}
+
 /// Carries a world-yaw offset forward through the aircraft's heading changes.
 ///
 /// **Why this exists.** Every anchor before build 25 assumed ARKit's in-flight azimuth error was one
