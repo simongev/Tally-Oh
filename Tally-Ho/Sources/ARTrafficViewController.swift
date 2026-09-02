@@ -1089,9 +1089,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// airborne against ground track, which is the only azimuth reference that works in a cabin.
     private var worldYawSource: WorldYawSource = .none
 
-    /// Carries whichever offset is in force through the aircraft's heading changes. See
-    /// TrackFollowingYawOffset: ARKit's world rides with the fuselage through slow turns, so an
-    /// offset measured once decays at exactly the rate the aircraft turns.
+    /// Holds whichever offset is in force. Built to carry it through the aircraft's heading changes;
+    /// that following is **off** from build 28, because the FL362 turn measured ARKit tracking the
+    /// aircraft at a slope of 0.893 with r = 0.978 — Earth-locked, so the offset is a constant and
+    /// following was adding 30° of error per turn. The default gain of 0 is deliberate; see
+    /// TrackFollowingYawOffset.
     private var yawFollower = TrackFollowingYawOffset()
     /// Set when the ground correction is ready to seed the follower but the track is not yet usable
     /// — the airborne transition can fire a moment before GPS course settles.

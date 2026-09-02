@@ -1195,27 +1195,41 @@ struct AlignPromptScheduler {
     }
 }
 
-/// Carries a world-yaw offset forward through the aircraft's heading changes.
+/// Holds the world-yaw offset, and — **currently disabled, see the gain** — can carry it forward
+/// through the aircraft's heading changes.
 ///
-/// **Why this exists.** Every anchor before build 25 assumed ARKit's in-flight azimuth error was one
-/// constant per session. The FL317 log killed that. Over 71 seconds the aircraft turned 12.7° left
-/// and ARKit's azimuth moved **+0.7°** — an Earth-locked frame would have moved −12.7°. The same
-/// thing off the other column: `course_residual` fell 13.2° while `track` fell 13.1°, one for one to
-/// a tenth of a degree. At cruise, through slow heading change, ARKit's world **rides with the
-/// fuselage**: every visual feature it tracks is cabin interior, and at 0.2 °/s the visual solution
-/// outvotes the gyro.
+/// **Retracted in build 28.** This existed because build 25 read the FL317 log as saying ARKit's
+/// world rides with the fuselage: over 71 seconds the aircraft turned 12.7° while ARKit's azimuth
+/// moved 0.7°, which looks exactly like a cabin-locked frame. It was not. That reading had two
+/// endpoints and no correlation behind it, and it is what an *Earth-locked* frame also produces when
+/// the user happens to hold the phone on a fixed feature out of the window — the phone's Earth
+/// azimuth then stays constant by construction, whatever the aircraft does. Non-discriminating
+/// evidence, which is the mistake this project keeps making.
 ///
-/// So an anchor is accurate at the moment it is taken and decays at exactly the rate the aircraft
-/// turns. In that log the anchor read 1.5° at t=20 s and the truth was −10.8° two minutes later.
-/// This adds the aircraft's heading change back in, which is the whole correction.
+/// The FL362 log settled it with an actual turn — 30.6° of heading change over 110 s — and every
+/// measure agrees that ARKit is **Earth-locked**:
 ///
-/// **Gain is 1.0.** That is what the log measured, in the cruise-and-look-around regime the app is
-/// actually used in. The known risk is a fast turn — an earlier log's `frame_lock` read +1.065
-/// through a real turn, where the gyro wins and ARKit *does* follow the aircraft, and full following
-/// would then double-count by the size of the turn. Rather than guess a crossover rate, build 25
-/// applies 1.0 and measures the gain independently (see GyroAzimuthIntegrator). The alternative
-/// available today is gain 0, which the same log shows is also wrong, and wrong in the regime that
-/// actually occurs.
+/// | method | d(ARKit azimuth) / d(track) |
+/// |---|---|
+/// | least squares, n=103 | **0.893, r = 0.978** |
+/// | endpoints | 1.023 |
+/// | first third vs last third | 0.881 |
+/// | `frame_lock` in-app | 0.696 |
+/// | `follow_gain`, gyro-referenced and pan-immune | 0.129, i.e. Earth-locked on its own scale |
+///
+/// 1.0 means ARKit turns with the aircraft, so the offset an anchor measures is a **constant** and
+/// following the track is not a correction but an injected error. In that same log following
+/// accumulated −30.6° and dragged the applied offset from −35.5° to −66.1° — thirty degrees of pure
+/// error added on top of an anchor the user had given correctly.
+///
+/// (The 0.11 shortfall below unity needs no mechanism. The phone is fuselage-referenced, so it
+/// follows *heading*, while `track` carries the drift angle, which changes with wind through a 30°
+/// turn. Not enough to build a partial gain on.)
+///
+/// **So `gain` is 0 and this applies nothing.** `followedDeg` still accumulates and is still logged,
+/// as the counterfactual — what following *would* have added — so `follow_gain` keeps measuring the
+/// one thing that would justify turning it back on. If a log ever shows a slope near 0 with a
+/// correlation worth trusting, the gain goes back up, with evidence this time.
 struct TrackFollowingYawOffset {
 
     /// Where the base offset came from. Recorded so a log can tell an automatic seed from a
@@ -1235,10 +1249,16 @@ struct TrackFollowingYawOffset {
     /// After this long without a usable sample, re-baseline instead of accumulating. Swallowing an
     /// unknown amount of turning as one step would be worse than under-correcting.
     let maxGapSeconds: TimeInterval
+    /// **Zero, and the measurement above is why.** How much of the accumulated heading change to add
+    /// to the base offset: 0 holds the offset constant, which is what an Earth-locked ARKit needs;
+    /// 1 would fully follow the aircraft, which is what build 25 shipped and what cost 30°.
+    /// Configurable rather than deleted so the tests can still exercise the accumulator, and so
+    /// turning it back on is a one-number change if a future log ever earns it.
+    let gain: Double
 
     private(set) var baseOffsetDeg: Double = 0
-    /// Heading change accumulated since the seed. Kept unwrapped and separate from the base so the
-    /// log can show how much of the applied offset is followed rather than measured.
+    /// Heading change accumulated since the seed, unwrapped. With `gain` at 0 this is a pure
+    /// counterfactual — what following would have added — kept so the log can still show it.
     private(set) var followedDeg: Double = 0
     private(set) var source: Source?
     private var lastTrackDeg: Double = -1
@@ -1247,17 +1267,20 @@ struct TrackFollowingYawOffset {
     init(maxCourseAccuracyDeg: Double = 5.0,
          minGroundSpeedKt: Double = 80.0,
          maxTurnRateDps: Double = 6.0,
-         maxGapSeconds: TimeInterval = 30.0) {
+         maxGapSeconds: TimeInterval = 30.0,
+         gain: Double = 0.0) {
         self.maxCourseAccuracyDeg = maxCourseAccuracyDeg
         self.minGroundSpeedKt = minGroundSpeedKt
         self.maxTurnRateDps = maxTurnRateDps
         self.maxGapSeconds = maxGapSeconds
+        self.gain = gain
     }
 
-    /// The offset to apply, or nil while nothing has been seeded.
+    /// The offset to apply, or nil while nothing has been seeded. At `gain` 0 this is exactly what
+    /// the last anchor measured, held constant.
     var offsetDeg: Double? {
         guard source != nil else { return nil }
-        return TrackFollowingYawOffset.wrap180(baseOffsetDeg + followedDeg)
+        return TrackFollowingYawOffset.wrap180(baseOffsetDeg + gain * followedDeg)
     }
 
     var hasSeed: Bool { source != nil }

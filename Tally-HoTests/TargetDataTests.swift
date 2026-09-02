@@ -1177,13 +1177,44 @@ struct TargetDataTests {
 
     // MARK: - Track-following offset
 
-    // The FL317 log: the aircraft turned 12.7° left while ARKit's azimuth moved +0.7°, so an offset
-    // measured once decays at exactly the aircraft's turn rate. These cover the accumulation and
-    // every guard that decides whether a heading sample is worth integrating.
+    // Following is OFF from build 28 — the FL362 turn measured ARKit's azimuth tracking the
+    // aircraft at a slope of 0.893 with r = 0.978, so the offset is a constant. The tests below
+    // construct the struct with an explicit `gain: 1.0` because what they exercise is the
+    // accumulator, which is unchanged and still feeds the log; the two tests immediately following
+    // are the ones that pin the shipped behaviour.
+
+    /// **The build-28 retraction.** The default gain must apply nothing: an anchor's offset is held
+    /// exactly as measured, however far the aircraft turns. In the FL362 log the difference is the
+    /// offset staying at −35.5 instead of walking to −66.1.
+    @Test func defaultGainHoldsTheOffsetThroughATurn() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: -35.5, trackDeg: 229.9, source: .anchor, at: 0)
+        // The turn that settled it: 30.6° left over 110 s.
+        for i in 1...110 {
+            follower.update(trackDeg: 229.9 - 30.6 * Double(i) / 110.0,
+                            courseAccuracyDeg: 0.1, groundSpeedKt: 460, at: Double(i))
+        }
+        #expect(abs((follower.offsetDeg ?? 99) - (-35.5)) < 0.001)
+    }
+
+    /// The accumulation still runs under the zero gain, because the log records it as the
+    /// counterfactual that would justify switching following back on.
+    @Test func followedDegreesStillAccumulateWhileDisabled() {
+        var follower = TrackFollowingYawOffset()
+        follower.seed(offsetDeg: -35.5, trackDeg: 229.9, source: .anchor, at: 0)
+        for i in 1...110 {
+            follower.update(trackDeg: 229.9 - 30.6 * Double(i) / 110.0,
+                            courseAccuracyDeg: 0.1, groundSpeedKt: 460, at: Double(i))
+        }
+        #expect(abs(follower.followedDeg - (-30.6)) < 0.01)
+    }
+
+    // The accumulator itself, exercised at gain 1.0: every guard that decides whether a heading
+    // sample is worth integrating, and the unwrapping that survives a course reversal.
 
     /// Steady cruise: a fixed course accumulates nothing, so the offset stays where it was measured.
     @Test func straightFlightDoesNotMoveTheOffset() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 1.5, trackDeg: 298, source: .anchor, at: 0)
         for i in 1...60 {
             follower.update(trackDeg: 298, courseAccuracyDeg: 0.1, groundSpeedKt: 440,
@@ -1195,7 +1226,7 @@ struct TargetDataTests {
 
     /// The FL317 case itself: 12.7° of left turn must be added back to the offset.
     @Test func offsetFollowsTheHeadingChange() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 1.5, trackDeg: 298.2, source: .anchor, at: 0)
         // 12.7° left over 64 s, the rate the log actually flew.
         for i in 1...64 {
@@ -1209,7 +1240,7 @@ struct TargetDataTests {
     /// **Accumulate, don't difference.** A flight that turns through more than 180° would wrap and
     /// invert the correction if the offset were computed against the seed's heading.
     @Test func followingSurvivesATurnPastOneEighty() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 0, trackDeg: 0, source: .anchor, at: 0)
         // 270° right, at 2 °/s — a whole course reversal and then some.
         for i in 1...135 {
@@ -1222,7 +1253,7 @@ struct TargetDataTests {
     }
 
     @Test func followingIgnoresAnInaccurateCourse() {
-        var follower = TrackFollowingYawOffset(maxCourseAccuracyDeg: 5)
+        var follower = TrackFollowingYawOffset(maxCourseAccuracyDeg: 5, gain: 1.0)
         follower.seed(offsetDeg: 0, trackDeg: 300, source: .anchor, at: 0)
         for i in 1...30 {
             follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 40,
@@ -1233,7 +1264,7 @@ struct TargetDataTests {
 
     /// Taxiing is not a direction. Below the speed gate nothing accumulates.
     @Test func followingIgnoresSlowGroundSpeed() {
-        var follower = TrackFollowingYawOffset(minGroundSpeedKt: 80)
+        var follower = TrackFollowingYawOffset(minGroundSpeedKt: 80, gain: 1.0)
         follower.seed(offsetDeg: 0, trackDeg: 300, source: .anchor, at: 0)
         for i in 1...30 {
             follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 0.5,
@@ -1244,7 +1275,7 @@ struct TargetDataTests {
 
     /// A course that jumps faster than an aircraft can turn is GPS noise, not a turn.
     @Test func followingRejectsAnImpossibleTurnRate() {
-        var follower = TrackFollowingYawOffset(maxTurnRateDps: 6)
+        var follower = TrackFollowingYawOffset(maxTurnRateDps: 6, gain: 1.0)
         follower.seed(offsetDeg: 0, trackDeg: 0, source: .anchor, at: 0)
         follower.update(trackDeg: 90, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 1)
         #expect(follower.followedDeg == 0)
@@ -1256,7 +1287,7 @@ struct TargetDataTests {
     /// After a long blackout the aircraft may have turned any amount; booking it as one step would
     /// be worse than under-correcting.
     @Test func followingReBaselinesAfterALongGap() {
-        var follower = TrackFollowingYawOffset(maxGapSeconds: 30)
+        var follower = TrackFollowingYawOffset(maxGapSeconds: 30, gain: 1.0)
         follower.seed(offsetDeg: 5, trackDeg: 0, source: .anchor, at: 0)
         follower.update(trackDeg: 120, courseAccuracyDeg: 1, groundSpeedKt: 440, at: 600)
         #expect(follower.followedDeg == 0)
@@ -1267,14 +1298,14 @@ struct TargetDataTests {
     }
 
     @Test func unseededFollowerAppliesNothing() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.update(trackDeg: 300, courseAccuracyDeg: 0.1, groundSpeedKt: 440, at: 1)
         #expect(follower.offsetDeg == nil)
         #expect(!follower.hasSeed)
     }
 
     @Test func seedingResetsTheAccumulation() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 0, trackDeg: 300, source: .ground, at: 0)
         for i in 1...10 {
             follower.update(trackDeg: 300 - Double(i), courseAccuracyDeg: 1,
@@ -1288,7 +1319,7 @@ struct TargetDataTests {
     }
 
     @Test func clearStopsFollowing() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 3, trackDeg: 300, source: .ground, at: 0)
         follower.clear()
         #expect(follower.offsetDeg == nil)
@@ -1299,7 +1330,7 @@ struct TargetDataTests {
     /// **The FL317 mis-aim.** A capture 50° off the nose must read as a disagreement against what
     /// following predicts, rather than being applied silently.
     @Test func disagreementCatchesAMisaimedAnchor() {
-        var follower = TrackFollowingYawOffset()
+        var follower = TrackFollowingYawOffset(gain: 1.0)
         follower.seed(offsetDeg: 1.5, trackDeg: 297.8, source: .anchor, at: 0)
         for i in 1...108 {
             follower.update(trackDeg: 297.8 - 12.3 * Double(i) / 108.0,
@@ -1315,7 +1346,7 @@ struct TargetDataTests {
     }
 
     @Test func disagreementIsNilWithoutASeed() {
-        let follower = TrackFollowingYawOffset()
+        let follower = TrackFollowingYawOffset(gain: 1.0)
         #expect(follower.disagreementDeg(with: 39.1) == nil)
     }
 

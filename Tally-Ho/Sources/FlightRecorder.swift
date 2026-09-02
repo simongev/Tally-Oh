@@ -118,13 +118,15 @@ final class FlightRecorder {
         /// value while airborne is a carry-over seeded at takeoff and is expected; a "ground" value
         /// whose *base* keeps being re-measured while airborne would be the build-8 failure.
         var yawSource: String?
-        /// How much of anchorOffsetDeg is accumulated heading change rather than measurement.
+        /// Heading change accumulated since the offset was seeded — a **counterfactual**, not a
+        /// component of anchorOffsetDeg.
         ///
-        /// ARKit's world rides with the fuselage through slow turns — measured at FL317 as the
-        /// aircraft turning 12.7° while ARKit's azimuth moved 0.7° — so an offset measured once
-        /// decays at exactly the aircraft's turn rate. This is the amount added back. It should
-        /// equal the heading change since the seed; if it does not, the follower is being starved
-        /// by its course-quality gate.
+        /// Build 25 added this to the applied offset, on a reading of the FL317 log that said
+        /// ARKit's world rides with the fuselage. The FL362 turn disproved it: ARKit's azimuth
+        /// tracks the aircraft at a slope of 0.893 with r = 0.978, so the offset is a constant and
+        /// following it was injecting error — 30.6° of it across that turn. The gain is 0 from build
+        /// 28 on, and this column now records only what following would have added. Read it with
+        /// followGain, which is the number that would justify switching it back on.
         var yawFollowedDeg: Double?
         /// Share of the aircraft's turn that ARKit fails to follow: 1 = rides with the cabin,
         /// 0 = stays Earth-locked. Measured as (gyro azimuth change − ARKit azimuth change) per
