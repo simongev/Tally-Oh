@@ -933,8 +933,19 @@ struct StartupSeed {
         /// Airborne: the aircraft's GPS ground track, which is the nose to within the drift angle.
         /// The compass cannot be used here — it measures the fuselage, not the phone.
         case track
-        /// On the ground: the phone's own true heading. Here the compass really does measure the
-        /// phone (`compass_response` ≈ 1.00 against 0.018 in the air), so it needs no aiming at all.
+        /// The phone's own true heading. **No longer selected by policy** — see
+        /// `ARTrafficViewController.seedReference`.
+        ///
+        /// The reasoning that put it here was that on the ground the compass measures the phone
+        /// (`compass_response` ≈ 1.00 against 0.018 in the air). That is true and it is not enough:
+        /// the response test proves the compass *follows* the phone, and says nothing about its
+        /// absolute bias. One ground log had `hdg_true` swing 273° → 345° while the phone turned
+        /// 60° — ratios against the gyro of 1.16, 0.45, 0.65, 0.62 over successive intervals —
+        /// reporting `hdg_acc` 10–11° throughout. Seeding a world is an absolute claim, and a
+        /// one-second median of that is a worse one than ARKit's own filtered fusion.
+        ///
+        /// Kept in the type because the capability is sound and its tests are worth having, in case
+        /// a future caller has a compass it can trust.
         case compass
     }
 
