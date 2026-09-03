@@ -68,7 +68,7 @@ final class FlightRecorder {
         "adsb_press_alt_ft", "adsb_hae_ft",
         "hdg_mag_deg", "hdg_true_deg", "hdg_acc_deg", "declination_deg",
         "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg", "yaw_src",
-        "yaw_follow_deg", "follow_gain", "follow_gain_r",
+        "yaw_follow_deg", "follow_gain", "follow_gain_r", "gyro_az_deg",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
         "ar_heading_deg", "heading_delta_deg",
@@ -140,6 +140,15 @@ final class FlightRecorder {
         /// should become rate-dependent. Read it with followGainR, as with every slope here.
         var followGain: Double?
         var followGainR: Double?
+        /// Integrated device-gyro azimuth — **the reference ARKit cannot corrupt.**
+        ///
+        /// Its absolute value is meaningless: gyro bias walks it over minutes. What matters is
+        /// `ar_heading_deg` minus this one. That difference cancels whatever the user did with the
+        /// phone, because a pan moves both together, so any change in it is the ARKit world itself
+        /// rotating. Added in build 30 because no earlier log could separate "the world rotated"
+        /// from "the phone panned" — which is why a flight that ended 176° wrong could only be
+        /// explained by hypothesis. See also the world_yaw_diverged event.
+        var gyroAzimuthDeg: Double?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
         /// Near 1: the compass is measuring the phone's azimuth, and an alignment correction
@@ -360,6 +369,7 @@ final class FlightRecorder {
         fields.append(format(sample.yawFollowedDeg, decimals: 1))
         fields.append(format(sample.followGain,    decimals: 3))
         fields.append(format(sample.followGainR,   decimals: 2))
+        fields.append(format(sample.gyroAzimuthDeg, decimals: 1))
         fields.append(format(sample.compassResponse,  decimals: 3))
         fields.append(format(sample.compassResponseR, decimals: 2))
         fields.append(format(sample.frameLock,        decimals: 3))

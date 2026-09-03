@@ -1116,10 +1116,36 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// AlignPromptScheduler: two flights offered it continuously and neither took it.
     private var alignPrompts = AlignPromptScheduler()
 
-    /// Whether the startup card is up waiting for the world to finish initialising. Cleared by the
-    /// first `.normal` tracking state, which is when the seed is established and the card has done
-    /// its job.
+    // MARK: - Startup seed
+
+    /// The world's own alignment capture. See StartupSeed: under `.gravity` this is the *only*
+    /// thing that orients the scene, so it runs on every world and is not optional.
+    private var startupSeed = StartupSeed()
+    /// Set by every world reset, cleared when a seed is published or abandoned. While true the tick
+    /// is trying to start or feed a capture.
+    private var awaitingSeed = false
+    /// Render clock at the reset, so the 10 s fallback is measured from the world's birth rather
+    /// than from whenever the first tick happened to run.
+    private var seedDeadline: TimeInterval = 0
+    /// Set when a world went 10 s with no usable reference. Makes the *next* start use
+    /// `.gravityAndHeading` so the app degrades to build 28's accidental alignment rather than to a
+    /// `.gravity` world with arbitrary yaw. Cleared once a seed succeeds.
+    private var seedFallbackToHeading = false
+    /// Whether the startup card is up. Cleared when the seed publishes, which is also when the card
+    /// has done its job.
     private var awaitingSeedConfirmation = false
+    /// Render-thread throttle for feeding the capture: 5 Hz, as for the manual anchor, because hand
+    /// wobble is correlated over about a second.
+    private var lastSeedSampleTime: TimeInterval = 0
+    /// ARKit's azimuth minus the gyro's at the moment the world was seeded. Any later change in that
+    /// difference is the world rotating, with the user's panning cancelled out — the measurement
+    /// this project has been missing. Recorded only; nothing acts on it.
+    private var seedGyroReferenceDeg: Double = .nan
+    private var loggedYawDivergence = false
+    /// The integrated gyro azimuth, published for the log. Its absolute value is meaningless — gyro
+    /// bias walks it — but `ar_heading_deg` minus this one is the world's own rotation, free of
+    /// whatever the user did with the phone.
+    private var gyroAzimuthDeg: Double = .nan
 
     /// Whether the OS suspended the ARSession since the last start. Set when the app backgrounds and
     /// consumed by the next `startARSession`, which withdraws the offset — a resumed session reports
@@ -1983,7 +2009,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         )
 
         let config = ARWorldTrackingConfiguration()
-        config.worldAlignment = .gravityAndHeading
+        // `.gravity`, not `.gravityAndHeading`, from build 30. The heading variant does not seed
+        // once — ARKit keeps fusing the magnetometer, and in a cabin the magnetometer measures the
+        // fuselage rather than the phone. One flight showed compass_response swinging 0.105 -> 0.02
+        // -> 0.33 -> 0.005, and across three limited:motion episodes in twenty seconds the world
+        // rotated about 176 degrees until the scene pointed backwards. `.gravity` keeps the
+        // gravity alignment the HUD depends on and takes the magnetometer out of ARKit's pipeline
+        // entirely; the yaw alignment is then ours to establish, once, in StartupSeed.
+        //
+        // The exception is the fallback below: if no seed reference turns up, an unseeded `.gravity`
+        // world has arbitrary yaw, which is worse than the accident this replaces.
+        config.worldAlignment = seedFallbackToHeading ? .gravityAndHeading : .gravity
         config.providesAudioData = false
         let options: ARSession.RunOptions = resetting ? [.resetTracking, .removeExistingAnchors] : []
         arSceneView.session.run(config, options: options)
@@ -2089,28 +2125,20 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // pushing the user toward a hand-aimed capture that measures the same quantity worse: three
         // captures against an unchanging track read 6.3°, 16.6° and 18.4°, and the first of them
         // took a world the user called accurate and moved it 6.3° off.
-        // Judged on ground speed rather than `isAirborneEstimate`, which is only recomputed in the
-        // visualisation tick and is therefore still false here on the session that matters most —
-        // the first one. `airborne_changed` lands about 0.25 s after `ar_session_start` in every
-        // flight log, while `gs` is already populated in the start line itself.
-        if lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt {
-            worldYawSource = .seed
-            // Bounded rather than left open: initialisation runs about 2 s, and a card that never
-            // clears because tracking never reached .normal would sit over the scene for the flight.
-            showAlignBanner("Hold the phone facing the direction of flight", clearAfter: 12.0)
-            awaitingSeedConfirmation = true
-            // hdg_acc is here because it is the one thing that could make this claim false: with no
-            // compass heading, .gravityAndHeading falls back to gravity alone and the world's yaw
-            // really is arbitrary. Every airborne log so far reports 10°.
-            FlightRecorder.shared.record(
-                event: "seed_alignment",
-                detail: String(format: "why=%@ hdg=%.0f track=%.0f hdg_acc=%.0f gs=%.0fkt",
-                               whyReset ?? "-", lastTrueHeading, lastGPSCourseDeg,
-                               lastHeadingAccuracy, lastGPSSpeedKt)
-            )
-        } else {
-            worldYawSource = .none
-        }
+        // The seed is *armed* here and started from the visualisation tick, never decided here.
+        //
+        // Build 29 decided here and never ran once: the session-start line reads `gs=0kt track=-1
+        // hdg=-1` because GPS has not delivered yet, and `airborne_changed` lands about 0.25 s
+        // later. Ground speed is exactly as stale at this point as `isAirborneEstimate`, which was
+        // rejected for the same reason — the same mistake made twice. Nothing about the flight state
+        // is knowable at `session.run`, so nothing here may depend on it.
+        worldYawSource = .none
+        awaitingSeed = true
+        awaitingSeedConfirmation = false
+        startupSeed.cancel()
+        seedDeadline = CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds
+        seedGyroReferenceDeg = .nan
+        loggedYawDivergence = false
         // The gain regression pairs ARKit's azimuth against the gyro's. A reset jumps one and not
         // the other, so a window spanning it would fit that discontinuity as if it were a turn.
         gyroAzimuth.reset()
@@ -2693,6 +2721,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         let airborne = isAirborneEstimate
 
+        // Establish the world's alignment, if this world has not got one yet. Here rather than in
+        // startARSession because this is the first place the flight state is actually known.
+        updateStartupSeed()
+
         // Carry the offset through the aircraft's heading change. Ahead of the placement below so
         // this tick's markers are drawn with the offset this tick's heading calls for.
         updateYawFollowing()
@@ -2835,15 +2867,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
-        // Empty for both `none` and `seed`: neither applies an offset, and a logged 0.0 would read
-        // as a measured zero rather than as "nothing is being subtracted". yawSource distinguishes
-        // the two.
-        sample.anchorOffsetDeg       = (worldYawSource == .none || worldYawSource == .seed)
-            ? nil : appliedWorldYawOffsetDeg
+        // Empty only for `none`. From build 30 the seed carries a real measured offset like every
+        // other source, rather than build 29's "seed means zero".
+        sample.anchorOffsetDeg       = worldYawSource == .none ? nil : appliedWorldYawOffsetDeg
         sample.yawSource             = worldYawSource.rawValue
         sample.yawFollowedDeg        = yawFollower.hasSeed ? yawFollower.followedDeg : nil
         sample.followGain            = followGain.isNaN  ? nil : followGain
         sample.followGainR           = followGainR.isNaN ? nil : followGainR
+        sample.gyroAzimuthDeg        = gyroAzimuthDeg.isNaN ? nil : gyroAzimuthDeg
 
         // ARKit's raw alignment error: how far the frame the scene is drawn in sits from the
         // live compass, before correction. Deliberately uncorrected — a corrected heading would
@@ -3553,6 +3584,18 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // with the ARKit azimuth it is compared against. The rate itself updates at 20 Hz and is
         // held between updates, which is more than enough resolution for a 90 s regression.
         gyroAzimuth.add(yawRateDps: verticalYawRateDps, at: time)
+        let gyroAz = gyroAzimuth.hasSamples ? gyroAzimuth.azimuthDeg : Double.nan
+        gyroAzimuthDeg = gyroAz
+
+        // The world's alignment, and the watch on whether it stays put. Both need the uncorrected
+        // azimuth, and both belong on main because they write what placement reads.
+        if awaitingSeed || seedGyroReferenceDeg.isFinite {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.feedStartupSeed(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz, at: time)
+                self.checkYawDivergence(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz)
+            }
+        }
 
         yawDrift.add(azimuthDeg: rawAzimuthDeg,
                      gyroYawRateDps: verticalYawRateDps,
@@ -3581,6 +3624,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// the life of that world, so the two can never fight over the same variable.
     private func updateGroundYawCorrection(medianErrorDeg: Double?, at time: TimeInterval) {
         guard !hasFlightAnchor else { return }
+        // Not on top of a seed. `worldYawErrorDeg` is measured against the *uncorrected* ARKit
+        // azimuth, so once a seed is applied that median reads back approximately the seed's own
+        // offset — applying it again would double-count it. On the ground the seed already is a
+        // compass alignment, taken once instead of continuously, so there is nothing left to add.
+        guard worldYawSource != .seed else { return }
 
         let outcome = groundYaw.update(
             medianErrorDeg: medianErrorDeg,
@@ -3625,6 +3673,134 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                isAirborneEstimate ? 1 : 0)
             )
         }
+    }
+
+    // MARK: - Startup seed
+
+    /// How long a `.gravity` world may go without a usable reference before the app gives up and
+    /// falls back to letting ARKit align from the compass.
+    private static let seedReferenceTimeoutSeconds: TimeInterval = 10.0
+
+    /// Which direction the phone is being asked to be pointing at, or nil if neither reference is
+    /// usable yet. Read from the visualisation tick, where all of this is live.
+    private var seedReference: (kind: StartupSeed.Reference, degrees: Double)? {
+        if isAirborneEstimate || lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt {
+            guard lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt,
+                  lastGPSCourseDeg >= 0,
+                  lastGPSCourseAccuracy >= 0, lastGPSCourseAccuracy <= 5
+            else { return nil }
+            return (.track, lastGPSCourseDeg)
+        }
+        // On the ground the compass measures the phone, so it needs no aiming and no gesture.
+        guard lastTrueHeading >= 0,
+              lastHeadingAccuracy >= 0, lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        else { return nil }
+        return (.compass, lastTrueHeading)
+    }
+
+    /// Start the capture once a reference exists, and give up after the timeout. Called from the
+    /// 4 Hz tick; the samples themselves are fed from the render thread, which is where ARKit's
+    /// azimuth lives.
+    private func updateStartupSeed() {
+        guard awaitingSeed, !startupSeed.isCapturing else { return }
+
+        // The card goes up before the capture can start, not with it. ARKit's azimuth means nothing
+        // until tracking is `.normal`, so the capture waits for that — but the whole point of the
+        // card is to have the phone already pointing forward when the capture runs, and a card that
+        // appears at the same moment is a card nobody has read yet.
+        if !awaitingSeedConfirmation,
+           lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt {
+            // Only the airborne reference needs the user to do anything: the track is the nose, and
+            // the app cannot know where the phone points relative to it. On the ground the compass
+            // measures the phone, so the seed needs no aiming and says nothing.
+            showAlignBanner("Hold the phone facing the direction of flight", clearAfter: 12.0)
+            awaitingSeedConfirmation = true
+        }
+
+        guard worldIsUsableForDisplay(arTrackingState) else { return }
+
+        guard let reference = seedReference else {
+            // Once only. A second fallback would restart the session forever on an aircraft where
+            // neither reference ever appears.
+            guard !seedFallbackToHeading, CACurrentMediaTime() >= seedDeadline else { return }
+            // A `.gravity` world nobody seeded points nowhere in particular, which is worse than the
+            // accidental alignment `.gravityAndHeading` gives. Fall back and rebuild.
+            awaitingSeed = false
+            seedFallbackToHeading = true
+            FlightRecorder.shared.record(
+                event: "seed_unavailable",
+                detail: String(format: "gs=%.0fkt course_acc=%.1f hdg=%.0f hdg_acc=%.0f airborne=%d",
+                               lastGPSSpeedKt, lastGPSCourseAccuracy, lastTrueHeading,
+                               lastHeadingAccuracy, isAirborneEstimate ? 1 : 0)
+            )
+            startARSession(reason: "seed_fallback")
+            return
+        }
+
+        startupSeed.begin(reference: reference.kind)
+        lastSeedSampleTime = 0
+    }
+
+    /// Feed and close the capture. Called on the main thread from the render dispatch, with the same
+    /// uncorrected azimuth the anchor uses — the offset being measured *is* the correction, so a
+    /// corrected azimuth would be measuring it against itself.
+    private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval) {
+        guard awaitingSeed, startupSeed.isCapturing else { return }
+        guard let reference = seedReference else {
+            // The reference went away mid-capture; the samples already taken were measured against
+            // it, so they go with it.
+            startupSeed.cancel()
+            return
+        }
+        guard time - lastSeedSampleTime >= 0.2 else { return }
+        lastSeedSampleTime = time
+        startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees, at: time)
+
+        guard let estimate = startupSeed.finish(at: time) else { return }
+        awaitingSeed = false
+        seedFallbackToHeading = false
+        worldYawSource = .seed
+        appliedWorldYawOffsetDeg = estimate.offsetDeg
+        sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
+        // Seeded into the follower too, so the anchor's disagreement check has something to compare
+        // a later capture against — and so a capture that contradicts the seed is visible rather
+        // than silently replacing it.
+        yawFollower.seed(offsetDeg: estimate.offsetDeg,
+                         trackDeg: lastGPSCourseDeg,
+                         source: .seed,
+                         at: time)
+        // The reference for the divergence measurement. Any later change in (ARKit − gyro) is the
+        // world rotating with the user's panning cancelled out.
+        seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
+
+        if awaitingSeedConfirmation {
+            awaitingSeedConfirmation = false
+            showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
+        }
+        FlightRecorder.shared.record(
+            event: "seed_captured",
+            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f",
+                           estimate.offsetDeg, estimate.referenceKind.rawValue, reference.degrees,
+                           estimate.sampleCount, estimate.seconds, estimate.azimuthSpreadDeg,
+                           seedGyroReferenceDeg)
+        )
+    }
+
+    /// How far the world has rotated since it was seeded, with panning cancelled out by the gyro.
+    /// **Recorded only.** A noisy integrated gyro driving automatic re-seeds could easily be worse
+    /// than the fault it is watching for, so this build measures and does nothing.
+    private func checkYawDivergence(arAzimuthDeg: Double, gyroAzimuthDeg: Double) {
+        guard seedGyroReferenceDeg.isFinite, !loggedYawDivergence else { return }
+        let now = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
+        let divergence = angleDifferenceDeg(from: seedGyroReferenceDeg, to: now)
+        guard abs(divergence) > 20 else { return }
+        loggedYawDivergence = true
+        FlightRecorder.shared.record(
+            event: "world_yaw_diverged",
+            detail: String(format: "deg=%.1f ar_az=%.1f gyro_az=%.1f seed_ref=%.1f state=%@",
+                           divergence, arAzimuthDeg, gyroAzimuthDeg, seedGyroReferenceDeg,
+                           arTrackingStateDescription)
+        )
     }
 
     // MARK: - Track following
@@ -3828,7 +4004,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard let prior = followerBeforeAnchor else { return }
         yawFollower = prior
         hasFlightAnchor = prior.source == .anchor
-        worldYawSource = prior.source == .anchor ? .anchor : .ground
+        switch prior.source {
+        case .anchor: worldYawSource = .anchor
+        case .seed:   worldYawSource = .seed
+        case .ground: worldYawSource = .ground
+        case nil:     worldYawSource = .none
+        }
         if let offset = yawFollower.offsetDeg {
             appliedWorldYawOffsetDeg = offset
             sceneManager?.worldYawOffsetDeg = offset

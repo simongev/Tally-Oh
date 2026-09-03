@@ -908,6 +908,107 @@ struct FlightDirectionAnchor {
     }
 }
 
+/// The world's alignment, taken once at startup without asking the user for a gesture.
+///
+/// **Why the app takes this itself from build 30.** Until now ARKit did it: `.gravityAndHeading`
+/// orients the world by assuming the device points where the compass says, and in a cabin the
+/// compass reads the aircraft — median `hdg_true − track` of 0.00° over 204 samples. That accident
+/// made the world correct whenever the phone happened to be held forward at startup, which is why
+/// the one session that reported targets landing on the traffic ran with no correction at all.
+///
+/// But `.gravityAndHeading` does not seed once. ARKit keeps fusing the magnetometer, and a
+/// magnetometer measuring the fuselage feeds it garbage: `compass_response` swung 0.105 → 0.02 →
+/// 0.33 → 0.005 inside a single flight, and across three `limited:motion` episodes in twenty seconds
+/// the world rotated about 176°, ending with the scene pointing backwards. So build 30 runs
+/// `.gravity` — no magnetometer anywhere in ARKit's pipeline — and does the seeding here instead,
+/// exactly once per world.
+///
+/// The arithmetic is the flight anchor's, in one second and with no gesture: the offset is the
+/// median of `reference − arAzimuth`, asserting that the phone is currently pointing along the
+/// reference direction. That assertion is what the startup card is on screen asking for.
+struct StartupSeed {
+
+    /// What the phone is being assumed to point at.
+    enum Reference: String {
+        /// Airborne: the aircraft's GPS ground track, which is the nose to within the drift angle.
+        /// The compass cannot be used here — it measures the fuselage, not the phone.
+        case track
+        /// On the ground: the phone's own true heading. Here the compass really does measure the
+        /// phone (`compass_response` ≈ 1.00 against 0.018 in the air), so it needs no aiming at all.
+        case compass
+    }
+
+    struct Estimate {
+        var offsetDeg: Double
+        var referenceKind: Reference
+        var sampleCount: Int
+        var seconds: TimeInterval
+        var azimuthSpreadDeg: Double
+    }
+
+    /// A second is enough at 5 Hz, and short enough that the aircraft's turn inside it is
+    /// negligible — 0.2 °/s at cruise is 0.2° across the whole capture.
+    let minSeconds: TimeInterval
+    let minSamples: Int
+
+    private(set) var reference: Reference?
+    private var startTime: TimeInterval?
+    private var samples: [(offset: Double, az: Double)] = []
+
+    init(minSeconds: TimeInterval = 1.0, minSamples: Int = 5) {
+        self.minSeconds = minSeconds
+        self.minSamples = minSamples
+    }
+
+    var isCapturing: Bool { reference != nil }
+
+    /// Arm the capture. Takes no time on purpose: the hold begins at the first sample, on the render
+    /// clock, because `add` and `finish` are fed from there and the two sides must share one
+    /// timebase or the duration check is meaningless. Arming happens on the display tick, which
+    /// cannot see that clock.
+    mutating func begin(reference: Reference) {
+        self.reference = reference
+        startTime = nil
+        samples.removeAll()
+    }
+
+    mutating func add(arAzimuthDeg: Double, referenceDeg: Double, at time: TimeInterval) {
+        guard reference != nil, arAzimuthDeg.isFinite, referenceDeg.isFinite else { return }
+        if startTime == nil { startTime = time }
+        samples.append((offset: AngularResponse.signedDelta(arAzimuthDeg, referenceDeg),
+                        az: arAzimuthDeg))
+    }
+
+    mutating func cancel() {
+        startTime = nil
+        reference = nil
+        samples.removeAll()
+    }
+
+    /// Publish the seed, or nil if the capture was too short or too sparse. Cleared either way.
+    ///
+    /// Deliberately **not** gated on how far the phone wandered, unlike the manual anchor. The user
+    /// is holding the phone up during initialisation, not performing an aim, and a refused seed
+    /// under `.gravity` leaves the world with no alignment at all — which is worse than a seed a few
+    /// degrees loose. The spread is published instead, so a bad one is visible in the log.
+    mutating func finish(at time: TimeInterval) -> Estimate? {
+        defer { cancel() }
+        guard let startTime, let reference else { return nil }
+        let seconds = time - startTime
+        guard seconds >= minSeconds, samples.count >= minSamples else { return nil }
+
+        let offsets = samples.map(\.offset).sorted()
+        let mid = offsets.count / 2
+        let median = offsets.count % 2 == 0 ? (offsets[mid - 1] + offsets[mid]) / 2 : offsets[mid]
+
+        return Estimate(offsetDeg: median,
+                        referenceKind: reference,
+                        sampleCount: samples.count,
+                        seconds: seconds,
+                        azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(samples.map(\.az)))
+    }
+}
+
 /// Whether ARKit's world is established enough that a marker drawn in it means anything.
 ///
 /// Target nodes are repositioned every frame from the live camera transform, which is what makes
@@ -1241,6 +1342,8 @@ struct TrackFollowingYawOffset {
     /// Where the base offset came from. Recorded so a log can tell an automatic seed from a
     /// user-captured one without inferring it from timing.
     enum Source: String {
+        /// StartupSeed, taken once when the world was created. The normal case from build 30.
+        case seed
         case ground
         case anchor
     }

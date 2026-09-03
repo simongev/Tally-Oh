@@ -1091,6 +1091,110 @@ struct TargetDataTests {
         #expect(slaved == .refused(.compassNotMeasuringPhone))
     }
 
+    // MARK: - Startup seed
+
+    // Under .gravity this is the only thing that orients the scene, so these cover the arithmetic
+    // and the one property that matters most: that it produces the same number, with the same sign,
+    // as the manual anchor measuring the same situation.
+
+    private func feedSeed(_ seed: inout StartupSeed, az: [Double], reference: Double,
+                          from t0: Double = 0, step: Double = 0.2) {
+        for (i, a) in az.enumerated() {
+            seed.add(arAzimuthDeg: a, referenceDeg: reference, at: t0 + Double(i) * step)
+        }
+    }
+
+    /// The offset is reference minus ARKit azimuth — the same quantity and sign the anchor publishes
+    /// and that placement subtracts from every bearing.
+    @Test func seedPublishesReferenceMinusAzimuth() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: Array(repeating: 254.0, count: 8), reference: 78.0)
+        guard let e = seed.finish(at: 1.6) else { #expect(Bool(false)); return }
+        // 78 - 254 wraps to -176, which is what the anchor read on the flight that ended backwards.
+        #expect(abs(e.offsetDeg - (-176)) < 0.001)
+        #expect(e.referenceKind == .track)
+        #expect(e.sampleCount == 8)
+    }
+
+    /// The seed and the manual anchor must agree when handed identical inputs; they are the same
+    /// measurement taken at different moments, and a sign difference between them would be silent.
+    @Test func seedAgreesWithTheAnchorOnTheSameInput() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
+        guard let s = seed.finish(at: 1.6) else { #expect(Bool(false)); return }
+
+        var anchor = FlightDirectionAnchor(minSeconds: 3, minSamples: 8)
+        anchor.begin(at: 0)
+        holdSamples(&anchor, az: Array(repeating: 100.0, count: 20), track: 130.0)
+        guard case .success(let a) = anchor.finish(at: 4.0) else { #expect(Bool(false)); return }
+
+        #expect(abs(s.offsetDeg - a.offsetDeg) < 0.001)
+    }
+
+    /// Wobble is medianed away, as in the anchor.
+    @Test func seedMediansWobble() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .compass)
+        feedSeed(&seed, az: [98, 103, 99, 102, 100, 101, 97, 104], reference: 130.0)
+        guard let e = seed.finish(at: 1.6) else { #expect(Bool(false)); return }
+        #expect(abs(e.offsetDeg - 30) < 3)
+        #expect(e.referenceKind == .compass)
+    }
+
+    /// **Deliberately not gated on spread**, unlike the anchor: a refused seed under `.gravity`
+    /// leaves the world with no alignment at all, which is worse than one a few degrees loose. The
+    /// spread is published instead so a bad one is visible in the log.
+    @Test func seedPublishesEvenWhenLooseButReportsTheSpread() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: (0..<8).map { 100.0 + Double($0) * 4 }, reference: 130.0)
+        guard let e = seed.finish(at: 1.6) else { #expect(Bool(false)); return }
+        #expect(e.azimuthSpreadDeg > 25)
+    }
+
+    @Test func seedRefusesTooShortAHold() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
+        #expect(seed.finish(at: 0.4) == nil)
+    }
+
+    @Test func seedRefusesTooFewSamples() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: [100, 100, 100], reference: 130.0)
+        #expect(seed.finish(at: 1.6) == nil)
+    }
+
+    /// Finishing clears, so a refused capture cannot leak its samples into the next attempt.
+    @Test func seedClearsAfterFinishing() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
+        _ = seed.finish(at: 1.6)
+        #expect(!seed.isCapturing)
+        #expect(seed.finish(at: 3.0) == nil)
+    }
+
+    /// A world reset cancels any capture in flight; its samples were measured in the old frame.
+    @Test func seedCancelDiscardsSamples() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
+        seed.cancel()
+        #expect(!seed.isCapturing)
+        #expect(seed.finish(at: 1.6) == nil)
+    }
+
+    @Test func seedIgnoresNonFiniteInputs() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        for i in 0..<8 { seed.add(arAzimuthDeg: .nan, referenceDeg: 130, at: Double(i) * 0.2) }
+        #expect(seed.finish(at: 1.6) == nil)
+    }
+
     // MARK: - Align prompt scheduling
 
     // Two flights offered the align button on every healthy-tracking row and neither took it, so
