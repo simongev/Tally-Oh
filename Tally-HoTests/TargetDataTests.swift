@@ -1168,6 +1168,49 @@ struct TargetDataTests {
         #expect(seed.finish(at: 1.6) == nil)
     }
 
+    /// **The build-30 bug, written down.** The real caller polls `finish` after every single sample.
+    /// Build 30's `finish` opened with `defer { cancel() }`, so the not-ready-yet return destroyed
+    /// the capture too: one sample taken, discarded and re-begun four times a second for a whole
+    /// session, `yaw_src=none` throughout, and under `.gravity` a world with no alignment at all —
+    /// a ground test 192° out. Every existing test called `finish` once at the end, which is exactly
+    /// why they all passed a struct that could not work in the app.
+    @Test func seedSurvivesBeingPolledAfterEverySample() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .compass)
+        var published: StartupSeed.Estimate?
+        for i in 0..<10 {
+            let t = Double(i) * 0.2
+            seed.add(arAzimuthDeg: 3.0, referenceDeg: 195.0, at: t)
+            if let e = seed.finish(at: t) { published = e; break }
+        }
+        #expect(published != nil)
+        // 195 - 3 = 192, which wraps to -168 — the error the ground test actually showed.
+        #expect(abs((published?.offsetDeg ?? 0) - (-168)) < 0.001)
+    }
+
+    /// Not-ready is a no-op, so polling cannot cost the capture its samples.
+    @Test func pollingBeforeReadyLeavesTheCaptureIntact() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        seed.begin(reference: .track)
+        seed.add(arAzimuthDeg: 100, referenceDeg: 130, at: 0)
+        #expect(seed.finish(at: 0.2) == nil)
+        #expect(seed.isCapturing)
+        #expect(seed.progress(at: 0.2) < 1.0)
+    }
+
+    /// Progress is the lower of the elapsed and sample fractions, so both gates must be satisfied.
+    @Test func seedProgressNeedsBothTimeAndSamples() {
+        var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
+        #expect(seed.progress(at: 5.0) == 0)          // not begun
+        seed.begin(reference: .track)
+        #expect(seed.progress(at: 0) == 0)            // no samples yet
+        // Plenty of samples, not enough time.
+        for i in 0..<8 { seed.add(arAzimuthDeg: 100, referenceDeg: 130, at: Double(i) * 0.01) }
+        #expect(seed.progress(at: 0.3) < 1.0)
+        // Enough of both.
+        #expect(seed.progress(at: 1.2) >= 1.0)
+    }
+
     /// Finishing clears, so a refused capture cannot leak its samples into the next attempt.
     @Test func seedClearsAfterFinishing() {
         var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)

@@ -3702,7 +3702,34 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// 4 Hz tick; the samples themselves are fed from the render thread, which is where ARKit's
     /// azimuth lives.
     private func updateStartupSeed() {
-        guard awaitingSeed, !startupSeed.isCapturing else { return }
+        guard awaitingSeed else { return }
+
+        // The deadline is checked for *every* way the seed can fail to arrive, not only a missing
+        // reference. Build 30 buried it inside the no-reference branch, so when the capture itself
+        // was broken — begun and destroyed four times a second, publishing nothing — the compass
+        // reference was present the whole time and the watchdog never armed. A `.gravity` world with
+        // no alignment then had no recovery path at all, and the ground test read 192° out for the
+        // whole session. A watchdog that catches one of the ways a thing can fail is not a watchdog.
+        if !seedFallbackToHeading, CACurrentMediaTime() >= seedDeadline {
+            // Recorded before the state is torn down, so `capturing` says what was actually
+            // happening rather than reading 0 because this line just cancelled it.
+            FlightRecorder.shared.record(
+                event: "seed_unavailable",
+                detail: String(format: "gs=%.0fkt course_acc=%.1f hdg=%.0f hdg_acc=%.0f airborne=%d had_ref=%d capturing=%d",
+                               lastGPSSpeedKt, lastGPSCourseAccuracy, lastTrueHeading,
+                               lastHeadingAccuracy, isAirborneEstimate ? 1 : 0,
+                               seedReference == nil ? 0 : 1, startupSeed.isCapturing ? 1 : 0)
+            )
+            awaitingSeed = false
+            seedFallbackToHeading = true
+            startupSeed.cancel()
+            // Back to the alignment ARKit takes for itself. Not good — it is what rotated 176° in
+            // flight — but a world pointing nowhere in particular is worse.
+            startARSession(reason: "seed_fallback")
+            return
+        }
+
+        guard !startupSeed.isCapturing else { return }
 
         // The card goes up before the capture can start, not with it. ARKit's azimuth means nothing
         // until tracking is `.normal`, so the capture waits for that — but the whole point of the
@@ -3719,23 +3746,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         guard worldIsUsableForDisplay(arTrackingState) else { return }
 
-        guard let reference = seedReference else {
-            // Once only. A second fallback would restart the session forever on an aircraft where
-            // neither reference ever appears.
-            guard !seedFallbackToHeading, CACurrentMediaTime() >= seedDeadline else { return }
-            // A `.gravity` world nobody seeded points nowhere in particular, which is worse than the
-            // accidental alignment `.gravityAndHeading` gives. Fall back and rebuild.
-            awaitingSeed = false
-            seedFallbackToHeading = true
-            FlightRecorder.shared.record(
-                event: "seed_unavailable",
-                detail: String(format: "gs=%.0fkt course_acc=%.1f hdg=%.0f hdg_acc=%.0f airborne=%d",
-                               lastGPSSpeedKt, lastGPSCourseAccuracy, lastTrueHeading,
-                               lastHeadingAccuracy, isAirborneEstimate ? 1 : 0)
-            )
-            startARSession(reason: "seed_fallback")
-            return
-        }
+        // No reference yet — GPS or the compass will deliver one shortly, and the deadline above
+        // covers the case where neither ever does.
+        guard let reference = seedReference else { return }
 
         startupSeed.begin(reference: reference.kind)
         lastSeedSampleTime = 0
@@ -3756,6 +3769,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         lastSeedSampleTime = time
         startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees, at: time)
 
+        // Polled, as the flight anchor's caller polls it. `finish` is a no-op before this point, but
+        // asking only when the hold is complete keeps the two capture flows reading the same way.
+        guard startupSeed.progress(at: time) >= 1.0 else { return }
         guard let estimate = startupSeed.finish(at: time) else { return }
         awaitingSeed = false
         seedFallbackToHeading = false

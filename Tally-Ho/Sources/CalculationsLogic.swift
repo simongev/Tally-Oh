@@ -985,17 +985,34 @@ struct StartupSeed {
         samples.removeAll()
     }
 
-    /// Publish the seed, or nil if the capture was too short or too sparse. Cleared either way.
+    /// How far along the hold is, 0 to 1 — the lower of the elapsed and sample fractions, so both
+    /// have to be satisfied. The caller polls this and only calls `finish` at 1.0.
+    func progress(at time: TimeInterval) -> Double {
+        guard let startTime, minSeconds > 0, minSamples > 0 else { return 0 }
+        let elapsed = min(1.0, (time - startTime) / minSeconds)
+        let filled = min(1.0, Double(samples.count) / Double(minSamples))
+        return min(elapsed, filled)
+    }
+
+    /// Publish the seed, or nil.
+    ///
+    /// **Only clears when it has actually decided.** Build 30 opened this with `defer { cancel() }`,
+    /// which cleared the capture on the not-ready-yet returns as well — and the caller polls after
+    /// every sample. The result was one sample taken, discarded, and re-begun four times a second
+    /// for a whole session: `yaw_src=none` throughout, and under `.gravity` that means a world with
+    /// no alignment at all, which is how a ground test came back 192° out. Not ready is now a
+    /// no-op, so the struct is correct however it is called rather than only if the caller
+    /// remembers to gate on `progress`.
     ///
     /// Deliberately **not** gated on how far the phone wandered, unlike the manual anchor. The user
     /// is holding the phone up during initialisation, not performing an aim, and a refused seed
     /// under `.gravity` leaves the world with no alignment at all — which is worse than a seed a few
     /// degrees loose. The spread is published instead, so a bad one is visible in the log.
     mutating func finish(at time: TimeInterval) -> Estimate? {
-        defer { cancel() }
         guard let startTime, let reference else { return nil }
         let seconds = time - startTime
         guard seconds >= minSeconds, samples.count >= minSamples else { return nil }
+        defer { cancel() }
 
         let offsets = samples.map(\.offset).sorted()
         let mid = offsets.count / 2
