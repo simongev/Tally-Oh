@@ -840,6 +840,10 @@ class ARSceneManager {
     private(set) var liveAircraft: [Aircraft] = []
     private(set) var liveUserLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     private(set) var liveUserAltitude: Double = 0
+    /// Local geoid separation (HAE − MSL, feet), for converting a target's ellipsoid-referenced
+    /// geometric altitude into the MSL frame the viewer's own altitude is measured in. Nil until
+    /// the phone has reported both altitudes for one fix; see `geometricPlacementAltitude`.
+    private(set) var liveGeoidSeparationFt: Double?
 
     /// Ownship position, velocity and altitude for the 60 Hz ticks.
     ///
@@ -891,9 +895,11 @@ class ARSceneManager {
         let aircraft = liveAircraft
         var userLoc = liveUserLocation
         var userAlt = liveUserAltitude
+        var geoidSep = liveGeoidSeparationFt
         if let ownship = ownshipEstimator?.snapshot(), ownship.hasPosition {
             userLoc = ownship.coordinate
             userAlt = ownship.displayAltitudeFt
+            if ownship.hasGeoidSeparation { geoidSep = ownship.geoidSeparationFt }
         }
 
         // Take the snapshot under the lock — the main thread writes tickNodeSnapshot
@@ -909,7 +915,8 @@ class ARSceneManager {
             if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let targetAlt = CalculationsLogic.placementAltitude(
-                for: ac, targetAltitude: predAlt, userAltitudeFt: userAlt)
+                for: ac, targetAltitude: predAlt, userAltitudeFt: userAlt,
+                geoidSeparationFt: geoidSep)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: targetAlt,
@@ -967,7 +974,8 @@ class ARSceneManager {
         userHeading: Double,
         cameraWorldPosition: SCNVector3 = .init(),
         tcasEvaluation: TCASEvaluation = .clear,
-        onGround: Bool = false
+        onGround: Bool = false,
+        geoidSeparationFt: Double? = nil
     ) {
         guard settings.showAircraft else {
             nodesLock.lock()
@@ -1018,6 +1026,13 @@ class ARSceneManager {
             // the predicted coordinate below caused pop-in/pop-out and wrong depth
             // stacking whenever a report was stale and the aircraft fast-moving.
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
+            // Converted into the viewer's own vertical datum before anything compares the two.
+            // The separation filter below is one of those comparisons: against an unconverted
+            // pressure altitude it read ~1,900 ft of separation at cruise for co-altitude
+            // traffic, which is most of the 10,000 ft budget spent on a datum mismatch.
+            let targetAlt = CalculationsLogic.placementAltitude(
+                for: ac, targetAltitude: predAlt, userAltitudeFt: userAltitude,
+                geoidSeparationFt: geoidSeparationFt)
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
             guard distNM <= settings.aircraftMaxDistance else { continue }
             guard settings.passes(callsign: ac.callsign) else { continue }
@@ -1029,14 +1044,12 @@ class ARSceneManager {
             // altitude is unknown carries a placeholder zero, which at cruise would read as
             // 35,000 ft of separation and cull it — hiding traffic precisely because the
             // source said nothing about its altitude, rather than because it is far away.
-            if !onGround, ac.hasValidAltitude, abs(predAlt - userAltitude) > 10_000 { continue }
+            if !onGround, ac.hasValidAltitude, abs(targetAlt - userAltitude) > 10_000 { continue }
             let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)
             visibleAircraft.append(ac)
 
-            let targetAlt = CalculationsLogic.placementAltitude(
-                for: ac, targetAltitude: predAlt, userAltitudeFt: userAltitude)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: targetAlt,
@@ -1090,6 +1103,7 @@ class ARSceneManager {
         liveAircraft          = visibleAircraft
         liveUserLocation      = userLocation
         liveUserAltitude      = userAltitude
+        liveGeoidSeparationFt = geoidSeparationFt
         renderedAircraftCount = visibleAircraft.count
 
         nodesLock.lock()

@@ -77,7 +77,8 @@ final class FlightRecorder {
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
         "n_targets_press", "n_targets_geom",
-        "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft"
+        "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
+        "datum_band_n", "datum_band_median_ft", "own_press_alt_ft", "hud_heading_deg"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -238,11 +239,26 @@ final class FlightRecorder {
         var renderedNodeCount: Int?
 
         /// How many nearby targets reported each vertical datum, and the measured conversion
-        /// between them. This is the input the frame-aware vertical placement is built on:
-        /// without it the offset would have to be assumed rather than measured.
+        /// between them. Placement no longer uses this: each target carries its own pair and is
+        /// converted exactly. Kept because it is the column every log since build 27 has had, and
+        /// because comparing it against `datumBandOffset` shows the altitude mixing that made it
+        /// unusable — the two read +25 ft and +1,900 ft in the same air.
         var targetsWithPressureAltitude: Int?
         var targetsWithGeometricAltitude: Int?
         var datumOffset: AltitudeDatumOffset.Estimate?
+
+        /// The same offset measured only from traffic near the viewer's own altitude, and the
+        /// pressure altitude derived from it — what the HUD tape shows, and the only figure in
+        /// this file comparable with the aircraft's own altimeter. Empty when too few aircraft
+        /// near our level reported both datums, in which case the tape fell back to GPS.
+        var datumBandOffset: AltitudeDatumOffset.Estimate?
+        var ownPressureAltitudeFt: Double?
+
+        /// The heading the HUD rose is showing: ARKit's azimuth plus the applied world-yaw
+        /// offset. `ar_heading_deg` is the same azimuth uncorrected, so the gap between the two
+        /// columns is the offset in force — and a row with `ar_heading_deg` but no
+        /// `hud_heading_deg` is a world that had not been aligned yet.
+        var hudHeadingDeg: Double?
     }
 
     // MARK: - Recording
@@ -407,6 +423,11 @@ final class FlightRecorder {
         fields.append(format(sample.datumOffset?.medianFt,        decimals: 0))
         fields.append(format(sample.datumOffset?.lowerQuartileFt, decimals: 0))
         fields.append(format(sample.datumOffset?.upperQuartileFt, decimals: 0))
+
+        fields.append(sample.datumBandOffset.map { String($0.sampleCount) } ?? "")
+        fields.append(format(sample.datumBandOffset?.medianFt, decimals: 0))
+        fields.append(format(sample.ownPressureAltitudeFt,     decimals: 0))
+        fields.append(format(sample.hudHeadingDeg,             decimals: 1))
 
         return fields.joined(separator: ",")
     }

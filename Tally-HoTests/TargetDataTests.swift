@@ -231,6 +231,168 @@ struct TargetDataTests {
         }
     }
 
+    // MARK: - Vertical datum conversion at placement
+
+    /// The whole point: a target reporting pressure altitude is drawn against a viewer measured
+    /// in GPS geometric MSL, so it has to be converted before the two are subtracted.
+    @Test func targetIsConvertedIntoTheViewersGeometricFrame() {
+        // Reports FL350 on the standard datum, 1,900 ft higher against the ellipsoid.
+        let ac = aircraft(altitude: 35_000,
+                          pressureAltitudeFt: 35_000,
+                          geometricAltitudeFt: 36_900)
+        // Geoid sits 109 ft below the ellipsoid here, so MSL is 109 ft above HAE.
+        let placed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 35_000, geoidSeparationFt: -109)
+        #expect(abs(placed - 37_009) < 0.5)
+    }
+
+    /// The measured error from the FL420 flight, end to end: co-altitude traffic must come out
+    /// level with the viewer, not the ~2,000 ft below it was drawn at.
+    @Test func coAltitudeTrafficIsPlacedOnTheViewersLevel() {
+        let ownGeometricMSL = 42_327.0
+        let geoidSeparation = -108.9          // HAE − MSL, as the phone reported it
+        let ownHAE = ownGeometricMSL + geoidSeparation
+        let datumOffset = 1_900.0             // alt_geom − alt_baro at this level
+        // A genuinely co-altitude aircraft reports this pair.
+        let ac = aircraft(altitude: ownHAE - datumOffset,
+                          pressureAltitudeFt: ownHAE - datumOffset,
+                          geometricAltitudeFt: ownHAE)
+
+        let uncorrected = ac.altitude
+        #expect(abs(uncorrected - ownGeometricMSL) > 1_800)   // the bug, ~2,000 ft low
+
+        let placed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: ac.altitude, geoidSeparationFt: geoidSeparation)
+        #expect(abs(placed - ownGeometricMSL) < 1.0)
+    }
+
+    /// GDL90 traffic reports pressure altitude only. Nothing to convert with, so nothing changes
+    /// — the conversion must never be worse than the behaviour it replaced.
+    @Test func targetWithoutGeometricAltitudeIsLeftAsReported() {
+        let ac = aircraft(altitude: 12_000, pressureAltitudeFt: 12_000, geometricAltitudeFt: nil)
+        #expect(CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 12_000, geoidSeparationFt: -109) == 12_000)
+    }
+
+    /// When only `alt_geom` is reported it is already what `Aircraft.altitude` was populated
+    /// from, so the only step left is ellipsoid to MSL.
+    @Test func targetReportingOnlyGeometricIsOnlyGeoidCorrected() {
+        let ac = aircraft(altitude: 12_000, pressureAltitudeFt: nil, geometricAltitudeFt: 12_000)
+        let placed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 12_000, geoidSeparationFt: -109)
+        #expect(abs(placed - 12_109) < 0.5)
+    }
+
+    /// A pair no atmosphere could produce is a broken report, and moving a target 20,000 ft on
+    /// the strength of it would be far worse than leaving it where it was.
+    @Test func implausibleDatumPairIsNotApplied() {
+        let ac = aircraft(altitude: 35_000,
+                          pressureAltitudeFt: 35_000,
+                          geometricAltitudeFt: 55_000)
+        #expect(CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 35_000, geoidSeparationFt: -109) == 35_000)
+    }
+
+    /// The geoid term is worth ~109 ft; the datum term is worth ~1,900. Losing the small one
+    /// must not cost the large one.
+    @Test func missingGeoidSeparationStillCorrectsTheDatum() {
+        let ac = aircraft(altitude: 35_000,
+                          pressureAltitudeFt: 35_000,
+                          geometricAltitudeFt: 36_900)
+        #expect(CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 35_000, geoidSeparationFt: nil) == 36_900)
+    }
+
+    /// The vertical-rate extrapolation happens before the conversion, so it has to survive it.
+    @Test func conversionPreservesTheDeadReckonedClimb() {
+        let ac = aircraft(altitude: 35_000,
+                          pressureAltitudeFt: 35_000,
+                          geometricAltitudeFt: 36_900)
+        let climbed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 35_500, geoidSeparationFt: nil)
+        #expect(abs(climbed - 37_400) < 0.5)
+    }
+
+    /// placementAltitude keeps its own contract: an unreported altitude still draws the target
+    /// on the viewer's own level rather than converting a placeholder zero.
+    @Test func missingAltitudeStillPlacesTargetAtOwnLevelWhenConverting() {
+        let ac = aircraft(altitude: 0, hasValidAltitude: false,
+                          pressureAltitudeFt: nil, geometricAltitudeFt: nil)
+        #expect(CalculationsLogic.placementAltitude(
+            for: ac, targetAltitude: 0, userAltitudeFt: 41_000,
+            geoidSeparationFt: -109) == 41_000)
+    }
+
+    // MARK: - Banded datum offset (the HUD's flight level)
+
+    /// The defect the flight logs exposed: an unbanded median mixes surface traffic with traffic
+    /// at cruise and lands wherever the mix falls. The band has to keep the far-off traffic out.
+    @Test func bandExcludesTrafficAtOtherAltitudes() {
+        // Three at our level offset by 1,900; five near the surface offset by ~0.
+        var traffic = [Double](repeating: 41_000, count: 3).map {
+            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
+        }
+        traffic += [Double](repeating: 3_000, count: 5).map {
+            aircraft(pressureAltitudeFt: $0, geometricAltitudeFt: $0)
+        }
+
+        // The whole sky: the five low aircraft outvote the three at our level.
+        #expect(AltitudeDatumOffset.estimate(from: traffic)?.medianFt == 0)
+
+        let banded = AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000)
+        #expect(banded?.sampleCount == 3)
+        #expect(banded?.medianFt == 1_900)
+    }
+
+    /// Two aircraft can disagree with no way to tell which is wrong.
+    @Test func bandRefusesToEstimateFromTooFewAircraft() {
+        let traffic = [Double](repeating: 41_000, count: 2).map {
+            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
+        }
+        #expect(AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000) == nil)
+        // The same two are enough once the caller says so.
+        #expect(AltitudeDatumOffset.estimate(
+            from: traffic, nearAltitudeFt: 41_000, minSamples: 2)?.sampleCount == 2)
+    }
+
+    /// Traffic a couple of thousand feet away is still in our air mass and still measuring the
+    /// same offset — the band exists to exclude the surface, not the next flight level.
+    @Test func bandKeepsTrafficAtNeighbouringFlightLevels() {
+        let traffic = [39_000.0, 41_000.0, 43_000.0].map {
+            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
+        }
+        let banded = AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000)
+        #expect(banded?.sampleCount == 3)
+    }
+
+    /// An empty band is nil, not a confident zero — the HUD falls back to GPS on nil.
+    @Test func emptyBandYieldsNoEstimate() {
+        let traffic = [Double](repeating: 3_000, count: 8).map {
+            aircraft(pressureAltitudeFt: $0, geometricAltitudeFt: $0)
+        }
+        #expect(AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000) == nil)
+    }
+
+    // MARK: - Corrected HUD heading
+
+    /// The compass bug: the rose showed ARKit's raw azimuth, which under `.gravity` is out by
+    /// the whole world-yaw offset. Adding the offset has to wrap in both directions.
+    @Test func correctedHeadingWrapsAcrossNorth() {
+        // 350° of ARKit azimuth in a world seeded 20° off true reads 10°, not 370°.
+        #expect(CalculationsLogic.normalizedAzimuth(350 + 20) == 10)
+        // And the other way: 10° in a world seeded −20° off reads 350°, not −10°.
+        #expect(CalculationsLogic.normalizedAzimuth(10 - 20) == 350)
+    }
+
+    /// The offsets these logs actually produced were around −158°, well outside one turn once
+    /// added to an azimuth near 360.
+    @Test func correctedHeadingHandlesTheOffsetsMeasuredInFlight() {
+        #expect(abs(CalculationsLogic.normalizedAzimuth(355 - 158.3) - 196.7) < 0.001)
+        #expect(abs(CalculationsLogic.normalizedAzimuth(20 - 158.3) - 221.7) < 0.001)
+        #expect(CalculationsLogic.normalizedAzimuth(0) == 0)
+        #expect(CalculationsLogic.normalizedAzimuth(360) == 0)
+    }
+
     // MARK: - Visibility regressions
 
     /// Nearby traffic used to be hidden wholesale to mask the user's own aircraft. Only the

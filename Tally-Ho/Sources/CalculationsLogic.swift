@@ -121,6 +121,13 @@ class CalculationsLogic {
         return (bearing + 360).truncatingRemainder(dividingBy: 360)
     }
 
+    /// Wrap a compass direction into [0, 360). Handles inputs already out of range in either
+    /// direction, which a raw azimuth plus a world-yaw offset routinely is.
+    static func normalizedAzimuth(_ degrees: Double) -> Double {
+        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
+        return wrapped < 0 ? wrapped + 360 : wrapped
+    }
+
     // MARK: - AR Position Calculations
 
     /// Convert real-world position to AR scene position
@@ -284,14 +291,74 @@ class CalculationsLogic {
         )
     }
 
-    /// Altitude to draw a target at, in feet.
+    /// Altitude to draw a target at, in feet — converted into the viewer's own vertical datum.
     ///
     /// When the source reported no usable altitude the target is placed at the viewer's own
     /// altitude, so it appears on the horizon in the correct direction rather than being sunk
     /// to 0 ft MSL — which at a high-elevation airport would put ground traffic far below the
     /// viewer's feet, in a direction no one is looking.
-    static func placementAltitude(for aircraft: Aircraft, targetAltitude: Double, userAltitudeFt: Double) -> Double {
-        aircraft.hasValidAltitude ? targetAltitude : userAltitudeFt
+    static func placementAltitude(
+        for aircraft: Aircraft,
+        targetAltitude: Double,
+        userAltitudeFt: Double,
+        geoidSeparationFt: Double? = nil
+    ) -> Double {
+        guard aircraft.hasValidAltitude else { return userAltitudeFt }
+        return geometricPlacementAltitude(
+            for: aircraft,
+            reportedAltitudeFt: targetAltitude,
+            geoidSeparationFt: geoidSeparationFt
+        )
+    }
+
+    /// Convert a target's reported altitude into geometric MSL — the datum the viewer's own
+    /// altitude is measured in.
+    ///
+    /// The viewer's altitude is GPS geometric MSL. Traffic reports `alt_baro`, referenced to the
+    /// 29.92 inHg standard datum, and `Aircraft.altitude` carries that value whenever one was
+    /// reported. Subtracting one from the other leaves the local altimeter-setting and
+    /// temperature-deviation offset in the answer, as a bias on every target at once: measured at
+    /// roughly 1,900 ft at cruise in the FL420 logs, which is 3.8° of vertical error at 5 NM and
+    /// 9.4° at 2 NM.
+    ///
+    /// Every aircraft that reports both datums is measuring that offset for us *at its own
+    /// altitude*, which is the only place the measurement is valid — the offset grows with height,
+    /// so a fleet-wide median mixes traffic on the ground with traffic at our level (see
+    /// `AltitudeDatumOffset`). Using each target's own pair needs no estimator, no convergence and
+    /// no minimum sample count: one aircraft in view is enough, and it is exact for that aircraft.
+    ///
+    /// `alt_geom` is referenced to the WGS-84 ellipsoid, so it becomes MSL by subtracting the
+    /// geoid separation the phone reports for our own fix (HAE − MSL, −108.9 ft in these logs).
+    ///
+    /// Falls back to the reported altitude unchanged when the pair is unavailable — GDL90 traffic
+    /// reports carry pressure altitude only — which is exactly what the app did before. This is
+    /// never worse than the previous behaviour for any target.
+    static func geometricPlacementAltitude(
+        for aircraft: Aircraft,
+        reportedAltitudeFt: Double,
+        geoidSeparationFt: Double?
+    ) -> Double {
+        // How far `reportedAltitudeFt` has to move to become an ellipsoid-referenced height.
+        // Mirrors the source's own precedence (pressure altitude when present, else geometric),
+        // so the shift matches whichever datum `Aircraft.altitude` was populated from — and
+        // carries across the vertical-rate extrapolation already applied to it.
+        let toEllipsoidFt: Double
+        switch (aircraft.pressureAltitudeFt, aircraft.geometricAltitudeFt) {
+        case let (pressure?, geometric?):
+            let offset = geometric - pressure
+            // A pair no atmosphere could produce is a mis-set or stale report, not a measurement.
+            guard abs(offset) <= AltitudeDatumOffset.maxPlausibleOffsetFt else {
+                return reportedAltitudeFt
+            }
+            toEllipsoidFt = offset
+        case (nil, _?):
+            // The reported altitude is already the geometric one.
+            toEllipsoidFt = 0
+        default:
+            // Pressure only, or neither: nothing to convert with.
+            return reportedAltitudeFt
+        }
+        return reportedAltitudeFt + toEllipsoidFt - (geoidSeparationFt ?? 0)
     }
 
     /// Calculate position for airport marker
@@ -1805,7 +1872,12 @@ struct ScreenOrientationFollower {
 /// mis-set value, and the interquartile spread says how much the sample can be trusted: a
 /// tight spread means the aircraft agree, a wide one means the sample is contaminated.
 ///
-/// Currently measured and logged only. Applying it to target placement is the next phase.
+/// Target *placement* does not use this. Each target carries its own pair, so
+/// `CalculationsLogic.geometricPlacementAltitude` converts it exactly, per aircraft, with no
+/// estimator at all. What this is for is the one quantity no target can supply: the viewer's own
+/// pressure altitude, which is unmeasurable on board — the phone's barometer reads cabin pressure
+/// (5,474 ft at cruise in these logs), not outside static. For that, `estimate(from:nearAltitudeFt:)`
+/// borrows the offset from traffic flying near our own level.
 enum AltitudeDatumOffset {
 
     struct Estimate {
@@ -1837,8 +1909,45 @@ enum AltitudeDatumOffset {
     static let maxPlausibleOffsetFt: Double = 5_000.0
 
     static func estimate(from aircraft: [Aircraft]) -> Estimate? {
-        let values = offsets(from: aircraft).sorted()
-        guard !values.isEmpty else { return nil }
+        estimate(from: offsets(from: aircraft), minSamples: 1)
+    }
+
+    /// Default half-width of the altitude band. Wide enough to find traffic at a neighbouring
+    /// flight level in thin airspace, narrow enough that surface traffic never enters the sample
+    /// while the viewer is at altitude.
+    static let defaultBandFt: Double = 4_000.0
+
+    /// Fewest aircraft that may set the estimate. Two can disagree with no way to tell which is
+    /// wrong; three gives the median something to reject.
+    static let defaultMinSamples: Int = 3
+
+    /// The offset measured only from aircraft flying near `nearAltitudeFt`, compared on their own
+    /// geometric altitude. Nil when fewer than `minSamples` qualify.
+    ///
+    /// The unbanded estimate above cannot be used for anything but a log column, and the flight
+    /// logs say why: the offset is a function of the aircraft's own height, so a fleet-wide median
+    /// mixes surface traffic (offset near zero) with traffic at cruise (offset near 1,900 ft) and
+    /// lands on whichever population happens to dominate the sample. Two sessions nine minutes
+    /// apart at the same cruise altitude produced medians of +25 ft and +1,900 ft.
+    ///
+    /// Banding is only sound for a readout, never for placement: each target already carries its
+    /// own exact offset, which `CalculationsLogic.geometricPlacementAltitude` uses instead.
+    static func estimate(
+        from aircraft: [Aircraft],
+        nearAltitudeFt: Double,
+        bandFt: Double = defaultBandFt,
+        minSamples: Int = defaultMinSamples
+    ) -> Estimate? {
+        let inBand = aircraft.filter { ac in
+            guard let geometric = ac.geometricAltitudeFt else { return false }
+            return abs(geometric - nearAltitudeFt) <= bandFt
+        }
+        return estimate(from: offsets(from: inBand), minSamples: minSamples)
+    }
+
+    private static func estimate(from unsorted: [Double], minSamples: Int) -> Estimate? {
+        let values = unsorted.sorted()
+        guard values.count >= max(1, minSamples) else { return nil }
         return Estimate(
             sampleCount: values.count,
             medianFt: percentile(values, 0.50),

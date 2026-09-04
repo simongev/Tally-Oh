@@ -172,6 +172,9 @@ private final class HUDOverlayView: UIView {
     }
     private var headingTicks: [HeadingTick] = []
     private var lastHeadingDeg: Double = 0
+    /// Whether the rose is currently blanked for want of a world alignment. Held so a layout pass,
+    /// which re-runs the last heading, cannot bring an arbitrary rose back on screen.
+    private var headingRoseHidden: Bool = false
 
     private static func headingLabelText(for value: Double) -> String {
         switch value {
@@ -392,7 +395,11 @@ private final class HUDOverlayView: UIView {
         pointerPath.closeSubpath()
         headingPointerLayer.path = pointerPath
 
-        updateHeading(headingDeg: lastHeadingDeg)
+        if headingRoseHidden {
+            hideHeading()
+        } else {
+            updateHeading(headingDeg: lastHeadingDeg)
+        }
     }
 
     /// Rotate the heading rose to the current true heading — like a real
@@ -404,6 +411,7 @@ private final class HUDOverlayView: UIView {
     /// status-readout cadence, not per AR frame.
     func updateHeading(headingDeg: Double) {
         lastHeadingDeg = headingDeg
+        headingRoseHidden = false
         guard !headingTicks.isEmpty else { return }
         let visibleHalfRangeDeg = 100.0  // slight overscan past the nominal ±90° window
 
@@ -432,6 +440,20 @@ private final class HUDOverlayView: UIView {
             tick.label.isHidden = false
         }
         headingArcLayer.path = arcPath
+        headingPointerLayer.isHidden = false
+    }
+
+    /// Blank the heading rose entirely — ticks, numbers and lubber line.
+    ///
+    /// Used while the AR world has no alignment yet. A `.gravity` world's north is wherever the
+    /// session started, so an uncorrected rose is not roughly right, it is arbitrary; showing
+    /// nothing says "not yet" where showing a number says "this way", and only one of those is
+    /// true. Mirrors the target fade, which build 34 tied to the same condition.
+    func hideHeading() {
+        headingRoseHidden = true
+        headingArcLayer.path = nil
+        headingPointerLayer.isHidden = true
+        headingTicks.forEach { $0.label.isHidden = true }
     }
 
     /// Update the horizon/pitch-ladder lines. Each pair is (leftEndpoint, rightEndpoint)
@@ -1011,9 +1033,25 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var isAirborneEstimate: Bool = false
     private var airborneBasis: String = "unknown"
 
-    /// Most recent measured pressure-to-geometric offset, for display. Not applied to
-    /// placement — that is the next phase.
+    /// Most recent pressure-to-geometric offset across all visible traffic, whatever its
+    /// altitude. Diagnostic only: it mixes surface traffic with traffic at our level, which is
+    /// why it swung between +25 ft and +1,900 ft in two cruise sessions nine minutes apart. Kept
+    /// because `datum_offset_median_ft` has meant this in every log since build 27.
     private var latestDatumOffset: AltitudeDatumOffset.Estimate?
+
+    /// The same offset measured only from traffic flying near our own altitude, which is the
+    /// only band where it describes the air we are in.
+    private var latestBandedDatumOffset: AltitudeDatumOffset.Estimate?
+
+    /// The viewer's own pressure altitude — the flight level an altimeter would read — derived
+    /// from GPS ellipsoidal altitude and the banded offset above.
+    ///
+    /// It cannot be measured on board. The phone's barometer sits inside a pressurized cabin and
+    /// reads cabin pressure (5,474 ft while cruising above FL400 in these logs), so the only
+    /// outside-air pressure reference available is the traffic around us. Nil when too few
+    /// aircraft near our level report both datums, in which case the HUD falls back to the GPS
+    /// geometric altitude it showed before.
+    private var ownshipPressureAltitudeFt: Double?
 
     /// Reads absolute pressure only, so the cabin-versus-GPS altitude gap is measurable.
     /// Deliberately not part of the altitude chain: build 28 removed barometric fusion
@@ -2717,6 +2755,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard state.hasPosition else { return }
         let loc = state.coordinate
         let altitude = state.displayAltitudeFt
+        // Converts a target's ellipsoid-referenced geometric altitude into `altitude`'s MSL frame.
+        // Nil until the phone has reported MSL and ellipsoidal altitude for the same fix, in which
+        // case placement falls back to the reported altitude exactly as it did before.
+        let geoidSep = state.hasGeoidSeparation ? state.geoidSeparationFt : nil
 
         // Refreshed here so every consumer this tick — culling, TCAS, the node cap and the
         // GPS gate — agrees on whether we are flying.
@@ -2774,6 +2816,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             return true
         }
 
+        updateOwnshipPressureAltitude(aircraft: aircraftList)
+
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
             let t = pov.worldTransform
@@ -2794,7 +2838,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userAltitude: altitude,
                 userTrack: state.hasVelocity ? state.trackDeg : userHeading,
                 userGroundSpeed: state.hasVelocity ? state.groundSpeedKt : 0,
-                userVerticalRate: state.verticalRateFpm
+                userVerticalRate: state.verticalRateFpm,
+                geoidSeparationFt: geoidSep
             )
         } else {
             // Ground mode — clear any active TCAS alert and pass empty evaluation
@@ -2810,7 +2855,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userHeading: userHeading,
             cameraWorldPosition: cameraPos,
             tcasEvaluation: tcas,
-            onGround: !airborne
+            onGround: !airborne,
+            geoidSeparationFt: geoidSep
         )
         sceneManager?.updateAirports(
             airports,
@@ -2853,6 +2899,60 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                            elapsed, renderedCount, staleCount, arTrackingStateDescription,
                            worldIsUsableForDisplay(arTrackingState) ? 0 : 1)
         )
+    }
+
+    /// Work out what an altimeter in this aircraft would read, from the traffic around us.
+    ///
+    /// Ownship altitude is GPS geometric — satellite-derived, unaffected by the cabin, and the
+    /// right datum to place targets against now that each target is converted into it. It is not
+    /// the number a pilot or passenger recognises: at cruise it sits roughly 1,900 ft above the
+    /// flight level, because geometric height and pressure altitude diverge with height.
+    ///
+    /// Every aircraft reporting both `alt_baro` and `alt_geom` is measuring that divergence, but
+    /// only at its own altitude — which is why this takes the median across a band around our own
+    /// level rather than across everything in the sky. Unbanded, the sample mixes traffic on the
+    /// surface (offset near zero) with traffic at cruise, and the median lands on whichever
+    /// population happens to dominate: +25 ft and +1,900 ft in two sessions nine minutes apart at
+    /// the same altitude.
+    ///
+    /// This is a readout, not a placement input. Placement never uses an estimate — each target
+    /// carries its own exact offset.
+    private func updateOwnshipPressureAltitude(aircraft: [Aircraft]) {
+        // Before the first accepted fix the ellipsoidal altitude is a placeholder zero, and a band
+        // centred there would gather surface traffic and hand the tape a confident wrong number.
+        guard hasAcceptedGPSAltitude else {
+            latestBandedDatumOffset = nil
+            ownshipPressureAltitudeFt = nil
+            return
+        }
+        let banded = AltitudeDatumOffset.estimate(
+            from: aircraft,
+            nearAltitudeFt: gpsEllipsoidalAltitudeFeet
+        )
+        latestBandedDatumOffset = banded
+        // Against the ellipsoid on both sides: `alt_geom` is ellipsoid-referenced and so is
+        // `gps_hae_ft`, so the geoid never enters this subtraction.
+        ownshipPressureAltitudeFt = banded.map { gpsEllipsoidalAltitudeFeet - $0.medianFt }
+    }
+
+    /// Lowest usable flight level in US airspace. Above the transition altitude every altimeter
+    /// is set to 29.92 and reads pressure altitude; below it they are set to the local QNH and
+    /// read something much closer to MSL.
+    private static let transitionAltitudeFt: Double = 18_000
+
+    /// Altitude for the HUD tape: the flight level while the aircraft is in the flight levels,
+    /// and GPS geometric MSL below them.
+    ///
+    /// Which is the same rule the altimeter in the cockpit follows, and the reason this is not
+    /// simply "pressure altitude whenever we can compute one". Below the transition altitude a
+    /// standard-datum reading can sit a thousand feet from what the crew sees on a low-QNH day,
+    /// so showing it there would trade one wrong number for another.
+    private var hudAltitudeFt: Double {
+        guard let pressure = ownshipPressureAltitudeFt,
+              activeAltitude >= ARTrafficViewController.transitionAltitudeFt else {
+            return activeAltitude
+        }
+        return pressure
     }
 
     /// Emit one flight-recorder row per second, driven off the existing 4 Hz tick so no
@@ -2951,21 +3051,30 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.targetsWithGeometricAltitude = aircraft.filter { $0.geometricAltitudeFt != nil }.count
         sample.datumOffset = AltitudeDatumOffset.estimate(from: aircraft)
         latestDatumOffset  = sample.datumOffset
+        // Refreshed on the 4 Hz tick, read here — the same cadence separation the other cached
+        // measurements in this row already use.
+        sample.datumBandOffset       = latestBandedDatumOffset
+        sample.ownPressureAltitudeFt = ownshipPressureAltitudeFt
+        if worldIsAligned, let raw = sample.arHeadingDeg {
+            sample.hudHeadingDeg = CalculationsLogic.normalizedAzimuth(
+                raw + appliedWorldYawOffsetDeg)
+        }
 
         return sample
     }
 
-    /// The heading ARKit's world frame is working in, for a camera forward vector.
+    /// The heading ARKit's *own* world frame is working in, for a camera forward vector.
     ///
-    /// This is the frame targets are actually placed in, so it is what the HUD rose shows and
-    /// what the flight recorder logs — one function for both, so the rose and the traffic can
-    /// never disagree about north.
+    /// No correction is applied, and that is deliberate: it keeps `heading_delta_deg` measuring
+    /// something. A corrected heading would equal the compass by construction, so that column
+    /// would read zero forever and the alignment error would become invisible in exactly the log
+    /// used to diagnose it.
     ///
-    /// No correction is applied, and that is deliberate twice over. It keeps the rose honest
-    /// about the frame the markers really live in, including ARKit's own world-alignment error;
-    /// and it keeps `heading_delta_deg` measuring something. A corrected heading would equal the
-    /// compass by construction, so that column would read zero forever and the alignment error
-    /// would become invisible in exactly the log used to diagnose it.
+    /// Which makes this the wrong number to show anybody. Under `.gravity` — which every world has
+    /// used since build 33 — ARKit's north is wherever the session started, ~150–160° out in the
+    /// FL420 logs. Build 34 fed it straight to the HUD rose anyway, which is why the compass was
+    /// wrong through a flight whose targets were accurate. Callers who want a heading for a human
+    /// add `appliedWorldYawOffsetDeg`, the same term the markers are placed with.
     private func arFrameRawAzimuthDeg(forward: SIMD3<Float>) -> Double {
         let deg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
         return (deg + 360).truncatingRemainder(dividingBy: 360)
@@ -3051,7 +3160,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 let id = String(nodeID.dropFirst("aircraft_".count))
                 if let ac = connectionLogic.detectedAircraft[id] {
                     targetCoord = ac.coordinate
-                    targetAlt   = ac.altitude
+                    // Same datum conversion the marker itself is placed with, so an arrow and the
+                    // target it points at never disagree about which way is up.
+                    let state = ownshipEstimator.snapshot()
+                    targetAlt = CalculationsLogic.geometricPlacementAltitude(
+                        for: ac,
+                        reportedAltitudeFt: ac.altitude,
+                        geoidSeparationFt: state.hasGeoidSeparation ? state.geoidSeparationFt : nil
+                    )
                 } else { targetCoord = nil; targetAlt = 0 }
             } else if nodeID.hasPrefix("airport_") {
                 let icao = String(nodeID.dropFirst("airport_".count))
@@ -3279,7 +3395,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     private func updateStatusLabel() {
         if sceneManager?.settings.showHUD == true {
-            hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: activeAltitude)
+            hudOverlayView.updateReadouts(speedKt: activeGroundSpeedKt, altitudeFt: hudAltitudeFt)
             // Heading-rose updates happen in updateHUDLadder()'s per-frame
             // dispatch block now, not here — it's a visibly rotating
             // element, so it needs the same per-frame cadence as the
@@ -3334,7 +3450,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let altAccStr = lastVerticalAccuracy > 0
                 ? String(format: "±%.0fft", lastVerticalAccuracy * CalculationsLogic.metersToFeet)
                 : "?"
-            lines.append(String(format: "✈️ %.0f ft (GPS %@)   🧭 %.0f° (%@)  Δ%@", displayAlt, altAccStr, userHeading, compassAccStr, corrStr))
+            // Both altitudes, always: the tape shows the flight level, and the GPS geometric
+            // figure behind it is what placement actually runs on. A single number here could not
+            // say which of the two a disagreement in the air belonged to.
+            let altStr = ownshipPressureAltitudeFt.map {
+                String(format: "%.0f ft PA / %.0f ft GPS %@%@", $0, displayAlt, altAccStr,
+                       hudAltitudeFt == displayAlt ? " (below TA)" : "")
+            } ?? String(format: "%.0f ft GPS %@ (no PA)", displayAlt, altAccStr)
+            // The corrected AR azimuth — the direction the phone is actually pointing, in the same
+            // frame the markers are placed in and the HUD rose now shows. CoreLocation's own
+            // heading follows on the next line: inside a cabin it reads the aircraft's track no
+            // matter where the phone points, which is a diagnostic, not a heading.
+            let arHeadingStr: String
+            if worldIsAligned, let raw = currentARFrameRawAzimuthDeg {
+                arHeadingStr = String(format: "%.0f°", CalculationsLogic.normalizedAzimuth(
+                    raw + appliedWorldYawOffsetDeg))
+            } else {
+                arHeadingStr = "—"
+            }
+            lines.append(String(format: "✈️ %@   🧭 %@  cmps %.0f° (%@)  Δ%@",
+                                altStr, arHeadingStr, userHeading, compassAccStr, corrStr))
 
             // GPS course/speed, and the residual between the corrected AR heading and that
             // course. The residual is only meaningful while the phone points near the nose, but
@@ -3393,12 +3528,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 lines.append("🎚 cabin — (motion: \(motionAuthDescription))")
             }
 
-            // Measured pressure-to-geometric conversion from nearby traffic. Displayed only;
-            // it does not yet move any target.
-            if let offset = latestDatumOffset {
-                lines.append(String(format: "📊 datum offset %+.0f ft  (n=%d, IQR %.0f ft)",
-                                    offset.medianFt, offset.sampleCount, offset.spreadFt))
-            }
+            // Two measurements of the same quantity: the band around our own level, which sets the
+            // flight level on the tape, and the whole sky, which is the number every previous log
+            // recorded. When they disagree by thousands of feet the sky is mixing altitudes, which
+            // is exactly why the tape does not use it.
+            let bandStr = latestBandedDatumOffset.map {
+                String(format: "%+.0f ft n=%d", $0.medianFt, $0.sampleCount)
+            } ?? "— (too few near our level)"
+            let allStr = latestDatumOffset.map {
+                String(format: "%+.0f ft n=%d IQR %.0f", $0.medianFt, $0.sampleCount, $0.spreadFt)
+            } ?? "—"
+            lines.append("📊 datum band \(bandStr)   all \(allStr)")
             if state.hasGeoidSeparation {
                 lines.append(String(format: "📐 geoid %+.0f ft", state.geoidSeparationFt))
             }
@@ -4442,7 +4582,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // 0 → +6.1° → −1.7° in 38 seconds, chasing ARKit's own convergence. worldYawErrorDeg
         // now measures that convergence error directly instead of learning around it; the
         // course residual survives as a diagnostic in the flight log.
-        let trueHeadingDeg = arFrameRawAzimuthDeg(forward: forward)
+        //
+        // Build 34 shipped this comment's promise and not its code: the rose was fed
+        // `arFrameRawAzimuthDeg` directly, which is deliberately uncorrected so that
+        // `ar_heading_deg` keeps measuring ARKit's own frame for the log. Under `.gravity` that
+        // frame's north is wherever the session happened to start — ~150–160° out in the FL420
+        // logs — so the rose was wrong by the whole world-yaw offset while the markers, which do
+        // apply it, were right. Exactly the reported symptom: accurate targets, wrong compass.
+        //
+        // The correction is applied on the main thread below, where the offset is owned, rather
+        // than read across threads here.
+        let rawHeadingDeg = arFrameRawAzimuthDeg(forward: forward)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -4457,7 +4607,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 self.hudOverlayView.hideLadder()
             }
             self.hudOverlayView.updateBank(rollDeg: rollDeg)
-            self.hudOverlayView.updateHeading(headingDeg: trueHeadingDeg)
+            // Markers go at `bearing − offset`, so a direction sitting at ARKit azimuth `a` is
+            // truly at `a + offset`. Before the world has an alignment the offset is not merely
+            // approximate, it is meaningless — so the rose is hidden rather than shown pointing
+            // somewhere arbitrary, the same rule build 34 applied to the target fade.
+            if self.worldIsAligned {
+                self.hudOverlayView.updateHeading(
+                    headingDeg: CalculationsLogic.normalizedAzimuth(
+                        rawHeadingDeg + self.appliedWorldYawOffsetDeg))
+            } else {
+                self.hudOverlayView.hideHeading()
+            }
             // The horizon line projected successfully above, but at a
             // steep-but-not-extreme pitch it can still land outside the
             // visible area — show the same fixed arrow in that case too.

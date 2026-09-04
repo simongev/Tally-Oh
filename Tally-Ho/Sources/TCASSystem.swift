@@ -85,13 +85,19 @@ class TCASSystem {
     ///   - userTrack: User's track in degrees true (0 = north). Pass 0 if unknown.
     ///   - userGroundSpeed: User's ground speed in knots. Pass 0 if stationary/unknown.
     ///   - userVerticalRate: User's vertical rate in ft/min. Pass 0 if unknown.
+    ///   - geoidSeparationFt: Local geoid separation (HAE − MSL), used to convert each target's
+    ///     reported altitude into `userAltitude`'s geometric MSL datum. Traffic reports pressure
+    ///     altitude while the viewer's altitude is GPS geometric, and the gap between the two runs
+    ///     to ~1,900 ft at cruise — four times the RA vertical threshold, which would decide every
+    ///     vertical comparison here on a datum mismatch rather than on real separation.
     static func evaluate(
         aircraft: [Aircraft],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userTrack: Double = 0,
         userGroundSpeed: Double = 0,
-        userVerticalRate: Double = 0
+        userVerticalRate: Double = 0,
+        geoidSeparationFt: Double? = nil
     ) -> TCASEvaluation {
 
         var threats: [String: TCASAlertLevel] = [:]
@@ -108,7 +114,8 @@ class TCASSystem {
                 ac: ac,
                 userLocation: userLocation,
                 userAltitude: userAltitude,
-                userVel: userVel
+                userVel: userVel,
+                geoidSeparationFt: geoidSeparationFt
             )
             if level != .none {
                 threats[ac.id] = level
@@ -125,13 +132,19 @@ class TCASSystem {
         ac: Aircraft,
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
-        userVel: SIMD3<Double>
+        userVel: SIMD3<Double>,
+        geoidSeparationFt: Double?
     ) -> TCASAlertLevel {
+
+        // In the viewer's own datum, so every vertical figure below is real separation rather
+        // than the pressure-versus-geometric gap.
+        let acAltitude = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: ac.altitude, geoidSeparationFt: geoidSeparationFt)
 
         // Compute instantaneous separation (used for guard range check below)
         let horizNM = CalculationsLogic.distanceInNauticalMiles(
             from: userLocation, to: ac.coordinate)
-        let vertFt = abs(ac.altitude - userAltitude)
+        let vertFt = abs(acAltitude - userAltitude)
 
         // --- CPA prediction — skip aircraft clearly outside the outer guard range ---
         guard horizNM <= guardHorizNM && vertFt <= guardVertFt else {
@@ -146,7 +159,7 @@ class TCASSystem {
 
         // Relative position: intruder relative to ownship (metres, North-East-Up)
         let (dx, dy) = horizontalOffsetMeters(from: userLocation, to: ac.coordinate)
-        let dz = (ac.altitude - userAltitude) * CalculationsLogic.feetToMeters
+        let dz = (acAltitude - userAltitude) * CalculationsLogic.feetToMeters
 
         // Relative velocity: intruder velocity minus ownship velocity
         let rvx = acVel.x - userVel.x   // North component
