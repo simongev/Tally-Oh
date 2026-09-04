@@ -1869,6 +1869,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// meaningless.
     private static let unusableWorldOpacity: CGFloat = 0.25
 
+    /// Whether the world has an azimuth alignment at all, as opposed to merely being tracked.
+    ///
+    /// Build 22 faded on tracking state alone, which was the right test while ARKit aligned the
+    /// world itself. Under `.gravity` it is not: a tracked world with no seed points nowhere in
+    /// particular, and two ground sessions showed targets going solid 1.13 s before `seed_captured`
+    /// landed — which is precisely the "first second was about 180 degrees wrong" reported. The
+    /// fallback counts as aligned because it hands the job back to `.gravityAndHeading`, which does
+    /// align the world, badly but not arbitrarily.
+    private var worldIsAligned: Bool { worldYawSource != .none || seedFallbackToHeading }
+
     /// Fade the scene to match whether its world is usable. Runs from the tracking-state callback.
     ///
     /// `rootNode.opacity` propagates down the scene graph, so this covers aircraft and airports in
@@ -1878,7 +1888,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     ///
     /// The HUD is a UIKit overlay and is untouched.
     private func applyWorldUsabilityFade() {
-        let target: CGFloat = worldIsUsableForDisplay(arTrackingState)
+        let target: CGFloat = (worldIsUsableForDisplay(arTrackingState) && worldIsAligned)
             ? 1.0 : ARTrafficViewController.unusableWorldOpacity
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isViewLoaded else { return }
@@ -3834,6 +3844,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // world rotating with the user's panning cancelled out.
         seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
 
+        // The world has an alignment now, so the scene may go solid. Without this the fade would
+        // wait for the next tracking-state transition, which on a steady session may never come.
+        applyWorldUsabilityFade()
+
         if awaitingSeedConfirmation {
             awaitingSeedConfirmation = false
             showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
@@ -4478,9 +4492,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let elapsedSinceLift = liftStartTime.map { Date().timeIntervalSince($0) } ?? -1
         FlightRecorder.shared.record(
             event: "ar_tracking_state",
-            detail: String(format: "%@ t=%.2fs targets_faded=%d%@", arTrackingStateDescription,
-                           elapsedSinceLift,
-                           worldIsUsableForDisplay(camera.trackingState) ? 0 : 1, recovery)
+            detail: String(format: "%@ t=%.2fs targets_faded=%d aligned=%d%@",
+                           arTrackingStateDescription, elapsedSinceLift,
+                           (worldIsUsableForDisplay(camera.trackingState) && worldIsAligned) ? 0 : 1,
+                           worldIsAligned ? 1 : 0, recovery)
         )
         DispatchQueue.main.async {
             self.updateStatusLabel()

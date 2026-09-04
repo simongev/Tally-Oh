@@ -1159,8 +1159,21 @@ struct AlignmentDriftMonitor {
 /// behaviour, not a gap: with no rotation there is no evidence about which sensor is measuring what.
 struct GroundYawCorrection {
 
-    /// Beyond this the compass and ARKit disagree by more than any plausible drift, so the reading
-    /// is more likely a broken sensor than a 40°-wrong world. Refuse rather than apply it.
+    /// A magnitude cap on the offset. **180° from build 34, i.e. no cap.**
+    ///
+    /// It was 20°, on build 24's reasoning that ARKit was already compass-aligned so a larger gap
+    /// meant a broken sensor rather than a genuinely wrong world. Under `.gravity` that premise is
+    /// void: ARKit takes no alignment of its own, the median handed in here is the *total* offset
+    /// measured against the uncorrected azimuth, and it is arbitrary by construction. Two ground
+    /// sessions had it refuse `median=-150.74` and `median=149.00` at `response` 1.06 and 1.08 with
+    /// `r` 0.97 and 0.98 — a healthy compass, rejected on magnitude alone, so the refinement never
+    /// ran once and the offset stayed pinned at the seed's value for both whole sessions.
+    ///
+    /// The gates that discriminate are the other ones — airborne, `compass_response` near 1 with a
+    /// real correlation, heading accuracy. This one never did. Removing it does mean a badly wrong
+    /// compass can now drive a badly wrong offset, and on a `.gravity` world there is no second
+    /// reference to cross-check against; the response gate is the protection, and it is the one that
+    /// has held up in testing.
     let maxOffsetDeg: Double
     /// How far `compassResponse` may sit from 1.0 and still count as "measuring the phone".
     let responseToleranceFromOne: Double
@@ -1187,7 +1200,7 @@ struct GroundYawCorrection {
     private(set) var hasOffset: Bool = false
     private var lastUpdateTime: TimeInterval = -.greatestFiniteMagnitude
 
-    init(maxOffsetDeg: Double = 20.0,
+    init(maxOffsetDeg: Double = 180.0,
          responseToleranceFromOne: Double = 0.3,
          minResponseCorrelation: Double = 0.8,
          maxHeadingAccuracyDeg: Double = 25.0,

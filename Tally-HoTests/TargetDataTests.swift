@@ -1024,11 +1024,23 @@ struct TargetDataTests {
         #expect(!correction.hasOffset)
     }
 
-    /// A 40° disagreement on the ground is a broken sensor, not a 40°-wrong world.
+    /// The cap still works when a caller asks for one — it is only the *default* that changed.
     @Test func refusedWhenTheOffsetIsImplausible() {
         var correction = GroundYawCorrection(maxOffsetDeg: 20, deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -45, ticks: 10)
         #expect(!correction.hasOffset)
+    }
+
+    /// **The build-34 unblocking.** Under `.gravity` the median is the *total* offset and is
+    /// arbitrary by construction. Two ground sessions had a healthy compass — response 1.06 and
+    /// 1.08, r 0.97 and 0.98 — refused on magnitude alone at −150.74 and 149.00, so the refinement
+    /// never ran and the offset stayed pinned at the seed's value for both whole sessions.
+    @Test func defaultAcceptsALargeOffset() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        correction.prime(offsetDeg: -147.1)
+        applyGround(&correction, medianDeg: -150.7, ticks: 8, response: 1.06, responseR: 0.97)
+        #expect(correction.hasOffset)
+        #expect(abs(correction.appliedOffsetDeg - (-150.7)) < 0.01)
     }
 
     /// The rate limit: the correction updates about once a second, not at the feed rate.
