@@ -948,7 +948,7 @@ struct TargetDataTests {
     }
 
     @Test func groundCorrectionConvergesOnTheMedian() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10)
         #expect(correction.hasOffset)
         #expect(abs(correction.appliedOffsetDeg - (-2.5)) < 0.01)
@@ -956,7 +956,7 @@ struct TargetDataTests {
 
     /// The slew limit: one second may not move the scene by the whole correction.
     @Test func groundCorrectionSlewsRatherThanStepping() {
-        var correction = GroundYawCorrection(maxSlewPerUpdateDeg: 1.0)
+        var correction = GroundYawCorrection(deadbandDeg: 0.5, maxSlewPerUpdateDeg: 1.0)
         applyGround(&correction, medianDeg: -8.0, ticks: 1)
         #expect(abs(correction.appliedOffsetDeg - (-1.0)) < 0.001)
         applyGround(&correction, medianDeg: -8.0, ticks: 1, from: 1)
@@ -966,7 +966,7 @@ struct TargetDataTests {
     /// **The build-8 fence.** Inside a fuselage CLHeading reports the aircraft's ground track, so
     /// this median is the phone-to-nose angle, not an alignment error.
     @Test func refusedWhenAirborne() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10, airborne: true)
         #expect(!correction.hasOffset)
         #expect(correction.appliedOffsetDeg == 0)
@@ -975,14 +975,14 @@ struct TargetDataTests {
     /// **The discriminating gate** — it would have caught build 8 even on the ground. A compass
     /// that turns 0.018° per degree the phone turns is not measuring the phone.
     @Test func refusedWhenCompassIsTrackSlaved() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10, response: 0.018, responseR: 0.1)
         #expect(!correction.hasOffset)
     }
 
     /// A slope near 1 fitted through noise is not evidence that the compass follows the phone.
     @Test func refusedWhenResponseCorrelationIsWeak() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10, response: 1.0, responseR: 0.2)
         #expect(!correction.hasOffset)
     }
@@ -990,13 +990,13 @@ struct TargetDataTests {
     /// Nothing is published until the estimator has a slope at all — a phone held perfectly still
     /// from launch is corrected by nothing, which is correct.
     @Test func refusedWhileResponseIsUnmeasured() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10, response: .nan, responseR: .nan)
         #expect(!correction.hasOffset)
     }
 
     @Test func refusedWithoutAMedian() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         for i in 0..<10 {
             correction.update(medianErrorDeg: nil, compassResponse: 1.0, compassResponseR: 0.95,
                               headingAccuracyDeg: 10, airborne: false, worldUsable: true,
@@ -1006,7 +1006,7 @@ struct TargetDataTests {
     }
 
     @Test func refusedWhileTheWorldIsUnusable() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         for i in 0..<10 {
             correction.update(medianErrorDeg: -2.5, compassResponse: 1.0, compassResponseR: 0.95,
                               headingAccuracyDeg: 10, airborne: false, worldUsable: false,
@@ -1016,7 +1016,7 @@ struct TargetDataTests {
     }
 
     @Test func refusedWhenTheCompassCallsItselfInaccurate() {
-        var correction = GroundYawCorrection(maxHeadingAccuracyDeg: 25)
+        var correction = GroundYawCorrection(maxHeadingAccuracyDeg: 25, deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10, headingAccuracy: 40)
         #expect(!correction.hasOffset)
         // And a negative accuracy — CoreLocation's "no fix" — is refused, not read as excellent.
@@ -1026,14 +1026,14 @@ struct TargetDataTests {
 
     /// A 40° disagreement on the ground is a broken sensor, not a 40°-wrong world.
     @Test func refusedWhenTheOffsetIsImplausible() {
-        var correction = GroundYawCorrection(maxOffsetDeg: 20)
+        var correction = GroundYawCorrection(maxOffsetDeg: 20, deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -45, ticks: 10)
         #expect(!correction.hasOffset)
     }
 
     /// The rate limit: the correction updates about once a second, not at the feed rate.
     @Test func groundCorrectionIsRateLimited() {
-        var correction = GroundYawCorrection(minUpdateInterval: 1.0, maxSlewPerUpdateDeg: 1.0)
+        var correction = GroundYawCorrection(minUpdateInterval: 1.0, deadbandDeg: 0.5, maxSlewPerUpdateDeg: 1.0)
         for i in 0..<20 { applyGround(&correction, medianDeg: -10, ticks: 1, from: Double(i) * 0.1) }
         // Two seconds of feed at 10 Hz is two updates, so two degrees — not twenty.
         #expect(abs(correction.appliedOffsetDeg) <= 2.01)
@@ -1051,7 +1051,7 @@ struct TargetDataTests {
     /// Takeoff freezes the last ground value rather than discarding it: the ARKit world survives
     /// takeoff, so a correction measured minutes ago is still the better estimate.
     @Test func goingAirborneFreezesRatherThanClears() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10)
         let settled = correction.appliedOffsetDeg
         applyGround(&correction, medianDeg: -30, ticks: 20, from: 20, airborne: true)
@@ -1061,7 +1061,7 @@ struct TargetDataTests {
 
     /// A world reset builds a different frame, so the number measured against the old one goes.
     @Test func groundCorrectionResetsWithTheWorld() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: -2.5, ticks: 10)
         #expect(correction.hasOffset)
         correction.reset()
@@ -1071,16 +1071,49 @@ struct TargetDataTests {
 
     /// A genuine 0.0° must be distinguishable from "never ran", since both read zero.
     @Test func aMeasuredZeroStillCountsAsApplied() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         applyGround(&correction, medianDeg: 0, ticks: 3)
         #expect(correction.hasOffset)
         #expect(correction.appliedOffsetDeg == 0)
     }
 
+    /// **Build 33's composition.** The seed hands its offset over, and the correction refines from
+    /// there rather than crawling up from zero at 1°/s — which for a −38° seed would take most of a
+    /// minute.
+    @Test func primedCorrectionRefinesFromTheSeedRatherThanFromZero() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        correction.prime(offsetDeg: -38.4)
+        #expect(correction.hasOffset)
+        #expect(abs(correction.appliedOffsetDeg - (-38.4)) < 0.001)
+        // A median three degrees off the seed converges in three ticks, not forty.
+        applyGround(&correction, medianDeg: -41.4, ticks: 4)
+        #expect(abs(correction.appliedOffsetDeg - (-41.4)) < 0.01)
+    }
+
+    /// Priming with a non-finite value must not poison the offset.
+    @Test func primeIgnoresNonFiniteOffsets() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        correction.prime(offsetDeg: .nan)
+        #expect(!correction.hasOffset)
+        #expect(correction.appliedOffsetDeg == 0)
+    }
+
+    /// The shipped deadband. One ground session walked 0.59 → −3.02 → +4.56 at 0.5°, chasing a
+    /// median that was mostly noise around 1.5°; at 1.5° that jitter moves nothing.
+    @Test func defaultDeadbandIgnoresMedianJitter() {
+        var correction = GroundYawCorrection()
+        correction.prime(offsetDeg: 2.0)
+        applyGround(&correction, medianDeg: 3.0, ticks: 5)
+        #expect(correction.appliedOffsetDeg == 2.0)
+        // A real move still gets through.
+        applyGround(&correction, medianDeg: 6.0, ticks: 5, from: 20)
+        #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
+    }
+
     /// The refusal reason is reported, not swallowed — the log distinguishes "no correction" from
     /// "no correction because the compass is track-slaved".
     @Test func refusalNamesItsReason() {
-        var correction = GroundYawCorrection()
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
         let airborne = correction.update(medianErrorDeg: -2.5, compassResponse: 1.0,
                                          compassResponseR: 0.95, headingAccuracyDeg: 10,
                                          airborne: true, worldUsable: true, at: 0)

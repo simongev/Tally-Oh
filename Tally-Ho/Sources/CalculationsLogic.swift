@@ -933,19 +933,19 @@ struct StartupSeed {
         /// Airborne: the aircraft's GPS ground track, which is the nose to within the drift angle.
         /// The compass cannot be used here — it measures the fuselage, not the phone.
         case track
-        /// The phone's own true heading. **No longer selected by policy** — see
-        /// `ARTrafficViewController.seedReference`.
+        /// The phone's own true heading, used on the ground — but only as a *rough* first
+        /// alignment, never as the whole of one.
         ///
-        /// The reasoning that put it here was that on the ground the compass measures the phone
-        /// (`compass_response` ≈ 1.00 against 0.018 in the air). That is true and it is not enough:
-        /// the response test proves the compass *follows* the phone, and says nothing about its
-        /// absolute bias. One ground log had `hdg_true` swing 273° → 345° while the phone turned
-        /// 60° — ratios against the gyro of 1.16, 0.45, 0.65, 0.62 over successive intervals —
-        /// reporting `hdg_acc` 10–11° throughout. Seeding a world is an absolute claim, and a
-        /// one-second median of that is a worse one than ARKit's own filtered fusion.
+        /// A single snapshot carries the magnetometer's full absolute bias. `compass_response` ≈ 1
+        /// proves the compass *follows* the phone and says nothing about that bias: one ground log
+        /// had `hdg_true` swing 273° → 345° while the phone turned 60° — ratios against the gyro of
+        /// 1.16, 0.45, 0.65, 0.62 — while reporting `hdg_acc` 10–11° throughout. Build 31 seeded
+        /// from exactly that and the scene jumped 38° the moment it landed.
         ///
-        /// Kept in the type because the capability is sound and its tests are worth having, in case
-        /// a future caller has a compass it can trust.
+        /// What makes it safe in build 33 is what follows it: `GroundYawCorrection` refines the
+        /// offset from a fifteen-second rolling median across many phone headings, which averages
+        /// the heading-dependent part of the error down. The snapshot's job is only to stop a
+        /// `.gravity` world pointing nowhere for the first few seconds.
         case compass
     }
 
@@ -1171,6 +1171,10 @@ struct GroundYawCorrection {
     /// Minimum gap between applied updates.
     let minUpdateInterval: TimeInterval
     /// Changes smaller than this are not worth moving the scene for.
+    ///
+    /// Raised 0.5° → 1.5° in build 33. At 0.5° the correction walked 0.59 → −3.02 → +4.56 across one
+    /// ground session, chasing a median that was mostly noise around 1.5° — four degrees of
+    /// continuous scene motion for no gain. The median is the signal; its jitter is not.
     let deadbandDeg: Double
     /// Most the applied offset may move in one update, so the correction converges over a few
     /// seconds rather than stepping every marker at once.
@@ -1188,7 +1192,7 @@ struct GroundYawCorrection {
          minResponseCorrelation: Double = 0.8,
          maxHeadingAccuracyDeg: Double = 25.0,
          minUpdateInterval: TimeInterval = 1.0,
-         deadbandDeg: Double = 0.5,
+         deadbandDeg: Double = 1.5,
          maxSlewPerUpdateDeg: Double = 1.0) {
         self.maxOffsetDeg = maxOffsetDeg
         self.responseToleranceFromOne = responseToleranceFromOne
@@ -1251,6 +1255,20 @@ struct GroundYawCorrection {
         appliedOffsetDeg += step
         hasOffset = true
         return .applied(appliedOffsetDeg)
+    }
+
+    /// Start from an offset somebody else established, so the slew limit only has the *residual* to
+    /// walk off rather than the whole thing.
+    ///
+    /// Build 33 primes this with `StartupSeed`'s value. Without it the correction would begin at 0
+    /// and crawl toward the seed's offset at 1°/s — minutes, for an offset the seed already had
+    /// within a second. Primed, the two compose the way they are meant to: the seed gets the world
+    /// roughly right immediately, and the rolling median refines it.
+    mutating func prime(offsetDeg: Double) {
+        guard offsetDeg.isFinite else { return }
+        appliedOffsetDeg = offsetDeg
+        hasOffset = true
+        lastUpdateTime = -.greatestFiniteMagnitude
     }
 
     /// Clear with the world. The offset describes one ARKit session's frame and means nothing about

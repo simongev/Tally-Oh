@@ -1131,10 +1131,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// `.gravityAndHeading` so the app degrades to build 28's accidental alignment rather than to a
     /// `.gravity` world with arbitrary yaw. Cleared once a seed succeeds.
     private var seedFallbackToHeading = false
-    /// Whether this world should be built with `.gravity` and seeded by the app, rather than aligned
-    /// by ARKit's own compass fusion. **Only true in the air.** Set by the visualisation tick, which
-    /// is the first place the flight state is knowable, and consumed by the next session start.
-    private var useGravityOnlyAlignment = false
     /// Whether the startup card is up. Cleared when the seed publishes, which is also when the card
     /// has done its job.
     private var awaitingSeedConfirmation = false
@@ -2013,30 +2009,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         )
 
         let config = ARWorldTrackingConfiguration()
-        // **Split by regime from build 32, and the ground half is the safe default.**
+        // **`.gravity` everywhere, and the measurement that settled it.**
         //
-        // In the air `.gravity` earns its place: the heading variant does not seed once, ARKit keeps
-        // fusing a magnetometer that in a cabin measures the fuselage rather than the phone
-        // (compass_response swinging 0.105 -> 0.02 -> 0.33 -> 0.005 inside one flight), and across
-        // three limited:motion episodes the world rotated about 176 degrees until the scene pointed
-        // backwards. There the seed comes from GPS track, which the compass never touches.
+        // `.gravityAndHeading` does not align the world once — ARKit keeps re-fusing the
+        // magnetometer and drags the world with it. `ar_heading_deg − gyro_az_deg` cancels whatever
+        // the user does with the phone, so any change in it is the world itself moving, and on the
+        // same phone on the same ground:
         //
-        // On the ground build 30 replaced ARKit's own alignment with a one-second median of
-        // CLHeading.trueHeading, and that was worse, not better. A magnetometer near buildings or
-        // metal follows the phone perfectly and is still tens of degrees out in absolute terms: one
-        // ground log had hdg_true swing 273 -> 345 while the phone turned 60, reporting hdg_acc
-        // 10-11 the whole time, and the seed baked that error straight into the world -- correct for
-        // 1.2 s, then a 38 degree jump the moment the offset landed. ARKit's fusion filters and
-        // validates headings; a raw snapshot cannot. So the ground goes back to `.gravityAndHeading`
-        // with no seed at all, which is the one configuration this app has ever been reported
-        // accurate in.
+        //     .gravityAndHeading, 40 s   spread 24.8 deg  (130.6 -> 155.4)
+        //     .gravity,           19 s   spread  0.6 deg
         //
-        // Defaulting to false matters: nothing about the flight state is knowable at session.run --
-        // gs reads 0 and hdg -1 in every cold-start log -- so a cold start comes up in the ground
-        // configuration and the tick restarts into `.gravity` once it can see the aircraft is
-        // flying. Builds 29 and 30 both shipped bugs by deciding this here instead.
-        config.worldAlignment = (useGravityOnlyAlignment && !seedFallbackToHeading)
-            ? .gravity : .gravityAndHeading
+        // Not gyro drift: the difference went 130.6 -> 145.0 in 1.17 s, which no gyro bias can do,
+        // and it held to 0.5 deg through a still window in the same log. In a cabin, where the
+        // compass is far worse, this is the flight that ended 176 degrees out.
+        //
+        // Build 32 gave the ground back to `.gravityAndHeading` on the reasoning that ARKit's fusion
+        // beats a raw one-second snapshot. Half of that stands — a snapshot at one heading really is
+        // a weak absolute reference, which is why build 31's ground test jumped — but the fusion is
+        // now measured as actively harmful. The answer is to keep the snapshot for speed and let
+        // GroundYawCorrection's rolling median refine it, not to hand the job back.
+        config.worldAlignment = seedFallbackToHeading ? .gravityAndHeading : .gravity
         config.providesAudioData = false
         let options: ARSession.RunOptions = resetting ? [.resetTracking, .removeExistingAnchors] : []
         arSceneView.session.run(config, options: options)
@@ -2740,18 +2732,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 // `.gravity` with a track reference that never arrives, and only the 10 s watchdog
                 // would eventually put it right.
                 clearYawFollower(reason: "landed")
-                useGravityOnlyAlignment = false
+                // A landed world seeds from the compass again, so let the fallback re-arm.
                 seedFallbackToHeading = false
             }
         }
         let airborne = isAirborneEstimate
 
-        // Move to the airborne alignment once the flight state says so. Here rather than in
-        // startARSession because this is the first place the flight state is actually known — `gs`
-        // reads 0 and `hdg` −1 in the start line of every cold-start log.
-        updateWorldAlignmentRegime()
-
-        // Establish the world's alignment, if this world is one the app aligns itself.
+        // Establish the world's alignment, if this world has not got one yet.
         updateStartupSeed()
 
         // Carry the offset through the aircraft's heading change. Ahead of the placement below so
@@ -3653,11 +3640,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// the life of that world, so the two can never fight over the same variable.
     private func updateGroundYawCorrection(medianErrorDeg: Double?, at time: TimeInterval) {
         guard !hasFlightAnchor else { return }
-        // Not on top of a seed. `worldYawErrorDeg` is measured against the *uncorrected* ARKit
-        // azimuth, so once a seed is applied that median reads back approximately the seed's own
-        // offset — applying it again would double-count it. On the ground the seed already is a
-        // compass alignment, taken once instead of continuously, so there is nothing left to add.
-        guard worldYawSource != .seed else { return }
+        // **Runs on top of the seed from build 33, and that is the point.** The median here is
+        // measured against the *uncorrected* ARKit azimuth, so it reads back the total offset the
+        // world needs — the seed's value plus whatever the seed got wrong — which is why the
+        // correction is primed with the seed rather than starting from zero. Build 32 skipped this
+        // whenever a seed existed, which left the world stuck with a one-second snapshot's error.
+        // Fifteen seconds of median across many phone headings is what averages that down.
 
         let outcome = groundYaw.update(
             medianErrorDeg: medianErrorDeg,
@@ -3674,6 +3662,17 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             appliedWorldYawOffsetDeg = offset
             sceneManager?.worldYawOffsetDeg = offset
             worldYawSource = .ground
+            // The follower is the single owner of the applied offset — `updateYawFollowing` writes
+            // it to placement every tick — so a refinement that did not go through it would be
+            // overwritten by the seed's value on the very next tick. Re-seeding keeps the two in
+            // step and keeps the anchor's disagreement check comparing against what is really
+            // applied. Gain is 0, so this only moves the base.
+            if yawFollower.hasSeed {
+                yawFollower.seed(offsetDeg: offset,
+                                 trackDeg: lastGPSCourseDeg,
+                                 source: .ground,
+                                 at: time)
+            }
             lastLoggedGroundYawRefusal = nil
             FlightRecorder.shared.record(
                 event: "ground_yaw_applied",
@@ -3712,41 +3711,32 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     /// Which direction the phone is being asked to be pointing at, or nil if neither reference is
     /// usable yet. Read from the visualisation tick, where all of this is live.
-    /// **Track only.** Build 30 had a `.compass` branch for the ground; build 32 removed it, because
-    /// the compass is a fine *relative* reference and a poor *absolute* one, and seeding a world is
-    /// an absolute claim. On the ground ARKit's own `.gravityAndHeading` fusion does the alignment
-    /// instead — see the comment on `config.worldAlignment`. `StartupSeed.Reference.compass` is kept
-    /// in the type because the capability is sound; policy simply no longer selects it.
-    private var seedReference: (kind: StartupSeed.Reference, degrees: Double)? {
-        guard lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt,
-              lastGPSCourseDeg >= 0,
-              lastGPSCourseAccuracy >= 0, lastGPSCourseAccuracy <= 5
-        else { return nil }
-        return (.track, lastGPSCourseDeg)
-    }
-
-    /// Whether this world is one the app aligns itself. False on the ground, where ARKit does it.
-    private var shouldSeedThisWorld: Bool { useGravityOnlyAlignment && !seedFallbackToHeading }
-
-    /// Switch to the airborne alignment the first time the aircraft is seen flying.
+    /// Which direction the phone is being asked to be pointing at, or nil if neither reference is
+    /// usable yet.
     ///
-    /// The two regimes need opposite things. On the ground the compass measures the phone and
-    /// ARKit's fusion of it is better than anything the app can compute, so `.gravityAndHeading`
-    /// and no seed. In the air the compass measures the fuselage, so ARKit's fusion is actively
-    /// harmful and the app aligns `.gravity` itself from GPS track. Costs one 1.4 s
-    /// re-initialisation per flight, and only in flight.
-    private func updateWorldAlignmentRegime() {
-        guard !useGravityOnlyAlignment else { return }
-        guard isAirborneEstimate || lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt
-        else { return }
-        useGravityOnlyAlignment = true
-        FlightRecorder.shared.record(
-            event: "alignment_regime",
-            detail: String(format: "mode=gravity_seeded gs=%.0fkt airborne=%d basis=%@",
-                           lastGPSSpeedKt, isAirborneEstimate ? 1 : 0, airborneBasis)
-        )
-        startARSession(reason: "airborne_alignment")
+    /// The compass branch is back in build 33, having been removed in build 32 as a poor *absolute*
+    /// reference. It still is one — a one-second snapshot at a single heading carries the
+    /// magnetometer's full bias — but it is not the whole alignment any more. It gets the world
+    /// roughly right within a second so a `.gravity` world is never left pointing nowhere, and
+    /// `GroundYawCorrection`'s 15 s rolling median then refines it across many phone headings, which
+    /// is the part that averages the error down. Build 31 shipped the snapshot without the
+    /// refinement and jumped; build 32 dropped both and let ARKit drag the world 25°.
+    private var seedReference: (kind: StartupSeed.Reference, degrees: Double)? {
+        if lastGPSSpeedKt >= ARTrafficViewController.minAnchorGroundSpeedKt {
+            guard lastGPSCourseDeg >= 0,
+                  lastGPSCourseAccuracy >= 0, lastGPSCourseAccuracy <= 5
+            else { return nil }
+            return (.track, lastGPSCourseDeg)
+        }
+        guard lastTrueHeading >= 0,
+              lastHeadingAccuracy >= 0, lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        else { return nil }
+        return (.compass, lastTrueHeading)
     }
+
+    /// Whether this world is one the app aligns itself — every world now, except after the
+    /// fallback has handed alignment back to ARKit.
+    private var shouldSeedThisWorld: Bool { !seedFallbackToHeading }
 
     /// Start the capture once a reference exists, and give up after the timeout. Called from the
     /// 4 Hz tick; the samples themselves are fed from the render thread, which is where ARKit's
@@ -3835,6 +3825,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                          trackDeg: lastGPSCourseDeg,
                          source: .seed,
                          at: time)
+        // And handed to the ground correction as its starting point, so its 1°/s slew has only the
+        // seed's *residual* to walk off instead of the whole offset. On the ground the two are
+        // designed to compose: a one-second snapshot for speed, then a fifteen-second rolling
+        // median across many headings for accuracy.
+        groundYaw.prime(offsetDeg: estimate.offsetDeg)
         // The reference for the divergence measurement. Any later change in (ARKit − gyro) is the
         // world rotating with the user's panning cancelled out.
         seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
