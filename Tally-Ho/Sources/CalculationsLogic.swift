@@ -60,6 +60,56 @@ class CalculationsLogic {
         return 145_366.45 * (1.0 - pow(ratio, 0.190284))
     }
 
+    /// ISA sea-level temperature, in kelvin.
+    static let isaSeaLevelTemperatureK: Double = 288.15
+    /// ISA tropopause: above this the standard atmosphere is isothermal.
+    static let isaTropopauseFt: Double = 36_089.0
+    static let isaTropopauseTemperatureK: Double = 216.65
+    /// ISA temperature lapse below the tropopause, kelvin per foot.
+    static let isaLapseKPerFt: Double = (isaSeaLevelTemperatureK - isaTropopauseTemperatureK) / isaTropopauseFt
+
+    /// Mean ISA temperature of the air column from sea level up to `altitudeFt`, in kelvin.
+    ///
+    /// Linear lapse to the tropopause, isothermal above it — so this is the average of a ramp for
+    /// the first 36,089 ft and a ramp-plus-constant beyond. It is the denominator of the
+    /// pressure-to-geometric conversion below: what separates the two datums is how much warmer
+    /// the real column is than the standard one, averaged over its whole height.
+    static func isaMeanColumnTemperatureK(toAltitudeFt altitudeFt: Double) -> Double {
+        let h = max(0, altitudeFt)
+        guard h > 0 else { return isaSeaLevelTemperatureK }
+        if h <= isaTropopauseFt {
+            // Mean of a linear ramp is its midpoint value.
+            return isaSeaLevelTemperatureK - 0.5 * isaLapseKPerFt * h
+        }
+        let tropopauseMean = isaSeaLevelTemperatureK - 0.5 * isaLapseKPerFt * isaTropopauseFt
+        let aboveFt = h - isaTropopauseFt
+        return (isaTropopauseFt * tropopauseMean + aboveFt * isaTropopauseTemperatureK) / h
+    }
+
+    /// Geometric altitude minus pressure altitude at `altitudeFt`, for an air mass `deltaISAK`
+    /// kelvin from standard. Positive means geometric reads higher, which a warm air mass produces.
+    ///
+    /// A column warmer than standard is less dense, so a given pressure sits physically higher than
+    /// the standard atmosphere puts it. The height error is the fractional temperature excess times
+    /// the height itself — the same relation behind the altimetry rule of thumb of four feet per
+    /// thousand feet per degree of deviation.
+    ///
+    /// This is what makes traffic at *any* altitude a usable measurement of the offset. The offset
+    /// itself is not one number for the sky; `deltaISAK` is.
+    static func datumOffsetFt(atAltitudeFt altitudeFt: Double, deltaISAK: Double) -> Double {
+        guard altitudeFt.isFinite, deltaISAK.isFinite, altitudeFt > 0 else { return 0 }
+        return deltaISAK * altitudeFt / isaMeanColumnTemperatureK(toAltitudeFt: altitudeFt)
+    }
+
+    /// The inverse: the temperature deviation implied by one aircraft reporting both datums.
+    /// Nil when `geometricAltitudeFt` is too low for the division to mean anything.
+    static func deltaISAK(geometricAltitudeFt: Double, pressureAltitudeFt: Double) -> Double? {
+        guard geometricAltitudeFt.isFinite, pressureAltitudeFt.isFinite,
+              geometricAltitudeFt > 0 else { return nil }
+        return (geometricAltitudeFt - pressureAltitudeFt)
+            * isaMeanColumnTemperatureK(toAltitudeFt: geometricAltitudeFt) / geometricAltitudeFt
+    }
+
     // MARK: - Distance Calculations
 
     /// Calculate distance between two coordinates in metres using the Haversine formula
@@ -1876,8 +1926,12 @@ struct ScreenOrientationFollower {
 /// `CalculationsLogic.geometricPlacementAltitude` converts it exactly, per aircraft, with no
 /// estimator at all. What this is for is the one quantity no target can supply: the viewer's own
 /// pressure altitude, which is unmeasurable on board — the phone's barometer reads cabin pressure
-/// (5,474 ft at cruise in these logs), not outside static. For that, `estimate(from:nearAltitudeFt:)`
-/// borrows the offset from traffic flying near our own level.
+/// (5,474 ft at cruise in these logs), not outside static. For that, `deltaISAEstimate(from:)`
+/// reads the air mass's temperature deviation off the traffic, at whatever altitude it is flying.
+///
+/// `estimate(from:)` itself is now a log column and nothing else. Its median mixes altitudes and is
+/// only meaningful when the sample happens to be at one level; keep reading it as a diagnostic, not
+/// as a number to act on.
 enum AltitudeDatumOffset {
 
     struct Estimate {
@@ -1912,37 +1966,58 @@ enum AltitudeDatumOffset {
         estimate(from: offsets(from: aircraft), minSamples: 1)
     }
 
-    /// Default half-width of the altitude band. Wide enough to find traffic at a neighbouring
-    /// flight level in thin airspace, narrow enough that surface traffic never enters the sample
-    /// while the viewer is at altitude.
-    static let defaultBandFt: Double = 4_000.0
+    /// Below this height the offset is a few tens of feet dominated by the geoid and the local
+    /// altimeter setting, so dividing by the height turns that constant into an enormous apparent
+    /// temperature deviation. Above it the temperature term dominates and the division is stable.
+    static let minContributorAltitudeFt: Double = 5_000.0
 
-    /// Fewest aircraft that may set the estimate. Two can disagree with no way to tell which is
-    /// wrong; three gives the median something to reject.
-    static let defaultMinSamples: Int = 3
+    /// Widest temperature deviation from standard that is weather rather than a broken report.
+    /// ±30 K spans everything from a Siberian winter to a desert summer.
+    static let maxPlausibleDeltaISAK: Double = 30.0
 
-    /// The offset measured only from aircraft flying near `nearAltitudeFt`, compared on their own
-    /// geometric altitude. Nil when fewer than `minSamples` qualify.
+    /// How far the air mass is from the standard atmosphere, in kelvin, as the traffic measures it.
     ///
-    /// The unbanded estimate above cannot be used for anything but a log column, and the flight
-    /// logs say why: the offset is a function of the aircraft's own height, so a fleet-wide median
-    /// mixes surface traffic (offset near zero) with traffic at cruise (offset near 1,900 ft) and
-    /// lands on whichever population happens to dominate the sample. Two sessions nine minutes
-    /// apart at the same cruise altitude produced medians of +25 ft and +1,900 ft.
+    /// **Why a temperature and not an offset.** Build 35 estimated the offset directly, from
+    /// traffic within ±4,000 ft of the viewer, and in a whole flight it returned a value in zero
+    /// rows out of 191: the sky held a mean of 2.0 aircraft and none of them were at our level. The
+    /// band was there because a fleet-wide median of offsets really does mix populations — surface
+    /// traffic reads near zero while traffic at cruise reads near 1,900 ft.
     ///
-    /// Banding is only sound for a readout, never for placement: each target already carries its
-    /// own exact offset, which `CalculationsLogic.geometricPlacementAltitude` uses instead.
-    static func estimate(
+    /// But those are not two populations. They are one measurement taken at two heights, and the
+    /// ratio between them barely moves:
+    ///
+    ///     ~42,250 ft  +2,250 ft   0.053      (log 78fe1ae2)
+    ///     ~42,000 ft  ~+1,850 ft  0.044      (log 6b73e28c)
+    ///      ~3,000 ft    ~+125 ft  0.042      (log 6b73e28c, same session)
+    ///
+    /// which is what the atmosphere does: one temperature deviation describes the whole column, and
+    /// the height error it produces scales with height. Read that way, **every aircraft in the sky
+    /// measures the same number**, and the surface traffic that poisoned the median becomes a
+    /// perfectly good sample. No band, no minimum count, and one reporting aircraft anywhere in
+    /// view is enough — which is the difference between a readout that works in this user's
+    /// airspace and one that never appeared.
+    ///
+    /// Placement still does not use this. Each target carries its own exact pair, which
+    /// `CalculationsLogic.geometricPlacementAltitude` applies with no model at all; this exists
+    /// only for the quantity no target can supply, the viewer's own pressure altitude.
+    static func deltaISAEstimate(
         from aircraft: [Aircraft],
-        nearAltitudeFt: Double,
-        bandFt: Double = defaultBandFt,
-        minSamples: Int = defaultMinSamples
-    ) -> Estimate? {
-        let inBand = aircraft.filter { ac in
-            guard let geometric = ac.geometricAltitudeFt else { return false }
-            return abs(geometric - nearAltitudeFt) <= bandFt
-        }
-        return estimate(from: offsets(from: inBand), minSamples: minSamples)
+        minAltitudeFt: Double = minContributorAltitudeFt,
+        maxDeltaK: Double = maxPlausibleDeltaISAK
+    ) -> (kelvin: Double, sampleCount: Int)? {
+        let deviations: [Double] = aircraft.compactMap { ac -> Double? in
+            guard let geometric = ac.geometricAltitudeFt,
+                  let pressure  = ac.pressureAltitudeFt,
+                  geometric >= minAltitudeFt,
+                  abs(geometric - pressure) <= maxPlausibleOffsetFt,
+                  let delta = CalculationsLogic.deltaISAK(geometricAltitudeFt: geometric,
+                                                          pressureAltitudeFt: pressure),
+                  abs(delta) <= maxDeltaK
+            else { return nil }
+            return delta
+        }.sorted()
+        guard !deviations.isEmpty else { return nil }
+        return (percentile(deviations, 0.50), deviations.count)
     }
 
     private static func estimate(from unsorted: [Double], minSamples: Int) -> Estimate? {

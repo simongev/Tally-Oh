@@ -325,52 +325,92 @@ struct TargetDataTests {
 
     // MARK: - Banded datum offset (the HUD's flight level)
 
-    /// The defect the flight logs exposed: an unbanded median mixes surface traffic with traffic
-    /// at cruise and lands wherever the mix falls. The band has to keep the far-off traffic out.
-    @Test func bandExcludesTrafficAtOtherAltitudes() {
-        // Three at our level offset by 1,900; five near the surface offset by ~0.
-        var traffic = [Double](repeating: 41_000, count: 3).map {
-            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
-        }
-        traffic += [Double](repeating: 3_000, count: 5).map {
-            aircraft(pressureAltitudeFt: $0, geometricAltitudeFt: $0)
-        }
+    /// Sea level is the ISA sea-level temperature; the mean of a linear ramp is its midpoint; and
+    /// above the tropopause the isothermal layer pulls the column mean down but never below
+    /// 216.65 K.
+    @Test func isaColumnMeanFollowsTheStandardAtmosphere() {
+        #expect(abs(CalculationsLogic.isaMeanColumnTemperatureK(toAltitudeFt: 0) - 288.15) < 0.01)
 
-        // The whole sky: the five low aircraft outvote the three at our level.
-        #expect(AltitudeDatumOffset.estimate(from: traffic)?.medianFt == 0)
+        // Halfway to the tropopause: the midpoint of 288.15 K and the temperature there.
+        let atTropopause = CalculationsLogic.isaMeanColumnTemperatureK(
+            toAltitudeFt: CalculationsLogic.isaTropopauseFt)
+        #expect(abs(atTropopause - (288.15 + 216.65) / 2) < 0.01)
 
-        let banded = AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000)
-        #expect(banded?.sampleCount == 3)
-        #expect(banded?.medianFt == 1_900)
+        // Above it, still falling, and bounded below by the isothermal layer.
+        let high = CalculationsLogic.isaMeanColumnTemperatureK(toAltitudeFt: 45_000)
+        #expect(high < atTropopause)
+        #expect(high > CalculationsLogic.isaTropopauseTemperatureK)
     }
 
-    /// Two aircraft can disagree with no way to tell which is wrong.
-    @Test func bandRefusesToEstimateFromTooFewAircraft() {
-        let traffic = [Double](repeating: 41_000, count: 2).map {
-            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
-        }
-        #expect(AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000) == nil)
-        // The same two are enough once the caller says so.
-        #expect(AltitudeDatumOffset.estimate(
-            from: traffic, nearAltitudeFt: 41_000, minSamples: 2)?.sampleCount == 2)
+    /// The point of the model: one temperature deviation describes the whole column, so an
+    /// aircraft at 8,000 ft and one at FL410 in the same air must report the same ΔISA even though
+    /// their offsets differ by thousands of feet.
+    @Test func deltaISAIsTheSameAtEveryAltitudeInOneAirMass() {
+        let deltaK = 13.0
+        let low  = 8_000.0
+        let high = 41_000.0
+        let lowOffset  = CalculationsLogic.datumOffsetFt(atAltitudeFt: low,  deltaISAK: deltaK)
+        let highOffset = CalculationsLogic.datumOffsetFt(atAltitudeFt: high, deltaISAK: deltaK)
+
+        // The offsets are nothing alike — which is exactly why medianing them was wrong.
+        #expect(highOffset - lowOffset > 1_500)
+
+        let traffic = [
+            aircraft(pressureAltitudeFt: low  - lowOffset,  geometricAltitudeFt: low),
+            aircraft(pressureAltitudeFt: high - highOffset, geometricAltitudeFt: high),
+        ]
+        let estimate = AltitudeDatumOffset.deltaISAEstimate(from: traffic)
+        #expect(estimate?.sampleCount == 2)
+        if let kelvin = estimate?.kelvin { #expect(abs(kelvin - deltaK) < 0.1) }
     }
 
-    /// Traffic a couple of thousand feet away is still in our air mass and still measuring the
-    /// same offset — the band exists to exclude the surface, not the next flight level.
-    @Test func bandKeepsTrafficAtNeighbouringFlightLevels() {
-        let traffic = [39_000.0, 41_000.0, 43_000.0].map {
-            aircraft(pressureAltitudeFt: $0 - 1_900, geometricAltitudeFt: $0)
-        }
-        let banded = AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000)
-        #expect(banded?.sampleCount == 3)
+    /// Build 35's band needed three aircraft near our own level and found them in zero rows of a
+    /// whole flight. One aircraft anywhere now suffices.
+    @Test func oneAircraftAnywhereIsEnoughToSetTheEstimate() {
+        let offset = CalculationsLogic.datumOffsetFt(atAltitudeFt: 41_000, deltaISAK: 13)
+        let traffic = [aircraft(pressureAltitudeFt: 41_000 - offset, geometricAltitudeFt: 41_000)]
+        let estimate = AltitudeDatumOffset.deltaISAEstimate(from: traffic)
+        #expect(estimate?.sampleCount == 1)
+        if let kelvin = estimate?.kelvin { #expect(abs(kelvin - 13) < 0.1) }
     }
 
-    /// An empty band is nil, not a confident zero — the HUD falls back to GPS on nil.
-    @Test func emptyBandYieldsNoEstimate() {
-        let traffic = [Double](repeating: 3_000, count: 8).map {
-            aircraft(pressureAltitudeFt: $0, geometricAltitudeFt: $0)
+    /// Round trip: read ΔISA off traffic at one altitude, apply it at another, and land on the
+    /// offset that altitude really has. This is the whole readout in two calls.
+    @Test func offsetSurvivesTheRoundTripThroughAnotherAltitude() {
+        let truthAtCruise = CalculationsLogic.datumOffsetFt(atAltitudeFt: 42_250, deltaISAK: 13.2)
+        let traffic = [aircraft(pressureAltitudeFt: 42_250 - truthAtCruise,
+                                geometricAltitudeFt: 42_250)]
+        guard let kelvin = AltitudeDatumOffset.deltaISAEstimate(from: traffic)?.kelvin else {
+            Issue.record("no estimate"); return
         }
-        #expect(AltitudeDatumOffset.estimate(from: traffic, nearAltitudeFt: 41_000) == nil)
+        let ownAltitude = 38_450.0
+        let predicted = CalculationsLogic.datumOffsetFt(atAltitudeFt: ownAltitude, deltaISAK: kelvin)
+        let truth = CalculationsLogic.datumOffsetFt(atAltitudeFt: ownAltitude, deltaISAK: 13.2)
+        #expect(abs(predicted - truth) < 1.0)
+    }
+
+    /// Near the surface the offset is a few tens of feet dominated by the geoid and the altimeter
+    /// setting, so dividing by a small height turns that constant into a wild temperature.
+    @Test func trafficTooLowToDivideByIsNotAContributor() {
+        let traffic = [aircraft(pressureAltitudeFt: 1_000, geometricAltitudeFt: 1_100)]
+        #expect(AltitudeDatumOffset.deltaISAEstimate(from: traffic) == nil)
+    }
+
+    /// No traffic reporting both datums means no estimate — the HUD falls back to GPS on nil
+    /// rather than showing a confident zero.
+    @Test func noPairsYieldsNoDeltaISA() {
+        #expect(AltitudeDatumOffset.deltaISAEstimate(from: []) == nil)
+        #expect(AltitudeDatumOffset.deltaISAEstimate(
+            from: [aircraft(pressureAltitudeFt: 35_000, geometricAltitudeFt: nil)]) == nil)
+    }
+
+    /// A 4,500 ft gap passes the raw offset gate — it is under `maxPlausibleOffsetFt` — but at
+    /// 14,500 ft it implies an air mass 85 K from standard, which is a broken report, not weather.
+    /// The temperature check catches what the feet-based one cannot.
+    @Test func implausibleTemperatureDeviationIsRejected() {
+        let traffic = [aircraft(pressureAltitudeFt: 10_000, geometricAltitudeFt: 14_500)]
+        #expect(abs(14_500.0 - 10_000.0) <= AltitudeDatumOffset.maxPlausibleOffsetFt)
+        #expect(AltitudeDatumOffset.deltaISAEstimate(from: traffic) == nil)
     }
 
     // MARK: - Corrected HUD heading

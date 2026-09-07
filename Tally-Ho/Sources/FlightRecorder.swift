@@ -78,7 +78,7 @@ final class FlightRecorder {
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
         "n_targets_press", "n_targets_geom",
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
-        "datum_band_n", "datum_band_median_ft", "own_press_alt_ft", "hud_heading_deg"
+        "datum_n", "datum_delta_isa_k", "own_press_alt_ft", "hud_heading_deg"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -241,17 +241,22 @@ final class FlightRecorder {
         /// How many nearby targets reported each vertical datum, and the measured conversion
         /// between them. Placement no longer uses this: each target carries its own pair and is
         /// converted exactly. Kept because it is the column every log since build 27 has had, and
-        /// because comparing it against `datumBandOffset` shows the altitude mixing that made it
+        /// because comparing it against `datumDeltaISAK` shows the altitude mixing that made it
         /// unusable — the two read +25 ft and +1,900 ft in the same air.
         var targetsWithPressureAltitude: Int?
         var targetsWithGeometricAltitude: Int?
         var datumOffset: AltitudeDatumOffset.Estimate?
 
-        /// The same offset measured only from traffic near the viewer's own altitude, and the
-        /// pressure altitude derived from it — what the HUD tape shows, and the only figure in
-        /// this file comparable with the aircraft's own altimeter. Empty when too few aircraft
-        /// near our level reported both datums, in which case the tape fell back to GPS.
-        var datumBandOffset: AltitudeDatumOffset.Estimate?
+        /// How far the air mass is from the standard atmosphere, in kelvin, and how many aircraft
+        /// measured it — plus the pressure altitude derived from it, which is what the HUD tape
+        /// shows and the only figure in this file comparable with the aircraft's own altimeter.
+        ///
+        /// Unlike an offset this does not depend on the contributing aircraft's altitude, so it
+        /// should read as one steady number for a whole flight. Empty only when no traffic
+        /// reported both datums at all, in which case the tape fell back to GPS. Build 35's
+        /// altitude-banded predecessor was empty in all 191 rows of a flight.
+        var datumSampleCount: Int?
+        var datumDeltaISAK: Double?
         var ownPressureAltitudeFt: Double?
 
         /// The heading the HUD rose is showing: ARKit's azimuth plus the applied world-yaw
@@ -424,8 +429,8 @@ final class FlightRecorder {
         fields.append(format(sample.datumOffset?.lowerQuartileFt, decimals: 0))
         fields.append(format(sample.datumOffset?.upperQuartileFt, decimals: 0))
 
-        fields.append(sample.datumBandOffset.map { String($0.sampleCount) } ?? "")
-        fields.append(format(sample.datumBandOffset?.medianFt, decimals: 0))
+        fields.append(sample.datumSampleCount.map(String.init) ?? "")
+        fields.append(format(sample.datumDeltaISAK, decimals: 2))
         fields.append(format(sample.ownPressureAltitudeFt,     decimals: 0))
         fields.append(format(sample.hudHeadingDeg,             decimals: 1))
 

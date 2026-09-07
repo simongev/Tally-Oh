@@ -1039,12 +1039,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// because `datum_offset_median_ft` has meant this in every log since build 27.
     private var latestDatumOffset: AltitudeDatumOffset.Estimate?
 
-    /// The same offset measured only from traffic flying near our own altitude, which is the
-    /// only band where it describes the air we are in.
-    private var latestBandedDatumOffset: AltitudeDatumOffset.Estimate?
+    /// How far the air mass is from the standard atmosphere, as the traffic measures it, and how
+    /// many aircraft said so. One number for the whole column, so traffic at any altitude counts.
+    private var latestDeltaISA: (kelvin: Double, sampleCount: Int)?
 
     /// The viewer's own pressure altitude — the flight level an altimeter would read — derived
-    /// from GPS ellipsoidal altitude and the banded offset above.
+    /// from GPS altitude and the temperature deviation above.
     ///
     /// It cannot be measured on board. The phone's barometer sits inside a pressurized cabin and
     /// reads cabin pressure (5,474 ft while cruising above FL400 in these logs), so the only
@@ -1175,6 +1175,29 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Render-thread throttle for feeding the capture: 5 Hz, as for the manual anchor, because hand
     /// wobble is correlated over about a second.
     private var lastSeedSampleTime: TimeInterval = 0
+
+    /// Azimuth spread above which a seed was taken while the phone was still moving, and is worth
+    /// replacing with a steadier one.
+    ///
+    /// A seed measures where the nose is by assuming the phone points along it for one second. In
+    /// the FL360 flight one capture logged `az_spread=54.3°` — the phone swung 54° during that
+    /// second — and produced an offset 7.4° from what the manual anchor measured in the same world
+    /// five seconds later. Every other seed across every flight so far held to 0.1–4.5°, with a
+    /// single 10.9° outlier, so this clears every good hold and catches that one.
+    private static let seedResampleSpreadDeg: Double = 10.0
+    /// How many times one world may go back for a steadier hold, so a phone that never settles
+    /// cannot resample forever.
+    private static let maxSeedResamples = 3
+    /// Resamples left in this world.
+    private var seedResamplesRemaining = 0
+    /// True while a capture is running purely to improve an offset the world already has.
+    ///
+    /// Deliberately separate from `awaitingSeed`: that flag drives the 10 s watchdog, whose failure
+    /// path hands alignment back to ARKit's `.gravityAndHeading` — the very thing that dragged a
+    /// world 25°. A world that already has an offset must never be able to reach that path, however
+    /// long the phone takes to settle, so the retry runs on its own flag with no deadline. A loose
+    /// seed is worse than a tight one; it is far better than no alignment.
+    private var seedIsResampling = false
     /// ARKit's azimuth minus the gyro's at the moment the world was seeded. Any later change in that
     /// difference is the world rotating, with the user's panning cancelled out — the measurement
     /// this project has been missing. Recorded only; nothing acts on it.
@@ -2195,6 +2218,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         awaitingSeed = shouldSeedThisWorld
         awaitingSeedConfirmation = false
         startupSeed.cancel()
+        seedIsResampling = false
+        seedResamplesRemaining = ARTrafficViewController.maxSeedResamples
         seedDeadline = CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds
         seedGyroReferenceDeg = .nan
         loggedYawDivergence = false
@@ -2816,7 +2841,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             return true
         }
 
-        updateOwnshipPressureAltitude(aircraft: aircraftList)
+        updateOwnshipPressureAltitude(aircraft: aircraftList, ownAltitudeFt: altitude)
 
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
@@ -2908,31 +2933,62 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// the number a pilot or passenger recognises: at cruise it sits roughly 1,900 ft above the
     /// flight level, because geometric height and pressure altitude diverge with height.
     ///
-    /// Every aircraft reporting both `alt_baro` and `alt_geom` is measuring that divergence, but
-    /// only at its own altitude — which is why this takes the median across a band around our own
-    /// level rather than across everything in the sky. Unbanded, the sample mixes traffic on the
-    /// surface (offset near zero) with traffic at cruise, and the median lands on whichever
-    /// population happens to dominate: +25 ft and +1,900 ft in two sessions nine minutes apart at
-    /// the same altitude.
+    /// Every aircraft reporting both `alt_baro` and `alt_geom` is measuring that divergence — but
+    /// what it measures is the air mass's temperature deviation from standard, not an offset. The
+    /// offset is a function of height; the temperature is not. Reading it that way is what lets a
+    /// single aircraft at any altitude set the number, which build 35's altitude band could not:
+    /// it required traffic within ±4,000 ft of us and returned nothing in all 191 rows of a flight.
     ///
     /// This is a readout, not a placement input. Placement never uses an estimate — each target
     /// carries its own exact offset.
-    private func updateOwnshipPressureAltitude(aircraft: [Aircraft]) {
-        // Before the first accepted fix the ellipsoidal altitude is a placeholder zero, and a band
-        // centred there would gather surface traffic and hand the tape a confident wrong number.
+    private func updateOwnshipPressureAltitude(aircraft: [Aircraft], ownAltitudeFt: Double) {
+        // Before the first accepted fix the altitude is a placeholder zero, and subtracting an
+        // offset from it would hand the tape a confident wrong number.
         guard hasAcceptedGPSAltitude else {
-            latestBandedDatumOffset = nil
+            latestDeltaISA = nil
             ownshipPressureAltitudeFt = nil
             return
         }
-        let banded = AltitudeDatumOffset.estimate(
-            from: aircraft,
-            nearAltitudeFt: gpsEllipsoidalAltitudeFeet
+        guard let estimate = AltitudeDatumOffset.deltaISAEstimate(from: aircraft) else {
+            latestDeltaISA = nil
+            ownshipPressureAltitudeFt = nil
+            return
+        }
+        latestDeltaISA = estimate
+        // MSL on both sides. The geoid separation is a constant of the survey, not of the
+        // atmosphere, so it belongs in neither half of a temperature model — and MSL is what the
+        // tape is being compared against.
+        //
+        // Taken from the smoothed ownship altitude rather than the raw GPS field, so the tape
+        // inherits the same vertical filtering as every other altitude the app shows instead of
+        // carrying fix-to-fix noise the rest of the HUD has already had removed.
+        ownshipPressureAltitudeFt = ownAltitudeFt - CalculationsLogic.datumOffsetFt(
+            atAltitudeFt: ownAltitudeFt, deltaISAK: estimate.kelvin)
+    }
+
+    /// The raw vertical pairs the estimate above was built from.
+    ///
+    /// Build 35's log could not say whether its altitude band excluded that flight's traffic
+    /// rightly or wrongly, because nothing recorded the targets' own altitudes — only counts and
+    /// quartiles. So the model replacing it rests on three numbers read off two logs. These lines
+    /// are what make the next flight's answer arithmetic instead of inference: if the temperature
+    /// model is off by a constant, one flight of them shows it exactly.
+    private func recordDatumSample(aircraft: [Aircraft]) {
+        let pairs = aircraft.compactMap { ac -> String? in
+            guard let geometric = ac.geometricAltitudeFt,
+                  let pressure  = ac.pressureAltitudeFt else { return nil }
+            return String(format: "%@:%.0f:%.0f", ac.id, pressure, geometric)
+        }
+        guard !pairs.isEmpty else { return }
+        // Capped so a busy sky cannot bloat the file; the estimate is a median, and eight aircraft
+        // is already more than any flight logged so far has offered.
+        let shown = pairs.prefix(8)
+        FlightRecorder.shared.record(
+            event: "datum_sample",
+            detail: String(format: "own_msl=%.0f own_hae=%.0f n=%d %@",
+                           gpsMSLAltitudeFeet, gpsEllipsoidalAltitudeFeet, pairs.count,
+                           shown.joined(separator: " "))
         )
-        latestBandedDatumOffset = banded
-        // Against the ellipsoid on both sides: `alt_geom` is ellipsoid-referenced and so is
-        // `gps_hae_ft`, so the geoid never enters this subtraction.
-        ownshipPressureAltitudeFt = banded.map { gpsEllipsoidalAltitudeFeet - $0.medianFt }
     }
 
     /// Lowest usable flight level in US airspace. Above the transition altitude every altimeter
@@ -2962,6 +3018,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard now.timeIntervalSince(lastRecorderSampleTime) >= 1.0 else { return }
         lastRecorderSampleTime = now
         FlightRecorder.shared.record(currentFlightSample(state: state, aircraft: aircraft))
+        recordDatumSample(aircraft: aircraft)
     }
 
     private func currentFlightSample(state: OwnshipSnapshot, aircraft: [Aircraft]) -> FlightRecorder.Sample {
@@ -3053,7 +3110,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         latestDatumOffset  = sample.datumOffset
         // Refreshed on the 4 Hz tick, read here — the same cadence separation the other cached
         // measurements in this row already use.
-        sample.datumBandOffset       = latestBandedDatumOffset
+        sample.datumSampleCount      = latestDeltaISA?.sampleCount
+        sample.datumDeltaISAK        = latestDeltaISA?.kelvin
         sample.ownPressureAltitudeFt = ownshipPressureAltitudeFt
         if worldIsAligned, let raw = sample.arHeadingDeg {
             sample.hudHeadingDeg = CalculationsLogic.normalizedAzimuth(
@@ -3528,17 +3586,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 lines.append("🎚 cabin — (motion: \(motionAuthDescription))")
             }
 
-            // Two measurements of the same quantity: the band around our own level, which sets the
-            // flight level on the tape, and the whole sky, which is the number every previous log
-            // recorded. When they disagree by thousands of feet the sky is mixing altitudes, which
-            // is exactly why the tape does not use it.
-            let bandStr = latestBandedDatumOffset.map {
-                String(format: "%+.0f ft n=%d", $0.medianFt, $0.sampleCount)
-            } ?? "— (too few near our level)"
+            // The temperature deviation that sets the flight level on the tape, and beside it the
+            // raw offset median every previous log recorded. The offset is altitude-dependent and
+            // the deviation is not, so a large gap between them just means the sample spans
+            // altitudes — which is the whole reason the tape stopped using the offset.
+            let isaStr = latestDeltaISA.map {
+                String(format: "ISA%+.1fK n=%d", $0.kelvin, $0.sampleCount)
+            } ?? "— (no traffic reporting both)"
             let allStr = latestDatumOffset.map {
                 String(format: "%+.0f ft n=%d IQR %.0f", $0.medianFt, $0.sampleCount, $0.spreadFt)
             } ?? "—"
-            lines.append("📊 datum band \(bandStr)   all \(allStr)")
+            lines.append("📊 datum \(isaStr)   raw \(allStr)")
             if state.hasGeoidSeparation {
                 lines.append(String(format: "📐 geoid %+.0f ft", state.geoidSeparationFt))
             }
@@ -3948,11 +4006,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// uncorrected azimuth the anchor uses — the offset being measured *is* the correction, so a
     /// corrected azimuth would be measuring it against itself.
     private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval) {
-        guard awaitingSeed, startupSeed.isCapturing else { return }
+        guard awaitingSeed || seedIsResampling, startupSeed.isCapturing else { return }
         guard let reference = seedReference else {
             // The reference went away mid-capture; the samples already taken were measured against
             // it, so they go with it.
             startupSeed.cancel()
+            seedIsResampling = false
             return
         }
         guard time - lastSeedSampleTime >= 0.2 else { return }
@@ -3963,7 +4022,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // asking only when the hold is complete keeps the two capture flows reading the same way.
         guard startupSeed.progress(at: time) >= 1.0 else { return }
         guard let estimate = startupSeed.finish(at: time) else { return }
+        let wasResample = seedIsResampling
         awaitingSeed = false
+        seedIsResampling = false
         seedFallbackToHeading = false
         worldYawSource = .seed
         appliedWorldYawOffsetDeg = estimate.offsetDeg
@@ -3994,11 +4055,29 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
         FlightRecorder.shared.record(
             event: "seed_captured",
-            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f",
+            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f resample=%d",
                            estimate.offsetDeg, estimate.referenceKind.rawValue, reference.degrees,
                            estimate.sampleCount, estimate.seconds, estimate.azimuthSpreadDeg,
-                           seedGyroReferenceDeg)
+                           seedGyroReferenceDeg, wasResample ? 1 : 0)
         )
+
+        // A hold taken while the phone was still swinging measures where the phone was pointing on
+        // average, not where the nose is. Apply it anyway — the world must never be left unaligned,
+        // which is why `StartupSeed` itself has no spread gate — then immediately go back for a
+        // steadier one. The replacement arrives through this same path a second or two later and
+        // overwrites the offset; until it does the scene is roughly right rather than nowhere.
+        if estimate.azimuthSpreadDeg > ARTrafficViewController.seedResampleSpreadDeg,
+           seedResamplesRemaining > 0 {
+            seedResamplesRemaining -= 1
+            seedIsResampling = true
+            startupSeed.begin(reference: reference.kind)
+            lastSeedSampleTime = 0
+            FlightRecorder.shared.record(
+                event: "seed_resampling",
+                detail: String(format: "az_spread=%.1f applied=%.1f remaining=%d",
+                               estimate.azimuthSpreadDeg, estimate.offsetDeg, seedResamplesRemaining)
+            )
+        }
     }
 
     /// How far the world has rotated since it was seeded, with panning cancelled out by the gyro.
