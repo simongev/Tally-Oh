@@ -413,6 +413,104 @@ struct TargetDataTests {
         #expect(AltitudeDatumOffset.deltaISAEstimate(from: traffic) == nil)
     }
 
+    // MARK: - Seed resample policy
+
+    /// Under `.gravity` an unapplied seed leaves the world pointing nowhere, which is worse than
+    /// any loose seed — so however wild the first hold, it takes the world.
+    @Test func theFirstCaptureOfAWorldAlwaysApplies() {
+        #expect(SeedResamplePolicy.shouldApply(spreadDeg: 54.3, bestAppliedSpreadDeg: nil))
+        #expect(SeedResamplePolicy.shouldApply(spreadDeg: 0.1, bestAppliedSpreadDeg: nil))
+    }
+
+    /// Build 36's defect, as a test: it overwrote unconditionally, so the *last* capture won rather
+    /// than the steadiest. In the airliner log four captures landed in four seconds with spreads
+    /// 38.0, 34.7, 50.0, 29.8 and offsets spanning 48°.
+    @Test func onlyASteadierCaptureReplacesTheOffset() {
+        #expect(SeedResamplePolicy.shouldApply(spreadDeg: 34.7, bestAppliedSpreadDeg: 38.0))
+        #expect(!SeedResamplePolicy.shouldApply(spreadDeg: 50.0, bestAppliedSpreadDeg: 34.7))
+        #expect(SeedResamplePolicy.shouldApply(spreadDeg: 29.8, bestAppliedSpreadDeg: 34.7))
+        // Equal is not better: an identical spread is no reason to move the scene.
+        #expect(!SeedResamplePolicy.shouldApply(spreadDeg: 29.8, bestAppliedSpreadDeg: 29.8))
+    }
+
+    /// Replaying that whole sequence must leave the steadiest hold in force, not the last one.
+    @Test func theSteadiestHoldOfASequenceEndsInForce() {
+        var best: Double?
+        var appliedOffset: Double?
+        for (spread, offset) in [(38.0, 42.7), (34.7, 3.0), (50.0, 5.1), (29.8, 51.1)] {
+            if SeedResamplePolicy.shouldApply(spreadDeg: spread, bestAppliedSpreadDeg: best) {
+                best = spread
+                appliedOffset = offset
+            }
+        }
+        #expect(best == 29.8)
+        #expect(appliedOffset == 51.1)
+    }
+
+    /// A hold under the gate is the answer, not a step toward it.
+    @Test func resamplingStopsOnceAHoldIsSteady() {
+        #expect(!SeedResamplePolicy.shouldKeepResampling(spreadDeg: 1.5, now: 0, deadline: 30))
+        #expect(!SeedResamplePolicy.shouldKeepResampling(
+            spreadDeg: SeedResamplePolicy.spreadGateDeg, now: 0, deadline: 30))
+        #expect(SeedResamplePolicy.shouldKeepResampling(spreadDeg: 29.8, now: 0, deadline: 30))
+    }
+
+    /// The airliner flight in one assertion: the phone was still thrashing at t=5.6 where build 36
+    /// gave up, and rock still by t≈9. A clock-bounded window is still looking at both.
+    @Test func resamplingIsStillLookingWhenThePhoneSettles() {
+        let deadline = SeedResamplePolicy.windowSeconds
+        #expect(SeedResamplePolicy.shouldKeepResampling(spreadDeg: 29.8, now: 5.6, deadline: deadline))
+        #expect(SeedResamplePolicy.shouldKeepResampling(spreadDeg: 29.8, now: 9.0, deadline: deadline))
+        // And gives up eventually, so a phone that never settles cannot resample all flight.
+        #expect(!SeedResamplePolicy.shouldKeepResampling(
+            spreadDeg: 29.8, now: deadline + 0.1, deadline: deadline))
+    }
+
+    // MARK: - Depression angle (the airport vertical check)
+
+    /// Level with the viewer is on the horizon, whatever the distance.
+    @Test func coAltitudeSitsOnTheHorizon() {
+        let angle = CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: 35_000, targetAltitudeFt: 35_000, horizontalDistanceNM: 12)
+        #expect(angle != nil)
+        if let angle { #expect(abs(angle) < 0.001) }
+    }
+
+    /// Positive is below the horizon, which is where every airport is from an aircraft — and the
+    /// angle falls as the same field gets further away.
+    @Test func airportsSitBelowTheHorizonAndFlattenWithDistance() {
+        let near = CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: 13_500, targetAltitudeFt: 13, horizontalDistanceNM: 10)
+        let far = CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: 13_500, targetAltitudeFt: 13, horizontalDistanceNM: 40)
+        #expect(near != nil && far != nil)
+        if let near, let far {
+            #expect(near > 0 && far > 0)
+            #expect(near > far)
+        }
+    }
+
+    /// Hand-worked: one nautical mile is 6,076 ft, so a viewer 6,076 ft above a field one mile away
+    /// looks down at exactly 45°.
+    @Test func depressionAngleMatchesTheHandWorkedCase() {
+        let ftPerNM = CalculationsLogic.nauticalMileToMeters * CalculationsLogic.metersToFeet
+        let angle = CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: ftPerNM, targetAltitudeFt: 0, horizontalDistanceNM: 1)
+        #expect(angle != nil)
+        if let angle { #expect(abs(angle - 45) < 0.01) }
+    }
+
+    /// Traffic above the viewer gives a negative angle, and a target directly below has no
+    /// horizontal geometry to work from at all.
+    @Test func depressionAngleHandlesAboveAndDegenerate() {
+        let above = CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: 20_000, targetAltitudeFt: 35_000, horizontalDistanceNM: 8)
+        #expect(above != nil)
+        if let above { #expect(above < 0) }
+        #expect(CalculationsLogic.depressionAngleDeg(
+            viewerAltitudeFt: 20_000, targetAltitudeFt: 0, horizontalDistanceNM: 0) == nil)
+    }
+
     // MARK: - Corrected HUD heading
 
     /// The compass bug: the rose showed ARKit's raw azimuth, which under `.gravity` is out by

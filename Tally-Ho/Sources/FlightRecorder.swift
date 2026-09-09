@@ -76,6 +76,7 @@ final class FlightRecorder {
         "ar_state", "airborne", "airborne_basis",
         "gdl90_ok", "gdl90_crc_fail", "gdl90_malformed",
         "n_aircraft", "n_adsb", "n_internet", "n_stale", "n_rendered",
+        "n_airports", "n_airports_rendered",
         "n_targets_press", "n_targets_geom",
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
         "datum_n", "datum_delta_isa_k", "own_press_alt_ft", "hud_heading_deg"
@@ -237,6 +238,16 @@ final class FlightRecorder {
         var internetAircraftCount: Int?
         var staleAircraftCount: Int?
         var renderedNodeCount: Int?
+
+        /// Airports in range after the type filters, and airport nodes actually standing in the
+        /// scene. Blank before the bundled CSV has finished loading.
+        ///
+        /// Absent from this file until build 37, which is how an airliner flight that drew airport
+        /// markers correctly for two minutes with no traffic in the sky read, from the log alone,
+        /// as a flight with nothing on screen. Airports need no network, so these are the two
+        /// columns that say whether there was anything to see at all.
+        var airportsInRangeCount: Int?
+        var renderedAirportCount: Int?
 
         /// How many nearby targets reported each vertical datum, and the measured conversion
         /// between them. Placement no longer uses this: each target carries its own pair and is
@@ -421,6 +432,9 @@ final class FlightRecorder {
         fields.append(sample.internetAircraftCount.map(String.init) ?? "")
         fields.append(sample.staleAircraftCount.map(String.init)    ?? "")
         fields.append(sample.renderedNodeCount.map(String.init)     ?? "")
+
+        fields.append(sample.airportsInRangeCount.map(String.init)  ?? "")
+        fields.append(sample.renderedAirportCount.map(String.init)  ?? "")
 
         fields.append(sample.targetsWithPressureAltitude.map(String.init)  ?? "")
         fields.append(sample.targetsWithGeometricAltitude.map(String.init) ?? "")

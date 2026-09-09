@@ -1026,6 +1026,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// Throttle for the 1 Hz flight-recorder sample, driven off the existing 4 Hz tick.
     private var lastRecorderSampleTime: Date = .distantPast
+    /// Throttle for the airport check, which runs slower than the recorder row it rides on.
+    private var lastAirportCheckTime: Date = .distantPast
 
     /// Whether the user is currently judged to be flying, refreshed each 4 Hz tick.
     /// Stored rather than computed on demand because the nearest-field search walks the
@@ -1176,27 +1178,20 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// wobble is correlated over about a second.
     private var lastSeedSampleTime: TimeInterval = 0
 
-    /// Azimuth spread above which a seed was taken while the phone was still moving, and is worth
-    /// replacing with a steadier one.
-    ///
-    /// A seed measures where the nose is by assuming the phone points along it for one second. In
-    /// the FL360 flight one capture logged `az_spread=54.3°` — the phone swung 54° during that
-    /// second — and produced an offset 7.4° from what the manual anchor measured in the same world
-    /// five seconds later. Every other seed across every flight so far held to 0.1–4.5°, with a
-    /// single 10.9° outlier, so this clears every good hold and catches that one.
-    private static let seedResampleSpreadDeg: Double = 10.0
-    /// How many times one world may go back for a steadier hold, so a phone that never settles
-    /// cannot resample forever.
-    private static let maxSeedResamples = 3
-    /// Resamples left in this world.
-    private var seedResamplesRemaining = 0
+    /// Render clock past which this world stops looking for a steadier hold. Set at every world
+    /// reset; the window itself lives in `SeedResamplePolicy`, which also decides both questions.
+    private var seedResampleDeadline: TimeInterval = 0
+    /// Azimuth spread of the steadiest capture applied to this world so far, or nil until one has
+    /// been. A later capture only replaces the offset if it beats this — see
+    /// `SeedResamplePolicy.shouldApply`.
+    private var bestSeedSpreadDeg: Double?
     /// True while a capture is running purely to improve an offset the world already has.
     ///
     /// Deliberately separate from `awaitingSeed`: that flag drives the 10 s watchdog, whose failure
     /// path hands alignment back to ARKit's `.gravityAndHeading` — the very thing that dragged a
     /// world 25°. A world that already has an offset must never be able to reach that path, however
-    /// long the phone takes to settle, so the retry runs on its own flag with no deadline. A loose
-    /// seed is worse than a tight one; it is far better than no alignment.
+    /// long the phone takes to settle, so the retry runs on its own flag and its own deadline. A
+    /// loose seed is worse than a tight one; it is far better than no alignment.
     private var seedIsResampling = false
     /// ARKit's azimuth minus the gyro's at the moment the world was seeded. Any later change in that
     /// difference is the world rotating, with the user's panning cancelled out — the measurement
@@ -2219,7 +2214,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         awaitingSeedConfirmation = false
         startupSeed.cancel()
         seedIsResampling = false
-        seedResamplesRemaining = ARTrafficViewController.maxSeedResamples
+        bestSeedSpreadDeg = nil
+        seedResampleDeadline = CACurrentMediaTime() + SeedResamplePolicy.windowSeconds
         seedDeadline = CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds
         seedGyroReferenceDeg = .nan
         loggedYawDivergence = false
@@ -2991,6 +2987,55 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         )
     }
 
+    /// Where the nearest few airports were drawn, so a flight with no traffic is still a
+    /// measurable accuracy test.
+    ///
+    /// Airports are the only reference this app has that is fixed, exactly surveyed, needs no
+    /// network and is present on every flight — and six builds of accuracy work never used them.
+    /// An airliner flight with no wifi (log `e66045cc`) drew airport markers correctly for two
+    /// solid minutes and the log recorded not one thing about it, which is how a successful test
+    /// read as a dead loss.
+    ///
+    /// **What this proves and what it does not.** The bearing figures are a *record*, not a
+    /// validation: a marker is drawn at `bearing − worldYawOffsetDeg`, so logging the bearing
+    /// alongside the drawn azimuth is tautological — the same trap as reading
+    /// `compass_response ≈ 1` as proof of alignment in build 24, which cost this project several
+    /// builds. Their worth is that "the marker sat well left of the runway" becomes a number to
+    /// compare against instead of a memory.
+    ///
+    /// The depression angle *is* independent, and is the part worth having: airport elevation is
+    /// surveyed MSL and ownship altitude is GPS MSL, so no pressure conversion and no ΔISA model
+    /// touch it. Vertical placement can be checked by eye with no traffic in the sky at all.
+    private func recordAirportCheck(userLocation: CLLocationCoordinate2D, userAltitudeFt: Double) {
+        // Every five seconds, not every one. An airport is fixed: at 450 kt a field 10 NM abeam
+        // swings about 3.6° in that time, which is finer than any check made by eye, and a 1 Hz
+        // line here would have tripled the size of a file the user has to send.
+        let now = Date()
+        guard now.timeIntervalSince(lastAirportCheckTime) >= 5.0 else { return }
+        let visible = sceneManager?.visibleAirports ?? []
+        guard !visible.isEmpty else { return }
+        lastAirportCheckTime = now
+        // The nearest few carry the check: they subtend the largest angles, so they are the ones a
+        // misalignment is visible on and the ones the user can actually identify out of a window.
+        let described = visible.prefix(4).map { airport -> String in
+            let bearing = CalculationsLogic.bearing(from: userLocation, to: airport.coordinate)
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation,
+                                                                   to: airport.coordinate)
+            let depression = CalculationsLogic.depressionAngleDeg(
+                viewerAltitudeFt: userAltitudeFt,
+                targetAltitudeFt: airport.elevation,
+                horizontalDistanceNM: distNM) ?? .nan
+            return String(format: "%@:brg=%.0f:dist=%.1f:elev=%.0f:depr=%.1f",
+                          airport.icao, bearing, distNM, airport.elevation, depression)
+        }
+        FlightRecorder.shared.record(
+            event: "airport_check",
+            detail: String(format: "own_alt=%.0f yaw_off=%.1f n=%d %@",
+                           userAltitudeFt, appliedWorldYawOffsetDeg, visible.count,
+                           described.joined(separator: " "))
+        )
+    }
+
     /// Lowest usable flight level in US airspace. Above the transition altitude every altimeter
     /// is set to 29.92 and reads pressure altitude; below it they are set to the local QNH and
     /// read something much closer to MSL.
@@ -3019,6 +3064,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         lastRecorderSampleTime = now
         FlightRecorder.shared.record(currentFlightSample(state: state, aircraft: aircraft))
         recordDatumSample(aircraft: aircraft)
+        recordAirportCheck(userLocation: state.coordinate, userAltitudeFt: state.displayAltitudeFt)
     }
 
     private func currentFlightSample(state: OwnshipSnapshot, aircraft: [Aircraft]) -> FlightRecorder.Sample {
@@ -3101,6 +3147,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.internetAircraftCount = connectionLogic.detectedAircraft.values.filter { $0.source == .internet }.count
         sample.staleAircraftCount   = connectionLogic.detectedAircraft.values.filter { CalculationsLogic.isStale($0) }.count
         sample.renderedNodeCount    = sceneManager?.renderedAircraftCount
+        // Counted from the scene manager's filtered set, not from `airports`, so this says what was
+        // drawn rather than what was loaded — the two differ by the type filters and the node cap.
+        sample.airportsInRangeCount = sceneManager?.visibleAirports.count
+        sample.renderedAirportCount = sceneManager?.renderedAirportCount
 
         // Measured from the traffic actually on display, so the offset comes from aircraft
         // sharing this air mass rather than from the whole fetch radius.
@@ -4023,8 +4073,33 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard startupSeed.progress(at: time) >= 1.0 else { return }
         guard let estimate = startupSeed.finish(at: time) else { return }
         let wasResample = seedIsResampling
-        awaitingSeed = false
         seedIsResampling = false
+
+        // A hold taken while the phone was still swinging measures an average of everywhere it
+        // visited, not where the nose is — so a capture only takes the world if it is steadier than
+        // the steadiest one already applied. The first capture of a world always passes, because an
+        // unapplied seed under `.gravity` leaves the scene pointing nowhere, which is worse than any
+        // loose seed; after that the spread only ever falls, which bounds how often the scene moves
+        // and makes each move an improvement.
+        //
+        // Build 36 overwrote unconditionally, so the *last* capture won rather than the best. In the
+        // airliner log four captures landed in four seconds with spreads 38.0, 34.7, 50.0, 29.8 and
+        // offsets spanning 48°; the steadiest happening to come last was luck.
+        guard SeedResamplePolicy.shouldApply(spreadDeg: estimate.azimuthSpreadDeg,
+                                             bestAppliedSpreadDeg: bestSeedSpreadDeg) else {
+            FlightRecorder.shared.record(
+                event: "seed_rejected",
+                detail: String(format: "az_spread=%.1f offset=%.1f best=%.1f",
+                               estimate.azimuthSpreadDeg, estimate.offsetDeg,
+                               bestSeedSpreadDeg ?? .nan)
+            )
+            armSeedResampleIfWorthwhile(spreadDeg: estimate.azimuthSpreadDeg,
+                                        reference: reference, at: time)
+            return
+        }
+
+        bestSeedSpreadDeg = estimate.azimuthSpreadDeg
+        awaitingSeed = false
         seedFallbackToHeading = false
         worldYawSource = .seed
         appliedWorldYawOffsetDeg = estimate.offsetDeg
@@ -4061,23 +4136,36 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                            seedGyroReferenceDeg, wasResample ? 1 : 0)
         )
 
-        // A hold taken while the phone was still swinging measures where the phone was pointing on
-        // average, not where the nose is. Apply it anyway — the world must never be left unaligned,
-        // which is why `StartupSeed` itself has no spread gate — then immediately go back for a
-        // steadier one. The replacement arrives through this same path a second or two later and
-        // overwrites the offset; until it does the scene is roughly right rather than nowhere.
-        if estimate.azimuthSpreadDeg > ARTrafficViewController.seedResampleSpreadDeg,
-           seedResamplesRemaining > 0 {
-            seedResamplesRemaining -= 1
-            seedIsResampling = true
-            startupSeed.begin(reference: reference.kind)
-            lastSeedSampleTime = 0
-            FlightRecorder.shared.record(
-                event: "seed_resampling",
-                detail: String(format: "az_spread=%.1f applied=%.1f remaining=%d",
-                               estimate.azimuthSpreadDeg, estimate.offsetDeg, seedResamplesRemaining)
-            )
-        }
+        armSeedResampleIfWorthwhile(spreadDeg: estimate.azimuthSpreadDeg,
+                                    reference: reference, at: time)
+    }
+
+    /// Go back for a steadier hold, if this one was loose and the world is still inside its window.
+    ///
+    /// Bounded by a clock rather than a count of attempts. Build 36 allowed three, which in the
+    /// airliner log covered four seconds of a two-minute lift: the budget ran out at t=5.6 and the
+    /// phone went still at t≈9, then stayed still — tenths of a degree per second — for the next
+    /// forty. The steady window that would have seeded the world correctly was four seconds away and
+    /// the app had stopped looking, so a human pressed the align button at t=93 and the anchor read
+    /// 31.3° away from the seed still in force. A resample costs nothing: it re-reads an azimuth
+    /// stream already being sampled at 5 Hz, so waiting is the cheap part.
+    private func armSeedResampleIfWorthwhile(
+        spreadDeg: Double,
+        reference: (kind: StartupSeed.Reference, degrees: Double),
+        at time: TimeInterval
+    ) {
+        guard SeedResamplePolicy.shouldKeepResampling(spreadDeg: spreadDeg,
+                                                      now: time,
+                                                      deadline: seedResampleDeadline) else { return }
+        seedIsResampling = true
+        startupSeed.begin(reference: reference.kind)
+        lastSeedSampleTime = 0
+        FlightRecorder.shared.record(
+            event: "seed_resampling",
+            detail: String(format: "az_spread=%.1f best=%.1f secs_left=%.0f",
+                           spreadDeg, bestSeedSpreadDeg ?? .nan,
+                           max(0, seedResampleDeadline - time))
+        )
     }
 
     /// How far the world has rotated since it was seeded, with panning cancelled out by the gyro.

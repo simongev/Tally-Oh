@@ -856,6 +856,17 @@ class ARSceneManager {
     /// Number of aircraft nodes positioned on the most recent 4 Hz pass, for the flight log.
     private(set) var renderedAircraftCount: Int = 0
 
+    /// Airport nodes standing in the scene after the most recent 4 Hz pass, for the flight log.
+    ///
+    /// Airports had no representation in the log at all until build 37, which is how a whole
+    /// airliner flight with no traffic read as "nothing to show" when in fact the app was drawing
+    /// airport markers correctly the entire time. They need no network, so they are the one
+    /// reference always available.
+    private(set) var renderedAirportCount: Int = 0
+
+    /// The airports the last pass actually drew, nearest first, for the flight log's airport check.
+    private(set) var visibleAirports: [Airport] = []
+
     /// ARKit world north minus true north, in degrees, subtracted from every bearing at placement.
     ///
     /// Zero until a FlightDirectionAnchor capture succeeds, which can only happen airborne — on the
@@ -1190,6 +1201,8 @@ class ARSceneManager {
             nearby = []
         }
 
+        // Already nearest-first: `cachedNearbyAirports` is built from a distance sort above.
+        visibleAirports = nearby
         let visibleIDs = Set(nearby.map { $0.icao })
 
         var airportNodesAdded = false
@@ -1294,6 +1307,7 @@ class ARSceneManager {
         if airportNodesAdded || !staleAirportNodes.isEmpty {
             lastAppliedSelectionID = "___unset___"
         }
+        renderedAirportCount = airportNodes.count
         applySelectionToAllNodes()
 
         // Refresh the lock-protected snapshot consumed by tickAirportPositions() at 60 Hz.

@@ -171,6 +171,30 @@ class CalculationsLogic {
         return (bearing + 360).truncatingRemainder(dividingBy: 360)
     }
 
+    /// How far below the horizon something sits, in degrees, from its slant geometry.
+    ///
+    /// Positive means below the horizon, which is where every airport is from an aircraft. Negative
+    /// would mean above, which is what traffic higher than the viewer gives.
+    ///
+    /// This exists as the one *independent* check on vertical placement. An airport's elevation is
+    /// surveyed MSL and ownship altitude is GPS MSL — the same datum, with no pressure conversion
+    /// and no ΔISA model anywhere in the path — so the angle is exactly computable and owes nothing
+    /// to the altitude work. Logged so that "the marker sat too low" becomes a number.
+    ///
+    /// Flat-Earth over the horizontal distance: at the ranges markers are drawn (≤ 40 NM for
+    /// airports) Earth curvature adds a few tenths of a degree, which is far below what an eye
+    /// check can resolve.
+    static func depressionAngleDeg(
+        viewerAltitudeFt: Double,
+        targetAltitudeFt: Double,
+        horizontalDistanceNM: Double
+    ) -> Double? {
+        guard horizontalDistanceNM > 0, horizontalDistanceNM.isFinite,
+              viewerAltitudeFt.isFinite, targetAltitudeFt.isFinite else { return nil }
+        let horizontalFt = horizontalDistanceNM * nauticalMileToMeters * metersToFeet
+        return atan2(viewerAltitudeFt - targetAltitudeFt, horizontalFt).toDegrees()
+    }
+
     /// Wrap a compass direction into [0, 360). Handles inputs already out of range in either
     /// direction, which a raw azimuth plus a world-yaw offset routinely is.
     static func normalizedAzimuth(_ degrees: Double) -> Double {
@@ -1151,6 +1175,60 @@ struct StartupSeed {
                         sampleCount: samples.count,
                         seconds: seconds,
                         azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(samples.map(\.az)))
+    }
+}
+
+/// When a startup seed is worth applying, and when it is worth going back for a steadier one.
+///
+/// This lives here, apart from the capture and apart from the view controller, because it is the
+/// part that has twice been wrong while the mechanism around it worked. Build 36 shipped resampling
+/// that fired, re-armed and logged exactly as designed, and still left a world 31° out, because the
+/// *policy* driving it was wrong in two ways: it budgeted three attempts when what mattered was
+/// elapsed time, and it let the last capture win rather than the steadiest. Builds 29 through 33
+/// each shipped a defect of the same shape — correct-looking code in a path no test could reach.
+/// So the decision is pure, and tested.
+enum SeedResamplePolicy {
+
+    /// Azimuth spread above which a hold was taken while the phone was still moving.
+    ///
+    /// A seed measures where the nose is by assuming the phone points along it for one second, so a
+    /// hold that swept 50° during that second is measuring an average of where the phone visited.
+    /// In the airliner flight one capture logged `az_spread=54.3°`, another 50.0°; every good hold
+    /// across every flight so far held to 0.1–4.5°, with one 10.9° outlier. Ten degrees clears all
+    /// of those and catches all of these.
+    static let spreadGateDeg: Double = 10.0
+
+    /// How long one world keeps looking for a steadier hold.
+    ///
+    /// Time, not attempts. A resample is nearly free — it re-reads an azimuth stream already being
+    /// sampled at 5 Hz — and build 36's budget of three attempts covered four seconds of a
+    /// two-minute lift. The phone in that lift went still at t≈9 and stayed still for forty
+    /// seconds; the app had stopped looking at t=5.6. Thirty seconds covers that with margin.
+    static let windowSeconds: TimeInterval = 30.0
+
+    /// Whether a fresh capture should replace the offset currently in force.
+    ///
+    /// The first capture of a world always applies: under `.gravity` an unapplied seed leaves the
+    /// world pointing nowhere, which is worse than any loose seed. After that a capture must be
+    /// *strictly* steadier than the best already applied. That makes every scene movement a genuine
+    /// improvement and makes them self-limiting, since the spread only ever falls.
+    static func shouldApply(spreadDeg: Double, bestAppliedSpreadDeg: Double?) -> Bool {
+        guard let best = bestAppliedSpreadDeg else { return true }
+        return spreadDeg < best
+    }
+
+    /// Whether to arm another capture after applying (or skipping) one with this spread.
+    ///
+    /// Stops as soon as a hold comes in under the gate — that is the answer, not a step toward it —
+    /// and stops at the deadline whatever the spread, so a phone that never settles cannot resample
+    /// for the whole flight.
+    static func shouldKeepResampling(
+        spreadDeg: Double,
+        now: TimeInterval,
+        deadline: TimeInterval
+    ) -> Bool {
+        guard spreadDeg > spreadGateDeg else { return false }
+        return now < deadline
     }
 }
 
