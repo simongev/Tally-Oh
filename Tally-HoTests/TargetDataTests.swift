@@ -1426,6 +1426,43 @@ struct TargetDataTests {
         #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
     }
 
+    // MARK: - Compass calibration policy
+
+    /// On the ground, with nothing in the way, the offer stands. This is the case that had never
+    /// been reachable: all three routes to calibrating the magnetometer were gated on
+    /// `headingAccuracy`, which is a constant on this device.
+    @Test func calibrationIsOfferedOnAQuietGroundSession() {
+        #expect(CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: false, modalShowing: false, seedCapturing: false, airborne: false))
+    }
+
+    /// One refusal is an answer. A second prompt is a nag.
+    @Test func aSkippedCalibrationIsNotOfferedAgain() {
+        #expect(!CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: true, modalShowing: false, seedCapturing: false, airborne: false))
+    }
+
+    /// Never stack on another modal — build 24's edge detector fired at CoreLocation's 10 Hz and
+    /// stalled ARKit's initialisation, which presented as a frozen camera.
+    @Test func calibrationNeverStacksOnAnotherModal() {
+        #expect(!CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: false, modalShowing: true, seedCapturing: false, airborne: false))
+    }
+
+    /// The figure-8 is a metre of vigorous waving. Asking for it mid-hold would destroy the very
+    /// capture being measured — the seed asserts the phone is pointing one way for a whole second.
+    @Test func calibrationWaitsForTheSeedToFinish() {
+        #expect(!CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: false, modalShowing: false, seedCapturing: true, airborne: false))
+    }
+
+    /// In the air the alignment comes from the GPS track, not the compass, so a calibration buys
+    /// nothing and costs the user the view out of the window.
+    @Test func calibrationIsNeverOfferedInTheAir() {
+        #expect(!CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: false, modalShowing: false, seedCapturing: false, airborne: true))
+    }
+
     // MARK: - Dispersion gate
 
     /// The monitor published only a median until build 38, which said where the middle was and

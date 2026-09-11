@@ -1232,6 +1232,63 @@ enum SeedResamplePolicy {
     }
 }
 
+/// When to offer the compass calibration screen.
+///
+/// **Why this needed writing at all.** Every alignment path on the ground rests on the
+/// magnetometer, and this app had never let anything calibrate it. Two remedies exist and both
+/// were dead: `locationManagerShouldDisplayHeadingCalibration` was not implemented, so iOS —
+/// whose delegate default is `false` — was never permitted to show its own figure-8 dance; and the
+/// app's own `CalibrationViewController` was reached only by an edge crossing of 20° in
+/// `CLHeading.headingAccuracy`, a value that reads **exactly 10.0 in 34 of 35 flight logs and is
+/// never once beaten**. A constant is not a measurement, so that edge never happened.
+///
+/// The symptom matches: the user reports an offset of the same size and the same side whichever
+/// way they face, roughly 5–15°, which is what an uncalibrated magnetometer's hard-iron bias looks
+/// like. Direction-*dependent* error was tested against the logs and rejected (Theil–Sen slopes of
+/// +0.007 and −0.006 on the two best-sampled lifts, 213° and 175° of heading coverage), as was a
+/// tilt dependence and a rotating ARKit world.
+///
+/// Offering is deliberately conservative, because an interruption at the wrong moment is its own
+/// fault: build 24's edge detector fired at CoreLocation's 10 Hz and stalled ARKit's
+/// initialisation, presenting as a frozen camera.
+enum CompassCalibrationPolicy {
+
+    /// Whether to put the calibration screen up now.
+    ///
+    /// - `alreadySkipped`: the user dismissed it once; never ask again this launch. One refusal is
+    ///   an answer, and a second prompt is a nag.
+    /// - `modalShowing`: something is already on screen. Never stack.
+    /// - `seedCapturing`: the startup seed is mid-hold. The dance is a metre of vigorous phone
+    ///   waving, which would destroy the very hold being measured.
+    /// - `airborne`: in the air the alignment comes from the GPS track, not the compass, so a
+    ///   calibration buys nothing and costs the user the view out of the window.
+    static func shouldOffer(
+        alreadySkipped: Bool,
+        modalShowing: Bool,
+        seedCapturing: Bool,
+        airborne: Bool
+    ) -> Bool {
+        !alreadySkipped && !modalShowing && !seedCapturing && !airborne
+    }
+
+    /// Key for "this install has been offered the deliberate figure-8 once".
+    static let offeredDefaultsKey = "compassCalibrationOffered"
+
+    /// Whether that has happened. **Once per install, not once per launch**, and the distinction
+    /// carries the whole standing requirement: *"This app should be instant and automatic. The user
+    /// should lift up his phone, see where the traffic is, and put the phone down."* A full-screen
+    /// calibration on every ground launch would break exactly that. One deliberate offer, ever,
+    /// with `locationManagerShouldDisplayHeadingCalibration` handling everything afterwards —
+    /// iOS raises that itself only when the magnetometer actually needs it.
+    static var hasCalibratedOnce: Bool {
+        UserDefaults.standard.bool(forKey: offeredDefaultsKey)
+    }
+
+    static func markCalibrationOffered() {
+        UserDefaults.standard.set(true, forKey: offeredDefaultsKey)
+    }
+}
+
 /// Whether ARKit's world is established enough that a marker drawn in it means anything.
 ///
 /// Target nodes are repositioned every frame from the live camera transform, which is what makes

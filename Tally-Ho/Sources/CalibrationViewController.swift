@@ -25,6 +25,15 @@ class CalibrationViewController: UIViewController {
     // MARK: - Thresholds
 
     private let gpsAccuracyThreshold:     CLLocationAccuracy         = 10.0   // metres
+    /// **This gate has never once held.** `CLHeading.headingAccuracy` reads exactly 10.0 in 34 of
+    /// 35 flight logs and is never beaten, so it passes on the first reading every time and the
+    /// screen bypasses itself instantly, exactly as the header above describes — which means the
+    /// figure-8 this file exists to ask for has never been performed. Left at 13° deliberately:
+    /// tightening it would make the screen block every launch on a number that means nothing, and
+    /// "lift the phone, see the traffic, put it down" is the standing requirement. The compass gets
+    /// calibrated instead by `locationManagerShouldDisplayHeadingCalibration`, which lets iOS raise
+    /// its own prompt when the magnetometer genuinely needs one, plus a single deliberate offer per
+    /// install. See `CompassCalibrationPolicy`.
     private let compassAccuracyThreshold: CLLocationDirectionAccuracy = 13.0   // degrees
 
     // MARK: - UI

@@ -924,8 +924,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Whether `worldYawErrorDeg` holds a real measurement yet, as opposed to a default zero.
     private var hasSeededWorldYawError = false
     /// Compass accuracy past which the heading is too poor to measure against. Deliberately
-    /// loose: these logs run at a constant ±10°, and a tight gate inside a fuselage would
-    /// silently record nothing at all.
+    /// loose, and it barely matters which value it takes.
+    ///
+    /// **`CLHeading.headingAccuracy` carries no information on this device.** It reads exactly
+    /// 10.0 in 34 of 35 flight logs — months apart, many locations, ground and air, thousands of
+    /// samples — and is never once beaten. A real accuracy estimate varies with conditions; this is
+    /// a constant iOS reports when it has nothing better to say. Any gate keyed on it either always
+    /// passes or always fails, which is how all three routes to calibrating the magnetometer came to
+    /// be disabled at once (see `CompassCalibrationPolicy`), and how build 38 came to tell the user
+    /// the residual was "the compass's own limit, and iOS says so" on the strength of a placeholder.
+    /// Do not gate a decision on it. It stays in the CSV because a column that never moves is worth
+    /// being able to see.
     private let maxHeadingAccuracyForYawFix: Double = 25.0
 
     /// **The test build 8 should have run before trusting the compass.**
@@ -4883,6 +4892,28 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
 extension ARTrafficViewController: CLLocationManagerDelegate {
 
+    /// Let iOS put its own figure-8 calibration up when it judges the magnetometer needs it.
+    ///
+    /// **This delegate method was simply absent, and its default is `false`.** So for this app's
+    /// entire history the system has asked to calibrate the compass and been told no, every time —
+    /// while fourteen builds of alignment work rested on that compass. It is the single mechanism
+    /// Apple provides for removing a hard-iron bias, and it was switched off by omission.
+    ///
+    /// The symptom fits: an offset of the same size and the same side whichever way the phone
+    /// faces, roughly 5–15°. Direction-dependent error, tilt dependence and a rotating ARKit world
+    /// were each tested against the flight logs and rejected; see `CompassCalibrationPolicy`.
+    ///
+    /// Returning true is not a decision to interrupt — iOS shows the dance only when it actually
+    /// needs one. It is a decision to stop refusing.
+    func locationManagerShouldDisplayHeadingCalibration(_ manager: CLLocationManager) -> Bool {
+        CompassCalibrationPolicy.shouldOffer(
+            alreadySkipped: calibrationWasSkipped,
+            modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
+            seedCapturing: startupSeed.isCapturing,
+            airborne: isAirborneEstimate
+        )
+    }
+
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
 
@@ -5059,20 +5090,36 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
 
         let accuracy = newHeading.headingAccuracy
 
-        // Degraded compass accuracy prompts recalibration on the ground, but deliberately
-        // does NOT reset the ARKit world any more.
+        // Offer the deliberate figure-8 once per install, on the ground, where the compass is the
+        // only absolute reference the app has. Once per *install* and not per launch because a
+        // full-screen calibration on every ground start would break the standing requirement that
+        // the user lifts the phone, sees the traffic and puts it down. After that one offer, iOS
+        // raises its own prompt through the delegate above whenever it actually needs one.
         //
-        // Resetting cannot improve compass accuracy: it re-anchors ARKit's north to the
-        // current sample, which this very condition has just established is a bad one. It also
-        // discards the learned interference correction and drops tracking back to
-        // initialising. And because this is an edge detector re-armed every time accuracy dips
-        // back under the threshold, a compass wobbling around 20° — the exact state that makes
-        // a user reach for Skip — fired it at CoreLocation's ~10 Hz. ARKit could never finish
-        // initialising between resets, so the camera feed stalled while the UI kept running.
-        if !tcasEnabled
-            && lastHeadingAccuracy >= 0
-            && lastHeadingAccuracy <= 20
-            && accuracy > 20 {
+        // **This used to be an edge crossing of 20° in `headingAccuracy`, which never happened.**
+        // That figure reads exactly 10.0 in 34 of 35 flight logs and is never once beaten, across
+        // months, many locations, ground and air — it is a constant iOS reports when it has nothing
+        // better to say, not a measurement. So the screen existed, complete with its figure-8
+        // animation, and nothing could reach it; the compass underneath fourteen builds of
+        // alignment work was never calibrated by anything. The same reading is why build 38's
+        // claim that the residual was "the compass's own limit, and iOS says so" was unfounded.
+        //
+        // Resetting the ARKit world is still deliberately *not* done here. Resetting cannot improve
+        // compass accuracy: it re-anchors ARKit's north to the current sample, which the condition
+        // firing has just established is a bad one, and it drops tracking back to initialising. The
+        // old edge detector re-armed every time accuracy dipped back under the threshold, so a
+        // compass wobbling around 20° — the exact state that makes a user reach for Skip — fired it
+        // at CoreLocation's ~10 Hz and ARKit could never finish initialising between resets,
+        // presenting as a frozen camera. `presentCalibrationPopupIfNeeded` carries the re-entrancy
+        // and skip guards that stop that recurring.
+        if !tcasEnabled,
+           !CompassCalibrationPolicy.hasCalibratedOnce,
+           CompassCalibrationPolicy.shouldOffer(
+               alreadySkipped: calibrationWasSkipped,
+               modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
+               seedCapturing: startupSeed.isCapturing,
+               airborne: isAirborneEstimate) {
+            CompassCalibrationPolicy.markCalibrationOffered()
             presentCalibrationPopupIfNeeded()
         }
 
