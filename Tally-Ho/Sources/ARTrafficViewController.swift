@@ -3837,8 +3837,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if time - lastGroundYawCheck >= 0.5 {
             lastGroundYawCheck = time
             let median = alignmentDrift.medianErrorDeg
+            // Read from the same window in the same breath as the median, so the correction is
+            // told how much the readings behind that median disagree.
+            let dispersion = alignmentDrift.interquartileRangeDeg
             DispatchQueue.main.async { [weak self] in
-                self?.updateGroundYawCorrection(medianErrorDeg: median, at: time)
+                self?.updateGroundYawCorrection(medianErrorDeg: median,
+                                                dispersionDeg: dispersion, at: time)
             }
         }
 
@@ -3867,7 +3871,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.feedStartupSeed(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz, at: time)
-                self.checkYawDivergence(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz)
+                self.checkGyroDivergence(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz)
             }
         }
 
@@ -3896,7 +3900,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// The gates all live in `GroundYawCorrection`; this is the wiring plus the precedence rule.
     /// The flight anchor outranks this outright: once one has been captured, this stops writing for
     /// the life of that world, so the two can never fight over the same variable.
-    private func updateGroundYawCorrection(medianErrorDeg: Double?, at time: TimeInterval) {
+    private func updateGroundYawCorrection(medianErrorDeg: Double?,
+                                           dispersionDeg: Double?,
+                                           at time: TimeInterval) {
         guard !hasFlightAnchor else { return }
         // **Runs on top of the seed from build 33, and that is the point.** The median here is
         // measured against the *uncorrected* ARKit azimuth, so it reads back the total offset the
@@ -3907,6 +3913,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         let outcome = groundYaw.update(
             medianErrorDeg: medianErrorDeg,
+            dispersionDeg: dispersionDeg,
             compassResponse: compassResponse,
             compassResponseR: compassResponseR,
             headingAccuracyDeg: lastHeadingAccuracy,
@@ -3934,8 +3941,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             lastLoggedGroundYawRefusal = nil
             FlightRecorder.shared.record(
                 event: "ground_yaw_applied",
-                detail: String(format: "offset=%.2f median=%.2f response=%.2f r=%.2f hdg_acc=%.1f",
-                               offset, medianErrorDeg ?? Double.nan,
+                detail: String(format: "offset=%.2f median=%.2f iqr=%.1f response=%.2f r=%.2f hdg_acc=%.1f",
+                               offset, medianErrorDeg ?? Double.nan, dispersionDeg ?? Double.nan,
                                compassResponse, compassResponseR, lastHeadingAccuracy)
             )
 
@@ -3953,8 +3960,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             lastLoggedGroundYawRefusal = reason.rawValue
             FlightRecorder.shared.record(
                 event: "ground_yaw_refused",
-                detail: String(format: "reason=%@ median=%.2f response=%.2f r=%.2f hdg_acc=%.1f airborne=%d",
+                detail: String(format: "reason=%@ median=%.2f iqr=%.1f response=%.2f r=%.2f hdg_acc=%.1f airborne=%d",
                                reason.rawValue, medianErrorDeg ?? Double.nan,
+                               dispersionDeg ?? Double.nan,
                                compassResponse, compassResponseR, lastHeadingAccuracy,
                                isAirborneEstimate ? 1 : 0)
             )
@@ -4168,17 +4176,36 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         )
     }
 
-    /// How far the world has rotated since it was seeded, with panning cancelled out by the gyro.
-    /// **Recorded only.** A noisy integrated gyro driving automatic re-seeds could easily be worse
-    /// than the fault it is watching for, so this build measures and does nothing.
-    private func checkYawDivergence(arAzimuthDeg: Double, gyroAzimuthDeg: Double) {
+    /// How far ARKit's azimuth has drifted from the integrated gyro's since the world was seeded.
+    ///
+    /// **This does not detect a rotating world, and build 38 stopped pretending it did.** It was
+    /// introduced as exactly that — the measurement this project had been missing, with panning
+    /// cancelled out — and flagged as "the next thing I would chase" in three consecutive builds.
+    /// The Teterboro ground log settles it, because it carries both witnesses: this one, and
+    /// `world_yaw_corr` (compass versus ARKit). A genuinely rotating world moves both together,
+    /// slope ≈ +1. Across three lifts, standing still on the ground:
+    ///
+    ///     lift 1:  compass -32.4..+46.8   gyro -49.6..  +3.1   r=+0.045  slope=+0.03
+    ///     lift 2:  compass -24.1..+60.6   gyro -14.1.. +30.4   r=-0.198  slope=-0.31
+    ///     lift 4:  compass -49.6..+78.1   gyro  -1.7..+105.0   r=-0.050  slope=-0.02
+    ///
+    /// Correlations of essentially zero, and 105° accumulated on a stationary lift, which no world
+    /// does. Each witness is measuring its own sensor's error. There is a mechanism for the gyro's
+    /// in the integrator itself: `GyroAzimuthIntegrator` drops samples arriving more than
+    /// `maxGapSeconds` apart but lets its clock run on, so every gap silently discards the rotation
+    /// that happened during it and the error only ever grows.
+    ///
+    /// So it stays **recorded only**, and keeps that name. Acting on it would repeat build 25,
+    /// which injected 30° of error across a turn by acting on a measurement it had misread. What it
+    /// is still worth reading as is a gyro-health signal.
+    private func checkGyroDivergence(arAzimuthDeg: Double, gyroAzimuthDeg: Double) {
         guard seedGyroReferenceDeg.isFinite, !loggedYawDivergence else { return }
         let now = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
         let divergence = angleDifferenceDeg(from: seedGyroReferenceDeg, to: now)
         guard abs(divergence) > 20 else { return }
         loggedYawDivergence = true
         FlightRecorder.shared.record(
-            event: "world_yaw_diverged",
+            event: "gyro_divergence",
             detail: String(format: "deg=%.1f ar_az=%.1f gyro_az=%.1f seed_ref=%.1f state=%@",
                            divergence, arAzimuthDeg, gyroAzimuthDeg, seedGyroReferenceDeg,
                            arTrackingStateDescription)

@@ -1235,9 +1235,11 @@ struct TargetDataTests {
                              airborne: Bool = false,
                              response: Double = 1.0,
                              responseR: Double = 0.95,
-                             headingAccuracy: Double = 10) {
+                             headingAccuracy: Double = 10,
+                             dispersion: Double = 4.0) {
         for i in 0..<ticks {
             correction.update(medianErrorDeg: medianDeg,
+                              dispersionDeg: dispersion,
                               compassResponse: response,
                               compassResponseR: responseR,
                               headingAccuracyDeg: headingAccuracy,
@@ -1298,7 +1300,8 @@ struct TargetDataTests {
     @Test func refusedWithoutAMedian() {
         var correction = GroundYawCorrection(deadbandDeg: 0.5)
         for i in 0..<10 {
-            correction.update(medianErrorDeg: nil, compassResponse: 1.0, compassResponseR: 0.95,
+            correction.update(medianErrorDeg: nil, dispersionDeg: 4.0,
+                              compassResponse: 1.0, compassResponseR: 0.95,
                               headingAccuracyDeg: 10, airborne: false, worldUsable: true,
                               at: Double(i))
         }
@@ -1308,7 +1311,8 @@ struct TargetDataTests {
     @Test func refusedWhileTheWorldIsUnusable() {
         var correction = GroundYawCorrection(deadbandDeg: 0.5)
         for i in 0..<10 {
-            correction.update(medianErrorDeg: -2.5, compassResponse: 1.0, compassResponseR: 0.95,
+            correction.update(medianErrorDeg: -2.5, dispersionDeg: 4.0,
+                              compassResponse: 1.0, compassResponseR: 0.95,
                               headingAccuracyDeg: 10, airborne: false, worldUsable: false,
                               at: Double(i))
         }
@@ -1422,15 +1426,99 @@ struct TargetDataTests {
         #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
     }
 
+    // MARK: - Dispersion gate
+
+    /// The monitor published only a median until build 38, which said where the middle was and
+    /// nothing about whether the readings agreed.
+    @Test func theMonitorReportsHowFarItsReadingsDisagree() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        // Quartiles of 0…10 at nearest rank: 2.5 and 7.5, so an IQR of 5.
+        for (i, v) in (0...10).enumerated() {
+            monitor.add(errorDeg: Double(v), at: Double(i) * 0.5)
+        }
+        #expect(monitor.interquartileRangeDeg != nil)
+        if let iqr = monitor.interquartileRangeDeg { #expect(abs(iqr - 5) < 0.001) }
+    }
+
+    /// Nothing is published before the sample is big enough, dispersion included — otherwise an
+    /// IQR of zero from two readings would read as perfect agreement.
+    @Test func dispersionIsWithheldUntilThereAreEnoughReadings() {
+        var monitor = AlignmentDriftMonitor(window: 15, minSamples: 10, minSampleInterval: 0.5)
+        for i in 0..<4 { monitor.add(errorDeg: 1.0, at: Double(i) * 0.5) }
+        #expect(monitor.interquartileRangeDeg == nil)
+        #expect(monitor.medianErrorDeg == nil)
+    }
+
+    /// The Teterboro numbers. A settled compass — median 137.7 behind an IQR of 3.8 — is acted on.
+    @Test func aSettledCompassIsActedOn() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        applyGround(&correction, medianDeg: 137.7, ticks: 10, dispersion: 3.8)
+        #expect(correction.hasOffset)
+    }
+
+    /// And the excursion that walked the scene four degrees off: median 133.4 behind an IQR of
+    /// 46.6, which is the compass disagreeing with itself, not a world that has moved.
+    @Test func aDisturbedCompassIsRefusedWithItsOwnReason() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        let outcome = correction.update(medianErrorDeg: 133.41, dispersionDeg: 46.6,
+                                        compassResponse: 0.83, compassResponseR: 0.80,
+                                        headingAccuracyDeg: 10, airborne: false,
+                                        worldUsable: true, at: 0)
+        #expect(outcome == .refused(.dispersed))
+        #expect(!correction.hasOffset)
+    }
+
+    /// Asked before the response gate, so a compass that is following the phone but cannot agree
+    /// with itself is not misreported as one that is reading the aircraft.
+    @Test func dispersionIsNamedAheadOfTheResponseGate() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        let outcome = correction.update(medianErrorDeg: 133.41, dispersionDeg: 46.6,
+                                        compassResponse: 0.018, compassResponseR: 0.1,
+                                        headingAccuracyDeg: 10, airborne: false,
+                                        worldUsable: true, at: 0)
+        #expect(outcome == .refused(.dispersed))
+    }
+
+    /// A missing dispersion must not block the correction — the gate is an extra piece of evidence,
+    /// not a new requirement, so a monitor that has not published one yet behaves as before.
+    @Test func absentDispersionDoesNotBlockTheCorrection() {
+        var correction = GroundYawCorrection(deadbandDeg: 0.5)
+        for i in 0..<10 {
+            correction.update(medianErrorDeg: -2.5, dispersionDeg: nil,
+                              compassResponse: 1.0, compassResponseR: 0.95,
+                              headingAccuracyDeg: 10, airborne: false, worldUsable: true,
+                              at: Double(i))
+        }
+        #expect(correction.hasOffset)
+    }
+
+    /// Replaying lift 1: the four corrections behind IQRs of 41–47° are the ones that walked the
+    /// scene from 139 down to 136, and the gate must leave the offset where the good ones put it.
+    @Test func theDisturbedExcursionNeverReachesTheScene() {
+        // Slew uncapped so the settled value is reached at once and the assertion is about the
+        // gate rather than about how far a 1°/s crawl happened to get.
+        var correction = GroundYawCorrection(deadbandDeg: 0.5, maxSlewPerUpdateDeg: 180)
+        applyGround(&correction, medianDeg: 137.73, ticks: 2, from: 0, dispersion: 3.8)
+        #expect(abs(correction.appliedOffsetDeg - 137.73) < 0.01)
+        // The disturbance: a median dragged four degrees down, behind a wide spread.
+        applyGround(&correction, medianDeg: 133.41, ticks: 6, from: 10, dispersion: 46.6)
+        #expect(abs(correction.appliedOffsetDeg - 137.73) < 0.01)
+        // And once the compass settles again, the correction resumes normally.
+        applyGround(&correction, medianDeg: 140.65, ticks: 2, from: 20, dispersion: 4.5)
+        #expect(abs(correction.appliedOffsetDeg - 140.65) < 0.01)
+    }
+
     /// The refusal reason is reported, not swallowed — the log distinguishes "no correction" from
     /// "no correction because the compass is track-slaved".
     @Test func refusalNamesItsReason() {
         var correction = GroundYawCorrection(deadbandDeg: 0.5)
-        let airborne = correction.update(medianErrorDeg: -2.5, compassResponse: 1.0,
+        let airborne = correction.update(medianErrorDeg: -2.5, dispersionDeg: 4.0,
+                                         compassResponse: 1.0,
                                          compassResponseR: 0.95, headingAccuracyDeg: 10,
                                          airborne: true, worldUsable: true, at: 0)
         #expect(airborne == .refused(.airborne))
-        let slaved = correction.update(medianErrorDeg: -2.5, compassResponse: 0.018,
+        let slaved = correction.update(medianErrorDeg: -2.5, dispersionDeg: 4.0,
+                                       compassResponse: 0.018,
                                        compassResponseR: 0.1, headingAccuracyDeg: 10,
                                        airborne: false, worldUsable: true, at: 1)
         #expect(slaved == .refused(.compassNotMeasuringPhone))

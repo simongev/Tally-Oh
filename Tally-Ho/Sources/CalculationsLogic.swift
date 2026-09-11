@@ -1320,6 +1320,22 @@ struct AlignmentDriftMonitor {
         return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
     }
 
+    /// How far apart the readings behind that median are — the interquartile range, in degrees.
+    ///
+    /// A median says where the middle is and nothing about whether the sample agrees with itself,
+    /// and until build 38 that was the only thing published, so `GroundYawCorrection` had no way to
+    /// tell a settled compass from a disturbed one. In the Teterboro ground log the magnetometer
+    /// spent seven seconds forty degrees away from its own cluster; the median dutifully followed
+    /// it and walked the scene four degrees off, then four degrees back, over eighty seconds. Every
+    /// correction that excursion produced sat behind an IQR above 41°, and every good one behind an
+    /// IQR under 6°. One number separates them.
+    var interquartileRangeDeg: Double? {
+        guard samples.count >= minSamples else { return nil }
+        let sorted = samples.map(\.deg).sorted()
+        return AltitudeDatumOffset.percentile(sorted, 0.75)
+             - AltitudeDatumOffset.percentile(sorted, 0.25)
+    }
+
     /// Clear after a re-anchor. Without this the large readings that *caused* a reset would still
     /// be in the window afterwards and would immediately demand another.
     mutating func reset() {
@@ -1387,6 +1403,17 @@ struct GroundYawCorrection {
     /// Most the applied offset may move in one update, so the correction converges over a few
     /// seconds rather than stepping every marker at once.
     let maxSlewPerUpdateDeg: Double
+    /// Widest the readings behind the median may disagree and still be worth acting on.
+    ///
+    /// The deadband above asks whether the median has moved enough to be worth chasing. This asks
+    /// the prior question — whether the median means anything — and until build 38 nothing did.
+    /// In the Teterboro log a magnetometer disturbance dragged the 15 s median from 137.7 to 133.4
+    /// and the correction followed, walking the scene four degrees off over twenty-three seconds
+    /// before the compass recovered and it walked back. Every correction from that excursion had an
+    /// IQR of 41–47°; every good one in the same session had 3.8–5.9°, and the session's median IQR
+    /// was 6.1°. Twelve degrees is loose in ordinary conditions and bites only while the compass
+    /// cannot agree with itself.
+    let maxDispersionDeg: Double
 
     /// The correction currently in force, in the same sense as `worldYawOffsetDeg`: ARKit's world
     /// north minus true north, subtracted from every bearing.
@@ -1401,7 +1428,8 @@ struct GroundYawCorrection {
          maxHeadingAccuracyDeg: Double = 25.0,
          minUpdateInterval: TimeInterval = 1.0,
          deadbandDeg: Double = 1.5,
-         maxSlewPerUpdateDeg: Double = 1.0) {
+         maxSlewPerUpdateDeg: Double = 1.0,
+         maxDispersionDeg: Double = 12.0) {
         self.maxOffsetDeg = maxOffsetDeg
         self.responseToleranceFromOne = responseToleranceFromOne
         self.minResponseCorrelation = minResponseCorrelation
@@ -1409,6 +1437,7 @@ struct GroundYawCorrection {
         self.minUpdateInterval = minUpdateInterval
         self.deadbandDeg = deadbandDeg
         self.maxSlewPerUpdateDeg = maxSlewPerUpdateDeg
+        self.maxDispersionDeg = maxDispersionDeg
     }
 
     /// Why an update did nothing. Recorded rather than returned as a bare nil so a log can say which
@@ -1418,6 +1447,10 @@ struct GroundYawCorrection {
         case airborne
         case worldUnusable
         case noMedian
+        /// The compass is following the phone but cannot agree with itself: the readings behind
+        /// the median are spread too widely to act on. Distinct from `compassNotMeasuringPhone`,
+        /// which is the compass reporting something that is not the phone at all.
+        case dispersed
         case compassNotMeasuringPhone
         case headingInaccurate
         case implausibleOffset
@@ -1437,6 +1470,7 @@ struct GroundYawCorrection {
     /// the phone.
     @discardableResult
     mutating func update(medianErrorDeg: Double?,
+                         dispersionDeg: Double?,
                          compassResponse: Double,
                          compassResponseR: Double,
                          headingAccuracyDeg: Double,
@@ -1446,6 +1480,12 @@ struct GroundYawCorrection {
         guard !airborne else { return .refused(.airborne) }
         guard worldUsable else { return .refused(.worldUnusable) }
         guard let median = medianErrorDeg, median.isFinite else { return .refused(.noMedian) }
+        // Asked before the response gate, and deliberately: a compass that is following the phone
+        // but disagreeing with itself is a different fault from one reporting the aircraft, and the
+        // log is only useful if it names the right one.
+        if let dispersion = dispersionDeg, dispersion.isFinite, dispersion > maxDispersionDeg {
+            return .refused(.dispersed)
+        }
         guard compassResponse.isFinite, compassResponseR.isFinite,
               abs(compassResponse - 1.0) <= responseToleranceFromOne,
               abs(compassResponseR) >= minResponseCorrelation

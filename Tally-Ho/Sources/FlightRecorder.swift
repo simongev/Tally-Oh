@@ -145,11 +145,16 @@ final class FlightRecorder {
         /// Integrated device-gyro azimuth — **the reference ARKit cannot corrupt.**
         ///
         /// Its absolute value is meaningless: gyro bias walks it over minutes. What matters is
-        /// `ar_heading_deg` minus this one. That difference cancels whatever the user did with the
-        /// phone, because a pan moves both together, so any change in it is the ARKit world itself
-        /// rotating. Added in build 30 because no earlier log could separate "the world rotated"
-        /// from "the phone panned" — which is why a flight that ended 176° wrong could only be
-        /// explained by hypothesis. See also the world_yaw_diverged event.
+        /// `ar_heading_deg` minus this one. A pan moves both together, so the difference was
+        /// introduced in build 30 as the measurement that could finally separate "the world
+        /// rotated" from "the phone panned" — the question a flight ending 176° wrong could only
+        /// be answered about by hypothesis.
+        ///
+        /// **It does not answer it, and build 38 stopped claiming it did.** On the ground, standing
+        /// still, this difference moved as much as 105° in one lift while the compass-versus-ARKit
+        /// witness moved independently of it (r ≈ 0 across three lifts). What it measures is the
+        /// gyro's own integration error, which grows with every sample gap the integrator drops.
+        /// See `checkGyroDivergence` for the numbers. Read it as gyro health, not as world motion.
         var gyroAzimuthDeg: Double?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///
