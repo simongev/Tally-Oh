@@ -97,7 +97,8 @@ class TCASSystem {
         userTrack: Double = 0,
         userGroundSpeed: Double = 0,
         userVerticalRate: Double = 0,
-        geoidSeparationFt: Double? = nil
+        geoidSeparationFt: Double? = nil,
+        datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) -> TCASEvaluation {
 
         var threats: [String: TCASAlertLevel] = [:]
@@ -115,7 +116,8 @@ class TCASSystem {
                 userLocation: userLocation,
                 userAltitude: userAltitude,
                 userVel: userVel,
-                geoidSeparationFt: geoidSeparationFt
+                geoidSeparationFt: geoidSeparationFt,
+                datumFit: datumFit
             )
             if level != .none {
                 threats[ac.id] = level
@@ -133,13 +135,15 @@ class TCASSystem {
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userVel: SIMD3<Double>,
-        geoidSeparationFt: Double?
+        geoidSeparationFt: Double?,
+        datumFit: AltitudeDatumOffset.DatumFit?
     ) -> TCASAlertLevel {
 
         // In the viewer's own datum, so every vertical figure below is real separation rather
         // than the pressure-versus-geometric gap.
         let acAltitude = CalculationsLogic.geometricPlacementAltitude(
-            for: ac, reportedAltitudeFt: ac.altitude, geoidSeparationFt: geoidSeparationFt)
+            for: ac, reportedAltitudeFt: ac.altitude, geoidSeparationFt: geoidSeparationFt,
+            datumFit: datumFit)
 
         // Compute instantaneous separation (used for guard range check below)
         let horizNM = CalculationsLogic.distanceInNauticalMiles(

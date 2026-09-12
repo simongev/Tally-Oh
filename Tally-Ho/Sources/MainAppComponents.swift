@@ -844,6 +844,10 @@ class ARSceneManager {
     /// geometric altitude into the MSL frame the viewer's own altitude is measured in. Nil until
     /// the phone has reported both altitudes for one fix; see `geometricPlacementAltitude`.
     private(set) var liveGeoidSeparationFt: Double?
+    /// The air-mass datum fit, for converting targets that report pressure altitude only. Nil when
+    /// the traffic does not span enough altitude to fit one, in which case those targets are placed
+    /// at their reported altitude exactly as before.
+    private(set) var liveDatumFit: AltitudeDatumOffset.DatumFit?
 
     /// Ownship position, velocity and altitude for the 60 Hz ticks.
     ///
@@ -907,6 +911,7 @@ class ARSceneManager {
         var userLoc = liveUserLocation
         var userAlt = liveUserAltitude
         var geoidSep = liveGeoidSeparationFt
+        let fit = liveDatumFit
         if let ownship = ownshipEstimator?.snapshot(), ownship.hasPosition {
             userLoc = ownship.coordinate
             userAlt = ownship.displayAltitudeFt
@@ -927,7 +932,7 @@ class ARSceneManager {
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let targetAlt = CalculationsLogic.placementAltitude(
                 for: ac, targetAltitude: predAlt, userAltitudeFt: userAlt,
-                geoidSeparationFt: geoidSep)
+                geoidSeparationFt: geoidSep, datumFit: fit)
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord: predCoord,
                 targetAltitude: targetAlt,
@@ -986,7 +991,8 @@ class ARSceneManager {
         cameraWorldPosition: SCNVector3 = .init(),
         tcasEvaluation: TCASEvaluation = .clear,
         onGround: Bool = false,
-        geoidSeparationFt: Double? = nil
+        geoidSeparationFt: Double? = nil,
+        datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) {
         guard settings.showAircraft else {
             nodesLock.lock()
@@ -1043,7 +1049,7 @@ class ARSceneManager {
             // traffic, which is most of the 10,000 ft budget spent on a datum mismatch.
             let targetAlt = CalculationsLogic.placementAltitude(
                 for: ac, targetAltitude: predAlt, userAltitudeFt: userAltitude,
-                geoidSeparationFt: geoidSeparationFt)
+                geoidSeparationFt: geoidSeparationFt, datumFit: datumFit)
             let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
             guard distNM <= settings.aircraftMaxDistance else { continue }
             guard settings.passes(callsign: ac.callsign) else { continue }
@@ -1115,6 +1121,7 @@ class ARSceneManager {
         liveUserLocation      = userLocation
         liveUserAltitude      = userAltitude
         liveGeoidSeparationFt = geoidSeparationFt
+        liveDatumFit          = datumFit
         renderedAircraftCount = visibleAircraft.count
 
         nodesLock.lock()

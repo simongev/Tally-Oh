@@ -60,6 +60,10 @@ class CalculationsLogic {
         return 145_366.45 * (1.0 - pow(ratio, 0.190284))
     }
 
+    /// Steepest elevation a marker is placed at, in radians (85°). A bound on `tan`, not on the
+    /// field of view — see `calculateARPosition`.
+    static let maxPlacementElevationRad: Double = 85.0 * .pi / 180.0
+
     /// ISA sea-level temperature, in kelvin.
     static let isaSeaLevelTemperatureK: Double = 288.15
     /// ISA tropopause: above this the standard atmosphere is isothermal.
@@ -295,8 +299,21 @@ class CalculationsLogic {
         let elevationRad = atan2(altDiffM, max(horizontalDistanceM, 1.0))
 
         // Map the elevation angle onto the scaled AR horizontal radius.
-        // Cap to ±45° (tan ≈ 1.0) so markers stay within vertical FoV.
-        let clampedElev = max(-Double.pi / 4, min(Double.pi / 4, elevationRad))
+        //
+        // The cap was ±45°, "so markers stay within vertical FoV", and that reasoning is backwards:
+        // a marker outside the field of view is simply not on screen, which is correct and is what
+        // the off-screen arrow exists for — clamping it to 45° instead puts a *wrong* marker inside
+        // the view, at an elevation the target does not have. Anything steeper was drawn at 45°.
+        //
+        // It bites whenever the vertical separation exceeds the horizontal distance. A ground
+        // screenshot caught it exactly: AAL1744 at 35,000 ft and 4.5 NM is 52° up, and was drawn
+        // seven degrees low. Overhead traffic does this routinely from the ground, and a climb or
+        // descent with traffic a few miles off does it in the air.
+        //
+        // ±85° now, which is not a field-of-view judgement at all — it only keeps `tan` away from
+        // its singularity. At 85° the marker sits 11.4 radii up, which SceneKit places without
+        // complaint, and every elevation a target realistically has is reproduced exactly.
+        let clampedElev = max(-maxPlacementElevationRad, min(maxPlacementElevationRad, elevationRad))
         let arY = Float(arHorizR * tan(clampedElev))
 
         // All positions are expressed relative to the camera's current world
@@ -375,13 +392,15 @@ class CalculationsLogic {
         for aircraft: Aircraft,
         targetAltitude: Double,
         userAltitudeFt: Double,
-        geoidSeparationFt: Double? = nil
+        geoidSeparationFt: Double? = nil,
+        datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) -> Double {
         guard aircraft.hasValidAltitude else { return userAltitudeFt }
         return geometricPlacementAltitude(
             for: aircraft,
             reportedAltitudeFt: targetAltitude,
-            geoidSeparationFt: geoidSeparationFt
+            geoidSeparationFt: geoidSeparationFt,
+            datumFit: datumFit
         )
     }
 
@@ -404,13 +423,16 @@ class CalculationsLogic {
     /// `alt_geom` is referenced to the WGS-84 ellipsoid, so it becomes MSL by subtracting the
     /// geoid separation the phone reports for our own fix (HAE − MSL, −108.9 ft in these logs).
     ///
-    /// Falls back to the reported altitude unchanged when the pair is unavailable — GDL90 traffic
-    /// reports carry pressure altitude only — which is exactly what the app did before. This is
-    /// never worse than the previous behaviour for any target.
+    /// A target reporting pressure altitude only — every GDL90 traffic report, and about 2% of
+    /// internet traffic — has no pair of its own, and build 35 left those unconverted because there
+    /// was no air-mass model to fall back on. There is now: `datumFit` inverts the fitted line to
+    /// recover the geometric height. Without a fit the reported altitude is returned unchanged,
+    /// which is what the app did before and is never worse for any target.
     static func geometricPlacementAltitude(
         for aircraft: Aircraft,
         reportedAltitudeFt: Double,
-        geoidSeparationFt: Double?
+        geoidSeparationFt: Double?,
+        datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) -> Double {
         // How far `reportedAltitudeFt` has to move to become an ellipsoid-referenced height.
         // Mirrors the source's own precedence (pressure altitude when present, else geometric),
@@ -428,8 +450,17 @@ class CalculationsLogic {
         case (nil, _?):
             // The reported altitude is already the geometric one.
             toEllipsoidFt = 0
+        case (.some, nil):
+            // Pressure only. No pair of its own, so the air-mass fit stands in — the same line the
+            // ownship readout uses, inverted. At cruise this is worth 1,500–2,000 ft, the
+            // difference between a target on the horizon and one well below it.
+            guard let fit = datumFit else { return reportedAltitudeFt }
+            let geometric = fit.geometricAltitudeFt(fromPressureFt: reportedAltitudeFt)
+            guard abs(geometric - reportedAltitudeFt) <= AltitudeDatumOffset.maxPlausibleOffsetFt
+            else { return reportedAltitudeFt }
+            toEllipsoidFt = geometric - reportedAltitudeFt
         default:
-            // Pressure only, or neither: nothing to convert with.
+            // Neither datum: nothing to convert with.
             return reportedAltitudeFt
         }
         return reportedAltitudeFt + toEllipsoidFt - (geoidSeparationFt ?? 0)
@@ -2172,9 +2203,12 @@ enum AltitudeDatumOffset {
     /// view is enough — which is the difference between a readout that works in this user's
     /// airspace and one that never appeared.
     ///
-    /// Placement still does not use this. Each target carries its own exact pair, which
-    /// `CalculationsLogic.geometricPlacementAltitude` applies with no model at all; this exists
-    /// only for the quantity no target can supply, the viewer's own pressure altitude.
+    /// **Superseded as the estimator by `datumFit` in build 41, and kept for the log column.** The
+    /// pure proportion has no constant term, and the offset has one: `alt_baro` is always
+    /// referenced to 1013.25 hPa, so it carries the sea-level pressure deviation as well as the
+    /// temperature. Forcing that through the origin tilts the slope, which showed as a temperature
+    /// that rose with altitude across the very sample that validated it — 9.04 K at 5,475 ft
+    /// against 10.69 K at 35,500 ft. `datumFit` fits both terms and is 13× closer at cruise.
     static func deltaISAEstimate(
         from aircraft: [Aircraft],
         minAltitudeFt: Double = minContributorAltitudeFt,
@@ -2193,6 +2227,104 @@ enum AltitudeDatumOffset {
         }.sorted()
         guard !deviations.isEmpty else { return nil }
         return (percentile(deviations, 0.50), deviations.count)
+    }
+
+    // MARK: - The two-term fit
+
+    /// Geometric minus pressure altitude as a straight line in height: `offset = slope·H + intercept`.
+    ///
+    /// Both terms are physical. The slope is the temperature deviation — a column warmer than
+    /// standard is less dense, so a given pressure sits higher, by a fraction of the height. The
+    /// intercept is the sea-level pressure deviation, roughly 30 ft per hPa, and it does **not**
+    /// scale with height: `alt_baro` is referenced to 1013.25 hPa whatever the local altimeter
+    /// setting, so every report carries it.
+    struct DatumFit: Equatable {
+        var slope: Double
+        var interceptFt: Double
+        var sampleCount: Int
+
+        /// Geometric minus pressure at a height.
+        func offsetFt(atAltitudeFt altitudeFt: Double) -> Double {
+            slope * altitudeFt + interceptFt
+        }
+
+        /// The temperature half alone, without the pressure constant.
+        ///
+        /// This is what an altimeter set to the local QNH still gets wrong, because setting QNH is
+        /// precisely what removes the constant. Above the transition altitude the altimeter is on
+        /// 29.92 and both terms apply; below it, only this one does.
+        func temperatureOffsetFt(atAltitudeFt altitudeFt: Double) -> Double {
+            slope * altitudeFt
+        }
+
+        /// Geometric altitude of a target that reported only pressure altitude, by inverting the
+        /// fit: `H = (pressure + intercept) / (1 − slope)`.
+        func geometricAltitudeFt(fromPressureFt pressureFt: Double) -> Double {
+            let denominator = 1.0 - slope
+            guard abs(denominator) > 0.5 else { return pressureFt }
+            return (pressureFt + interceptFt) / denominator
+        }
+    }
+
+    /// Fewest contributors, and the least altitude they must span, before a line is worth fitting.
+    /// Two points define a line exactly and so cannot disagree; three can. The span matters more
+    /// than the count — a line through aircraft all at one level says nothing about the slope.
+    static let minFitSamples = 3
+    static let minFitSpanFt: Double = 5_000.0
+
+    /// Plausible bounds on the fitted terms, so a pathological sample cannot move the readout far.
+    /// A slope of 0.10 is roughly ISA +28 K; 1,000 ft of intercept is 33 hPa from standard.
+    static let maxFitSlope: Double = 0.10
+    static let maxFitInterceptFt: Double = 1_000.0
+
+    /// Fit the offset against height across the traffic, robustly.
+    ///
+    /// **Theil–Sen rather than least squares**, because the sample is a handful of aircraft and
+    /// ADS-B carries the occasional nonsense report. On the five contributors that validated the
+    /// previous model, adding one absurd extra (9,000 ft reporting −400 ft) moves the Theil–Sen
+    /// answer by 19 ft at cruise while least squares is visibly dragged. The median of pairwise
+    /// slopes simply ignores it.
+    ///
+    /// Nil when there are too few contributors or too little altitude spread between them, which
+    /// is not a failure: the caller falls back to the proportional model, and with no spread to fit
+    /// through, a line anchored at the origin is the better-conditioned answer.
+    static func datumFit(
+        from aircraft: [Aircraft],
+        minAltitudeFt: Double = minContributorAltitudeFt
+    ) -> DatumFit? {
+        let points: [(h: Double, offset: Double)] = aircraft.compactMap { ac in
+            guard let geometric = ac.geometricAltitudeFt,
+                  let pressure  = ac.pressureAltitudeFt,
+                  geometric >= minAltitudeFt,
+                  abs(geometric - pressure) <= maxPlausibleOffsetFt
+            else { return nil }
+            return (geometric, geometric - pressure)
+        }
+        guard points.count >= minFitSamples else { return nil }
+        guard let lowest = points.map(\.h).min(), let highest = points.map(\.h).max(),
+              highest - lowest >= minFitSpanFt else { return nil }
+
+        // Median of the pairwise slopes, over pairs far enough apart in height that the slope
+        // between them means something. A pair a hundred feet apart divides two noisy offsets by a
+        // tiny denominator and produces a wild slope.
+        var slopes: [Double] = []
+        for i in points.indices {
+            for j in points.index(after: i)..<points.endIndex {
+                let dh = points[j].h - points[i].h
+                guard abs(dh) >= minFitSpanFt / 2 else { continue }
+                slopes.append((points[j].offset - points[i].offset) / dh)
+            }
+        }
+        guard !slopes.isEmpty else { return nil }
+        let slope = percentile(slopes.sorted(), 0.50)
+        guard abs(slope) <= maxFitSlope else { return nil }
+
+        // The intercept that leaves the residuals balanced, which for a median slope is the median
+        // residual rather than the mean.
+        let intercept = percentile(points.map { $0.offset - slope * $0.h }.sorted(), 0.50)
+        guard abs(intercept) <= maxFitInterceptFt else { return nil }
+
+        return DatumFit(slope: slope, interceptFt: intercept, sampleCount: points.count)
     }
 
     private static func estimate(from unsorted: [Double], minSamples: Int) -> Estimate? {

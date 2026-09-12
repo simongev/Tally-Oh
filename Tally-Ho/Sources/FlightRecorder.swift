@@ -79,7 +79,8 @@ final class FlightRecorder {
         "n_airports", "n_airports_rendered",
         "n_targets_press", "n_targets_geom",
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
-        "datum_n", "datum_delta_isa_k", "own_press_alt_ft", "hud_heading_deg"
+        "datum_n", "datum_delta_isa_k", "datum_k", "datum_c_ft",
+        "own_press_alt_ft", "hud_heading_deg"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -273,6 +274,17 @@ final class FlightRecorder {
         /// altitude-banded predecessor was empty in all 191 rows of a flight.
         var datumSampleCount: Int?
         var datumDeltaISAK: Double?
+
+        /// The two-term fit the readout and the pressure-only targets actually use:
+        /// `offset = datumK · H + datumCFt`. The slope is the air mass's temperature deviation, the
+        /// intercept its sea-level pressure deviation at roughly 30 ft per hPa.
+        ///
+        /// Empty when the traffic in view does not span enough altitude to fit a line, in which
+        /// case `datum_delta_isa_k` — the proportional model, build 36's — is what was used
+        /// instead. Both should hold steady across a flight; a wandering `datum_c_ft` means the fit
+        /// is chasing noise rather than the atmosphere.
+        var datumK: Double?
+        var datumCFt: Double?
         var ownPressureAltitudeFt: Double?
 
         /// The heading the HUD rose is showing: ARKit's azimuth plus the applied world-yaw
@@ -450,6 +462,8 @@ final class FlightRecorder {
 
         fields.append(sample.datumSampleCount.map(String.init) ?? "")
         fields.append(format(sample.datumDeltaISAK, decimals: 2))
+        fields.append(format(sample.datumK,  decimals: 5))
+        fields.append(format(sample.datumCFt, decimals: 0))
         fields.append(format(sample.ownPressureAltitudeFt,     decimals: 0))
         fields.append(format(sample.hudHeadingDeg,             decimals: 1))
 

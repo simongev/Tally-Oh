@@ -1051,8 +1051,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var latestDatumOffset: AltitudeDatumOffset.Estimate?
 
     /// How far the air mass is from the standard atmosphere, as the traffic measures it, and how
-    /// many aircraft said so. One number for the whole column, so traffic at any altitude counts.
+    /// many aircraft said so. Kept for the log column and as the fallback when the traffic does not
+    /// span enough altitude to fit a line through.
     private var latestDeltaISA: (kelvin: Double, sampleCount: Int)?
+
+    /// The offset against height as a line — temperature in the slope, sea-level pressure in the
+    /// intercept. Supersedes `latestDeltaISA` as the estimator wherever it is available, and is
+    /// what pressure-only targets are converted with.
+    private var latestDatumFit: AltitudeDatumOffset.DatumFit?
+
+    /// What an altimeter set to the local QNH would read: geometric altitude less the temperature
+    /// term only, because setting QNH is what removes the pressure constant. This is the tape
+    /// below the transition altitude.
+    private var ownshipQNHAltitudeFt: Double?
 
     /// The viewer's own pressure altitude — the flight level an altimeter would read — derived
     /// from GPS altitude and the temperature deviation above.
@@ -2869,7 +2880,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userTrack: state.hasVelocity ? state.trackDeg : userHeading,
                 userGroundSpeed: state.hasVelocity ? state.groundSpeedKt : 0,
                 userVerticalRate: state.verticalRateFpm,
-                geoidSeparationFt: geoidSep
+                geoidSeparationFt: geoidSep,
+                datumFit: latestDatumFit
             )
         } else {
             // Ground mode — clear any active TCAS alert and pass empty evaluation
@@ -2886,7 +2898,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             cameraWorldPosition: cameraPos,
             tcasEvaluation: tcas,
             onGround: !airborne,
-            geoidSeparationFt: geoidSep
+            geoidSeparationFt: geoidSep,
+            datumFit: latestDatumFit
         )
         sceneManager?.updateAirports(
             airports,
@@ -2954,21 +2967,34 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             ownshipPressureAltitudeFt = nil
             return
         }
-        guard let estimate = AltitudeDatumOffset.deltaISAEstimate(from: aircraft) else {
-            latestDeltaISA = nil
-            ownshipPressureAltitudeFt = nil
-            return
-        }
-        latestDeltaISA = estimate
+        // Kept for the log column and for the fallback below.
+        latestDeltaISA = AltitudeDatumOffset.deltaISAEstimate(from: aircraft)
+        // The two-term fit when the traffic spans enough altitude to support one; the proportional
+        // model otherwise, which is what build 36 always did and is better conditioned when there
+        // is no spread to fit a slope through.
+        latestDatumFit = AltitudeDatumOffset.datumFit(from: aircraft)
+
         // MSL on both sides. The geoid separation is a constant of the survey, not of the
-        // atmosphere, so it belongs in neither half of a temperature model — and MSL is what the
-        // tape is being compared against.
+        // atmosphere, so it belongs in neither half of the model — and MSL is what the tape is
+        // being compared against.
         //
         // Taken from the smoothed ownship altitude rather than the raw GPS field, so the tape
         // inherits the same vertical filtering as every other altitude the app shows instead of
         // carrying fix-to-fix noise the rest of the HUD has already had removed.
-        ownshipPressureAltitudeFt = ownAltitudeFt - CalculationsLogic.datumOffsetFt(
-            atAltitudeFt: ownAltitudeFt, deltaISAK: estimate.kelvin)
+        if let fit = latestDatumFit {
+            ownshipPressureAltitudeFt = ownAltitudeFt - fit.offsetFt(atAltitudeFt: ownAltitudeFt)
+            ownshipQNHAltitudeFt = ownAltitudeFt - fit.temperatureOffsetFt(atAltitudeFt: ownAltitudeFt)
+        } else if let estimate = latestDeltaISA {
+            let offset = CalculationsLogic.datumOffsetFt(atAltitudeFt: ownAltitudeFt,
+                                                         deltaISAK: estimate.kelvin)
+            ownshipPressureAltitudeFt = ownAltitudeFt - offset
+            // With no intercept to separate out, the proportional model's whole offset is
+            // temperature by construction, so both readings coincide.
+            ownshipQNHAltitudeFt = ownAltitudeFt - offset
+        } else {
+            ownshipPressureAltitudeFt = nil
+            ownshipQNHAltitudeFt = nil
+        }
     }
 
     /// The raw vertical pairs the estimate above was built from.
@@ -3050,19 +3076,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// read something much closer to MSL.
     private static let transitionAltitudeFt: Double = 18_000
 
-    /// Altitude for the HUD tape: the flight level while the aircraft is in the flight levels,
-    /// and GPS geometric MSL below them.
+    /// Altitude for the HUD tape: what the altimeter in the cockpit is reading.
     ///
-    /// Which is the same rule the altimeter in the cockpit follows, and the reason this is not
-    /// simply "pressure altitude whenever we can compute one". Below the transition altitude a
-    /// standard-datum reading can sit a thousand feet from what the crew sees on a low-QNH day,
-    /// so showing it there would trade one wrong number for another.
+    /// Which is a different quantity above and below the transition altitude, and separating the
+    /// fit's two terms is what lets both be right. Above it every altimeter is set to 29.92 and
+    /// reads pressure altitude, so both terms come off. Below it they are set to the local QNH,
+    /// and setting QNH is *precisely* what removes the pressure constant — so only the temperature
+    /// term is left, and the reading is much closer to true altitude.
+    ///
+    /// Build 36 could not make that distinction: with no intercept to separate, it showed raw GPS
+    /// below the transition altitude, which is off by the temperature term — a few hundred feet at
+    /// 10,000 ft. That the ground readout still came out right is not evidence it was correct; at
+    /// field elevation the temperature term is about a foot.
     private var hudAltitudeFt: Double {
-        guard let pressure = ownshipPressureAltitudeFt,
-              activeAltitude >= ARTrafficViewController.transitionAltitudeFt else {
-            return activeAltitude
+        if activeAltitude >= ARTrafficViewController.transitionAltitudeFt {
+            return ownshipPressureAltitudeFt ?? activeAltitude
         }
-        return pressure
+        return ownshipQNHAltitudeFt ?? activeAltitude
     }
 
     /// Emit one flight-recorder row per second, driven off the existing 4 Hz tick so no
@@ -3171,6 +3201,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // measurements in this row already use.
         sample.datumSampleCount      = latestDeltaISA?.sampleCount
         sample.datumDeltaISAK        = latestDeltaISA?.kelvin
+        sample.datumK                = latestDatumFit?.slope
+        sample.datumCFt              = latestDatumFit?.interceptFt
         sample.ownPressureAltitudeFt = ownshipPressureAltitudeFt
         if worldIsAligned, let raw = sample.arHeadingDeg {
             sample.hudHeadingDeg = CalculationsLogic.normalizedAzimuth(
@@ -3283,7 +3315,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                     targetAlt = CalculationsLogic.geometricPlacementAltitude(
                         for: ac,
                         reportedAltitudeFt: ac.altitude,
-                        geoidSeparationFt: state.hasGeoidSeparation ? state.geoidSeparationFt : nil
+                        geoidSeparationFt: state.hasGeoidSeparation ? state.geoidSeparationFt : nil,
+                        datumFit: latestDatumFit
                     )
                 } else { targetCoord = nil; targetAlt = 0 }
             } else if nodeID.hasPrefix("airport_") {
@@ -3649,8 +3682,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // raw offset median every previous log recorded. The offset is altitude-dependent and
             // the deviation is not, so a large gap between them just means the sample spans
             // altitudes — which is the whole reason the tape stopped using the offset.
-            let isaStr = latestDeltaISA.map {
-                String(format: "ISA%+.1fK n=%d", $0.kelvin, $0.sampleCount)
+            // The fit when there is one, and what it falls back to when there is not. A reader
+            // seeing only ISA knows the traffic had no altitude spread to fit a line through.
+            let isaStr = latestDatumFit.map {
+                String(format: "k=%.4f c=%+.0fft n=%d", $0.slope, $0.interceptFt, $0.sampleCount)
+            } ?? latestDeltaISA.map {
+                String(format: "ISA%+.1fK n=%d (no fit)", $0.kelvin, $0.sampleCount)
             } ?? "— (no traffic reporting both)"
             let allStr = latestDatumOffset.map {
                 String(format: "%+.0f ft n=%d IQR %.0f", $0.medianFt, $0.sampleCount, $0.spreadFt)

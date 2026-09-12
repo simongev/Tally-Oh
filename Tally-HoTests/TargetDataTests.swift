@@ -466,6 +466,166 @@ struct TargetDataTests {
             spreadDeg: 29.8, now: deadline + 0.1, deadline: deadline))
     }
 
+    // MARK: - The two-term datum fit
+
+    /// Traffic spanning a real altitude range, built from a known slope and intercept. The fit has
+    /// to recover both — the whole point is that the constant exists and the proportional model
+    /// had nowhere to put it.
+    @Test func theFitRecoversBothTermsFromTheTraffic() {
+        let k = 0.045, c = -80.0
+        let traffic = [6_000.0, 12_000.0, 20_000.0, 35_000.0].map { h in
+            aircraft(pressureAltitudeFt: h - (k * h + c), geometricAltitudeFt: h)
+        }
+        let fit = AltitudeDatumOffset.datumFit(from: traffic)
+        #expect(fit != nil)
+        if let fit {
+            #expect(abs(fit.slope - k) < 0.002)
+            #expect(abs(fit.interceptFt - c) < 25)
+            #expect(fit.sampleCount == 4)
+        }
+    }
+
+    /// Theil–Sen rather than least squares, because ADS-B carries the occasional nonsense report
+    /// and the sample is a handful of aircraft. One absurd contributor must barely move it.
+    @Test func oneAbsurdContributorBarelyMovesTheFit() {
+        let k = 0.045, c = -80.0
+        var traffic = [6_000.0, 12_000.0, 20_000.0, 35_000.0].map { h in
+            aircraft(pressureAltitudeFt: h - (k * h + c), geometricAltitudeFt: h)
+        }
+        let clean = AltitudeDatumOffset.datumFit(from: traffic)
+        traffic.append(aircraft(pressureAltitudeFt: 9_400, geometricAltitudeFt: 9_000))
+        let dirty = AltitudeDatumOffset.datumFit(from: traffic)
+        #expect(clean != nil && dirty != nil)
+        if let clean, let dirty {
+            let own = 38_450.0
+            let moved = abs(clean.offsetFt(atAltitudeFt: own) - dirty.offsetFt(atAltitudeFt: own))
+            #expect(moved < 60)
+        }
+    }
+
+    /// A line through aircraft all at one level says nothing about the slope, so no fit is
+    /// published and the caller keeps the proportional model — which is build 36's behaviour and
+    /// the better-conditioned answer with no spread to fit through.
+    @Test func tooLittleAltitudeSpreadYieldsNoFit() {
+        let traffic = [35_000.0, 35_500.0, 36_000.0].map { h in
+            aircraft(pressureAltitudeFt: h - 1_500, geometricAltitudeFt: h)
+        }
+        #expect(AltitudeDatumOffset.datumFit(from: traffic) == nil)
+        // The proportional model still answers, so the readout does not go blank.
+        #expect(AltitudeDatumOffset.deltaISAEstimate(from: traffic) != nil)
+    }
+
+    /// Two points define a line exactly and so cannot disagree with each other.
+    @Test func twoContributorsAreNotEnoughToFit() {
+        let traffic = [6_000.0, 35_000.0].map { h in
+            aircraft(pressureAltitudeFt: h - (0.045 * h - 80), geometricAltitudeFt: h)
+        }
+        #expect(AltitudeDatumOffset.datumFit(from: traffic) == nil)
+    }
+
+    /// The inversion the pressure-only targets need: pressure in, geometric out, round tripping
+    /// against the forward direction.
+    @Test func theFitInvertsForPressureOnlyTargets() {
+        let fit = AltitudeDatumOffset.DatumFit(slope: 0.045, interceptFt: -80, sampleCount: 4)
+        let geometric = 35_000.0
+        let pressure = geometric - fit.offsetFt(atAltitudeFt: geometric)
+        #expect(abs(fit.geometricAltitudeFt(fromPressureFt: pressure) - geometric) < 0.5)
+    }
+
+    /// A target reporting pressure altitude only is now lifted into the viewer's datum instead of
+    /// being left ~1,500 ft low. Build 35 had no model to do this with; build 41 does.
+    @Test func aPressureOnlyTargetIsLiftedIntoTheViewersDatum() {
+        let fit = AltitudeDatumOffset.DatumFit(slope: 0.045, interceptFt: -80, sampleCount: 4)
+        let ac = aircraft(altitude: 34_000, pressureAltitudeFt: 34_000, geometricAltitudeFt: nil)
+
+        // Without a fit: unchanged, exactly as before.
+        #expect(CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 34_000, geoidSeparationFt: nil) == 34_000)
+
+        let placed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 34_000, geoidSeparationFt: nil, datumFit: fit)
+        #expect(placed > 35_000)
+        #expect(abs(placed - fit.geometricAltitudeFt(fromPressureFt: 34_000)) < 0.5)
+    }
+
+    /// A target carrying its own pair keeps using it — exact for that aircraft beats any model.
+    @Test func aTargetWithItsOwnPairIgnoresTheFit() {
+        let fit = AltitudeDatumOffset.DatumFit(slope: 0.045, interceptFt: -80, sampleCount: 4)
+        let ac = aircraft(altitude: 34_000, pressureAltitudeFt: 34_000, geometricAltitudeFt: 35_900)
+        let placed = CalculationsLogic.geometricPlacementAltitude(
+            for: ac, reportedAltitudeFt: 34_000, geoidSeparationFt: nil, datumFit: fit)
+        #expect(abs(placed - 35_900) < 0.5)
+    }
+
+    /// A slope or intercept no atmosphere produces is refused outright rather than moving the
+    /// readout, so a pathological sample cannot drag the tape.
+    @Test func animplausibleFitIsRefused() {
+        // Offsets that grow at 0.5 of height: far past any temperature deviation.
+        let traffic = [6_000.0, 20_000.0, 35_000.0].map { h in
+            aircraft(pressureAltitudeFt: h * 0.5, geometricAltitudeFt: h)
+        }
+        #expect(AltitudeDatumOffset.datumFit(from: traffic) == nil)
+    }
+
+    /// The two altimetry regimes. Above the transition altitude both terms come off; below it the
+    /// QNH setting has already removed the constant, so only the temperature term does.
+    @Test func theTwoRegimesDifferByExactlyTheIntercept() {
+        let fit = AltitudeDatumOffset.DatumFit(slope: 0.045, interceptFt: -80, sampleCount: 4)
+        let h = 35_000.0
+        #expect(abs((fit.offsetFt(atAltitudeFt: h) - fit.temperatureOffsetFt(atAltitudeFt: h))
+                    - fit.interceptFt) < 0.001)
+        // And at field elevation the temperature term is about a foot, which is why the ground
+        // readout has always looked right.
+        #expect(abs(fit.temperatureOffsetFt(atAltitudeFt: 30)) < 2)
+    }
+
+    // MARK: - Placement elevation
+
+    /// The defect: anything steeper than 45° was drawn at 45°. AAL1744 at 35,000 ft and 4.5 NM is
+    /// 52° up and was seven degrees low.
+    @Test func steepTrafficIsPlacedAtItsRealElevation() {
+        let own = CLLocationCoordinate2D(latitude: 40.75, longitude: -74.03)
+        // 4.5 NM north, 35,000 ft above.
+        let target = CLLocationCoordinate2D(latitude: 40.75 + 4.5 / 60.0, longitude: -74.03)
+        let raw = CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 35_000,
+            userCoord: own, userAltitude: 0, userHeading: 0)
+        // Through the same rescale the scene applies: Y is already computed against the clamped
+        // radius, so the elevation only reads correctly once the horizontal is clamped to match.
+        let pos = ARComponentFactory.scaledPosition(raw)
+        let horizontal = sqrt(Double(pos.x * pos.x + pos.z * pos.z))
+        let elevation = atan2(Double(pos.y), horizontal) * 180 / .pi
+        #expect(elevation > 50)   // was pinned at 45
+        #expect(abs(elevation - 52) < 2)
+    }
+
+    /// Ordinary shallow traffic is untouched by the change.
+    @Test func shallowTrafficIsUnaffectedByTheRaisedClamp() {
+        let own = CLLocationCoordinate2D(latitude: 40.75, longitude: -74.03)
+        let target = CLLocationCoordinate2D(latitude: 40.75 + 10.0 / 60.0, longitude: -74.03)
+        let raw = CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 36_000,
+            userCoord: own, userAltitude: 35_000, userHeading: 0)
+        let pos = ARComponentFactory.scaledPosition(raw)
+        let horizontal = sqrt(Double(pos.x * pos.x + pos.z * pos.z))
+        let elevation = atan2(Double(pos.y), horizontal) * 180 / .pi
+        #expect(abs(elevation - 0.94) < 0.2)
+    }
+
+    /// Straight overhead still resolves rather than blowing `tan` up.
+    @Test func straightOverheadStaysFinite() {
+        let own = CLLocationCoordinate2D(latitude: 40.75, longitude: -74.03)
+        let target = CLLocationCoordinate2D(latitude: 40.75 + 0.05 / 60.0, longitude: -74.03)
+        let raw = CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 30_000,
+            userCoord: own, userAltitude: 0, userHeading: 0)
+        let pos = ARComponentFactory.scaledPosition(raw)
+        #expect(pos.y.isFinite)
+        let horizontal = sqrt(Double(pos.x * pos.x + pos.z * pos.z))
+        let elevation = atan2(Double(pos.y), horizontal) * 180 / .pi
+        #expect(abs(elevation - 85) < 0.5)
+    }
+
     // MARK: - Depression angle (the airport vertical check)
 
     /// Level with the viewer is on the horizon, whatever the distance.
