@@ -1788,14 +1788,16 @@ struct TargetDataTests {
         var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
         seed.begin(reference: .track)
         feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
-        #expect(seed.finish(at: 0.4) == nil)
+        let finished1 = seed.finish(at: 0.4)
+        #expect(finished1 == nil)
     }
 
     @Test func seedRefusesTooFewSamples() {
         var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
         seed.begin(reference: .track)
         feedSeed(&seed, az: [100, 100, 100], reference: 130.0)
-        #expect(seed.finish(at: 1.6) == nil)
+        let finished1 = seed.finish(at: 1.6)
+        #expect(finished1 == nil)
     }
 
     /// **The build-30 bug, written down.** The real caller polls `finish` after every single sample.
@@ -1823,7 +1825,8 @@ struct TargetDataTests {
         var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
         seed.begin(reference: .track)
         seed.add(arAzimuthDeg: 100, referenceDeg: 130, at: 0)
-        #expect(seed.finish(at: 0.2) == nil)
+        let finished1 = seed.finish(at: 0.2)
+        #expect(finished1 == nil)
         #expect(seed.isCapturing)
         #expect(seed.progress(at: 0.2) < 1.0)
     }
@@ -1848,7 +1851,8 @@ struct TargetDataTests {
         feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
         _ = seed.finish(at: 1.6)
         #expect(!seed.isCapturing)
-        #expect(seed.finish(at: 3.0) == nil)
+        let finished1 = seed.finish(at: 3.0)
+        #expect(finished1 == nil)
     }
 
     /// A world reset cancels any capture in flight; its samples were measured in the old frame.
@@ -1858,14 +1862,16 @@ struct TargetDataTests {
         feedSeed(&seed, az: Array(repeating: 100.0, count: 8), reference: 130.0)
         seed.cancel()
         #expect(!seed.isCapturing)
-        #expect(seed.finish(at: 1.6) == nil)
+        let finished1 = seed.finish(at: 1.6)
+        #expect(finished1 == nil)
     }
 
     @Test func seedIgnoresNonFiniteInputs() {
         var seed = StartupSeed(minSeconds: 1.0, minSamples: 5)
         seed.begin(reference: .track)
         for i in 0..<8 { seed.add(arAzimuthDeg: .nan, referenceDeg: 130, at: Double(i) * 0.2) }
-        #expect(seed.finish(at: 1.6) == nil)
+        let finished1 = seed.finish(at: 1.6)
+        #expect(finished1 == nil)
     }
 
     // MARK: - Align prompt scheduling
@@ -1877,15 +1883,16 @@ struct TargetDataTests {
     /// Fires as soon as the opportunity appears — that is the moment it is worth saying.
     @Test func promptsOnFirstAvailability() {
         var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
-        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 100))
+        let prompted1 = s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 100)
+        #expect(prompted1)
         #expect(s.promptCount == 1)
     }
 
     @Test func doesNotPromptWhileUnavailable() {
         var s = AlignPromptScheduler()
         for i in 0..<100 {
-            #expect(!s.shouldPrompt(available: false, hasOffset: false, capturing: false,
-                                    at: Double(i)))
+            let prompted1 = s.shouldPrompt(available: false, hasOffset: false, capturing: false, at: Double(i))
+            #expect(!prompted1)
         }
         #expect(s.promptCount == 0)
     }
@@ -1900,7 +1907,8 @@ struct TargetDataTests {
                               at: Double(i) * 0.25) { fired += 1 }
         }
         #expect(fired == 1)
-        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 300))
+        let prompted1 = s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 300)
+        #expect(prompted1)
     }
 
     /// After three the user has decided. A fourth is nagging.
@@ -1917,10 +1925,11 @@ struct TargetDataTests {
     /// Once an offset is in force there is nothing left to ask for.
     @Test func promptGoesSilentOnceAligned() {
         var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
-        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 0))
+        let prompted1 = s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 0)
+        #expect(prompted1)
         for i in 1..<20 {
-            #expect(!s.shouldPrompt(available: true, hasOffset: true, capturing: false,
-                                    at: Double(i) * 300))
+            let prompted2 = s.shouldPrompt(available: true, hasOffset: true, capturing: false, at: Double(i) * 300)
+            #expect(!prompted2)
         }
         #expect(s.promptCount == 1)
     }
@@ -1928,7 +1937,8 @@ struct TargetDataTests {
     /// Interrupting a running capture with a banner telling the user to start one would be absurd.
     @Test func promptStaysQuietDuringACapture() {
         var s = AlignPromptScheduler(minIntervalSeconds: 300, maxPrompts: 3)
-        #expect(!s.shouldPrompt(available: true, hasOffset: false, capturing: true, at: 0))
+        let prompted1 = s.shouldPrompt(available: true, hasOffset: false, capturing: true, at: 0)
+        #expect(!prompted1)
         #expect(s.promptCount == 0)
     }
 
@@ -1962,7 +1972,8 @@ struct TargetDataTests {
         #expect(s.promptCount == 3)
         s.reset()
         #expect(s.promptCount == 0)
-        #expect(s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 1000))
+        let prompted1 = s.shouldPrompt(available: true, hasOffset: false, capturing: false, at: 1000)
+        #expect(prompted1)
     }
 
     // MARK: - Track-following offset
@@ -2235,22 +2246,30 @@ struct TargetDataTests {
 
     @Test func aHeldRotationSwitchesAfterTheDwell() {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
-        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)     // starts the clock
-        #expect(follower.update(imageRollDeg: -178, at: 0.2) == nil)     // not yet
-        #expect(follower.update(imageRollDeg: -179, at: 0.6) == .landscapeLeft)
+        let updated1 = follower.update(imageRollDeg: -180, at: 0.0)
+        #expect(updated1 == nil)     // starts the clock
+        let updated2 = follower.update(imageRollDeg: -178, at: 0.2)
+        #expect(updated2 == nil)     // not yet
+        let updated3 = follower.update(imageRollDeg: -179, at: 0.6)
+        #expect(updated3 == .landscapeLeft)
         #expect(follower.current == .landscapeLeft)
         // Settled: no repeat request while it stays there.
-        #expect(follower.update(imageRollDeg: -179, at: 1.2) == nil)
+        let updated4 = follower.update(imageRollDeg: -179, at: 1.2)
+        #expect(updated4 == nil)
     }
 
     /// Turbulence, or a hand passing through landscape on the way somewhere else, must not rotate
     /// the interface.
     @Test func aBriefRotationIsIgnored() {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
-        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
-        #expect(follower.update(imageRollDeg: -90,  at: 0.2) == nil)     // back to portrait
-        #expect(follower.update(imageRollDeg: -180, at: 0.4) == nil)     // clock restarts here
-        #expect(follower.update(imageRollDeg: -180, at: 0.7) == nil)     // 0.3s served, not 0.7
+        let updated1 = follower.update(imageRollDeg: -180, at: 0.0)
+        #expect(updated1 == nil)
+        let updated2 = follower.update(imageRollDeg: -90, at: 0.2)
+        #expect(updated2 == nil)     // back to portrait
+        let updated3 = follower.update(imageRollDeg: -180, at: 0.4)
+        #expect(updated3 == nil)     // clock restarts here
+        let updated4 = follower.update(imageRollDeg: -180, at: 0.7)
+        #expect(updated4 == nil)     // 0.3s served, not 0.7
         #expect(follower.current == .portrait)
     }
 
@@ -2258,7 +2277,8 @@ struct TargetDataTests {
     @Test func anAngledHoldNeverSwitches() {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
         for step in 0..<40 {
-            #expect(follower.update(imageRollDeg: -45, at: Double(step) * 0.2) == nil)
+            let updated1 = follower.update(imageRollDeg: -45, at: Double(step) * 0.2)
+            #expect(updated1 == nil)
         }
         #expect(follower.current == .portrait)
     }
@@ -2268,7 +2288,8 @@ struct TargetDataTests {
     @Test func anUndeclaredOrientationIsHeldNotChased() {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
         for step in 0..<20 {
-            #expect(follower.update(imageRollDeg: 90, at: Double(step) * 0.2) == nil)
+            let updated1 = follower.update(imageRollDeg: 90, at: Double(step) * 0.2)
+            #expect(updated1 == nil)
         }
         #expect(follower.current == .portrait)
     }
@@ -2277,12 +2298,17 @@ struct TargetDataTests {
     /// phone laid down and picked up differently does not switch on stale evidence.
     @Test func goingFlatRestartsTheDwell() {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
-        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
-        #expect(follower.update(imageRollDeg: nil,  at: 0.2) == nil)     // laid flat
-        #expect(follower.update(imageRollDeg: -180, at: 0.4) == nil)     // clock restarts
-        #expect(follower.update(imageRollDeg: -180, at: 0.7) == nil)
+        let updated1 = follower.update(imageRollDeg: -180, at: 0.0)
+        #expect(updated1 == nil)
+        let updated2 = follower.update(imageRollDeg: nil, at: 0.2)
+        #expect(updated2 == nil)     // laid flat
+        let updated3 = follower.update(imageRollDeg: -180, at: 0.4)
+        #expect(updated3 == nil)     // clock restarts
+        let updated4 = follower.update(imageRollDeg: -180, at: 0.7)
+        #expect(updated4 == nil)
         #expect(follower.current == .portrait)
-        #expect(follower.update(imageRollDeg: -180, at: 0.95) == .landscapeLeft)
+        let updated5 = follower.update(imageRollDeg: -180, at: 0.95)
+        #expect(updated5 == .landscapeLeft)
     }
 
     /// iOS rotating the interface on its own (rotation lock off) must be adopted, not fought.
@@ -2291,8 +2317,10 @@ struct TargetDataTests {
         follower.sync(to: .landscapeLeft)
         #expect(follower.current == .landscapeLeft)
         // Already there, so no request is issued for the same orientation.
-        #expect(follower.update(imageRollDeg: -180, at: 0.0) == nil)
-        #expect(follower.update(imageRollDeg: -180, at: 1.0) == nil)
+        let updated1 = follower.update(imageRollDeg: -180, at: 0.0)
+        #expect(updated1 == nil)
+        let updated2 = follower.update(imageRollDeg: -180, at: 1.0)
+        #expect(updated2 == nil)
     }
 
     /// The values a phone lying still in portrait actually produced on the device, from the
@@ -2304,7 +2332,8 @@ struct TargetDataTests {
         }
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0.5)
         for (i, roll) in [-91.4, -94.8, -96.0, -100.5, -93.3].enumerated() {
-            #expect(follower.update(imageRollDeg: roll, at: Double(i)) == nil)
+            let updated1 = follower.update(imageRollDeg: roll, at: Double(i))
+            #expect(updated1 == nil)
         }
         #expect(follower.current == .portrait)
         #expect(follower.isFollowing)
@@ -2337,12 +2366,15 @@ struct TargetDataTests {
         var follower = ScreenOrientationFollower(current: .portrait, dwellSeconds: 0,
                                                  maxChangesInWindow: 1, changeWindowSeconds: 20)
         _ = follower.update(imageRollDeg: -180, at: 0.0)
-        #expect(follower.update(imageRollDeg: -180, at: 0.1) == .landscapeLeft)   // 1st change, allowed
+        let updated1 = follower.update(imageRollDeg: -180, at: 0.1)
+        #expect(updated1 == .landscapeLeft)   // 1st change, allowed
         _ = follower.update(imageRollDeg: -90, at: 1.0)
-        #expect(follower.update(imageRollDeg: -90, at: 1.1) == nil)               // 2nd, refused
+        let updated2 = follower.update(imageRollDeg: -90, at: 1.1)
+        #expect(updated2 == nil)               // 2nd, refused
         #expect(!follower.isFollowing)
         for step in 0..<20 {
-            #expect(follower.update(imageRollDeg: -90, at: 100 + Double(step)) == nil)
+            let updated3 = follower.update(imageRollDeg: -90, at: 100 + Double(step))
+            #expect(updated3 == nil)
         }
     }
 
