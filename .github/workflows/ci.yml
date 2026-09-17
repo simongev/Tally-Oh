@@ -41,7 +41,12 @@ jobs:
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Report failure
+        if: failure()
+        run: .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Upload test results
         if: failure()

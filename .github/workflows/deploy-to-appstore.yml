@@ -35,7 +35,12 @@ jobs:
             -scheme "Tally-Ho" \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Report test failure
+        if: failure()
+        run: .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Set up App Store Connect API key
         env:
