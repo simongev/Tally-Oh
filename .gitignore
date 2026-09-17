@@ -1,2 +1,17 @@
 .claude/worktrees/
 .DS_Store
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserdatad
+*.xcuserdatastate
+
+# Build output
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+
+# Secrets: any gitignored config lives here. Never commit a real key,
+# and never invent a placeholder one -- ask Gev instead.
+Secrets.xcconfig
