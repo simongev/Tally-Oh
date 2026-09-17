@@ -1194,6 +1194,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Whether the startup card is up. Cleared when the seed publishes, which is also when the card
     /// has done its job.
     private var awaitingSeedConfirmation = false
+    /// Render clock at which the airborne card went up, or `.nan` while it is down. The airborne
+    /// capture may not close until `AirborneSeedAim.dwellSeconds` after this — see
+    /// `updateStartupSeed`.
+    private var seedConfirmationShownAt: TimeInterval = .nan
+    /// What the seed currently in force was measured against, or nil if no seed holds the world.
+    /// Only meaningful while `worldYawSource == .seed`; an anchor or a ground correction replaces
+    /// the offset outright.
+    private var seedReferenceKind: StartupSeed.Reference?
+
+    /// Whether the world's alignment is an unverified assumption rather than a measurement.
+    ///
+    /// True for exactly one case: a seed taken against the GPS track. That seed assumes the phone
+    /// pointed along the nose, which nothing in the app can check — see `AirborneSeedAim`. A ground
+    /// seed is compass-referenced and the compass genuinely measures the phone there; an anchor is
+    /// a deliberate aim the user just performed; a ground correction is a rolling median across
+    /// many headings. Those three are measurements. This one is a guess, so the align button keeps
+    /// asking until somebody replaces it.
+    private var alignmentIsUnverified: Bool {
+        worldYawSource == .seed && seedReferenceKind == .track
+    }
     /// Render-thread throttle for feeding the capture: 5 Hz, as for the manual anchor, because hand
     /// wobble is correlated over about a second.
     private var lastSeedSampleTime: TimeInterval = 0
@@ -1222,6 +1242,30 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// bias walks it — but `ar_heading_deg` minus this one is the world's own rotation, free of
     /// whatever the user did with the phone.
     private var gyroAzimuthDeg: Double = .nan
+
+    // MARK: - Nose probe (instrumentation only — see NoseProbeAccumulator)
+
+    /// m/s² per G, for turning CoreMotion's G-unit accelerations into velocity.
+    private static let standardGravityMPS2: Double = 9.80665
+    /// How much flight each `nose_probe` line covers. Ten seconds at the 0.096 m/s² measured in
+    /// log 355d4e73 is ~1 m/s of signal — small, which is the point of measuring before building.
+    private static let noseProbeWindowSeconds: TimeInterval = 10.0
+
+    private var noseProbe = NoseProbeAccumulator()
+    /// Guards `noseProbe`: written on CoreMotion's queue at 20 Hz, drained on the 4 Hz tick.
+    private let noseProbeLock = NSLock()
+    private var lastNoseProbeMotionTime: TimeInterval = 0
+    private var noseProbeWindowStart: TimeInterval = 0
+    private var noseProbeStartSpeedKt: Double = .nan
+    private var noseProbeStartTrackDeg: Double = .nan
+    /// Device yaw in CoreMotion's reference frame, and ARKit's azimuth for the same phone. Logged
+    /// as a pair so the offline fit can tie the two frames together itself.
+    ///
+    /// The two are sampled on their own clocks — 20 Hz on the motion queue, 60 Hz on the render
+    /// thread — so a pair can be up to ~50 ms of hand movement apart, about 1.5° at a brisk pan.
+    /// Noise on a question about tens of degrees, but the analysis should know it is there.
+    private var latestAttitudeYawDeg: Double = .nan
+    private var arAzimuthForNoseProbe: Double = .nan
 
     /// Whether the OS suspended the ARSession since the last start. Set when the app backgrounds and
     /// consumed by the next `startARSession`, which withdraws the offset — a resumed session reports
@@ -1350,7 +1394,106 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let gravity = motion.gravity
             let aboutVertical = rate.x * gravity.x + rate.y * gravity.y + rate.z * gravity.z
             self.verticalYawRateDps = aboutVertical * 180.0 / Double.pi
+            self.accumulateNoseProbe(motion)
         }
+    }
+
+    /// Feed one device-motion sample to the nose probe. Background queue; see NoseProbeAccumulator
+    /// for what this is for and why nothing reads its result yet.
+    ///
+    /// `startDeviceMotionUpdates(to:)` with no reference frame gives `.xArbitraryZVertical`, so the
+    /// attitude's rotation matrix maps the device frame onto a frame with Z along true vertical and
+    /// X at a fixed-but-arbitrary azimuth. Rotating `userAcceleration` by it therefore yields a
+    /// horizontal (X, Y) whose direction is stable across the whole session, which is all the
+    /// integration needs; tying that azimuth to ARKit's is left to the log and the offline fit.
+    private func accumulateNoseProbe(_ motion: CMDeviceMotion) {
+        let dt = lastNoseProbeMotionTime > 0 ? motion.timestamp - lastNoseProbeMotionTime : 0
+        lastNoseProbeMotionTime = motion.timestamp
+        guard dt > 0 else { return }
+
+        let a = motion.userAcceleration
+        let m = motion.attitude.rotationMatrix
+        // Device → reference frame. Only the horizontal components are kept: the vertical one is
+        // climb and turbulence, neither of which says anything about where the nose points.
+        let refX = m.m11 * a.x + m.m12 * a.y + m.m13 * a.z
+        let refY = m.m21 * a.x + m.m22 * a.y + m.m23 * a.z
+
+        noseProbeLock.lock()
+        noseProbe.add(axMPS2: refX * ARTrafficViewController.standardGravityMPS2,
+                      ayMPS2: refY * ARTrafficViewController.standardGravityMPS2,
+                      dt: dt)
+        noseProbeLock.unlock()
+
+        // One concurrent (attitude yaw, ARKit azimuth) pair per window, sampled here where the
+        // attitude is live. `arAzimuthForNoseProbe` is written by the render thread.
+        latestAttitudeYawDeg = motion.attitude.yaw * 180.0 / Double.pi
+    }
+
+    /// Emit a `nose_probe` line and start the next window. Called from the 4 Hz tick.
+    private func updateNoseProbe() {
+        guard isAirborneEstimate, lastGPSSpeedKt > 0 else {
+            // On the ground the whole question is moot — the compass measures the phone there — and
+            // a window spanning the transition would integrate taxi acceleration into a flight
+            // answer. Dropped rather than carried.
+            noseProbeWindowStart = CACurrentMediaTime()
+            noseProbeStartSpeedKt = .nan
+            noseProbeLock.lock(); noseProbe.reset(); noseProbeLock.unlock()
+            return
+        }
+
+        if noseProbeStartSpeedKt.isNaN {
+            noseProbeWindowStart = CACurrentMediaTime()
+            noseProbeStartSpeedKt = lastGPSSpeedKt
+            noseProbeStartTrackDeg = lastGPSCourseDeg
+            noseProbeLock.lock(); noseProbe.reset(); noseProbeLock.unlock()
+            return
+        }
+
+        let elapsed = CACurrentMediaTime() - noseProbeWindowStart
+        guard elapsed >= ARTrafficViewController.noseProbeWindowSeconds else { return }
+
+        noseProbeLock.lock()
+        let probe = noseProbe
+        noseProbe.reset()
+        noseProbeLock.unlock()
+
+        // The truth the probe is being measured against: the aircraft's own velocity change over
+        // the same window, straight from GPS.
+        let v0 = velocityComponents(speedKt: noseProbeStartSpeedKt, trackDeg: noseProbeStartTrackDeg)
+        let v1 = velocityComponents(speedKt: lastGPSSpeedKt, trackDeg: lastGPSCourseDeg)
+        let trueDVNorth = v1.north - v0.north
+        let trueDVEast = v1.east - v0.east
+        let trueDVMag = (trueDVNorth * trueDVNorth + trueDVEast * trueDVEast).squareRoot()
+        let trueDVAz = trueDVMag > 0.1
+            ? CalculationsLogic.normalizedAzimuth(atan2(trueDVEast, trueDVNorth) * 180.0 / .pi)
+            : Double.nan
+
+        FlightRecorder.shared.record(
+            event: "nose_probe",
+            detail: String(
+                format: "secs=%.1f n=%d dvx=%.2f dvy=%.2f dv_mag=%.2f dv_az_ref=%.1f "
+                    + "att_yaw=%.1f ar_az=%.1f true_dv=%.2f true_dv_az=%.1f "
+                    + "gs0=%.0f gs1=%.0f trk0=%.0f trk1=%.0f applied=%.1f src=%@",
+                probe.seconds, probe.sampleCount, probe.deltaVX, probe.deltaVY,
+                probe.deltaVMagnitude, probe.deltaVAzimuthDeg ?? Double.nan,
+                latestAttitudeYawDeg, arAzimuthForNoseProbe,
+                trueDVMag, trueDVAz,
+                noseProbeStartSpeedKt, lastGPSSpeedKt,
+                noseProbeStartTrackDeg, lastGPSCourseDeg,
+                worldYawSource == .none ? Double.nan : appliedWorldYawOffsetDeg,
+                worldYawSource.rawValue)
+        )
+
+        noseProbeWindowStart = CACurrentMediaTime()
+        noseProbeStartSpeedKt = lastGPSSpeedKt
+        noseProbeStartTrackDeg = lastGPSCourseDeg
+    }
+
+    /// Ground-speed vector in m/s, North-East.
+    private func velocityComponents(speedKt: Double, trackDeg: Double) -> (north: Double, east: Double) {
+        let ms = speedKt * CalculationsLogic.knotsToMetersPerSecond
+        let rad = trackDeg * .pi / 180.0
+        return (ms * cos(rad), ms * sin(rad))
     }
 
     /// Human-readable CoreMotion authorisation state, for the log and the info panel.
@@ -2232,6 +2375,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // already aligned by ARKit, so there is nothing to capture and no watchdog to trip.
         awaitingSeed = shouldSeedThisWorld
         awaitingSeedConfirmation = false
+        seedConfirmationShownAt = .nan
+        seedReferenceKind = nil
         startupSeed.cancel()
         seedIsResampling = false
         bestSeedSpreadDeg = nil
@@ -2833,6 +2978,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         // Establish the world's alignment, if this world has not got one yet.
         updateStartupSeed()
+
+        // Instrumentation only — records whether the nose could be found without asking. Nothing
+        // below reads its output. See NoseProbeAccumulator.
+        updateNoseProbe()
 
         // Carry the offset through the aircraft's heading change. Ahead of the placement below so
         // this tick's markers are drawn with the offset this tick's heading calls for.
@@ -3859,6 +4008,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard sqrt(forward.x * forward.x + forward.z * forward.z) > 0.2 else { return }
 
         let rawAzimuthDeg = Double(atan2(forward.x, -forward.z)) * 180.0 / Double.pi
+        // Paired with `latestAttitudeYawDeg` in the nose probe's log line: the same phone, read in
+        // both frames, is what lets the offline fit relate them.
+        arAzimuthForNoseProbe = rawAzimuthDeg
 
         // The compass gate applies only to the compass-derived values. frame_lock compares ARKit
         // against GPS ground track and never touches the compass, so gating it on compass health
@@ -4019,12 +4171,36 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
     /// How long a `.gravity` world may go without a usable reference before the app gives up and
     /// falls back to letting ARKit align from the compass.
-    private static let seedReferenceTimeoutSeconds: TimeInterval = 10.0
+    ///
+    /// Sixteen seconds, not ten, since build 42: the airborne path now waits
+    /// `AirborneSeedAim.dwellSeconds` for the card to be obeyed before the one-second capture may
+    /// even begin, and tracking has to reach `.normal` before that. Ten left the watchdog racing
+    /// the dwell it was supposed to be protecting, and the watchdog's failure path hands alignment
+    /// back to `.gravityAndHeading` — the thing that dragged a world 24.8°.
+    private static let seedReferenceTimeoutSeconds: TimeInterval = 16.0
 
     /// Which direction the phone is being asked to be pointing at, or nil if neither reference is
     /// usable yet. Read from the visualisation tick, where all of this is live.
-    /// Which direction the phone is being asked to be pointing at, or nil if neither reference is
-    /// usable yet.
+    ///
+    /// **Airborne there is no compass branch and there can never be one.** `CLHeading` in a cabin
+    /// is not a magnetometer reading at all — it is the GPS course handed back as a heading. Two
+    /// flights on 2026-09-15 measured it directly:
+    ///
+    ///     log        phone yaw swept   d(hdg_mag)/d(cam_yaw)   r        hdg_mag − (track − decl)
+    ///     355d4e73   263°              −0.011                  −0.181   median +0.04°, p90 +0.34°
+    ///     a3926a16   143°              −0.002                  −0.025   median +0.04°, p90 +0.34°
+    ///
+    /// Zero response to the phone turning, and agreement with the *track* to four hundredths of a
+    /// degree. A magnetometer reading the airframe's own field would give the airframe's heading,
+    /// which differs from its track by the drift angle — several degrees in any wind — so matching
+    /// the track this precisely is not something a magnetic measurement can do. It also explains
+    /// `hdg_acc_deg` reading exactly 10.0 in 34 of 35 logs: a placeholder accuracy for a synthetic
+    /// value.
+    ///
+    /// So in the air the compass carries *zero* information about where the phone points, and any
+    /// scheme that reads it is using the track twice. `compass_response` and `world_yaw_corr_deg`
+    /// are vacuous airborne for the same reason — the same shape as the HUD-versus-iOS-Compass
+    /// test, which reduced to comparing the compass with itself.
     ///
     /// The compass branch is back in build 33, having been removed in build 32 as a poor *absolute*
     /// reference. It still is one — a one-second snapshot at a single heading carries the
@@ -4094,6 +4270,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // measures the phone, so the seed needs no aiming and says nothing.
             showAlignBanner("Hold the phone facing the direction of flight", clearAfter: 12.0)
             awaitingSeedConfirmation = true
+            seedConfirmationShownAt = CACurrentMediaTime()
         }
 
         guard worldIsUsableForDisplay(arTrackingState) else { return }
@@ -4101,6 +4278,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // No reference yet — GPS or the compass will deliver one shortly, and the deadline above
         // covers the case where neither ever does.
         guard let reference = seedReference else { return }
+
+        // The card has to have been readable, not merely shown. Build 39 put it up and let the
+        // capture close 1.1 s later, which measured where the phone already was rather than where
+        // the card had just asked the user to put it — 41.3° of error in log 355d4e73. See
+        // AirborneSeedAim.
+        guard AirborneSeedAim.mayBeginCapture(isAirborneReference: reference.kind == .track,
+                                              cardShownAt: seedConfirmationShownAt,
+                                              now: CACurrentMediaTime())
+        else { return }
 
         startupSeed.begin(reference: reference.kind)
         lastSeedSampleTime = 0
@@ -4178,17 +4364,36 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // wait for the next tracking-state transition, which on a steady session may never come.
         applyWorldUsabilityFade()
 
+        seedReferenceKind = estimate.referenceKind
+
         if awaitingSeedConfirmation {
             awaitingSeedConfirmation = false
-            showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
+            // Not "aligned". An airborne seed is an assumption the app cannot check: it takes the
+            // GPS track for the nose and the phone's aim for zero, and in log 355d4e73 the second
+            // half of that was 41.3° wrong while every gate read clean. Saying "aligned" told the
+            // user a guess had been verified, which is how a 41° error goes unnoticed for a whole
+            // session — log a3926a16 never had the align button pressed at all.
+            showAlignBanner("Traffic placed — tap ➤ if it looks off", clearAfter: 3.0)
         }
         FlightRecorder.shared.record(
             event: "seed_captured",
-            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f resample=%d",
+            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f resample=%d dwell=%.1f",
                            estimate.offsetDeg, estimate.referenceKind.rawValue, reference.degrees,
                            estimate.sampleCount, estimate.seconds, estimate.azimuthSpreadDeg,
-                           seedGyroReferenceDeg, wasResample ? 1 : 0)
+                           seedGyroReferenceDeg, wasResample ? 1 : 0,
+                           seedConfirmationShownAt.isFinite
+                               ? CACurrentMediaTime() - seedConfirmationShownAt : Double.nan)
         )
+        // Distinguishes "seeded and never checked" from "seeded, then confirmed by an anchor" in
+        // the log. Log a3926a16 is the first case and is silent about it; `anchor_disagrees` only
+        // ever fires for flights where somebody pressed the button.
+        if alignmentIsUnverified {
+            FlightRecorder.shared.record(
+                event: "seed_unconfirmed",
+                detail: String(format: "offset=%.1f az_spread=%.1f track=%.0f",
+                               estimate.offsetDeg, estimate.azimuthSpreadDeg, reference.degrees)
+            )
+        }
 
         armSeedResampleIfWorthwhile(spreadDeg: estimate.azimuthSpreadDeg,
                                     reference: reference, at: time)
@@ -4503,12 +4708,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let shouldShow = canCaptureFlightAnchor || anchorCaptureActive
         if alignButton.isHidden == shouldShow { alignButton.isHidden = !shouldShow }
 
-        let unaligned = shouldShow && worldYawSource == .none && !anchorCaptureActive
+        // An unverified airborne seed counts as unaligned here. It puts traffic *somewhere*, which
+        // is why it is applied at all, but it has not been checked and in the one flight where it
+        // was checked it was 41.3° out. A quiet button says the job is done; this one is not.
+        let unaligned = shouldShow && (worldYawSource == .none || alignmentIsUnverified)
+            && !anchorCaptureActive
         setAlignButtonPulsing(unaligned)
 
         let now = CACurrentMediaTime()
         guard alignPrompts.shouldPrompt(available: canCaptureFlightAnchor,
-                                        hasOffset: worldYawSource != .none,
+                                        hasOffset: worldYawSource != .none && !alignmentIsUnverified,
                                         capturing: anchorCaptureActive,
                                         at: now)
         else { return }

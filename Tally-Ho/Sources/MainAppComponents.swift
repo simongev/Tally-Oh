@@ -1061,7 +1061,14 @@ class ARSceneManager {
             // altitude is unknown carries a placeholder zero, which at cruise would read as
             // 35,000 ft of separation and cull it — hiding traffic precisely because the
             // source said nothing about its altitude, rather than because it is far away.
-            if !onGround, ac.hasValidAltitude, abs(targetAlt - userAltitude) > 10_000 { continue }
+            //
+            // Never applied inside `alwaysShowWithinNM`. Traffic two miles away is traffic to look
+            // for out of the window whatever its level, and the standing rule for this app is that
+            // close traffic is always drawn. The cull is about relevance at range, and at 2 NM
+            // there is no range for it to be about.
+            if !onGround, ac.hasValidAltitude,
+               distNM > CalculationsLogic.alwaysShowWithinNM,
+               abs(targetAlt - userAltitude) > 10_000 { continue }
             let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)

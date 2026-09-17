@@ -43,6 +43,13 @@ class CalculationsLogic {
     static let nauticalMileToMeters: Double = 1852.0
     static let knotsToMetersPerSecond: Double = 0.514444
 
+    /// Traffic inside this range is drawn whatever else would have filtered it.
+    ///
+    /// The relevance filters — the ±10,000 ft separation cull in particular — are about traffic at
+    /// range. Two miles is close enough that the reason for the filter has stopped applying, and
+    /// close traffic being visible is the point of the app.
+    static let alwaysShowWithinNM: Double = 2.0
+
     // MARK: - Atmosphere
 
     /// Standard sea-level pressure of the ISA atmosphere, in hectopascals (29.92 inHg).
@@ -1263,6 +1270,124 @@ enum SeedResamplePolicy {
     }
 }
 
+/// How long the airborne startup card must have been up before a seed may close.
+///
+/// **The gates measure steadiness; the error is aim, and they are orthogonal.**
+///
+/// Airborne there is exactly one reference — the GPS ground track — and using it requires the phone
+/// to be pointed along the nose, which the app asks for on a card and cannot verify. Every existing
+/// gate (`SeedResamplePolicy.spreadGateDeg`, the resample window, the best-wins rule) measures how
+/// *still* the hold was. A phone held rock steady 43° off the nose scores `az_spread=1.0` and sails
+/// through all of them carrying 43° of pure error.
+///
+/// Measured, in log `355d4e73` (2026-09-15, climbing through FL235):
+///
+///     t=1.74  align card up
+///     t=2.86  seed_captured    offset=-60.1  az_spread=1.0   <- 1.1 s after the card
+///     t=56.4  anchor_captured  offset=-18.2  az_spread=3.2
+///     t=56.4  anchor_disagrees captured=-18.2 predicted=-59.4 delta=41.3
+///
+/// The user confirms the traffic looked right immediately after that 41° shift, so the anchor is
+/// ground truth and the seed was simply wrong. Nobody aims a phone in 1.1 s; the passenger was
+/// looking out of a side window, about 43° off the nose, exactly as the card had not yet asked.
+///
+/// The same log seeded twice, at −60.1 and −59.4, and their agreement proves nothing: both captures
+/// shared the same unverified assumption. Agreement between two guesses is not a measurement.
+///
+/// Four seconds is the whole remedy: long enough to read six words and turn a wrist, short enough
+/// that "lift the phone and see the traffic" still describes the app.
+enum AirborneSeedAim {
+
+    /// How long the card must have been readable before the airborne capture may begin.
+    static let dwellSeconds: TimeInterval = 4.0
+
+    /// Whether a capture may start now.
+    ///
+    /// Only the airborne reference is delayed. On the ground the compass genuinely measures the
+    /// phone, so the seed needs no aiming and shows no card — and `shownAt` is `.nan` there, which
+    /// this reads as "nothing to wait for" rather than as a wait that never ends.
+    ///
+    /// - `isAirborneReference`: the seed is being taken against the GPS track rather than the compass.
+    /// - `cardShownAt`: render clock at which the card went up, or `.nan` if it is not up.
+    static func mayBeginCapture(
+        isAirborneReference: Bool,
+        cardShownAt: TimeInterval,
+        now: TimeInterval
+    ) -> Bool {
+        guard isAirborneReference else { return true }
+        // The card is the thing being waited on. If it never went up there is nothing to wait for,
+        // and blocking here would strand the world with no alignment at all.
+        guard cardShownAt.isFinite else { return true }
+        return now - cardShownAt >= dwellSeconds
+    }
+}
+
+/// Accumulates the aircraft's own horizontal acceleration, to find out whether the nose can be
+/// located without asking the user.
+///
+/// **This measures; it decides nothing.** Nothing in the app reads its output — it exists to put
+/// the raw ingredients in the flight log so the question can be settled offline before any code
+/// depends on the answer. That order is deliberate: two north corrections were once shipped and
+/// reverted on impressions, which is why the recorder exists at all.
+///
+/// **The idea.** An aircraft accelerates along its own axis. Express the direction of its velocity
+/// change in the ARKit frame and that direction *is* the nose, with no user aim and no compass —
+/// the two things a cabin does not provide. ARKit itself cannot see the motion: the cabin is the
+/// phone's whole visual world, so VIO reports a stationary phone and absorbs the acceleration as
+/// sensor bias. CoreMotion's `userAcceleration` is not fused with vision and does see it.
+///
+/// **Whether the signal is big enough is an open question.** Log `355d4e73` climbed 402.4 → 416.4 kt
+/// over 75 s: 0.096 m/s², which is real but the same order as MEMS bias. Log `a3926a16` managed
+/// 466.9 → 470.1 kt over 142 s and is hopeless. So the honest expectation is that this works during
+/// climb and acceleration and not in steady cruise, and the log will say how well.
+///
+/// Accumulation happens in CoreMotion's own `.xArbitraryZVertical` reference frame, whose azimuth
+/// origin is arbitrary but *consistent*. The tie to the ARKit frame is logged as concurrent
+/// (ARKit azimuth, attitude yaw) pairs rather than being applied here, so no sign convention is
+/// baked in before the data has had a chance to contradict it.
+struct NoseProbeAccumulator {
+
+    /// Integrated horizontal velocity change in the reference frame, m/s.
+    private(set) var deltaVX: Double = 0
+    private(set) var deltaVY: Double = 0
+    private(set) var sampleCount: Int = 0
+    private(set) var seconds: TimeInterval = 0
+
+    /// One device-motion sample, already rotated into the Z-vertical reference frame.
+    ///
+    /// Samples arrive at 20 Hz, so `dt` is ~0.05 s. A gap — the app backgrounded, the queue
+    /// starved — would integrate one acceleration across dead time it never measured, so anything
+    /// longer than a few sample intervals is dropped rather than trusted.
+    mutating func add(axMPS2: Double, ayMPS2: Double, dt: TimeInterval) {
+        guard dt > 0, dt <= 0.5,
+              axMPS2.isFinite, ayMPS2.isFinite else { return }
+        deltaVX += axMPS2 * dt
+        deltaVY += ayMPS2 * dt
+        seconds += dt
+        sampleCount += 1
+    }
+
+    /// Azimuth of the accumulated velocity change in the reference frame, or nil if nothing
+    /// meaningful accumulated. Degrees, `atan2(y, x)` convention — the offline fit resolves how
+    /// this maps onto the ARKit frame.
+    var deltaVAzimuthDeg: Double? {
+        let magnitude = (deltaVX * deltaVX + deltaVY * deltaVY).squareRoot()
+        guard magnitude > 0.1 else { return nil }
+        return atan2(deltaVY, deltaVX) * 180.0 / .pi
+    }
+
+    var deltaVMagnitude: Double {
+        (deltaVX * deltaVX + deltaVY * deltaVY).squareRoot()
+    }
+
+    mutating func reset() {
+        deltaVX = 0
+        deltaVY = 0
+        sampleCount = 0
+        seconds = 0
+    }
+}
+
 /// When to offer the compass calibration screen.
 ///
 /// **Why this needed writing at all.** Every alignment path on the ground rests on the
@@ -2269,6 +2394,18 @@ enum AltitudeDatumOffset {
     /// Fewest contributors, and the least altitude they must span, before a line is worth fitting.
     /// Two points define a line exactly and so cannot disagree; three can. The span matters more
     /// than the count — a line through aircraft all at one level says nothing about the slope.
+    ///
+    /// Both flights of 2026-09-15 clear these comfortably, refitting their `datum_sample` lines:
+    ///
+    ///     log        contributors  span       k         c        worst residual
+    ///     355d4e73   6             12,100 ft  +0.0683   −107 ft   90 ft
+    ///     a3926a16   5             17,175 ft  +0.0655    −76 ft   50 ft
+    ///
+    /// `c` lands near the −72 ft measured on the flight before, which is the term's second
+    /// independent confirmation. Worth knowing for calibration: on these two the two-term fit and
+    /// the proportional model it replaced agreed on ownship pressure altitude to +16 ft and +19 ft.
+    /// The fit earns its place by not *needing* well-spread contributors, not by beating the old
+    /// model when they happen to be well spread.
     static let minFitSamples = 3
     static let minFitSpanFt: Double = 5_000.0
 

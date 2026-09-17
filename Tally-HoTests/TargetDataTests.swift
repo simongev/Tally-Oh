@@ -2415,4 +2415,77 @@ struct TargetDataTests {
         #expect(changes == 8)
         #expect(follower.isFollowing)
     }
+
+    // MARK: - Airborne seed aim (build 42)
+
+    /// The defect this exists for: in log 355d4e73 the card went up at t=1.74 and the capture
+    /// closed at t=2.86, so the seed measured where the phone already was rather than where the
+    /// card had just asked for it. The anchor 53 s later read 41.3 degrees away.
+    @Test func anAirborneSeedWaitsForTheCardToBeReadable() {
+        let shown = 100.0
+        #expect(!AirborneSeedAim.mayBeginCapture(
+            isAirborneReference: true, cardShownAt: shown, now: shown + 1.1))
+        #expect(AirborneSeedAim.mayBeginCapture(
+            isAirborneReference: true, cardShownAt: shown,
+            now: shown + AirborneSeedAim.dwellSeconds))
+    }
+
+    /// On the ground the compass genuinely measures the phone, so there is nothing to aim and no
+    /// card. Delaying there would only leave a .gravity world pointing nowhere for four seconds.
+    @Test func aGroundSeedIsNotDelayed() {
+        #expect(AirborneSeedAim.mayBeginCapture(
+            isAirborneReference: false, cardShownAt: Double.nan, now: 100))
+    }
+
+    /// If the card never went up there is nothing to wait for. Blocking on a timestamp that will
+    /// never be set would strand the world with no alignment at all, which is the one outcome
+    /// worse than a loose seed.
+    @Test func aMissingCardDoesNotBlockTheSeedForever() {
+        #expect(AirborneSeedAim.mayBeginCapture(
+            isAirborneReference: true, cardShownAt: Double.nan, now: 100))
+    }
+
+    // MARK: - Nose probe (build 42)
+
+    /// Integration is just acceleration times time, and the direction of the result is the whole
+    /// point: 0.096 m/s squared north for 75 s is the 14 kt the aircraft actually gained in log
+    /// 355d4e73, pointing where the nose pointed.
+    @Test func theProbeIntegratesAccelerationIntoAVelocityChange() {
+        var probe = NoseProbeAccumulator()
+        for _ in 0..<1500 { probe.add(axMPS2: 0.096, ayMPS2: 0, dt: 0.05) }
+        #expect(abs(probe.deltaVX - 7.2) < 0.01)
+        #expect(probe.sampleCount == 1500)
+        #expect(abs(probe.seconds - 75.0) < 0.01)
+        // atan2(0, +x) is zero: straight along the reference frame's X axis.
+        #expect(abs(probe.deltaVAzimuthDeg ?? .nan) < 0.001)
+    }
+
+    /// A gap — backgrounded app, starved queue — would integrate one acceleration across dead time
+    /// it never measured. Dropped rather than trusted.
+    @Test func theProbeRefusesASampleThatSpansAGap() {
+        var probe = NoseProbeAccumulator()
+        probe.add(axMPS2: 1.0, ayMPS2: 0, dt: 5.0)
+        probe.add(axMPS2: 1.0, ayMPS2: 0, dt: -0.05)
+        #expect(probe.sampleCount == 0)
+        #expect(probe.deltaVX == 0)
+    }
+
+    /// Steady cruise accumulates nothing but noise, and a direction fitted to noise is worse than
+    /// no direction. Log a3926a16 gained 3.2 kt in 142 s and is exactly this case.
+    @Test func theProbeReportsNoDirectionWhenNothingAccumulated() {
+        var probe = NoseProbeAccumulator()
+        for _ in 0..<200 { probe.add(axMPS2: 0.0001, ayMPS2: -0.0001, dt: 0.05) }
+        #expect(probe.deltaVAzimuthDeg == nil)
+    }
+
+    /// Reset has to clear the clock as well as the vector, or the next window reports its own
+    /// duration plus every window before it.
+    @Test func resettingClearsTheWindow() {
+        var probe = NoseProbeAccumulator()
+        probe.add(axMPS2: 1.0, ayMPS2: 1.0, dt: 0.05)
+        probe.reset()
+        #expect(probe.sampleCount == 0)
+        #expect(probe.seconds == 0)
+        #expect(probe.deltaVMagnitude == 0)
+    }
 }
