@@ -913,6 +913,11 @@ struct GroundYawCorrection {
     private(set) var hasOffset: Bool = false
     /// Whether a correction is part-way through slewing to the median that triggered it. The
     /// deadband is not consulted while this is set — that is the whole of "trigger, not filter".
+    ///
+    /// It therefore has to be cleared the moment the move stops being a move. A gate refusing is
+    /// not a pause: it says the conditions that justified this correction are no longer true, and
+    /// a flag left standing across one would carry the deadband's suspension into a later tick
+    /// that never earned it — see `abandonMove`.
     private var isConverging: Bool = false
     private var lastUpdateTime: TimeInterval = -.greatestFiniteMagnitude
 
@@ -957,11 +962,25 @@ struct GroundYawCorrection {
         case refused(Refusal)
     }
 
+    /// End a correction that is part-way through, and say why. Everything a gate refuses is an
+    /// abandonment rather than a pause: whatever justified the move — a settled compass, a world
+    /// worth correcting, a phone on the ground — has stopped being true, so the move does not get
+    /// to resume later on the strength of a decision taken before it.
+    ///
+    /// `rateLimited` is the one refusal that is *not* routed through here, because it is the only
+    /// one that is a pause. `minUpdateInterval` refusals are precisely the ticks that fall between
+    /// the successful steps of a single slew; ending the move on one would end every move after
+    /// its first step.
+    private mutating func abandonMove(_ reason: Refusal) -> Outcome {
+        isConverging = false
+        return .refused(reason)
+    }
+
     /// Feed the current measurements and get back what was done. `appliedOffsetDeg` is unchanged on
     /// every refusal — including `airborne`, which freezes the last ground value rather than
     /// discarding it: the ARKit world survives takeoff, so a correction measured minutes ago is
     /// still the better estimate, it just stops being updated by a sensor that no longer measures
-    /// the phone.
+    /// the phone. A refusal does end any move in progress, though; see `abandonMove`.
     @discardableResult
     mutating func update(medianErrorDeg: Double?,
                          dispersionDeg: Double?,
@@ -971,29 +990,40 @@ struct GroundYawCorrection {
                          airborne: Bool,
                          worldUsable: Bool,
                          at time: TimeInterval) -> Outcome {
-        guard !airborne else { return .refused(.airborne) }
-        guard worldUsable else { return .refused(.worldUnusable) }
-        guard let median = medianErrorDeg, median.isFinite else { return .refused(.noMedian) }
+        guard !airborne else { return abandonMove(.airborne) }
+        guard worldUsable else { return abandonMove(.worldUnusable) }
+        guard let median = medianErrorDeg, median.isFinite else { return abandonMove(.noMedian) }
         // Asked before the response gate, and deliberately: a compass that is following the phone
         // but disagreeing with itself is a different fault from one reporting the aircraft, and the
         // log is only useful if it names the right one.
+        //
+        // It is also the gate that settles what a refusal does to a move in progress. Build 38
+        // added it because a magnetometer disturbance dragged the Teterboro median four degrees and
+        // the correction followed it. If a move could survive the disturbance, the tick on which
+        // the compass recovered would be the one tick the deadband could not refuse — so a
+        // correction abandoned mid-slew is strictly better than one resumed through an excursion.
         if let dispersion = dispersionDeg, dispersion.isFinite, dispersion > maxDispersionDeg {
-            return .refused(.dispersed)
+            return abandonMove(.dispersed)
         }
         guard compassResponse.isFinite, compassResponseR.isFinite,
               abs(compassResponse - 1.0) <= responseToleranceFromOne,
               abs(compassResponseR) >= minResponseCorrelation
-        else { return .refused(.compassNotMeasuringPhone) }
+        else { return abandonMove(.compassNotMeasuringPhone) }
         guard headingAccuracyDeg >= 0, headingAccuracyDeg <= maxHeadingAccuracyDeg
-        else { return .refused(.headingInaccurate) }
-        guard abs(median) <= maxOffsetDeg else { return .refused(.implausibleOffset) }
+        else { return abandonMove(.headingInaccurate) }
+        guard abs(median) <= maxOffsetDeg else { return abandonMove(.implausibleOffset) }
+        // Not abandoned: a pause between the steps of one slew. See `abandonMove`.
         guard time - lastUpdateTime >= minUpdateInterval else { return .refused(.rateLimited) }
 
         let delta = median - appliedOffsetDeg
         // Asked only of a correction that is not already running. A move that has started is
         // finished, because a move abandoned inside the band leaves precisely the band's worth of
-        // standing error behind it — see `deadbandDeg`.
+        // standing error behind it — see `deadbandDeg`. Every gate above has already ended the move
+        // if it was going to, so reaching this line converging means the move is genuinely still
+        // underway and this tick is its next step.
         if !isConverging {
+            // Not routed through abandonMove: unreachable while converging, so there is no move
+            // here to end, and naming one would misdescribe the only state that gets here.
             guard abs(delta) >= deadbandDeg || !hasOffset else { return .refused(.withinDeadband) }
         }
 

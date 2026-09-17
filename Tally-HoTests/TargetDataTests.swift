@@ -1598,6 +1598,90 @@ struct TargetDataTests {
         #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
     }
 
+    /// Suspending the deadband for the duration of a move means the suspension has to end when
+    /// the move does — including when the move ends by being refused rather than by arriving.
+    ///
+    /// Nothing clears this on landing: the view controller deliberately does not reset the ground
+    /// correction there, so that it takes over again by measuring. A move interrupted by takeoff
+    /// would therefore still count as "in progress" hours later, and the first tick back on the
+    /// ground would be the one tick the deadband was unable to refuse — a full scene rotation on
+    /// a median move that is inside the band, which is the opposite of what the band is for.
+    @Test func aMoveInterruptedByFlightDoesNotResumeInsideTheDeadband() {
+        var correction = GroundYawCorrection()      // shipped defaults: deadband 1.5, slew 1.0
+        correction.prime(offsetDeg: 0)
+        // A genuine move starts. 5° clears the deadband, and one 1° step does not finish it.
+        let started = correction.update(medianErrorDeg: 5.0, dispersionDeg: 4.0,
+                                        compassResponse: 1.0, compassResponseR: 0.95,
+                                        headingAccuracyDeg: 10, airborne: false,
+                                        worldUsable: true, at: 0)
+        #expect(started == .applied(1.0))
+        // Takeoff, and hours of it.
+        applyGround(&correction, medianDeg: 5.0, ticks: 199, from: 1, airborne: true)
+        #expect(correction.appliedOffsetDeg == 1.0)
+        // Landed somewhere else, in a different magnetic environment: the median has moved, but by
+        // less than the deadband, so it must move nothing at all.
+        let landed = correction.update(medianErrorDeg: 2.4, dispersionDeg: 4.0,
+                                       compassResponse: 1.0, compassResponseR: 0.95,
+                                       headingAccuracyDeg: 10, airborne: false,
+                                       worldUsable: true, at: 500)
+        #expect(landed == .refused(.withinDeadband))
+        #expect(correction.appliedOffsetDeg == 1.0)
+    }
+
+    /// The same for the gate that settles the rule. Build 38 added the dispersion refusal because
+    /// a magnetometer disturbance dragged the Teterboro median four degrees and the correction
+    /// followed it. If a move could survive the disturbance, the tick on which the compass
+    /// recovered would be precisely the tick the deadband could not refuse, so the excursion would
+    /// reach the scene through the very gate built to keep it out.
+    @Test func aMoveAbandonedByDispersionDoesNotResumeInsideTheDeadband() {
+        var correction = GroundYawCorrection()
+        correction.prime(offsetDeg: 0)
+        let started = correction.update(medianErrorDeg: 5.0, dispersionDeg: 4.0,
+                                        compassResponse: 1.0, compassResponseR: 0.95,
+                                        headingAccuracyDeg: 10, airborne: false,
+                                        worldUsable: true, at: 0)
+        #expect(started == .applied(1.0))
+        // The disturbance: the median barely moves, but the readings behind it stop agreeing.
+        applyGround(&correction, medianDeg: 4.9, ticks: 9, from: 1, dispersion: 46.6)
+        #expect(correction.appliedOffsetDeg == 1.0)
+        // Recovered, with the median now inside the deadband of where the offset was left.
+        let recovered = correction.update(medianErrorDeg: 2.4, dispersionDeg: 4.0,
+                                          compassResponse: 1.0, compassResponseR: 0.95,
+                                          headingAccuracyDeg: 10, airborne: false,
+                                          worldUsable: true, at: 20)
+        #expect(recovered == .refused(.withinDeadband))
+        #expect(correction.appliedOffsetDeg == 1.0)
+    }
+
+    /// The one refusal that is a pause and not an abandonment. Rate-limited ticks are exactly the
+    /// ones that fall between the successful steps of a single slew, so ending a move on one would
+    /// end every move after its first step — and the correction is fed at 60 Hz against a one
+    /// second minimum interval, so that would be every move there is.
+    @Test func rateLimitingPausesAMoveRatherThanAbandoningIt() {
+        var correction = GroundYawCorrection()
+        correction.prime(offsetDeg: 2.0)
+        // Ten seconds of feed at 10 Hz. A 4° move at 1°/update needs four updates, with about
+        // ninety rate-limited refusals scattered between them.
+        for i in 0..<100 {
+            correction.update(medianErrorDeg: 6.0, dispersionDeg: 4.0,
+                              compassResponse: 1.0, compassResponseR: 0.95,
+                              headingAccuracyDeg: 10, airborne: false,
+                              worldUsable: true, at: Double(i) * 0.1)
+        }
+        #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
+    }
+
+    /// Abandoning a move must not refuse the next one: a median genuinely outside the deadband
+    /// still converges the whole way after an interruption.
+    @Test func aRealMoveStillConvergesAfterAnInterruption() {
+        var correction = GroundYawCorrection()
+        correction.prime(offsetDeg: 2.0)
+        applyGround(&correction, medianDeg: 6.0, ticks: 5, from: 0, airborne: true)
+        #expect(correction.appliedOffsetDeg == 2.0)
+        applyGround(&correction, medianDeg: 6.0, ticks: 10, from: 10)
+        #expect(abs(correction.appliedOffsetDeg - 6.0) < 0.01)
+    }
+
     // MARK: - Compass calibration policy
 
     /// On the ground, with nothing in the way, the offer stands. This is the case that had never
