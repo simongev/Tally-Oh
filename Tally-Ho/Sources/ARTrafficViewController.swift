@@ -879,6 +879,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var isCalibrationPopupShowing = false
 
     private var updateTimer: Timer?
+    /// Tokens for the block-based notification observers, so they can be removed.
+    ///
+    /// Block observers are owned by the notification centre, not by this controller: without the
+    /// token there is no way to unregister, and the registration outlives the object. The blocks
+    /// capture self weakly so nothing leaks, but the centre keeps calling into dead registrations
+    /// for the life of the process.
+    private var notificationObservers: [NSObjectProtocol] = []
     private var currentZoomScale: CGFloat = 1.0
     private var pinchStartScale: CGFloat = 1.0
     /// 1-finger pan offset while zoomed in, in final screen points (applied
@@ -1529,6 +1536,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     deinit {
         UIApplication.shared.isIdleTimerDisabled = false
         connectionLogic.stopListening()
+        // viewWillDisappear normally stops the tick, but it does not run on every path out of
+        // this controller. The run loop holds the timer either way, so an uninvalidated one
+        // keeps firing at 4 Hz for the life of the process -- a no-op through the weak self,
+        // and a wakeup that never stops.
+        updateTimer?.invalidate()
+        updateTimer = nil
+        for observer in notificationObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        notificationObservers.removeAll()
     }
 
     // MARK: - Setup
@@ -1801,7 +1818,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // Safety net: pause the ARSession the moment the app is backgrounded,
         // regardless of whether viewWillDisappear was called first.
         // ARKit running in the background causes a silent watchdog kill (no crash report).
-        NotificationCenter.default.addObserver(
+        notificationObservers.append(NotificationCenter.default.addObserver(
             forName: .appDidBackground, object: nil, queue: .main
         ) { [weak self] _ in
             self?.pauseARSession()
@@ -1815,8 +1832,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // must not either. Consumed by the next startARSession, whatever wakes it.
             self?.sessionSuspendedByBackground = true
             FlightRecorder.shared.endLift(reason: "background")
-        }
-        NotificationCenter.default.addObserver(
+        })
+        notificationObservers.append(NotificationCenter.default.addObserver(
             forName: .appWillForeground, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.isViewLoaded, self.view.window != nil else { return }
@@ -1829,7 +1846,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // stays empty until the app is reinstalled.
             self.startDiagnosticAltimeterIfNeeded(trigger: "foreground")
             self.startYawRateUpdates()
-        }
+        })
     }
 
     private func setupGestures() {
