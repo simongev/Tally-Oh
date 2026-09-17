@@ -46,7 +46,7 @@ jobs:
 
       - name: Report failure
         if: failure()
-        run: .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
+        run: bash .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Upload test results
         if: failure()

@@ -40,7 +40,7 @@ jobs:
 
       - name: Report test failure
         if: failure()
-        run: .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
+        run: bash .github/scripts/report-build-failure.sh "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Set up App Store Connect API key
         env:
