@@ -21,18 +21,13 @@ main way parallel work goes wrong here.
 1. Work in your worktree, on your branch. Never `main`.
 2. Commit in coherent steps with real messages — what changed and why, not "fix".
 3. Push. CI builds and runs the tests on every push.
-4. **Read the CI result.** You have no Swift toolchain, so CI is your only compiler. Raw Actions
-   logs are unreadable from here (they redirect to blob storage, which egress policy blocks), so
-   read the annotations instead:
+4. **Read the CI result** with `bash .github/scripts/ci-status.sh`. You have no Swift toolchain,
+   so CI is your only compiler. Raw Actions logs are unreadable from here — they redirect to blob
+   storage, which egress policy blocks — so the script reads the check-run annotations instead.
 
-   ```bash
-   API=https://api.github.com/repos/simongev/Tally-Oh
-   SHA=$(git rev-parse HEAD)
-   ID=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/commits/$SHA/check-runs" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["check_runs"][0]["id"])')
-   curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/check-runs/$ID/annotations" \
-        | python3 -c 'import json,sys; [print(a["message"]) for a in json.load(sys.stdin) if a["annotation_level"]=="failure"]'
-   ```
+   Exit 0 green, 1 failed (it prints the errors), 2 still running. **Exit 2 is not green.** Never
+   judge a run by reading annotations directly: an unfinished run returns an empty list, which
+   looks exactly like a pass.
 
 5. Fix until CI is green. A red branch is not ready for anything.
 6. Comment on the feature's GitHub issue: `READY FOR QA — round N`, with what changed, and what

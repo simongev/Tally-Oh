@@ -14,9 +14,10 @@ defaults, is wrong and those are the exact mistakes to catch.
 
 ## Order of work
 
-1. **CI must be green on the branch head.** Check it; do not take the dev agent's word. If it is
-   red, that is an immediate REJECT — read the annotations (the dev agent prompt has the command;
-   raw logs are unreadable from here).
+1. **CI must be green on the branch head.** Run `bash .github/scripts/ci-status.sh`; do not take
+   the dev agent's word. Exit 1 is an immediate REJECT and the script prints the errors. **Exit 2
+   means the run has not finished — wait for it.** An unfinished run has no annotations, which is
+   indistinguishable from a pass if you query the API yourself, so use the script.
 2. **The branch must contain current `main`.** `git merge-base --is-ancestor origin/main HEAD`.
    If it does not, REJECT: it will be flown against a base that no longer exists.
 3. **Read the whole diff.** `git diff origin/main...HEAD`.
