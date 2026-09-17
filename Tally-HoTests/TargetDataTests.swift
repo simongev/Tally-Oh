@@ -771,9 +771,19 @@ struct TargetDataTests {
 
     // MARK: - Angular response estimator
 
-    /// Feeds a synthetic series into the estimator: the driver turns by `driverStep` each sample
-    /// and the response follows at `responseRatio` of it, with `jitterDeg` of alternating noise
-    /// added to the response only.
+    /// Feeds a synthetic series into the estimator: the driver turns by a multiple of `driverStep`
+    /// each sample and the response follows at `responseRatio` of it, with `jitterDeg` of
+    /// alternating noise added to the response only.
+    ///
+    /// **The step size must vary, or the correlation is undefined.** `AngularResponse.correlation`
+    /// is Pearson's r over the per-sample *changes*, and a driver advancing by a constant amount
+    /// produces a constant change — zero variance, so the denominator is zero and r is `nan` by
+    /// definition, not by defect. A constant-rate driver therefore cannot test the correlation at
+    /// all, whatever the estimator does.
+    ///
+    /// The 1.0/1.5/2.0 cycle fixes that while leaving every other quantity exact. Its period of
+    /// three against the jitter's period of two means Σ(Δdriver · jitter) cancels over their
+    /// common period, so the measured slope stays exactly `responseRatio` with or without jitter.
     private func response(driverStep: Double,
                           responseRatio: Double,
                           jitterDeg: Double = 0,
@@ -787,8 +797,10 @@ struct TargetDataTests {
             estimator.add(driver: driver,
                           response: (response + jitter).truncatingRemainder(dividingBy: 360),
                           at: TimeInterval(i) * 0.1)
-            driver   += driverStep
-            response += driverStep * responseRatio
+            // Deterministic too: the cycle is a fixed function of the sample index.
+            let step = driverStep * (1.0 + 0.5 * Double(i % 3))
+            driver   += step
+            response += step * responseRatio
         }
         return estimator.estimate
     }
