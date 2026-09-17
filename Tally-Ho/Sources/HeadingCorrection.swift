@@ -256,6 +256,11 @@ struct YawDriftAccumulator {
     /// across a run. What disqualifies a run is the phone having ended up rotated, not having
     /// jittered on the way. Vibration integrates to zero by construction, and a run where the
     /// phone swung out and came back stays valid because both sides of the comparison are nets.
+    ///
+    /// Checked **only at run end** — in `closeRun()` and in `estimate`, both against the net the
+    /// run finished with. That is what makes the sentence above true rather than aspirational: a
+    /// mid-run test cannot know whether the phone is on its way out or on its way back, so any
+    /// such test refuses a cancelling swing as if it were a turn.
     let maxGyroNetDeg: Double
 
     private var runStartTime: TimeInterval?
@@ -282,8 +287,9 @@ struct YawDriftAccumulator {
     ///
     /// `gyroYawRateDps` must come from a source independent of ARKit — see the type comment for
     /// why ARKit's own attitude will not do. It is integrated across the run, and the run is
-    /// banked only if that integral stays small. `isTracking` false ends the current run, since
-    /// ARKit's azimuth means nothing then.
+    /// banked only if the integral it **ends** with is small; nothing here judges it while the run
+    /// is in progress. `isTracking` false ends the current run, since ARKit's azimuth means
+    /// nothing then.
     mutating func add(azimuthDeg: Double,
                       gyroYawRateDps: Double,
                       isTracking: Bool,
@@ -310,16 +316,14 @@ struct YawDriftAccumulator {
             return
         }
         _ = start
-        // Trapezoid over the interval since the last sample. Signed, so vibration cancels.
+        // Trapezoid over the interval since the last sample. Signed, so vibration cancels — and
+        // accumulated only, never tested against maxGyroNetDeg here. A running total that has gone
+        // wide says the phone is rotated *now*, which is not the question: the question is where it
+        // ends up, and a half-cycle of vibration is wide at its peak and zero at its end. Ending
+        // the run on the peak is the build 14 failure with an integral in place of a rate.
         runGyroNetDeg += gyroYawRateDps * (time - runLastTime)
         runLastTime = time
         runLastAzimuth = azimuthDeg
-        // A run that has already rotated too far cannot be rescued by continuing, and letting it
-        // run on would bank a contaminated stretch the moment it passed the duration minimum.
-        if abs(runGyroNetDeg) > maxGyroNetDeg {
-            runStartTime = nil
-            runGyroNetDeg = 0
-        }
     }
 
     /// End the current run, banking it if it lasted long enough to mean anything.
