@@ -876,11 +876,20 @@ struct GroundYawCorrection {
     let maxHeadingAccuracyDeg: Double
     /// Minimum gap between applied updates.
     let minUpdateInterval: TimeInterval
-    /// Changes smaller than this are not worth moving the scene for.
+    /// How far the median must have moved for a correction to **start**. A trigger, not a filter.
     ///
     /// Raised 0.5° → 1.5° in build 33. At 0.5° the correction walked 0.59 → −3.02 → +4.56 across one
     /// ground session, chasing a median that was mostly noise around 1.5° — four degrees of
     /// continuous scene motion for no gain. The median is the signal; its jitter is not.
+    ///
+    /// It used to be consulted on every tick, which is a different thing entirely and cost more
+    /// than it saved: a move stopped as soon as the *remaining* error fell inside the band, so
+    /// every correction settled up to the full 1.5° short of the median it was chasing.
+    /// `docs/AR_ACCURACY_PLAN.md` budgets 1–2° of total angular error, so that floor alone
+    /// consumed nearly all of it, and a standing residual of exactly that shape is what builds
+    /// 34–39 were chasing. Now it gates only whether a move begins; once one has, the correction
+    /// converges the whole way, and the band re-arms the moment it arrives. Jitter inside the
+    /// band still moves nothing, which is the property build 33 raised it for.
     let deadbandDeg: Double
     /// Most the applied offset may move in one update, so the correction converges over a few
     /// seconds rather than stepping every marker at once.
@@ -902,6 +911,9 @@ struct GroundYawCorrection {
     private(set) var appliedOffsetDeg: Double = 0
     /// Whether anything has been applied yet, so a legitimate 0.0° reads differently from "never ran".
     private(set) var hasOffset: Bool = false
+    /// Whether a correction is part-way through slewing to the median that triggered it. The
+    /// deadband is not consulted while this is set — that is the whole of "trigger, not filter".
+    private var isConverging: Bool = false
     private var lastUpdateTime: TimeInterval = -.greatestFiniteMagnitude
 
     init(maxOffsetDeg: Double = 180.0,
@@ -978,12 +990,21 @@ struct GroundYawCorrection {
         guard time - lastUpdateTime >= minUpdateInterval else { return .refused(.rateLimited) }
 
         let delta = median - appliedOffsetDeg
-        guard abs(delta) >= deadbandDeg || !hasOffset else { return .refused(.withinDeadband) }
+        // Asked only of a correction that is not already running. A move that has started is
+        // finished, because a move abandoned inside the band leaves precisely the band's worth of
+        // standing error behind it — see `deadbandDeg`.
+        if !isConverging {
+            guard abs(delta) >= deadbandDeg || !hasOffset else { return .refused(.withinDeadband) }
+        }
 
         lastUpdateTime = time
         let step = min(abs(delta), maxSlewPerUpdateDeg) * (delta < 0 ? -1.0 : 1.0)
         appliedOffsetDeg += step
         hasOffset = true
+        // Arrived when the step covered the whole remaining gap, which re-arms the deadband.
+        // Decided on the gap rather than on the new residual: that residual is the difference of
+        // two nearly equal doubles and is not reliably zero even when the move is exactly done.
+        isConverging = abs(delta) > maxSlewPerUpdateDeg
         return .applied(appliedOffsetDeg)
     }
 
@@ -998,6 +1019,9 @@ struct GroundYawCorrection {
         guard offsetDeg.isFinite else { return }
         appliedOffsetDeg = offsetDeg
         hasOffset = true
+        // Somebody else's absolute measurement, not a move in progress, so the deadband gates the
+        // next one normally.
+        isConverging = false
         lastUpdateTime = -.greatestFiniteMagnitude
     }
 
@@ -1006,6 +1030,7 @@ struct GroundYawCorrection {
     mutating func reset() {
         appliedOffsetDeg = 0
         hasOffset = false
+        isConverging = false
         lastUpdateTime = -.greatestFiniteMagnitude
     }
 }
