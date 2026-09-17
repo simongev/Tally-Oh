@@ -70,7 +70,7 @@ final class FlightRecorder {
         "world_yaw_corr_deg", "course_residual_deg", "anchor_offset_deg", "yaw_src",
         "yaw_follow_deg", "follow_gain", "follow_gain_r", "gyro_az_deg",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
-        "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg",
+        "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg", "ar_drift_excursion_deg",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "img_roll_deg", "ui_roll_deg", "ui_orient",
         "ar_state", "airborne", "airborne_basis",
@@ -196,10 +196,25 @@ final class FlightRecorder {
         var yawDriftDps: Double?
         /// Total still time behind yawDriftDps, so a thin estimate reads as thin.
         var yawDriftSeconds: Double?
-        /// Largest net rotation the gyro measured across any run behind yawDriftDps, in degrees.
-        /// Near zero means the phone genuinely ended each run where it started, so the drift
-        /// figure is clean; a large value means a run was contaminated by real rotation.
+        /// Largest net rotation the gyro measured across any run behind yawDriftDps, in degrees —
+        /// the net each run *ended* with, which is the quantity the gate judges. It is therefore
+        /// bounded by that gate by construction and says little more than that the runs were
+        /// admissible.
+        ///
+        /// **Near zero no longer means the phone held still.** It did until the drift gate moved to
+        /// judging the net only at run end, because no run could pass through a large excursion and
+        /// survive; now a run can swing forty degrees out and back and end at zero. Read it with
+        /// yawDriftExcursionDeg, which is the column that still distinguishes those.
         var yawDriftGyroDeg: Double?
+        /// Largest excursion across any run behind yawDriftDps, in degrees: the peak the gyro's
+        /// integrated net reached at any instant *within* a run, not only at its end.
+        ///
+        /// This is the one that says whether the phone actually stayed still, and so whether the
+        /// drift figure beside it is measuring drift or a net taken across a phone that moved and
+        /// came back. Near zero is clean. Large, against a small yawDriftGyroDeg, is a run that
+        /// contained real rotation which happened to cancel — admissible by design, since that is
+        /// what vibration is, but a reason to distrust the drift rate rather than to trust it.
+        var yawDriftExcursionDeg: Double?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
         /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
         /// where the compass is track-slaved, this and heading_delta_deg carry the same
@@ -426,6 +441,7 @@ final class FlightRecorder {
         fields.append(format(sample.yawDriftDps,      decimals: 3))
         fields.append(format(sample.yawDriftSeconds,  decimals: 0))
         fields.append(format(sample.yawDriftGyroDeg,  decimals: 2))
+        fields.append(format(sample.yawDriftExcursionDeg, decimals: 2))
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 

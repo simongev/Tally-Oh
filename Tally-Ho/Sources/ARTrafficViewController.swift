@@ -387,9 +387,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var yawDrift = YawDriftAccumulator()
     private var yawDriftDps: Double = .nan
     private var yawDriftSeconds: Double = .nan
-    /// Largest gyro-measured net rotation across any banked run. Near zero means the phone really
-    /// did end up where it started, so the drift figure beside it is clean.
+    /// Largest gyro-measured net rotation any banked run ended with — the quantity the drift gate
+    /// judges, so it is bounded by that gate and near zero does not by itself mean the phone held
+    /// still. `yawDriftExcursionDeg` is the one that says that.
     private var yawDriftGyroDeg: Double = .nan
+    /// Largest excursion reached *during* any banked run. Near zero means the phone really did stay
+    /// where it started, so the drift figure beside it is clean.
+    private var yawDriftExcursionDeg: Double = .nan
 
     /// The phone's physical roll about the viewing axis, from the session camera's own frame,
     /// which is independent of the interface orientation. Written on the render thread, read when
@@ -1565,6 +1569,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         yawDriftDps = .nan
         yawDriftSeconds = .nan
         yawDriftGyroDeg = .nan
+        yawDriftExcursionDeg = .nan
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2433,6 +2438,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftDps           = yawDriftDps.isNaN      ? nil : yawDriftDps
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
+        sample.yawDriftExcursionDeg  = yawDriftExcursionDeg.isNaN ? nil : yawDriftExcursionDeg
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
         // Empty only for `none`. From build 30 the seed carries a real measured offset like every
         // other source, rather than build 29's "seed means zero".
@@ -3228,6 +3234,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             yawDriftDps      = drift.degreesPerSecond
             yawDriftSeconds  = drift.totalStillSeconds
             yawDriftGyroDeg  = drift.worstGyroNetDeg
+            // Logged beside the net rather than instead of it: the net is what the gate judged,
+            // the excursion is what the phone actually did. See YawDriftAccumulator.Estimate.
+            yawDriftExcursionDeg = drift.worstGyroExcursionDeg
         }
 
         // Diagnostic only — see courseResidualDeg.
