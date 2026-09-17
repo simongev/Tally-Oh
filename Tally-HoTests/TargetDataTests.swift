@@ -1034,6 +1034,31 @@ struct TargetDataTests {
         }
     }
 
+    /// The cost of judging the net at run end, and the number that pays it.
+    ///
+    /// Admitting a run that swung out and came back is the whole point of the change above — but
+    /// it means `worstGyroNetDeg`, which is that same end-of-run net, can no longer tell a phone
+    /// that never moved from one that moved six degrees and gave them back. Both read zero. The
+    /// flight log's claim that a drift figure is clean rests on being able to tell those apart, so
+    /// the excursion is tracked as the run goes and published beside the net.
+    @Test func aCancellingSwingIsVisibleInTheExcursion() {
+        let estimate = drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 30.0)
+        #expect(estimate != nil)
+        if let estimate {
+            // 30 °/s across one 0.2 s half-cycle is 6°, reached and returned on every sample.
+            #expect(estimate.worstGyroNetDeg < 0.01)
+            #expect(abs(estimate.worstGyroExcursionDeg - 6.0) < 0.01)
+        }
+    }
+
+    /// And the other half of the distinction: a phone that genuinely held still reports no
+    /// excursion, so the two cases do not both read zero.
+    @Test func aStillRunReportsNoExcursion() {
+        let estimate = drift(driftDps: 0.1, seconds: 20)
+        #expect(estimate != nil)
+        if let estimate { #expect(estimate.worstGyroExcursionDeg < 0.001) }
+    }
+
     /// A run that ends rotated must be refused even if it never rotated fast: 0.5 deg/s for
     /// 20 s is 10 degrees of net rotation, and the phone's azimuth change over that is not drift.
     @Test func aSlowSustainedTurnIsRefused() {

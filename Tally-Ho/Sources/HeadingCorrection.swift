@@ -233,10 +233,26 @@ struct YawDriftAccumulator {
         var degreesPerSecond: Double
         /// Total still time the estimate is drawn from. A thin estimate should look thin.
         var totalStillSeconds: TimeInterval
-        /// Largest net rotation the gyro saw across any banked run, in degrees. Near zero means
-        /// the phone really did end up where it started and the drift figure is clean; a large
-        /// value means a run was contaminated and the number should not be trusted.
+        /// Largest net rotation any banked run **ended** with, in degrees.
+        ///
+        /// This is the quantity the gate judges, so it is bounded by `maxGyroNetDeg` by
+        /// construction: it says the runs behind the estimate were admissible, and little more.
+        /// It is **not** a bound on how far the phone moved during a run — a swing of forty
+        /// degrees out and back ends at zero and reads here as zero. That used to be a
+        /// distinction without a difference, because the gate ran continuously and no run could
+        /// pass through a large excursion and survive; now that the net is judged only at run
+        /// end, the two quantities genuinely differ and both are published.
         var worstGyroNetDeg: Double
+        /// Largest excursion any banked run reached, in degrees: the peak magnitude of the
+        /// integrated net at any instant *within* the run, not only at its end.
+        ///
+        /// This is the one to read to decide whether a drift figure is clean. Near zero means the
+        /// phone genuinely did not move, so the net across the run is drift and nothing else. Large
+        /// here with a small `worstGyroNetDeg` means a run contained real rotation that happened to
+        /// cancel: admissible by design — vibration is exactly that — but the drift measured across
+        /// it is a net taken over a phone that moved, so a large value is a reason to look harder
+        /// rather than to trust the number.
+        var worstGyroExcursionDeg: Double
         var runCount: Int
     }
 
@@ -261,6 +277,10 @@ struct YawDriftAccumulator {
     /// run finished with. That is what makes the sentence above true rather than aspirational: a
     /// mid-run test cannot know whether the phone is on its way out or on its way back, so any
     /// such test refuses a cancelling swing as if it were a turn.
+    ///
+    /// What the run passed through on the way is therefore not gated — but it is measured, and
+    /// published as `Estimate.worstGyroExcursionDeg`. A gate that admits a cancelling swing owes
+    /// the log a way to tell that swing from a phone that never moved.
     let maxGyroNetDeg: Double
 
     private var runStartTime: TimeInterval?
@@ -269,11 +289,16 @@ struct YawDriftAccumulator {
     private var runLastAzimuth: Double = 0
     /// Gyro-integrated net rotation across the run in progress, in degrees.
     private var runGyroNetDeg: Double = 0
+    /// Peak magnitude `runGyroNetDeg` has reached during the run in progress. Tracked as the run
+    /// goes because it cannot be recovered afterwards: the net is free to return to zero, and the
+    /// excursion it took to get there is gone the moment it does.
+    private var runGyroPeakDeg: Double = 0
 
     private var weightedRateSum: Double = 0      // Σ(rate · duration) = Σ(net change)
     private var totalSeconds: TimeInterval = 0
     private var runs: Int = 0
     private var worstGyroNet: Double = 0
+    private var worstGyroExcursion: Double = 0
 
     init(minRunSeconds: TimeInterval = 5.0,
          minTotalSeconds: TimeInterval = 10.0,
@@ -302,6 +327,7 @@ struct YawDriftAccumulator {
             runLastTime = time
             runLastAzimuth = azimuthDeg
             runGyroNetDeg = 0
+            runGyroPeakDeg = 0
             return
         }
         // A gap means samples stopped arriving — tracking dropped, or the app was backgrounded.
@@ -313,6 +339,7 @@ struct YawDriftAccumulator {
             runLastTime = time
             runLastAzimuth = azimuthDeg
             runGyroNetDeg = 0
+            runGyroPeakDeg = 0
             return
         }
         _ = start
@@ -322,13 +349,16 @@ struct YawDriftAccumulator {
         // ends up, and a half-cycle of vibration is wide at its peak and zero at its end. Ending
         // the run on the peak is the build 14 failure with an integral in place of a rate.
         runGyroNetDeg += gyroYawRateDps * (time - runLastTime)
+        // The excursion, on the other hand, can only be seen from inside the run: it is the peak
+        // the net reaches, and the net is free to come back from it.
+        runGyroPeakDeg = max(runGyroPeakDeg, abs(runGyroNetDeg))
         runLastTime = time
         runLastAzimuth = azimuthDeg
     }
 
     /// End the current run, banking it if it lasted long enough to mean anything.
     mutating func closeRun() {
-        defer { runStartTime = nil; runGyroNetDeg = 0 }
+        defer { runStartTime = nil; runGyroNetDeg = 0; runGyroPeakDeg = 0 }
         guard let start = runStartTime else { return }
         let duration = runLastTime - start
         guard duration >= minRunSeconds else { return }
@@ -338,15 +368,18 @@ struct YawDriftAccumulator {
         totalSeconds += duration
         runs += 1
         worstGyroNet = max(worstGyroNet, abs(runGyroNetDeg))
+        worstGyroExcursion = max(worstGyroExcursion, runGyroPeakDeg)
     }
 
     mutating func reset() {
         runStartTime = nil
         runGyroNetDeg = 0
+        runGyroPeakDeg = 0
         weightedRateSum = 0
         totalSeconds = 0
         runs = 0
         worstGyroNet = 0
+        worstGyroExcursion = 0
     }
 
     /// Includes the run in progress, so a long steady hold shows up without waiting for it to end.
@@ -355,6 +388,7 @@ struct YawDriftAccumulator {
         var seconds = totalSeconds
         var count = runs
         var worst = worstGyroNet
+        var worstExcursion = worstGyroExcursion
         if let start = runStartTime {
             let duration = runLastTime - start
             if duration >= minRunSeconds, abs(runGyroNetDeg) <= maxGyroNetDeg {
@@ -362,12 +396,14 @@ struct YawDriftAccumulator {
                 seconds += duration
                 count += 1
                 worst = max(worst, abs(runGyroNetDeg))
+                worstExcursion = max(worstExcursion, runGyroPeakDeg)
             }
         }
         guard seconds >= minTotalSeconds, count > 0 else { return nil }
         return Estimate(degreesPerSecond: sum / seconds,
                         totalStillSeconds: seconds,
                         worstGyroNetDeg: worst,
+                        worstGyroExcursionDeg: worstExcursion,
                         runCount: count)
     }
 }
