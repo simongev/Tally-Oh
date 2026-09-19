@@ -210,9 +210,11 @@ final class FlightRecorder {
         /// Largest excursion across any run behind yawDriftDps, in degrees: the peak the gyro's
         /// integrated net reached at any instant *within* a run, not only at its end.
         ///
-        /// This is the one that says whether the phone actually stayed still, and so whether the
-        /// drift figure beside it is measuring drift or a net taken across a phone that moved and
-        /// came back. Near zero is clean.
+        /// This is the one that says whether the phone stayed still *across the runs the drift
+        /// figure is built from*, and so whether that figure is measuring drift or a net taken over
+        /// a phone that moved and came back. Near zero is clean, for those runs — it says nothing
+        /// about stretches the excursion bound discarded, which appear in neither column. Read
+        /// ar_drift_abandoned for those.
         ///
         /// Bounded by YawDriftAccumulator's maxGyroExcursionDeg, since a run that passes that bound
         /// is abandoned rather than banked — so this can no longer read 68° or 128° the way build
@@ -225,16 +227,25 @@ final class FlightRecorder {
         var yawDriftExcursionDeg: Double?
         /// How many still runs the excursion bound threw away, cumulative for the ARKit session.
         ///
-        /// **Read this first whenever the drift columns are empty**, because it is the only thing
-        /// that says which of two very different situations produced them. Empty drift columns with
-        /// this at 0 is a phone that was never held still for five seconds. Empty drift columns
-        /// with this climbing is the excursion bound refusing every run — the phone *was* held, and
-        /// maxGyroExcursionDeg is too tight for how it was held.
+        /// **Read this whenever the drift columns are empty**, because it says which gate emptied
+        /// them. At 0 the runs are failing somewhere other than the excursion bound — the net bound
+        /// at run end, minRunSeconds, minTotalSeconds, a tracking dropout. Climbing, the excursion
+        /// bound is the one discarding them. Nothing else in the log can tell those apart.
         ///
-        /// That distinction is the point of the column. The bound's own comment names "a gate that
-        /// collects no still time in the air at all" as the cost of setting it too low, and without
-        /// this the log could not report that failure at all: it looks identical to nobody holding
-        /// the phone up. Populated even when the drift columns are blank, since blank is exactly
+        /// **A climbing count does NOT mean the phone was being held still.** A steady pan that
+        /// never returns trips the bound every 0.8 s and climbs this exactly as a too-tight bound
+        /// would, with the phone never still for an instant; build 389's lift 3, which swept
+        /// cam_yaw_deg through 246°, would do just that. Abandonment fires the moment the peak
+        /// crosses the bound, so the peak at abandonment is always just over it whether the phone
+        /// was about to stop at 11° or carry on to 128° — the distinction is destroyed by the
+        /// abandonment and cannot be recovered from this column.
+        ///
+        /// **So cross-check cam_yaw_deg over the same rows before concluding the bound is too
+        /// tight.** That is the column issue #4 used to show the phone was being scanned, at 228°
+        /// and 246° of travel, and a wide span there with this climbing is a scan being refused
+        /// correctly rather than a bound to loosen. Loosening it on this count alone would re-admit
+        /// the regression the bound exists to catch. Populated even when the drift columns are
+        /// blank, since blank is exactly
         /// when it matters.
         var yawDriftAbandonedRuns: Int?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only

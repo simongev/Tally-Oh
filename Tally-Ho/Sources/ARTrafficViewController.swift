@@ -391,8 +391,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// judges, so it is bounded by that gate and near zero does not by itself mean the phone held
     /// still. `yawDriftExcursionDeg` is the one that says that.
     private var yawDriftGyroDeg: Double = .nan
-    /// Largest excursion reached *during* any banked run. Near zero means the phone really did stay
-    /// where it started, so the drift figure beside it is clean.
+    /// Largest excursion reached *during* any banked run. Near zero means the phone stayed where it
+    /// started across the runs the drift figure is built from, so that figure is clean — it says
+    /// nothing about stretches the excursion bound discarded, which appear in neither.
     private var yawDriftExcursionDeg: Double = .nan
     /// Runs the excursion bound threw away. Negative means no reading yet, matching the `.nan`
     /// sentinel the drift figures above use. Recorded even when those are absent — that is the

@@ -248,7 +248,10 @@ struct YawDriftAccumulator {
         /// integrated net at any instant *within* the run, not only at its end.
         ///
         /// This is the one to read to decide whether a drift figure is clean. Near zero means the
-        /// phone genuinely did not move, so the net across the run is drift and nothing else.
+        /// phone did not move *during the runs behind this estimate*, so the net across them is
+        /// drift and nothing else — it says nothing about the rest of the session, since a run the
+        /// excursion bound threw away contributes to this no more than it contributes to the drift
+        /// rate. `excursionAbandonedRuns` is what covers that gap.
         ///
         /// Bounded by `maxGyroExcursionDeg`, since a run that passes that is abandoned rather than
         /// banked — so this can no longer read 68° or 128° the way build 389's log did. What it
@@ -329,6 +332,11 @@ struct YawDriftAccumulator {
     /// bound — a margin of **1.67×**, not the 20× that comparing 10° against a per-sample figure
     /// appears to give — and the same ±30 °/s breaches 10° below **1.5 Hz**.
     ///
+    /// (`A / 2f` is exact for the square wave the suite feeds, and is the worst case for a given
+    /// amplitude. A sine of equal amplitude integrates to `A / πf`, smaller by π/2 — so reasoning
+    /// from this formula about a real spectrum overstates the peak and understates the margin. It
+    /// errs in the safe direction, but it is not the number a real waveform would produce.)
+    ///
     /// So the honest statement of this bound is behavioural: *the phone may not be more than 10°
     /// from where the run started, at any instant of a run of five seconds or more.* Sub-2 Hz yaw
     /// of a handheld phone in chop is the person holding it rather than the airframe, which is the
@@ -370,12 +378,27 @@ struct YawDriftAccumulator {
     /// and `estimate` is nil — so a counter carried on `Estimate` would be unreachable in exactly
     /// the case it exists to explain.
     ///
-    /// Without it the two failures are indistinguishable in a log. "The bound refused every run"
-    /// and "the phone was never held still" both produce empty drift columns and an excursion
-    /// under the bound, byte for byte. Since the whole point of flying this is to find out whether
-    /// 10° is too tight, a negative result has to be legible, and this is what makes it so: drift
-    /// columns empty with this at zero is a phone that never settled; drift columns empty with
-    /// this climbing is the bound eating the evidence.
+    /// **What it separates: whether it is *this* bound discarding runs, or something else.** With
+    /// the drift columns empty, a count of zero says the runs are failing elsewhere — the net bound
+    /// at run end, `minRunSeconds`, `minTotalSeconds`, a tracking dropout — and a count climbing
+    /// says this bound is the one throwing them away. That is a real question, it is otherwise
+    /// unanswerable from a log, and it is the whole of what this number knows.
+    ///
+    /// **It cannot tell you the phone was being held still, and must not be read that way.** A
+    /// steady pan that never comes back trips the bound every 0.8 s and climbs this counter exactly
+    /// as a too-tight bound would, while the phone is never still for an instant — build 389's
+    /// lift 3 swept `cam_yaw_deg` through 246° and would do precisely that. The reason is
+    /// structural rather than a gap to be plugged: abandonment fires the moment the peak crosses
+    /// the bound, so the peak at abandonment is always just over it whether the phone was going to
+    /// stop at 11° or carry on to 128°. The information that would separate a marginally-tight
+    /// bound from a scan is destroyed by the abandonment itself, and no counter of this shape can
+    /// recover it.
+    ///
+    /// So a climbing count is a reason to go and look, not a verdict. **Cross-check `cam_yaw_deg`
+    /// over the same rows before concluding the bound is too tight**: that is the column issue #4
+    /// used to establish the phone was being scanned, at 228° and 246° of travel. Loosening 10°
+    /// against a climbing count alone would re-admit the exact regression this bound exists to
+    /// refuse.
     private(set) var excursionAbandonedRuns: Int = 0
 
     init(minRunSeconds: TimeInterval = 5.0,

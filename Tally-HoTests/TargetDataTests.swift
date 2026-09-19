@@ -1134,9 +1134,12 @@ struct TargetDataTests {
         #expect(accumulator.excursionAbandonedRuns > 0)
     }
 
-    /// And the other reading of a blank drift column: a phone that genuinely held still abandons
-    /// nothing, so zero here means "nothing was refused" rather than "nothing was measured".
-    /// Without both halves the counter cannot discriminate, which is its only job.
+    /// A still phone does not trip the bound. That is all this shows — the run banks, so the drift
+    /// columns are populated rather than blank, and this is not the blank-column case at all.
+    ///
+    /// Worth stating because the counter is easy to over-read: a climbing count does **not** imply
+    /// the phone was held still, since a steady pan that never returns climbs it just as fast. See
+    /// `YawDriftAccumulator.excursionAbandonedRuns` for what it does and does not separate.
     @Test func aStillRunAbandonsNothing() {
         var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
         var t = 0.0
