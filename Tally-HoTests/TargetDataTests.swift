@@ -1059,6 +1059,58 @@ struct TargetDataTests {
         if let estimate { #expect(estimate.worstGyroExcursionDeg < 0.001) }
     }
 
+    /// **The build 389 regression.** A run that swings far out and comes back is not a still run,
+    /// and the end-of-run net cannot see it — a scan is zero-mean exactly as vibration is. In that
+    /// ground log two runs peaked at 68.37° and 128.21°, returned within 1.86° of where they
+    /// started, and were banked as still time with a drift rate computed across them, while
+    /// `cam_yaw_deg` showed the phone sweeping 228° and 246°: a person looking for traffic,
+    /// credited as a tripod. The mid-run excursion bound is what refuses this, and the end-of-run
+    /// net bound cannot be asked to.
+    @Test func aLargeExcursionThatReturnsToZeroIsRefused() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        // 12.8 °/s out for ten seconds and back for ten: a peak of 128°, ending where it began.
+        var t = 0.0
+        while t <= 20.0 {
+            accumulator.add(azimuthDeg: 100,
+                            gyroYawRateDps: t < 10.0 ? 12.8 : -12.8,
+                            isTracking: true,
+                            at: t)
+            t += 0.2
+        }
+        #expect(accumulator.estimate == nil)
+    }
+
+    /// Why the bound is 10° and not 5°: `vibrationDoesNotPreventARunFromBanking` has to keep
+    /// passing, and its 6° half-cycle is the largest excursion this suite requires to be admitted.
+    /// Asserted against the bound deliberately rather than left to hold by luck, so that lowering
+    /// the default under 6 fails a test that explains itself.
+    @Test func vibrationStaysWellUnderTheExcursionBound() {
+        let estimate = drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 30.0)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.worstGyroExcursionDeg - 6.0) < 0.01)
+            #expect(estimate.worstGyroExcursionDeg < YawDriftAccumulator().maxGyroExcursionDeg)
+        }
+    }
+
+    /// The bound bracketed rather than implied. At `dt` 0.2 a ±40 °/s square wave is an 8°
+    /// half-cycle and banks; ±60 °/s is 12° and does not. The 10° default sits between them.
+    ///
+    /// Deliberately not tested at exactly 10°: that comparison is a floating-point coin-toss, and
+    /// the statement worth pinning is which side of the bound each magnitude falls on.
+    @Test func anExcursionUnderTheBoundStillBanks() {
+        let estimate = drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 40.0)
+        #expect(estimate != nil)
+        if let estimate {
+            #expect(abs(estimate.worstGyroExcursionDeg - 8.0) < 0.01)
+            #expect(abs(estimate.degreesPerSecond - 0.1) < 0.05)
+        }
+    }
+
+    @Test func anExcursionOverTheBoundIsRefused() {
+        #expect(drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 60.0) == nil)
+    }
+
     /// A run that ends rotated must be refused even if it never rotated fast: 0.5 deg/s for
     /// 20 s is 10 degrees of net rotation, and the phone's azimuth change over that is not drift.
     @Test func aSlowSustainedTurnIsRefused() {

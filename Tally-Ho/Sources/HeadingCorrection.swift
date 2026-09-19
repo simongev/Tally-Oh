@@ -240,18 +240,25 @@ struct YawDriftAccumulator {
         /// It is **not** a bound on how far the phone moved during a run — a swing of forty
         /// degrees out and back ends at zero and reads here as zero. That used to be a
         /// distinction without a difference, because the gate ran continuously and no run could
-        /// pass through a large excursion and survive; now that the net is judged only at run
-        /// end, the two quantities genuinely differ and both are published.
+        /// pass through a large excursion and survive; now that the net is judged at run end, a
+        /// run may swing out as far as `maxGyroExcursionDeg` and come back reading zero here, so
+        /// the two quantities genuinely differ and both are published.
         var worstGyroNetDeg: Double
         /// Largest excursion any banked run reached, in degrees: the peak magnitude of the
         /// integrated net at any instant *within* the run, not only at its end.
         ///
         /// This is the one to read to decide whether a drift figure is clean. Near zero means the
-        /// phone genuinely did not move, so the net across the run is drift and nothing else. Large
-        /// here with a small `worstGyroNetDeg` means a run contained real rotation that happened to
-        /// cancel: admissible by design — vibration is exactly that — but the drift measured across
-        /// it is a net taken over a phone that moved, so a large value is a reason to look harder
-        /// rather than to trust the number.
+        /// phone genuinely did not move, so the net across the run is drift and nothing else.
+        ///
+        /// Bounded by `maxGyroExcursionDeg`, since a run that passes that is abandoned rather than
+        /// banked — so this can no longer read 68° or 128° the way build 389's log did. What it
+        /// can still show is a value approaching the bound, which says runs are being admitted at
+        /// the edge of what the gate is willing to call still, and that the drift rate beside it
+        /// is a net taken across a phone that moved and came back.
+        ///
+        /// It is a **session maximum**: once one run has peaked high it reads high for the rest of
+        /// the session, so it cannot say whether a *recent* run was clean. Worth knowing when
+        /// reading a log; a per-run variant would be a separate change.
         var worstGyroExcursionDeg: Double
         var runCount: Int
     }
@@ -260,28 +267,60 @@ struct YawDriftAccumulator {
     let minRunSeconds: TimeInterval
     /// Total still time required before an estimate is published at all.
     let minTotalSeconds: TimeInterval
-    /// Largest net rotation, per the gyro, that a run may end with and still be banked.
+    // MARK: The two gyro bounds
+    //
+    // These belong together and neither is the rule on its own. Reading one of them as the whole
+    // rule is exactly how build 389 shipped a 128° scan banked as still time, so they are
+    // documented in one place rather than each in its own comment describing half the story.
+    //
+    //   bound                  judged        catches
+    //   maxGyroNetDeg          at run end    a run that ENDED rotated — a slow sustained turn
+    //   maxGyroExcursionDeg    during a run  a run that WENT far and came back — a scan
+    //
+    // The thing that separates the cases is **magnitude**, and that is what the two earlier
+    // comments each got half of. Both a vibration and a scan are zero-mean, so the end-of-run net
+    // is near zero for both and cannot tell them apart at all:
+    //
+    //   - Vibration is a few degrees and must be ADMITTED. Refusing it is the build 14 failure —
+    //     51 seconds of still time in smooth cruise at FL415 and nothing at all descending
+    //     through FL340.
+    //   - A scan is tens or hundreds of degrees and must be REFUSED. In build 389's ground log
+    //     two runs peaked at 68.37° and 128.21°, returned within 1.86° of where they started, and
+    //     were banked as still time with a drift rate computed across them. The camera had swung
+    //     228° and 246° over those lifts: a person looking for traffic, credited as a tripod.
+    //
+    // So one bound is judged on where the run ended and the other on how far it ever got, and a
+    // change to either should be made knowing which case it is moving.
+
+    /// Largest net rotation, per the gyro, that a run may **end** with and still be banked.
     ///
     /// Gating on *integrated* rotation rather than instantaneous rate is what makes this usable
     /// in an aircraft. The first version required the instantaneous yaw rate to stay under a
     /// threshold at every single 60 Hz sample for five continuous seconds, so one vibration spike
-    /// ended a run: it collected 51 seconds in smooth cruise at FL415 and nothing at all in a
-    /// descent through FL340.
+    /// ended a run.
     ///
-    /// The integral is the right quantity anyway, because drift is measured as the **net** change
-    /// across a run. What disqualifies a run is the phone having ended up rotated, not having
-    /// jittered on the way. Vibration integrates to zero by construction, and a run where the
-    /// phone swung out and came back stays valid because both sides of the comparison are nets.
-    ///
-    /// Checked **only at run end** — in `closeRun()` and in `estimate`, both against the net the
-    /// run finished with. That is what makes the sentence above true rather than aspirational: a
-    /// mid-run test cannot know whether the phone is on its way out or on its way back, so any
-    /// such test refuses a cancelling swing as if it were a turn.
-    ///
-    /// What the run passed through on the way is therefore not gated — but it is measured, and
-    /// published as `Estimate.worstGyroExcursionDeg`. A gate that admits a cancelling swing owes
-    /// the log a way to tell that swing from a phone that never moved.
+    /// Judged at the end — in `closeRun()` and in `estimate` — because that is the question this
+    /// bound asks. Drift is the **net** change across a run, so what disqualifies a run *here* is
+    /// the phone having ended up rotated rather than having jittered on the way. A mid-run test of
+    /// the net cannot tell a phone on its way out from one on its way back, and would refuse the
+    /// cancelling couple of degrees that vibration is made of. How far the run travelled before
+    /// coming back is the other bound's business, not this one's.
     let maxGyroNetDeg: Double
+    /// Largest excursion a run may reach at any instant and still be allowed to continue, judged
+    /// **during** the run against `runGyroPeakDeg`.
+    ///
+    /// A run that exceeds it is abandoned outright rather than carried to its end, because it
+    /// cannot be rescued by coming back: letting it continue would bank a contaminated stretch the
+    /// moment it passed the duration minimum, which is precisely what build 389 did.
+    ///
+    /// **10° is a starting value, not a derivation, and has never been confirmed in flight.** It
+    /// comes from a single ground log: build 389's one genuinely still stretch peaked at 2.6° and
+    /// its two scans at 68.37° and 128.21°, so ten sits in the empty space between them. It is
+    /// also roughly twenty times the ~0.5° that one sample of realistic 60 Hz airframe vibration
+    /// contributes, and that margin is the one that matters — the cost of setting this too low is
+    /// build 14 over again, a gate that collects no still time in the air at all. A flight has
+    /// never exercised it. Confirm it against one before treating the number as settled.
+    let maxGyroExcursionDeg: Double
 
     private var runStartTime: TimeInterval?
     private var runStartAzimuth: Double = 0
@@ -302,19 +341,21 @@ struct YawDriftAccumulator {
 
     init(minRunSeconds: TimeInterval = 5.0,
          minTotalSeconds: TimeInterval = 10.0,
-         maxGyroNetDeg: Double = 2.0) {
+         maxGyroNetDeg: Double = 2.0,
+         maxGyroExcursionDeg: Double = 10.0) {
         self.minRunSeconds = minRunSeconds
         self.minTotalSeconds = minTotalSeconds
         self.maxGyroNetDeg = maxGyroNetDeg
+        self.maxGyroExcursionDeg = maxGyroExcursionDeg
     }
 
     /// Feed one sample.
     ///
     /// `gyroYawRateDps` must come from a source independent of ARKit — see the type comment for
-    /// why ARKit's own attitude will not do. It is integrated across the run, and the run is
-    /// banked only if the integral it **ends** with is small; nothing here judges it while the run
-    /// is in progress. `isTracking` false ends the current run, since ARKit's azimuth means
-    /// nothing then.
+    /// why ARKit's own attitude will not do. It is integrated across the run and judged against
+    /// two bounds asking different questions: the **peak** is tested here, as the run goes, and
+    /// the **net** when the run ends. See "The two gyro bounds" above for which case each catches.
+    /// `isTracking` false ends the current run, since ARKit's azimuth means nothing then.
     mutating func add(azimuthDeg: Double,
                       gyroYawRateDps: Double,
                       isTracking: Bool,
@@ -343,17 +384,22 @@ struct YawDriftAccumulator {
             return
         }
         _ = start
-        // Trapezoid over the interval since the last sample. Signed, so vibration cancels — and
-        // accumulated only, never tested against maxGyroNetDeg here. A running total that has gone
-        // wide says the phone is rotated *now*, which is not the question: the question is where it
-        // ends up, and a half-cycle of vibration is wide at its peak and zero at its end. Ending
-        // the run on the peak is the build 14 failure with an integral in place of a rate.
+        // Trapezoid over the interval since the last sample. Signed, so vibration cancels.
         runGyroNetDeg += gyroYawRateDps * (time - runLastTime)
-        // The excursion, on the other hand, can only be seen from inside the run: it is the peak
-        // the net reaches, and the net is free to come back from it.
+        // The excursion can only be seen from inside the run: it is the peak the net reaches, and
+        // the net is free to come back from it and erase the evidence.
         runGyroPeakDeg = max(runGyroPeakDeg, abs(runGyroNetDeg))
         runLastTime = time
         runLastAzimuth = azimuthDeg
+        // The mid-run bound, and the only one judged here — the net is deliberately not tested in
+        // this function. A run that has swung this far cannot be rescued by coming back, and
+        // letting it continue would bank a contaminated stretch the moment it passed the duration
+        // minimum. Abandoned outright, so the next sample starts a fresh run.
+        if runGyroPeakDeg > maxGyroExcursionDeg {
+            runStartTime = nil
+            runGyroNetDeg = 0
+            runGyroPeakDeg = 0
+        }
     }
 
     /// End the current run, banking it if it lasted long enough to mean anything.
