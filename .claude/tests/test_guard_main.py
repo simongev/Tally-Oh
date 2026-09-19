@@ -41,12 +41,17 @@ wrong thing confidently. Judge it by that standard and do not write a docstring
 that claims more.
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[1] / "hooks" / "guard-main.py"
+# Defaults to the installed hook. Point GUARD_HOOK at a candidate to vet a fix
+# before installing it -- which is the only way to verify a change to a file the
+# guard itself protects from being edited.
+HOOK = Path(os.environ.get("GUARD_HOOK",
+                           Path(__file__).resolve().parents[1] / "hooks" / "guard-main.py"))
 PROTECTED_HOOK = ".claude/hooks/guard-main.py"
 PROTECTED_SETTINGS = ".claude/settings.json"
 
