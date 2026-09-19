@@ -1111,6 +1111,59 @@ struct TargetDataTests {
         #expect(drift(driftDps: 0.1, seconds: 20, gyroVibrationDps: 60.0) == nil)
     }
 
+    /// **A negative result has to be legible.** If `maxGyroExcursionDeg` is too tight it abandons
+    /// every run, so no estimate is ever published and every drift column in the log is blank —
+    /// which is byte-for-byte what a phone nobody held still produces. Those are opposite
+    /// diagnoses, and the flight that exists to find out whether 10° is too tight would not be
+    /// able to tell them apart.
+    ///
+    /// So the count of abandoned runs lives on the accumulator rather than on `Estimate`, and this
+    /// pins the property that matters: it is readable **while `estimate` is nil**, which is exactly
+    /// when it is the only thing left to read.
+    @Test func abandonedRunsAreCountedEvenWhenThereIsNoEstimate() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        var t = 0.0
+        while t <= 20.0 {
+            accumulator.add(azimuthDeg: 100,
+                            gyroYawRateDps: t < 10.0 ? 12.8 : -12.8,
+                            isTracking: true,
+                            at: t)
+            t += 0.2
+        }
+        #expect(accumulator.estimate == nil)
+        #expect(accumulator.excursionAbandonedRuns > 0)
+    }
+
+    /// And the other reading of a blank drift column: a phone that genuinely held still abandons
+    /// nothing, so zero here means "nothing was refused" rather than "nothing was measured".
+    /// Without both halves the counter cannot discriminate, which is its only job.
+    @Test func aStillRunAbandonsNothing() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        var t = 0.0
+        while t <= 20.0 {
+            accumulator.add(azimuthDeg: 0.1 * t, gyroYawRateDps: 0, isTracking: true, at: t)
+            t += 0.2
+        }
+        #expect(accumulator.estimate != nil)
+        #expect(accumulator.excursionAbandonedRuns == 0)
+    }
+
+    /// The count belongs to one ARKit world, like every other figure here.
+    @Test func resetClearsTheAbandonedRunCount() {
+        var accumulator = YawDriftAccumulator(minRunSeconds: 5.0, minTotalSeconds: 10.0)
+        var t = 0.0
+        while t <= 20.0 {
+            accumulator.add(azimuthDeg: 100,
+                            gyroYawRateDps: t < 10.0 ? 12.8 : -12.8,
+                            isTracking: true,
+                            at: t)
+            t += 0.2
+        }
+        #expect(accumulator.excursionAbandonedRuns > 0)
+        accumulator.reset()
+        #expect(accumulator.excursionAbandonedRuns == 0)
+    }
+
     /// A run that ends rotated must be refused even if it never rotated fast: 0.5 deg/s for
     /// 20 s is 10 degrees of net rotation, and the phone's azimuth change over that is not drift.
     @Test func aSlowSustainedTurnIsRefused() {

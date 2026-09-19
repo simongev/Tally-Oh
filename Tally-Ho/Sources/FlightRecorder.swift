@@ -71,6 +71,7 @@ final class FlightRecorder {
         "yaw_follow_deg", "follow_gain", "follow_gain_r", "gyro_az_deg",
         "compass_response", "compass_resp_r", "frame_lock", "frame_lock_r",
         "ar_yaw_drift_dps", "ar_drift_secs", "ar_drift_gyro_deg", "ar_drift_excursion_deg",
+        "ar_drift_abandoned",
         "ar_heading_deg", "heading_delta_deg",
         "cam_yaw_deg", "cam_pitch_deg", "cam_roll_deg", "img_roll_deg", "ui_roll_deg", "ui_orient",
         "ar_state", "airborne", "airborne_basis",
@@ -222,6 +223,20 @@ final class FlightRecorder {
         /// It is a **session maximum**: once one run has peaked high it reads high for the rest of
         /// the session, so it cannot say whether a *recent* run was clean.
         var yawDriftExcursionDeg: Double?
+        /// How many still runs the excursion bound threw away, cumulative for the ARKit session.
+        ///
+        /// **Read this first whenever the drift columns are empty**, because it is the only thing
+        /// that says which of two very different situations produced them. Empty drift columns with
+        /// this at 0 is a phone that was never held still for five seconds. Empty drift columns
+        /// with this climbing is the excursion bound refusing every run — the phone *was* held, and
+        /// maxGyroExcursionDeg is too tight for how it was held.
+        ///
+        /// That distinction is the point of the column. The bound's own comment names "a gate that
+        /// collects no still time in the air at all" as the cost of setting it too low, and without
+        /// this the log could not report that failure at all: it looks identical to nobody holding
+        /// the phone up. Populated even when the drift columns are blank, since blank is exactly
+        /// when it matters.
+        var yawDriftAbandonedRuns: Int?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
         /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
         /// where the compass is track-slaved, this and heading_delta_deg carry the same
@@ -449,6 +464,7 @@ final class FlightRecorder {
         fields.append(format(sample.yawDriftSeconds,  decimals: 0))
         fields.append(format(sample.yawDriftGyroDeg,  decimals: 2))
         fields.append(format(sample.yawDriftExcursionDeg, decimals: 2))
+        fields.append(sample.yawDriftAbandonedRuns.map(String.init) ?? "")
         fields.append(format(sample.arHeadingDeg,   decimals: 1))
         fields.append(format(sample.headingDeltaDeg, decimals: 1))
 

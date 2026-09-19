@@ -313,13 +313,37 @@ struct YawDriftAccumulator {
     /// cannot be rescued by coming back: letting it continue would bank a contaminated stretch the
     /// moment it passed the duration minimum, which is precisely what build 389 did.
     ///
-    /// **10° is a starting value, not a derivation, and has never been confirmed in flight.** It
+    /// **10° is a starting value, not a derivation, and has never been exercised in flight.** It
     /// comes from a single ground log: build 389's one genuinely still stretch peaked at 2.6° and
-    /// its two scans at 68.37° and 128.21°, so ten sits in the empty space between them. It is
-    /// also roughly twenty times the ~0.5° that one sample of realistic 60 Hz airframe vibration
-    /// contributes, and that margin is the one that matters — the cost of setting this too low is
-    /// build 14 over again, a gate that collects no still time in the air at all. A flight has
-    /// never exercised it. Confirm it against one before treating the number as settled.
+    /// its two scans at 68.37° and 128.21°, so ten sits in the empty space between them.
+    ///
+    /// **The margin against vibration is set by frequency, not amplitude, and it is far narrower
+    /// than an amplitude-only reading suggests.** This bound tests an *accumulated* peak, so for a
+    /// zero-mean oscillation of amplitude `A` and frequency `f` the quantity it sees is
+    ///
+    ///     peak = A / 2f
+    ///
+    /// which does not shrink as the sampler runs faster — a per-sample vibration figure describes
+    /// something this gate never tests. Worked in the right quantity: ±30 °/s, the amplitude
+    /// `vibrationStaysWellUnderTheExcursionBound` uses, reaches 6.0° at 2.5 Hz. That is 60% of the
+    /// bound — a margin of **1.67×**, not the 20× that comparing 10° against a per-sample figure
+    /// appears to give — and the same ±30 °/s breaches 10° below **1.5 Hz**.
+    ///
+    /// So the honest statement of this bound is behavioural: *the phone may not be more than 10°
+    /// from where the run started, at any instant of a run of five seconds or more.* Sub-2 Hz yaw
+    /// of a handheld phone in chop is the person holding it rather than the airframe, which is the
+    /// case this is meant to catch — but the margin is thin enough that tightening it needs the
+    /// arithmetic above, not intuition about amplitudes.
+    ///
+    /// Note also that device motion is fed at **20 Hz** (`deviceMotionUpdateInterval = 1/20`),
+    /// which cannot represent airframe vibration and aliases anything above 10 Hz, so nothing here
+    /// rests on the true vibration spectrum.
+    ///
+    /// **The real lower frequency bound on vibration this must survive remains unknown.** Issue #3
+    /// asked for it and nothing has answered it; the figures above do not. The cost of setting this
+    /// too low is build 14 over again — a gate that collects no still time in the air at all — and
+    /// only a flight can say whether 10 is that. `excursionAbandonedRuns` is what makes that
+    /// answer readable when it is.
     let maxGyroExcursionDeg: Double
 
     private var runStartTime: TimeInterval?
@@ -338,6 +362,21 @@ struct YawDriftAccumulator {
     private var runs: Int = 0
     private var worstGyroNet: Double = 0
     private var worstGyroExcursion: Double = 0
+
+    /// How many runs `maxGyroExcursionDeg` has thrown away since the last `reset()`.
+    ///
+    /// **Deliberately not on `Estimate`, and readable whether or not there is one.** If the bound
+    /// is too tight then every run is abandoned, `totalSeconds` never reaches `minTotalSeconds`,
+    /// and `estimate` is nil — so a counter carried on `Estimate` would be unreachable in exactly
+    /// the case it exists to explain.
+    ///
+    /// Without it the two failures are indistinguishable in a log. "The bound refused every run"
+    /// and "the phone was never held still" both produce empty drift columns and an excursion
+    /// under the bound, byte for byte. Since the whole point of flying this is to find out whether
+    /// 10° is too tight, a negative result has to be legible, and this is what makes it so: drift
+    /// columns empty with this at zero is a phone that never settled; drift columns empty with
+    /// this climbing is the bound eating the evidence.
+    private(set) var excursionAbandonedRuns: Int = 0
 
     init(minRunSeconds: TimeInterval = 5.0,
          minTotalSeconds: TimeInterval = 10.0,
@@ -399,6 +438,9 @@ struct YawDriftAccumulator {
             runStartTime = nil
             runGyroNetDeg = 0
             runGyroPeakDeg = 0
+            // Counted, because an abandoned run leaves no other trace: it banks nothing, moves no
+            // total, and touches neither worst-case figure. See `excursionAbandonedRuns`.
+            excursionAbandonedRuns += 1
         }
     }
 
@@ -426,6 +468,7 @@ struct YawDriftAccumulator {
         runs = 0
         worstGyroNet = 0
         worstGyroExcursion = 0
+        excursionAbandonedRuns = 0
     }
 
     /// Includes the run in progress, so a long steady hold shows up without waiting for it to end.

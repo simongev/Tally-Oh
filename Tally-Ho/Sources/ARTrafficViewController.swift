@@ -394,6 +394,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Largest excursion reached *during* any banked run. Near zero means the phone really did stay
     /// where it started, so the drift figure beside it is clean.
     private var yawDriftExcursionDeg: Double = .nan
+    /// Runs the excursion bound threw away. Negative means no reading yet, matching the `.nan`
+    /// sentinel the drift figures above use. Recorded even when those are absent — that is the
+    /// case it exists for. See `YawDriftAccumulator.excursionAbandonedRuns`.
+    private var yawDriftAbandonedRuns: Int = -1
 
     /// The phone's physical roll about the viewing axis, from the session camera's own frame,
     /// which is independent of the interface orientation. Written on the render thread, read when
@@ -1570,6 +1574,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         yawDriftSeconds = .nan
         yawDriftGyroDeg = .nan
         yawDriftExcursionDeg = .nan
+        yawDriftAbandonedRuns = -1
     }
 
     /// Re-present the launch-time calibration screen as a full-screen popup when
@@ -2439,6 +2444,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.yawDriftSeconds       = yawDriftSeconds.isNaN  ? nil : yawDriftSeconds
         sample.yawDriftGyroDeg       = yawDriftGyroDeg.isNaN  ? nil : yawDriftGyroDeg
         sample.yawDriftExcursionDeg  = yawDriftExcursionDeg.isNaN ? nil : yawDriftExcursionDeg
+        sample.yawDriftAbandonedRuns = yawDriftAbandonedRuns < 0  ? nil : yawDriftAbandonedRuns
         sample.courseResidualDeg     = courseResidualDeg.isNaN ? nil : courseResidualDeg
         // Empty only for `none`. From build 30 the seed carries a real measured offset like every
         // other source, rather than build 29's "seed means zero".
@@ -3230,6 +3236,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                      gyroYawRateDps: verticalYawRateDps,
                      isTracking: true,
                      at: time)
+        // Read outside `if let drift`, and that placement is the whole point of the counter. If the
+        // excursion bound is too tight it abandons every run, no estimate is ever published, and
+        // everything inside the block below stays blank — which is indistinguishable from a phone
+        // nobody held still. This is the one figure that separates those, so it must not be behind
+        // the very condition that fails in the case it explains.
+        yawDriftAbandonedRuns = yawDrift.excursionAbandonedRuns
         if let drift = yawDrift.estimate {
             yawDriftDps      = drift.degreesPerSecond
             yawDriftSeconds  = drift.totalStillSeconds
