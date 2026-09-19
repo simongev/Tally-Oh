@@ -201,19 +201,26 @@ final class FlightRecorder {
         /// bounded by that gate by construction and says little more than that the runs were
         /// admissible.
         ///
-        /// **Near zero no longer means the phone held still.** It did until the drift gate moved to
-        /// judging the net only at run end, because no run could pass through a large excursion and
-        /// survive; now a run can swing forty degrees out and back and end at zero. Read it with
-        /// yawDriftExcursionDeg, which is the column that still distinguishes those.
+        /// **Near zero no longer means the phone held still.** It did while the net was tested
+        /// continuously, because no run could pass through an excursion at all and survive; now a
+        /// run may swing out as far as maxGyroExcursionDeg and come back reading zero here. Read it
+        /// with yawDriftExcursionDeg, which is the column that still distinguishes those.
         var yawDriftGyroDeg: Double?
         /// Largest excursion across any run behind yawDriftDps, in degrees: the peak the gyro's
         /// integrated net reached at any instant *within* a run, not only at its end.
         ///
         /// This is the one that says whether the phone actually stayed still, and so whether the
         /// drift figure beside it is measuring drift or a net taken across a phone that moved and
-        /// came back. Near zero is clean. Large, against a small yawDriftGyroDeg, is a run that
-        /// contained real rotation which happened to cancel — admissible by design, since that is
-        /// what vibration is, but a reason to distrust the drift rate rather than to trust it.
+        /// came back. Near zero is clean.
+        ///
+        /// Bounded by YawDriftAccumulator's maxGyroExcursionDeg, since a run that passes that bound
+        /// is abandoned rather than banked — so this can no longer read 68° or 128° the way build
+        /// 389's log did. What it can still show is a value approaching the bound, and that says
+        /// runs are being admitted at the edge of what the gate is willing to call still, with the
+        /// drift rate beside it taken across a phone that moved and came back.
+        ///
+        /// It is a **session maximum**: once one run has peaked high it reads high for the rest of
+        /// the session, so it cannot say whether a *recent* run was clean.
         var yawDriftExcursionDeg: Double?
         /// ARKit's raw azimuth minus GPS ground track. Diagnostic only, and meaningful only
         /// while the phone points near the aircraft's nose. Read it alongside compassResponse:
