@@ -238,19 +238,65 @@ class ARComponentFactory {
 
     // MARK: - Position Scaling
 
-    /// Scale the horizontal distance from the camera into [minARRadius, maxARRadius],
-    /// preserving the compass bearing.
+    /// Compress a target's placement onto the [minARRadius, maxARRadius] shell around the
+    /// camera, preserving both compass bearing and elevation angle exactly.
+    ///
+    /// This used to clamp only the horizontal (X/Z) distance and leave Y untouched — a
+    /// *cylindrical* clamp, not the spherical shell the design calls for (see
+    /// docs/AR_ACCURACY_PLAN.md, "distance is compressed onto a 5-80 m shell ... only angular
+    /// error matters"). `calculateARPosition` computes Y as `clampedHorizontalRadius *
+    /// tan(elevationAngle)`, so once the horizontal radius pins at `maxARRadius` (true for
+    /// virtually all real traffic — that is ~262 ft), Y keeps growing with elevation angle alone
+    /// and is unbounded up to the ±85 deg placement clamp: at 85 deg, Y is ~11.4x the horizontal
+    /// radius. The Euclidean camera distance `sqrt(x² + y² + z²)` is then `horizontalRadius *
+    /// sec(elevation)`, not `horizontalRadius` — and that distance, not distanceNM, is what
+    /// SceneKit's perspective projection actually uses to size the billboard on screen.
+    ///
+    /// For a climbing, receding aircraft, elevation angle very often *falls* over time (the
+    /// horizontal recession outpaces the climb once the target is more than a few dozen metres
+    /// out), which shrinks that Euclidean distance — even while `markerDistanceScale` is *also*
+    /// shrinking the marker for being farther away in `distanceNM`, this shrinks it net LESS: the
+    /// billboard is scaled down correctly by `distanceScale` but sat closer to the camera in AR
+    /// space than intended, so it reads as *larger* on screen, growing for as long as the
+    /// elevation-driven shrink outpaces the distance-driven one. That is the reported "label kept
+    /// getting bigger and bigger" bug — see
+    /// `labelApparentSizeDoesNotGrowAsADepartingAircraftRecedes` in TargetDataTests.swift, which
+    /// reproduces it against a realistic departure profile.
+    ///
+    /// The fix: after the horizontal-only clamp (kept exactly as before, so it goes on landing Y
+    /// at the correct elevation angle), re-clamp the *total* 3D distance into the same
+    /// [minARRadius, maxARRadius] shell, scaling X, Y and Z together. A uniform scale never
+    /// changes a ratio, so the elevation angle survives this second pass exactly unchanged; only
+    /// the radius does.
     static func scaledPosition(_ raw: SCNVector3, relativeTo cam: SCNVector3 = .init()) -> SCNVector3 {
         let dx = raw.x - cam.x
         let dz = raw.z - cam.z
+        let dy = raw.y - cam.y
         let horizLen = sqrt(dx * dx + dz * dz)
-        guard horizLen > 0 else { return SCNVector3(cam.x, raw.y, cam.z - minARRadius) }
-        let clamped = max(minARRadius, min(maxARRadius, horizLen))
-        let scale   = clamped / horizLen
-        return SCNVector3(cam.x + dx * scale, raw.y, cam.z + dz * scale)
+
+        // Pass 1 (unchanged): clamp the horizontal radius, preserving bearing. A target with
+        // zero horizontal offset (directly overhead/underneath) has no bearing to preserve, so
+        // it goes due south at the floor radius, same as before.
+        let cylX: Float
+        let cylZ: Float
+        if horizLen > 0 {
+            let horizScale = max(minARRadius, min(maxARRadius, horizLen)) / horizLen
+            cylX = dx * horizScale
+            cylZ = dz * horizScale
+        } else {
+            cylX = 0
+            cylZ = -minARRadius
+        }
+
+        // Pass 2 (the fix): clamp the total Euclidean distance, scaling X/Y/Z together.
+        let totalLen = sqrt(cylX * cylX + dy * dy + cylZ * cylZ)
+        guard totalLen > 0 else { return SCNVector3(cam.x, cam.y, cam.z - minARRadius) }
+        let totalScale = max(minARRadius, min(maxARRadius, totalLen)) / totalLen
+
+        return SCNVector3(cam.x + cylX * totalScale, cam.y + dy * totalScale, cam.z + cylZ * totalScale)
     }
 
-    /// Like scaledPosition but for airports — preserves the computed elevation Y.
+    /// Like scaledPosition but for airports — preserves the computed elevation angle exactly.
     static func scaledAirportPosition(_ raw: SCNVector3, relativeTo cam: SCNVector3 = .init()) -> SCNVector3 {
         return scaledPosition(raw, relativeTo: cam)
     }

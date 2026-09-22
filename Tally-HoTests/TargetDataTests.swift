@@ -626,6 +626,101 @@ struct TargetDataTests {
         #expect(abs(elevation - 85) < 0.5)
     }
 
+    // MARK: - AR shell distance (the "label kept getting bigger" bug)
+
+    /// The literal invariant the "5-80 m shell" design calls for: total camera distance is
+    /// bounded, not just the horizontal (X/Z) component. `calculateARPosition` computes Y as
+    /// `clampedHorizontalRadius * tan(elevationAngle)` — correct for the elevation *angle* — but
+    /// until this fix `scaledPosition` re-clamped only the horizontal magnitude and left Y
+    /// untouched, so the Euclidean distance `sqrt(x² + y² + z²)` (what SceneKit's perspective
+    /// projection actually sizes the billboard by) could run far past `maxARRadius`: up to
+    /// ~11.4x it at the ±85° placement clamp. Reusing the exact geometries already pinned above
+    /// (52° and 85° elevation) as the regression cases.
+    @Test func totalCameraDistanceStaysWithinTheShell() {
+        let own = CLLocationCoordinate2D(latitude: 40.75, longitude: -74.03)
+        let cases: [(name: String, target: CLLocationCoordinate2D, targetAltitudeFt: Double, userAltitudeFt: Double)] = [
+            ("52 deg elevation (AAL1744)",
+             CLLocationCoordinate2D(latitude: 40.75 + 4.5 / 60.0, longitude: -74.03), 35_000, 0),
+            ("85 deg elevation (straight overhead)",
+             CLLocationCoordinate2D(latitude: 40.75 + 0.05 / 60.0, longitude: -74.03), 30_000, 0),
+            ("under 1 deg elevation (shallow)",
+             CLLocationCoordinate2D(latitude: 40.75 + 10.0 / 60.0, longitude: -74.03), 36_000, 35_000),
+        ]
+        for c in cases {
+            let raw = CalculationsLogic.calculateARPosition(
+                targetCoord: c.target, targetAltitude: c.targetAltitudeFt,
+                userCoord: own, userAltitude: c.userAltitudeFt, userHeading: 0)
+            let pos = ARComponentFactory.scaledPosition(raw)
+            let cameraDistance = sqrt(Double(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z))
+            // c.name identifies which geometry failed when this trips (52 deg / 85 deg / shallow).
+            #expect(cameraDistance <= Double(ARComponentFactory.maxARRadius) + 0.01, "\(c.name)")
+        }
+    }
+
+    /// A target too close to have a meaningful bearing (near-zero horizontal offset) still lands
+    /// on the shell floor, not wherever an unbounded Y happens to put it.
+    @Test func totalCameraDistanceRespectsTheShellFloorWhenNearlyOverhead() {
+        let own = CLLocationCoordinate2D(latitude: 40.75, longitude: -74.03)
+        // ~2 m north, co-altitude: elevation is ~0 deg, horizontal distance is under minARRadius.
+        let target = CLLocationCoordinate2D(latitude: 40.75 + (2.0 / 111_320.0), longitude: -74.03)
+        let raw = CalculationsLogic.calculateARPosition(
+            targetCoord: target, targetAltitude: 1_000,
+            userCoord: own, userAltitude: 1_000, userHeading: 0)
+        let pos = ARComponentFactory.scaledPosition(raw)
+        let cameraDistance = sqrt(Double(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z))
+        #expect(abs(cameraDistance - Double(ARComponentFactory.minARRadius)) < 0.1)
+    }
+
+    /// The reported bug, reproduced against a realistic departure: a single aircraft, never
+    /// selected, no TCAS involved, flying away while climbing at 1,500 ft/min and 160 kt
+    /// groundspeed from a viewer standing close to its initial position (elevation starts at
+    /// 78.7° and falls as horizontal recession outpaces the climb). Real distance and
+    /// `markerDistanceScale` both grow monotonically the whole time — the marker should only
+    /// ever shrink. Before the `scaledPosition` fix, the falling elevation angle shrank the
+    /// Euclidean camera distance from ~306 m to ~80 m over the first 24 s (Y was tracking
+    /// elevation alone once the horizontal radius pinned at `maxARRadius`), which shrank the
+    /// *apparent* size faster than growing `distanceNM` could — net result, the on-screen label
+    /// grew to 3.6x its starting size before it finally started shrinking. This test fails on
+    /// the pre-fix `scaledPosition` and passes on the corrected one.
+    @Test func labelApparentSizeDoesNotGrowAsADepartingAircraftRecedes() {
+        let user = CLLocationCoordinate2D(latitude: 40.0, longitude: -74.0)
+        let metersPerDegreeLat = 111_320.0
+        let groundspeedMPS = 160.0 * CalculationsLogic.knotsToMetersPerSecond   // 160 kt
+        let climbRateMPS   = 1500.0 * CalculationsLogic.feetToMeters / 60.0    // 1,500 ft/min
+        let r0   = 60.0    // m — viewer close to the aircraft's initial position
+        let alt0 = 300.0   // m — already a few hundred feet up (78.7 deg initial elevation)
+
+        var previousApparentSize: Double?
+        var t = 0.0
+        while t <= 90.0 {
+            let horizontalM = r0 + groundspeedMPS * t
+            let altitudeM   = alt0 + climbRateMPS * t
+            let target = CLLocationCoordinate2D(
+                latitude: user.latitude + horizontalM / metersPerDegreeLat,
+                longitude: user.longitude)
+            let targetAltitudeFt = altitudeM * CalculationsLogic.metersToFeet
+
+            let distanceNM = CalculationsLogic.distanceInNauticalMiles(from: user, to: target)
+            let raw = CalculationsLogic.calculateARPosition(
+                targetCoord: target, targetAltitude: targetAltitudeFt,
+                userCoord: user, userAltitude: 0, userHeading: 0)
+            let pos = ARComponentFactory.scaledPosition(raw)
+            let cameraDistance = sqrt(Double(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z))
+            let distanceScale  = Double(ARComponentFactory.markerDistanceScale(distanceNM))
+            // Proportional to the on-screen size of a fixed-geometry billboard under
+            // perspective projection: bigger container.scale or a closer camera both make it
+            // bigger, so this is exactly what a person watching the screen perceives as "size".
+            let apparentSize = distanceScale / cameraDistance
+
+            if let previous = previousApparentSize {
+                #expect(apparentSize <= previous + 1e-9,
+                        "apparent size grew from \(previous) to \(apparentSize) at t=\(t)s while the aircraft climbed away — this is the reported label-growth bug")
+            }
+            previousApparentSize = apparentSize
+            t += 3.0
+        }
+    }
+
     // MARK: - Depression angle (the airport vertical check)
 
     /// Level with the viewer is on the horizon, whatever the distance.
