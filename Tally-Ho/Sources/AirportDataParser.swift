@@ -31,13 +31,21 @@ class AirportDataParser {
         // remaining columns not needed
     }
 
-    /// Load and parse airports from the bundled airports.csv
-    /// Returns nil if the file cannot be found or parsed
+    /// Load and parse airports from the bundled airports.csv.
+    /// Returns nil if the bundled resource cannot be found or opened.
     static func loadAirportsFromCSV() -> [Airport]? {
         guard let url = Bundle.main.url(forResource: "airports", withExtension: "csv") else {
             return nil
         }
+        return loadAirports(from: url)
+    }
 
+    /// Load and parse airports from a CSV file at an arbitrary URL (OurAirports format).
+    /// This is the actual parsing entry point — `loadAirportsFromCSV()` above just resolves
+    /// the bundled resource and forwards here, so no network or `Bundle.main` dependency
+    /// exists below this call: tests can point it at a fixture file directly.
+    /// Returns nil if the file cannot be opened.
+    static func loadAirports(from url: URL) -> [Airport]? {
         // Stream line-by-line instead of loading the entire 12 MB file into one String
         // and splitting it into 83,000 substrings simultaneously.  Each line is processed
         // inside its own autoreleasepool so intermediate String allocations (field splits,
