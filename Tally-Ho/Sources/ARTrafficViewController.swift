@@ -496,6 +496,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// wobble is correlated over about a second.
     private var lastSeedSampleTime: TimeInterval = 0
 
+    /// The airborne seed's trigger. Takes the place of `startupSeed` for the first capture of a
+    /// world whose reference is the track, so that capture closes when the phone has settled after
+    /// the card rather than one second after it began. The ground `.compass` capture and every
+    /// resample still run on `startupSeed`, unchanged. See AirborneSeedSettle.
+    private var airborneSeed = AirborneSeedSettle()
+    /// Set when `updateStartupSeed` starts an airborne capture; cleared when it publishes or is
+    /// abandoned. The capture itself begins at its first sample, because that is the first moment
+    /// both clocks are in hand — see `feedAirborneSeed`.
+    private var airborneSeedArmed = false
+    /// `CACurrentMediaTime()` when the airborne card went up this world, or `.nan` if it has not.
+    private var seedCardShownAt: TimeInterval = .nan
+    /// Main clock minus render clock, measured at the airborne capture's first sample. Logged on
+    /// `seed_captured` so a flight log settles whether the two are one clock; the capture is correct
+    /// either way, since it converts rather than assumes.
+    private var seedClockSkew: TimeInterval = .nan
+    /// How far ahead of the seed watchdog the airborne cap must fire. The watchdog runs on the 4 Hz
+    /// tick and a window needs about 0.6 s of samples, so two seconds leaves room for both.
+    private static let airborneSeedWatchdogMarginSeconds: TimeInterval = 2.0
+
+    /// Whether either capture is running, for everything outside the seed that must not interrupt one.
+    private var seedIsCapturing: Bool { startupSeed.isCapturing || airborneSeedArmed }
+
     /// Render clock past which this world stops looking for a steadier hold. Set at every world
     /// reset; the window itself lives in `SeedResamplePolicy`, which also decides both questions.
     private var seedResampleDeadline: TimeInterval = 0
@@ -1541,6 +1563,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         awaitingSeed = shouldSeedThisWorld
         awaitingSeedConfirmation = false
         startupSeed.cancel()
+        cancelAirborneSeed()
+        seedCardShownAt = .nan
+        seedClockSkew = .nan
         seedIsResampling = false
         bestSeedSpreadDeg = nil
         seedResampleDeadline = CACurrentMediaTime() + SeedResamplePolicy.windowSeconds
@@ -3391,18 +3416,19 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 detail: String(format: "gs=%.0fkt course_acc=%.1f hdg=%.0f hdg_acc=%.0f airborne=%d had_ref=%d capturing=%d",
                                lastGPSSpeedKt, lastGPSCourseAccuracy, lastTrueHeading,
                                lastHeadingAccuracy, isAirborneEstimate ? 1 : 0,
-                               seedReference == nil ? 0 : 1, startupSeed.isCapturing ? 1 : 0)
+                               seedReference == nil ? 0 : 1, seedIsCapturing ? 1 : 0)
             )
             awaitingSeed = false
             seedFallbackToHeading = true
             startupSeed.cancel()
+            cancelAirborneSeed()
             // Back to the alignment ARKit takes for itself. Not good — it is what rotated 176° in
             // flight — but a world pointing nowhere in particular is worse.
             startARSession(reason: "seed_fallback")
             return
         }
 
-        guard !startupSeed.isCapturing else { return }
+        guard !seedIsCapturing else { return }
 
         // The card goes up before the capture can start, not with it. ARKit's azimuth means nothing
         // until tracking is `.normal`, so the capture waits for that — but the whole point of the
@@ -3415,6 +3441,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // measures the phone, so the seed needs no aiming and says nothing.
             showAlignBanner("Hold the phone facing the direction of flight", clearAfter: 12.0)
             awaitingSeedConfirmation = true
+            // On the main clock. The capture runs on the render clock, so this is converted when
+            // the first sample arrives rather than compared directly — see `feedAirborneSeed`.
+            seedCardShownAt = CACurrentMediaTime()
         }
 
         guard worldIsUsableForDisplay(arTrackingState) else { return }
@@ -3423,7 +3452,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // covers the case where neither ever does.
         guard let reference = seedReference else { return }
 
-        startupSeed.begin(reference: reference.kind)
+        // The track needs the user to have obeyed the card, so it waits for the phone to settle;
+        // the compass measures the phone and needs nothing, so it keeps the one-second capture.
+        if reference.kind == .track {
+            airborneSeedArmed = true
+        } else {
+            startupSeed.begin(reference: reference.kind)
+        }
         lastSeedSampleTime = 0
     }
 
@@ -3431,22 +3466,39 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// uncorrected azimuth the anchor uses — the offset being measured *is* the correction, so a
     /// corrected azimuth would be measuring it against itself.
     private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval) {
-        guard awaitingSeed || seedIsResampling, startupSeed.isCapturing else { return }
+        guard awaitingSeed || seedIsResampling, seedIsCapturing else { return }
         guard let reference = seedReference else {
             // The reference went away mid-capture; the samples already taken were measured against
             // it, so they go with it.
             startupSeed.cancel()
+            cancelAirborneSeed()
             seedIsResampling = false
             return
         }
         guard time - lastSeedSampleTime >= 0.2 else { return }
         lastSeedSampleTime = time
-        startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees, at: time)
 
-        // Polled, as the flight anchor's caller polls it. `finish` is a no-op before this point, but
-        // asking only when the hold is complete keeps the two capture flows reading the same way.
-        guard startupSeed.progress(at: time) >= 1.0 else { return }
-        guard let estimate = startupSeed.finish(at: time) else { return }
+        // Two captures, one outcome: whichever closes, what follows is the same code on the same
+        // `StartupSeed.Estimate`, so the airborne trigger changes *when* a seed is taken and nothing
+        // about how it is applied.
+        let estimate: StartupSeed.Estimate
+        let settled: AirborneSeedSettle.Estimate?
+        if airborneSeedArmed {
+            guard let published = feedAirborneSeed(arAzimuthDeg: arAzimuthDeg,
+                                                   reference: reference, at: time) else { return }
+            settled = published
+            estimate = published.seed
+        } else {
+            startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees, at: time)
+
+            // Polled, as the flight anchor's caller polls it. `finish` is a no-op before this point,
+            // but asking only when the hold is complete keeps the two capture flows reading the same
+            // way.
+            guard startupSeed.progress(at: time) >= 1.0 else { return }
+            guard let captured = startupSeed.finish(at: time) else { return }
+            settled = nil
+            estimate = captured
+        }
         let wasResample = seedIsResampling
         seedIsResampling = false
 
@@ -3503,16 +3555,65 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             awaitingSeedConfirmation = false
             showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
         }
-        FlightRecorder.shared.record(
-            event: "seed_captured",
-            detail: String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f resample=%d",
-                           estimate.offsetDeg, estimate.referenceKind.rawValue, reference.degrees,
-                           estimate.sampleCount, estimate.seconds, estimate.azimuthSpreadDeg,
-                           seedGyroReferenceDeg, wasResample ? 1 : 0)
-        )
+        var detail = String(format: "offset=%.1f ref=%@ ref_deg=%.0f n=%d secs=%.1f az_spread=%.1f gyro_ref=%.1f resample=%d",
+                            estimate.offsetDeg, estimate.referenceKind.rawValue, reference.degrees,
+                            estimate.sampleCount, estimate.seconds, estimate.azimuthSpreadDeg,
+                            seedGyroReferenceDeg, wasResample ? 1 : 0)
+        // Airborne captures only, so a ground line reads exactly as it always has. `card_age` is the
+        // number the 2–3 s bar is judged on; `moved` says whether the user turned to the card at all;
+        // `clock_skew` is main minus render clock, and a few milliseconds means they are one clock.
+        if let settled {
+            detail += String(format: " path=%@ card_age=%.2f moved=%.1f clock_skew=%.3f",
+                             settled.path.rawValue, settled.cardAgeSeconds, settled.movedDeg,
+                             seedClockSkew)
+        }
+        FlightRecorder.shared.record(event: "seed_captured", detail: detail)
 
         armSeedResampleIfWorthwhile(spreadDeg: estimate.azimuthSpreadDeg,
                                     reference: reference, at: time)
+    }
+
+    /// Feed the airborne capture one sample, and return its seed if the phone has now settled.
+    ///
+    /// **The card time is converted onto the render clock here, not assumed to be on it.** The card
+    /// goes up on the main thread and is stamped with `CACurrentMediaTime()`; samples arrive stamped
+    /// with SceneKit's render `time`. Apple documents that only as "the current system time", which
+    /// is not a promise that it shares an epoch with `CACurrentMediaTime`. So at the first sample,
+    /// with both clocks in hand, the skew between them is measured once and the card time and the
+    /// watchdog deadline are both shifted by it. Both clocks count seconds, so this is exact up to
+    /// the main-queue hop between the render thread taking `time` and this line running — a few
+    /// milliseconds, against a one-second minimum.
+    private func feedAirborneSeed(
+        arAzimuthDeg: Double,
+        reference: (kind: StartupSeed.Reference, degrees: Double),
+        at time: TimeInterval
+    ) -> AirborneSeedSettle.Estimate? {
+        guard reference.kind == .track else {
+            // Slowed below the track threshold mid-capture. These samples were measured against the
+            // track, so they go with it; `awaitingSeed` still holds, so the next tick starts again
+            // against whatever reference exists then.
+            cancelAirborneSeed()
+            return nil
+        }
+        if !airborneSeed.isCapturing {
+            let hostNow = CACurrentMediaTime()
+            seedClockSkew = hostNow - time
+            let cardShownAt = seedCardShownAt.isFinite ? seedCardShownAt : hostNow
+            airborneSeed.begin(
+                cardShownAt: cardShownAt - seedClockSkew,
+                publishBy: seedDeadline - ARTrafficViewController.airborneSeedWatchdogMarginSeconds
+                    - seedClockSkew
+            )
+        }
+        airborneSeed.add(arAzimuthDeg: arAzimuthDeg, trackDeg: reference.degrees, at: time)
+        guard let published = airborneSeed.finish(at: time) else { return nil }
+        airborneSeedArmed = false
+        return published
+    }
+
+    private func cancelAirborneSeed() {
+        airborneSeed.cancel()
+        airborneSeedArmed = false
     }
 
     /// Go back for a steadier hold, if this one was loose and the world is still inside its window.
@@ -4267,7 +4368,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         CompassCalibrationPolicy.shouldOffer(
             alreadySkipped: calibrationWasSkipped,
             modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
-            seedCapturing: startupSeed.isCapturing,
+            seedCapturing: seedIsCapturing,
             airborne: isAirborneEstimate
         )
     }
@@ -4475,7 +4576,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
            CompassCalibrationPolicy.shouldOffer(
                alreadySkipped: calibrationWasSkipped,
                modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
-               seedCapturing: startupSeed.isCapturing,
+               seedCapturing: seedIsCapturing,
                airborne: isAirborneEstimate) {
             CompassCalibrationPolicy.markCalibrationOffered()
             presentCalibrationPopupIfNeeded()
