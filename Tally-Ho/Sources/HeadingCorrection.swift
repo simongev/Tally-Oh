@@ -116,6 +116,69 @@ struct AngularResponse {
         return d
     }
 
+    /// Median of a set of angles, in (−180, 180], or NaN for an empty set.
+    ///
+    /// **Why not sort the raw values.** Angles are only ordered on a line if the cluster does not
+    /// cross the seam. `{179.6, 179.8, −179.9, −179.7}` sorts to `−179.9, −179.7, 179.6, 179.8`,
+    /// and the middle pair averages to about 0 — a world put 180° wrong by four readings that agree
+    /// to half a degree. Offsets sit near the phone's starting true heading under `.gravity`, so any
+    /// southbound start is exposed: Gev's ground logs seed at −173.5, −160.7 and −158.9 with IQRs to
+    /// 11.8°, a few degrees from the seam.
+    ///
+    /// So each value is first moved by whole turns to lie within ±180° of the set's circular mean —
+    /// the direction of the summed unit vectors — which makes the cluster contiguous wherever it
+    /// sits; then the ordinary median is taken and wrapped back. A value already within ±180° of the
+    /// mean is not touched at all, so a cluster that does not cross the seam gives *exactly* the
+    /// same number as sorting the raw values did.
+    static func circularMedianDeg(_ degrees: [Double]) -> Double {
+        let sorted = unwrappedAboutCircularMean(degrees).sorted()
+        guard !sorted.isEmpty else { return .nan }
+        let mid = sorted.count / 2
+        let median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        return wrappedHalfOpen(median)
+    }
+
+    /// Interquartile range of a set of angles, in degrees, or NaN for an empty set. The same
+    /// nearest-rank percentiles as before, taken on the unwrapped values, so a tight cluster across
+    /// the seam reads as tight rather than as ~358° — which would otherwise trip
+    /// `GroundYawCorrection`'s dispersion gate and silently stop the refinement.
+    static func circularInterquartileRangeDeg(_ degrees: [Double]) -> Double {
+        let sorted = unwrappedAboutCircularMean(degrees).sorted()
+        guard !sorted.isEmpty else { return .nan }
+        return AltitudeDatumOffset.percentile(sorted, 0.75) - AltitudeDatumOffset.percentile(sorted, 0.25)
+    }
+
+    /// The finite values, each moved by whole turns to within (−180, 180] of their circular mean.
+    /// Values already there are returned bit-for-bit unchanged.
+    private static func unwrappedAboutCircularMean(_ degrees: [Double]) -> [Double] {
+        let finite = degrees.filter(\.isFinite)
+        guard !finite.isEmpty else { return [] }
+        var sumSin = 0.0, sumCos = 0.0
+        for d in finite {
+            let r = d * .pi / 180
+            sumSin += sin(r)
+            sumCos += cos(r)
+        }
+        // atan2(0, 0) is 0, so a set with no preferred direction is unwrapped about 0 — arbitrary,
+        // but deterministic, and such a set has no meaningful median anyway.
+        let mean = atan2(sumSin, sumCos) * 180 / .pi
+        return finite.map { value in
+            var v = value
+            while v - mean >  180 { v -= 360 }
+            while v - mean <= -180 { v += 360 }
+            return v
+        }
+    }
+
+    /// Wrap to (−180, 180], leaving anything already in range untouched.
+    private static func wrappedHalfOpen(_ degrees: Double) -> Double {
+        guard degrees.isFinite else { return degrees }
+        var d = degrees
+        while d >  180 { d -= 360 }
+        while d <= -180 { d += 360 }
+        return d
+    }
+
     /// Total absolute driver rotation currently in the window, regardless of whether that is
     /// enough to publish an estimate. Lets a caller say how close it came rather than only that
     /// it fell short.
@@ -633,9 +696,8 @@ struct FlightDirectionAnchor {
         guard trackSpread <= maxTrackSpreadDeg else { return .failure(.aircraftTurning) }
         guard azSpread <= maxAzimuthSpreadDeg else { return .failure(.phoneMoved) }
 
-        let offsets = samples.map(\.offset).sorted()
-        let mid = offsets.count / 2
-        let median = offsets.count % 2 == 0 ? (offsets[mid - 1] + offsets[mid]) / 2 : offsets[mid]
+        // Circular, not a raw sort: see `AngularResponse.circularMedianDeg`.
+        let median = AngularResponse.circularMedianDeg(samples.map(\.offset))
 
         return .success(Estimate(offsetDeg: median,
                                  sampleCount: samples.count,
@@ -771,9 +833,9 @@ struct StartupSeed {
         guard seconds >= minSeconds, samples.count >= minSamples else { return nil }
         defer { cancel() }
 
-        let offsets = samples.map(\.offset).sorted()
-        let mid = offsets.count / 2
-        let median = offsets.count % 2 == 0 ? (offsets[mid - 1] + offsets[mid]) / 2 : offsets[mid]
+        // Circular, not a raw sort: see `AngularResponse.circularMedianDeg`. On the ground the
+        // offset is about the phone's starting true heading, so a southbound start straddles ±180.
+        let median = AngularResponse.circularMedianDeg(samples.map(\.offset))
 
         return Estimate(offsetDeg: median,
                         referenceKind: reference,
@@ -938,7 +1000,7 @@ struct AirborneSeedSettle {
         defer { cancel() }
 
         let window = samples[chosen.window]
-        return Estimate(offsetDeg: AirborneSeedSettle.median(window.map(\.offset)),
+        return Estimate(offsetDeg: AngularResponse.circularMedianDeg(window.map(\.offset)),
                         path: chosen.path,
                         cardAgeSeconds: cardAge,
                         sampleCount: window.count,
@@ -988,12 +1050,6 @@ struct AirborneSeedSettle {
             if spread <= (best?.spread ?? .infinity) { best = (window: start...end, spread: spread) }
         }
         return best?.window
-    }
-
-    private static func median(_ values: [Double]) -> Double {
-        let sorted = values.sorted()
-        let mid = sorted.count / 2
-        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
     }
 }
 
@@ -1157,11 +1213,14 @@ struct AlignmentDriftMonitor {
     }
 
     /// Signed median of the readings in the window, or nil until there are enough of them.
+    ///
+    /// Circular: these are the *whole* offset under `.gravity`, not a residual near zero, so they sit
+    /// wherever the phone's starting heading put them — including across ±180, where a raw sort
+    /// splits one cluster into two and the median lands between them. See
+    /// `AngularResponse.circularMedianDeg`.
     var medianErrorDeg: Double? {
         guard samples.count >= minSamples else { return nil }
-        let sorted = samples.map(\.deg).sorted()
-        let mid = sorted.count / 2
-        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        return AngularResponse.circularMedianDeg(samples.map(\.deg))
     }
 
     /// How far apart the readings behind that median are — the interquartile range, in degrees.
@@ -1173,11 +1232,12 @@ struct AlignmentDriftMonitor {
     /// it and walked the scene four degrees off, then four degrees back, over eighty seconds. Every
     /// correction that excursion produced sat behind an IQR above 41°, and every good one behind an
     /// IQR under 6°. One number separates them.
+    ///
+    /// Circular for the same reason as the median: a tight cluster across ±180 sorted raw reads an
+    /// IQR near 358°, which the dispersion gate refuses as `.dispersed` — silently, every tick.
     var interquartileRangeDeg: Double? {
         guard samples.count >= minSamples else { return nil }
-        let sorted = samples.map(\.deg).sorted()
-        return AltitudeDatumOffset.percentile(sorted, 0.75)
-             - AltitudeDatumOffset.percentile(sorted, 0.25)
+        return AngularResponse.circularInterquartileRangeDeg(samples.map(\.deg))
     }
 
     /// Clear after a re-anchor. Without this the large readings that *caused* a reset would still
