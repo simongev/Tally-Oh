@@ -783,6 +783,220 @@ struct StartupSeed {
     }
 }
 
+/// When the airborne seed is taken: once the phone has settled after the card, not on a timer.
+///
+/// **Why this exists.** In the build 39 flight log the card went up at t=1.74 and the one-second
+/// `StartupSeed` capture closed at t=2.86. Nobody reads a card and turns a phone in 1.1 s, so the
+/// capture measured where the phone already was — out of a side window — and the seed was 41.3°
+/// wrong while `az_spread` read 1.0. Stillness said nothing about aim. Build 42 answered with a
+/// fixed 4 s dwell before the 1 s capture: 5 s, over the bar of an accurate world 2–3 s after
+/// opening the app in the air.
+///
+/// A dwell waits the same time for everyone. This waits for the thing the dwell was standing in
+/// for — the user having done what the card asked — which is visible in the azimuth itself:
+///
+/// - **moved:** the phone turned (more than `moveThresholdDeg` from where it was when samples
+///   began) and has since held within `settleSpreadDeg` for `settleSeconds`. That is a user who
+///   read the card, turned to the nose and stopped. The offset is the median over that steady run.
+/// - **still:** the phone never turned, and at `stillSeconds` after the card is holding steady.
+///   The user was already facing forward — or has not reacted, which nothing here can tell apart;
+///   2.5 s is the compromise between those two.
+/// - **cap:** neither by `capSeconds`, typically a phone that never stops wobbling. Takes the
+///   steadiest `settleSeconds` window seen, and `SeedResamplePolicy` goes back for a better one if
+///   that is still loose.
+///
+/// And never before `minCardAgeSeconds`, whatever the phone does: a card nobody has had time to
+/// read cannot have been obeyed.
+///
+/// Typical timings at 5 Hz, from the card: a turn that ends by ~1.4 s publishes at ~2.1 s, since
+/// a run spanning 0.5 s takes four samples; a phone already forward publishes at 2.5 s.
+///
+/// **One clock.** `begin`, `add` and `finish` must all be on the same timebase. The caller feeds
+/// samples on the render clock and shows the card on the main one, so it converts the card time
+/// before calling `begin` — this type cannot see either clock and does not try.
+///
+/// `.track` only. The ground seed is compass-referenced, needs no aim, and stays on `StartupSeed`.
+struct AirborneSeedSettle {
+
+    /// Which rule published the estimate. Logged as `path=` on `seed_captured`.
+    enum Path: String {
+        case moved
+        case still
+        case cap
+    }
+
+    struct Estimate {
+        /// Degrees to subtract from every bearing — `track − arAzimuth`, as `StartupSeed` publishes.
+        var offsetDeg: Double
+        var path: Path
+        /// Seconds from the card going up to the decision.
+        var cardAgeSeconds: TimeInterval
+        /// The window the offset is the median of.
+        var sampleCount: Int
+        var windowSeconds: TimeInterval
+        var azimuthSpreadDeg: Double
+        /// Furthest the phone got from where it was when samples began — how far the user turned.
+        var movedDeg: Double
+
+        /// The same measurement in the shape the rest of the seed plumbing already consumes, so
+        /// `SeedResamplePolicy` and everything after it are fed exactly as they were.
+        var seed: StartupSeed.Estimate {
+            StartupSeed.Estimate(offsetDeg: offsetDeg,
+                                 referenceKind: .track,
+                                 sampleCount: sampleCount,
+                                 seconds: windowSeconds,
+                                 azimuthSpreadDeg: azimuthSpreadDeg)
+        }
+    }
+
+    /// No publish before this, on any path.
+    let minCardAgeSeconds: TimeInterval
+    /// More than this from the first sample counts as having turned. Above hand wobble — good holds
+    /// run 0.1–4.5° over a whole second — and well below any turn from a side window to the nose.
+    let moveThresholdDeg: Double
+    /// How long a run must span to count as settled. At 5 Hz that is four samples.
+    let settleSeconds: TimeInterval
+    /// How far the azimuth may wander within a settled run.
+    let settleSpreadDeg: Double
+    /// When a phone that never turned is taken as already pointing forward.
+    let stillSeconds: TimeInterval
+    /// When waiting stops and the steadiest window is taken. Half the 10 s seed watchdog.
+    let capSeconds: TimeInterval
+
+    private var cardShownAt: TimeInterval?
+    private var capAt: TimeInterval = .infinity
+    private var samples: [(t: TimeInterval, offset: Double, az: Double)] = []
+
+    init(minCardAgeSeconds: TimeInterval = 1.0,
+         moveThresholdDeg: Double = 5.0,
+         settleSeconds: TimeInterval = 0.5,
+         settleSpreadDeg: Double = 2.0,
+         stillSeconds: TimeInterval = 2.5,
+         capSeconds: TimeInterval = 5.0) {
+        self.minCardAgeSeconds = minCardAgeSeconds
+        self.moveThresholdDeg = moveThresholdDeg
+        self.settleSeconds = settleSeconds
+        self.settleSpreadDeg = settleSpreadDeg
+        self.stillSeconds = stillSeconds
+        self.capSeconds = capSeconds
+    }
+
+    var isCapturing: Bool { cardShownAt != nil }
+
+    /// Start a capture for a card shown at `cardShownAt`.
+    ///
+    /// `publishBy` pulls the cap earlier when something else has a harder deadline — the caller's
+    /// watchdog, which is measured from the world's birth rather than from the card, so a card that
+    /// went up late would otherwise let the cap race it. It never pulls the cap inside
+    /// `minCardAgeSeconds`.
+    mutating func begin(cardShownAt: TimeInterval, publishBy: TimeInterval = .infinity) {
+        self.cardShownAt = cardShownAt
+        capAt = max(cardShownAt + minCardAgeSeconds, min(cardShownAt + capSeconds, publishBy))
+        samples.removeAll()
+    }
+
+    mutating func cancel() {
+        cardShownAt = nil
+        capAt = .infinity
+        samples.removeAll()
+    }
+
+    /// Feed one reading. Ignored unless a capture is running, and ignored if it predates the card —
+    /// a phone position from before the card was up cannot be an answer to it.
+    mutating func add(arAzimuthDeg: Double, trackDeg: Double, at time: TimeInterval) {
+        guard let cardShownAt, time >= cardShownAt,
+              arAzimuthDeg.isFinite, trackDeg.isFinite else { return }
+        samples.append((t: time,
+                        offset: AngularResponse.signedDelta(arAzimuthDeg, trackDeg),
+                        az: arAzimuthDeg))
+    }
+
+    /// Publish the seed, or nil if none of the paths is satisfied yet.
+    ///
+    /// Polled after every sample. Like `StartupSeed.finish`, not-ready is a no-op and only a
+    /// decision clears the capture.
+    mutating func finish(at time: TimeInterval) -> Estimate? {
+        guard let cardShownAt, let newest = samples.indices.last else { return nil }
+        let cardAge = time - cardShownAt
+        guard cardAge >= minCardAgeSeconds else { return nil }
+
+        let moved = movedDeg
+        var decision: (path: Path, window: ClosedRange<Int>)?
+
+        let runStart = steadyRunStart
+        if samples[newest].t - samples[runStart].t >= settleSeconds {
+            if moved > moveThresholdDeg {
+                decision = (path: .moved, window: runStart...newest)
+            } else if cardAge >= stillSeconds {
+                decision = (path: .still, window: runStart...newest)
+            }
+        }
+        if decision == nil, time >= capAt, let steadiest = steadiestWindow {
+            decision = (path: .cap, window: steadiest)
+        }
+        guard let chosen = decision else { return nil }
+        defer { cancel() }
+
+        let window = samples[chosen.window]
+        return Estimate(offsetDeg: AirborneSeedSettle.median(window.map(\.offset)),
+                        path: chosen.path,
+                        cardAgeSeconds: cardAge,
+                        sampleCount: window.count,
+                        windowSeconds: samples[chosen.window.upperBound].t
+                            - samples[chosen.window.lowerBound].t,
+                        azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(window.map(\.az)),
+                        movedDeg: moved)
+    }
+
+    /// Furthest any sample got from the first, in degrees, unwrapped so a phone straddling north is
+    /// not read as having turned 360°.
+    private var movedDeg: Double {
+        guard let first = samples.first else { return 0 }
+        return samples.reduce(0.0) { max($0, abs(AngularResponse.signedDelta(first.az, $1.az))) }
+    }
+
+    /// Index where the longest run ending at the newest sample, and staying within
+    /// `settleSpreadDeg`, begins. The newest sample's own index when even the pair before it
+    /// disagrees. Only called with at least one sample.
+    private var steadyRunStart: Int {
+        let newest = samples.count - 1
+        let reference = samples[newest].az
+        var lowest = 0.0, highest = 0.0
+        var start = newest
+        for i in stride(from: newest - 1, through: 0, by: -1) {
+            let d = AngularResponse.signedDelta(reference, samples[i].az)
+            let lo = min(lowest, d), hi = max(highest, d)
+            guard hi - lo <= settleSpreadDeg else { break }
+            lowest = lo
+            highest = hi
+            start = i
+        }
+        return start
+    }
+
+    /// The tightest-spread window spanning at least `settleSeconds`, or nil if the samples do not
+    /// span that yet. Each window is the shortest one ending at its sample, so a long quiet stretch
+    /// is judged in the same-sized pieces as a short one. Ties go to the later window: the user has
+    /// had longer to aim by then.
+    private var steadiestWindow: ClosedRange<Int>? {
+        var best: (window: ClosedRange<Int>, spread: Double)?
+        var start = 0
+        for end in samples.indices {
+            while start < end, samples[end].t - samples[start + 1].t >= settleSeconds { start += 1 }
+            guard samples[end].t - samples[start].t >= settleSeconds else { continue }
+            let spread = FlightDirectionAnchor.spreadDeg(samples[start...end].map(\.az))
+            if spread <= (best?.spread ?? .infinity) { best = (window: start...end, spread: spread) }
+        }
+        return best?.window
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+    }
+}
+
 /// When a startup seed is worth applying, and when it is worth going back for a steadier one.
 ///
 /// This lives here, apart from the capture and apart from the view controller, because it is the
