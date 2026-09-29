@@ -135,7 +135,7 @@ struct AngularResponse {
         guard !sorted.isEmpty else { return .nan }
         let mid = sorted.count / 2
         let median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
-        return wrappedHalfOpen(median)
+        return wrappedDeg(median)
     }
 
     /// Interquartile range of a set of angles, in degrees, or NaN for an empty set. The same
@@ -170,8 +170,9 @@ struct AngularResponse {
         }
     }
 
-    /// Wrap to (−180, 180], leaving anything already in range untouched.
-    private static func wrappedHalfOpen(_ degrees: Double) -> Double {
+    /// Wrap an angle to (−180, 180], leaving anything already in range untouched. Non-finite values
+    /// pass through.
+    static func wrappedDeg(_ degrees: Double) -> Double {
         guard degrees.isFinite else { return degrees }
         var d = degrees
         while d >  180 { d -= 360 }
@@ -1414,7 +1415,10 @@ struct GroundYawCorrection {
                          at time: TimeInterval) -> Outcome {
         guard !airborne else { return abandonMove(.airborne) }
         guard worldUsable else { return abandonMove(.worldUnusable) }
-        guard let median = medianErrorDeg, median.isFinite else { return abandonMove(.noMedian) }
+        guard let rawMedian = medianErrorDeg, rawMedian.isFinite else { return abandonMove(.noMedian) }
+        // Wrapped on the way in, so every gate below sees an angle rather than a number: 350 and −10
+        // are one offset, and the magnitude cap must judge them alike.
+        let median = AngularResponse.wrappedDeg(rawMedian)
         // Asked before the response gate, and deliberately: a compass that is following the phone
         // but disagreeing with itself is a different fault from one reporting the aircraft, and the
         // log is only useful if it names the right one.
@@ -1437,7 +1441,10 @@ struct GroundYawCorrection {
         // Not abandoned: a pause between the steps of one slew. See `abandonMove`.
         guard time - lastUpdateTime >= minUpdateInterval else { return .refused(.rateLimited) }
 
-        let delta = median - appliedOffsetDeg
+        // The short way round. A plain subtraction here sent a median that crossed the seam — applied
+        // −179.5, median +179.8 — the long way: 359.3° to cover at 1°/s, six minutes of the scene
+        // turning, where 0.7° was the answer. Everything below (deadband, step, arrival) reads this.
+        let delta = AngularResponse.signedDelta(appliedOffsetDeg, median)
         // Asked only of a correction that is not already running. A move that has started is
         // finished, because a move abandoned inside the band leaves precisely the band's worth of
         // standing error behind it — see `deadbandDeg`. Every gate above has already ended the move
@@ -1451,7 +1458,9 @@ struct GroundYawCorrection {
 
         lastUpdateTime = time
         let step = min(abs(delta), maxSlewPerUpdateDeg) * (delta < 0 ? -1.0 : 1.0)
-        appliedOffsetDeg += step
+        // Kept in (−180, 180], so a slew across the seam lands on −179.x rather than walking on to
+        // −180.x and handing the next `delta` a number off the circle.
+        appliedOffsetDeg = AngularResponse.wrappedDeg(appliedOffsetDeg + step)
         hasOffset = true
         // Arrived when the step covered the whole remaining gap, which re-arms the deadband.
         // Decided on the gap rather than on the new residual: that residual is the difference of
@@ -1469,7 +1478,7 @@ struct GroundYawCorrection {
     /// roughly right immediately, and the rolling median refines it.
     mutating func prime(offsetDeg: Double) {
         guard offsetDeg.isFinite else { return }
-        appliedOffsetDeg = offsetDeg
+        appliedOffsetDeg = AngularResponse.wrappedDeg(offsetDeg)
         hasOffset = true
         // Somebody else's absolute measurement, not a move in progress, so the deadband gates the
         // next one normally.
