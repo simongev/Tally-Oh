@@ -214,9 +214,13 @@ struct GyroYawHoldTests {
         hold.worldDidReset(offsetBeforeDeg: -146.1, carry: true)
         #expect(hold.isCarryPending)
         // Rendered from the world before the reset and processed after it.
-        #expect(feed(&hold, from: 1.01, count: 1, gap: 0.7).isEmpty)
-        #expect(lose(&hold, from: 1.11, count: 28).isEmpty)                    // 1.11 … 2.46
-        #expect(feed(&hold, from: 2.51, count: 6, rate: 40, gap: 37).isEmpty)  // turning
+        // (Fed outside `#expect`: the macro wraps its argument in a closure, where `&hold` cannot go.)
+        let stale = feed(&hold, from: 1.01, count: 1, gap: 0.7)
+        let initializing = lose(&hold, from: 1.11, count: 28)                  // 1.11 … 2.46
+        let turning = feed(&hold, from: 2.51, count: 6, rate: 40, gap: 37)
+        #expect(stale.isEmpty)
+        #expect(initializing.isEmpty)
+        #expect(turning.isEmpty)
         let events = feed(&hold, from: 2.81, count: 1, gap: 37)
 
         #expect(events.count == 1)
@@ -305,7 +309,8 @@ struct GyroYawHoldTests {
         #expect(abs(k - (-170)) < 1e-9)
         carry.worldDidReset(offsetBeforeDeg: 170, carry: true)
         lose(&carry, from: 1.01, count: 10)
-        let carriedEvent = try #require(feed(&carry, from: 1.51, count: 1, gap: -175).first)
+        let carriedEvents = feed(&carry, from: 1.51, count: 1, gap: -175)
+        let carriedEvent = try #require(carriedEvents.first)
         let carried = try #require(carriedEvent.carriedOffsetDeg)
         #expect(abs(carried - 5) < 1e-9)
     }
