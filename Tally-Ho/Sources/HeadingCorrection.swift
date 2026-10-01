@@ -865,8 +865,11 @@ struct StartupSeed {
 ///   The user was already facing forward — or has not reacted, which nothing here can tell apart;
 ///   2.5 s is the compromise between those two.
 /// - **cap:** neither by `capSeconds`, typically a phone that never stops wobbling. Takes the
-///   steadiest `settleSeconds` window seen, and `SeedResamplePolicy` goes back for a better one if
-///   that is still loose.
+///   steadiest `settleSeconds` window seen — **but only since the phone left the band it started
+///   in, if it ever did.** The pause while the card is read is the phone held wherever the user was
+///   looking, and in turbulence it can easily be steadier than the wobbling hold at the nose that
+///   follows; taking it would be the build-39 seed again, steady and aimed out of the side window.
+///   `SeedResamplePolicy` goes back for a better one if the window taken is still loose.
 ///
 /// And never before `minCardAgeSeconds`, whatever the phone does: a card nobody has had time to
 /// read cannot have been obeyed.
@@ -994,8 +997,8 @@ struct AirborneSeedSettle {
                 decision = (path: .still, window: runStart...newest)
             }
         }
-        if decision == nil, time >= capAt, let steadiest = steadiestWindow {
-            decision = (path: .cap, window: steadiest)
+        if decision == nil, time >= capAt, let capped = capWindow {
+            decision = (path: .cap, window: capped)
         }
         guard let chosen = decision else { return nil }
         defer { cancel() }
@@ -1037,14 +1040,42 @@ struct AirborneSeedSettle {
         return start
     }
 
-    /// The tightest-spread window spanning at least `settleSeconds`, or nil if the samples do not
-    /// span that yet. Each window is the shortest one ending at its sample, so a long quiet stretch
-    /// is judged in the same-sized pieces as a short one. Ties go to the later window: the user has
-    /// had longer to aim by then.
-    private var steadiestWindow: ClosedRange<Int>? {
+    /// Index of the first sample more than `moveThresholdDeg` from the first one — where the phone
+    /// left the band it started in — or nil if it never has. Uses the same test as `movedDeg`, so
+    /// this is non-nil exactly when the capture counts as moved.
+    private var moveStartIndex: Int? {
+        guard let first = samples.first else { return nil }
+        return samples.firstIndex {
+            abs(AngularResponse.signedDelta(first.az, $0.az)) > moveThresholdDeg
+        }
+    }
+
+    /// What the cap takes, or nil if there is nothing it may take yet.
+    ///
+    /// Never moved: the steadiest window of the whole capture, as before. Moved: only windows that
+    /// begin at or after the sample where the phone left its starting band. Nothing from before the
+    /// turn is eligible, however steady, because stillness says nothing about aim.
+    ///
+    /// If the turn came so late that the samples after it do not yet span `settleSeconds`, the cap
+    /// takes all of them rather than reach back before the turn — once there are at least two. A
+    /// single sample has a spread of zero by construction, which would slip under
+    /// `SeedResamplePolicy`'s gate however mid-turn it was; two or more report how much the phone was
+    /// still moving, so a loose late seed is gone back for rather than kept.
+    private var capWindow: ClosedRange<Int>? {
+        guard let moveStart = moveStartIndex else { return steadiestWindow(from: 0) }
+        if let window = steadiestWindow(from: moveStart) { return window }
+        let newest = samples.count - 1
+        return newest > moveStart ? moveStart...newest : nil
+    }
+
+    /// The tightest-spread window spanning at least `settleSeconds` among samples from `first` on,
+    /// or nil if those samples do not span that yet. Each window is the shortest one ending at its
+    /// sample, so a long quiet stretch is judged in the same-sized pieces as a short one. Ties go to
+    /// the later window: the user has had longer to aim by then.
+    private func steadiestWindow(from first: Int) -> ClosedRange<Int>? {
         var best: (window: ClosedRange<Int>, spread: Double)?
-        var start = 0
-        for end in samples.indices {
+        var start = first
+        for end in first..<samples.count {
             while start < end, samples[end].t - samples[start + 1].t >= settleSeconds { start += 1 }
             guard samples[end].t - samples[start].t >= settleSeconds else { continue }
             let spread = FlightDirectionAnchor.spreadDeg(samples[start...end].map(\.az))

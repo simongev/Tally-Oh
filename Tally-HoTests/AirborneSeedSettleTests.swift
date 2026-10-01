@@ -169,6 +169,67 @@ struct AirborneSeedSettleTests {
         #expect(result.at < 6.0)
     }
 
+    /// QA round 1's repro. About 1.4 s steady at a side window 40° off the nose while the card is
+    /// read (spread 1.8°), then a turn to the nose held with a 2.5° wobble — never within 2° for
+    /// 0.5 s, so neither the moved nor the still path fires. The cap used to take the reading pause:
+    /// offset −40.9°, spread 1.8°, under the resample gate, wrong for the life of the world. After a
+    /// move it may only look at what came after it.
+    @Test func capAfterAMoveNeverTakesTheReadingPause() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0)
+        let reading: [Double] = [140, 141.8, 140.5, 141.8, 140, 141.5, 140.2]  // side window
+        let turning: [Double] = [125, 110]
+        let atTheNose: [Double] = (0..<30).map { $0 % 2 == 0 ? 100.0 : 102.5 }  // wobbling 2.5°
+        let azimuths = reading + turning + atTheNose
+        let published = run(&seed, azimuths: azimuths, track: 100)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .cap)
+        #expect(result.at >= 5.0 && result.at < 5.2)
+        // track − az over the nose hold: 0, −2.5, 0, −2.5 → −1.25. The side window reads −40.9.
+        #expect(abs(result.estimate.offsetDeg - (-1.25)) < 0.001)
+        #expect(abs(result.estimate.azimuthSpreadDeg - 2.5) < 0.001)
+    }
+
+    /// A turn so late that the samples after it do not span a window by the cap: the cap takes
+    /// those, not the steadier-looking reading pause before them.
+    @Test func capWithALateTurnTakesThePostMoveSamplesNotTheReadingPause() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0)
+        // Wobbling 2.5° at the side window until t=4.65 — too loose for the still path — then onto
+        // the nose at 4.85 and 5.05, the cap's first sample.
+        let sideWindow: [Double] = (0..<24).map { $0 % 2 == 0 ? 140.0 : 142.5 }
+        let atTheNose: [Double] = [101, 100, 100.3, 99.8]
+        let azimuths = sideWindow + atTheNose
+        let published = run(&seed, azimuths: azimuths, track: 100)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .cap)
+        #expect(result.at >= 5.0 && result.at < 5.1)
+        #expect(result.estimate.sampleCount == 2)              // 4.85 and 5.05, only post-move
+        #expect(abs(result.estimate.offsetDeg - (-0.5)) < 0.001)
+        #expect(abs(result.estimate.azimuthSpreadDeg - 1.0) < 0.001)
+    }
+
+    /// One post-move sample has a spread of zero whatever it caught, which would slip under the
+    /// resample gate even mid-turn. So with only one, the cap waits a sample rather than take it —
+    /// and still never reaches back before the turn.
+    @Test func capNeverSeedsFromASinglePostMoveSample() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0)
+        // The turn lands exactly on the cap's first sample, 5.05.
+        let sideWindow: [Double] = (0..<25).map { $0 % 2 == 0 ? 140.0 : 142.5 }
+        let atTheNose: [Double] = [100, 100.4, 99.9]
+        let azimuths = sideWindow + atTheNose
+        let published = run(&seed, azimuths: azimuths, track: 100)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .cap)
+        #expect(result.at >= 5.2 && result.at < 5.3)            // waited one sample, to 5.25
+        #expect(result.estimate.sampleCount == 2)
+        #expect(abs(result.estimate.offsetDeg - (-0.2)) < 0.001)
+    }
+
     // MARK: - Never before 1.0 s
 
     /// A turn finished and settled at 0.85 s is still not taken until the card has been up a second.
