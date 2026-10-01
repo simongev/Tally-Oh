@@ -20,8 +20,11 @@
 //
 //  One pair of frames, end to end:
 //    1. The luma plane is reduced to ~480 px wide on the render thread and the ARFrame dropped.
-//    2. Sparse pyramidal Lucas–Kanade between the two, forward–backward checked. Pure Swift
-//       rather than Vision, so the flow's sign convention is this file's and the tests reach it.
+//       Frames are taken every 0.25 s; the older half of a pair is chosen 0.25–2.0 s back so the
+//       ground has moved enough to measure (`PairPlanner`), from up to eight kept as packed luma.
+//    2. Sparse pyramidal Lucas–Kanade between the two, forward–backward checked, each track
+//       starting where the IMU rotation alone would put it. Pure Swift rather than Vision, so the
+//       flow's sign convention is this file's and the tests reach it.
 //    3. The phone's own rotation between the frames, from device-motion attitude, is removed from
 //       every track. What is left is translation only; the cabin, static relative to the phone
 //       once the phone's rotation is gone, is left with about zero flow and is set aside.
@@ -29,7 +32,8 @@
 //       homogeneous e. RANSAC on pairs, then reweighted least squares on the inliers. Homogeneous
 //       throughout, so an FOE off-screen or at infinity (phone pointing sideways) is ordinary.
 //    5. FOE → ARKit world through camera.transform → azimuth by `rawAzimuthDeg`'s own formula;
-//       offset = signedDelta(foeAz, gpsTrack), the StartupSeed convention.
+//       offset = signedDelta(foeAz, gpsTrack), the StartupSeed convention, against the course
+//       halfway between the two frames.
 //
 
 import Foundation
@@ -216,6 +220,25 @@ enum CameraSeed {
         }
     }
 
+    /// A working image held at one byte a pixel, for the frames kept back for pairing: eight of
+    /// them at 480×360 are 1.4 MB this way and 5.5 MB as floats. Rounding the 2×2 averages to whole
+    /// grey levels adds less noise than the sensor already has.
+    struct PackedImage {
+        let width: Int
+        let height: Int
+        let bytes: [UInt8]
+
+        init(_ image: GrayImage) {
+            width = image.width
+            height = image.height
+            bytes = image.pixels.map { UInt8(max(0, min(255, $0.rounded()))) }
+        }
+
+        var image: GrayImage {
+            GrayImage(width: width, height: height, pixels: bytes.map { Float($0) })
+        }
+    }
+
     /// An image pyramid by repeated 2×2 averaging, with gradients at every level.
     struct Pyramid {
         let levels: [GrayImage]
@@ -286,8 +309,15 @@ enum CameraSeed {
             var tracks: [Track]
         }
 
+        /// `predict` and `predictBack`, when given, say where a pixel of one image should land in
+        /// the other before any search: the phone's rotation alone, from the IMU. Each track then
+        /// starts there and only has to find what translation added. Over a two-second pair a
+        /// steady hand still turns several degrees — 9° moves the view ~22 px at test scale, which
+        /// loses nine features in ten without the prediction and one in six with it.
         static func track(from first: GrayImage, to second: GrayImage,
-                          config: Config = Config()) -> Output {
+                          config: Config = Config(),
+                          predict: ((SIMD2<Double>) -> SIMD2<Double>?)? = nil,
+                          predictBack: ((SIMD2<Double>) -> SIMD2<Double>?)? = nil) -> Output {
             guard first.width == second.width, first.height == second.height,
                   first.width >= 2, first.height >= 2 else {
                 return Output(featureCount: 0, tracks: [])
@@ -301,10 +331,16 @@ enum CameraSeed {
             var tracks: [Track] = []
             tracks.reserveCapacity(features.count)
             for start in features {
-                guard let flow = pyramidal(from: a, to: b, point: start, config: config) else { continue }
+                var guess = SIMD2<Double>(0, 0)
+                if let predict, let predicted = predict(start) { guess = predicted - start }
+                guard let flow = pyramidal(from: a, to: b, point: start, initialFlow: guess,
+                                           config: config) else { continue }
                 let end = start + flow
                 guard end.x >= 0, end.y >= 0, end.x <= maxX, end.y <= maxY else { continue }
-                guard let back = pyramidal(from: b, to: a, point: end, config: config) else { continue }
+                var backGuess = SIMD2<Double>(0, 0)
+                if let predictBack, let predicted = predictBack(end) { backGuess = predicted - end }
+                guard let back = pyramidal(from: b, to: a, point: end, initialFlow: backGuess,
+                                           config: config) else { continue }
                 guard simd_length(end + back - start) <= config.forwardBackwardPx else { continue }
                 tracks.append(Track(p1: start, p2: end))
             }
@@ -364,12 +400,13 @@ enum CameraSeed {
             return found
         }
 
-        /// Displacement of the level-0 `point` from pyramid `a` to pyramid `b`, coarse to fine.
+        /// Displacement of the level-0 `point` from pyramid `a` to pyramid `b`, coarse to fine,
+        /// starting from `initialFlow` (level-0 pixels).
         static func pyramidal(from a: Pyramid, to b: Pyramid, point: SIMD2<Double>,
-                              config: Config) -> SIMD2<Double>? {
+                              initialFlow: SIMD2<Double>, config: Config) -> SIMD2<Double>? {
             let top = min(a.levels.count, b.levels.count) - 1
-            guard top >= 0 else { return nil }
-            var guess = SIMD2<Double>(0, 0)
+            guard top >= 0, initialFlow.x.isFinite, initialFlow.y.isFinite else { return nil }
+            var guess = initialFlow / Double(1 << top)
             for level in stride(from: top, through: 0, by: -1) {
                 let x = Pyramid.position(point, atLevel: level)
                 guard let d = refine(image: a.levels[level], gradX: a.gradX[level],
@@ -585,7 +622,8 @@ enum CameraSeed {
         private var times: [TimeInterval] = []
         private var orientations: [simd_quatd] = []
 
-        init(capacity: Int = 64, tolerance: TimeInterval = 0.01, maxGap: TimeInterval = 0.15) {
+        /// 100 samples at 20 Hz is five seconds: a 2.2 s pair processed after its delay, with room.
+        init(capacity: Int = 100, tolerance: TimeInterval = 0.01, maxGap: TimeInterval = 0.15) {
             self.capacity = capacity
             self.tolerance = tolerance
             self.maxGap = maxGap
@@ -644,6 +682,16 @@ enum CameraSeed {
             let ray = rotation.transpose * SIMD3<Double>(normalized.x, normalized.y, 1)
             guard ray.z > 1e-6 else { return nil }
             return SIMD2<Double>(ray.x / ray.z, ray.y / ray.z)
+        }
+
+        /// Where a pixel of one image lands in another under `rotation` alone (taking the first
+        /// camera's CV coordinates of a fixed direction to the second's). Nil behind the camera.
+        static func rotatedPixel(_ pixel: SIMD2<Double>, from: Pinhole, to: Pinhole,
+                                 rotation: simd_double3x3) -> SIMD2<Double>? {
+            let n = from.normalized(pixel)
+            let ray = rotation * SIMD3<Double>(n.x, n.y, 1)
+            guard ray.z > 1e-6 else { return nil }
+            return to.pixel(SIMD2<Double>(ray.x / ray.z, ray.y / ray.z))
         }
 
         static func samples(tracks: [Tracker.Track], pinhole1: Pinhole, pinhole2: Pinhole,
@@ -1026,18 +1074,33 @@ enum CameraSeed {
         }
     }
 
-    /// Which earlier frame to pair a new one with. A quarter second normally; half a second when
-    /// the flow is small, as over the ground from altitude (about 1°/s), where a longer baseline
-    /// doubles the signal against the same tracking noise.
+    /// Which earlier frame to pair a new one with: as far back as it takes for the ground to move
+    /// about `desiredFlowPx`, between a quarter second and two.
+    ///
+    /// Direction precision is set by how far the scenery moved against a roughly fixed tracking
+    /// error, so a short pair over slow ground is mostly noise. The 2026-10-01 flight, FL403 at
+    /// 480 kt: out of a side window the ground moves about 0.5°/s, which at ~8 px/° is 2 px across
+    /// half a second and 8 px across two. A car's roadside moves tens of pixels in a quarter
+    /// second, so there the gap stays at its floor.
+    ///
+    /// Proportional, with a comfort band so it settles instead of flapping between neighbouring
+    /// frames, and growth limited to doubling per pair so one odd pair cannot throw it to the far
+    /// end. Losing most tracks means the motion outran the tracker, and halves it.
     struct PairPlanner {
-        static let shortGap: TimeInterval = 0.25
-        static let longGap: TimeInterval = 0.5
+        static let shortestGap: TimeInterval = 0.25
+        static let longestGap: TimeInterval = 2.0
+        /// Pairs outside this are never formed. The upper bound leaves room for capture jitter
+        /// around the 2.0 s target (captures land on render ticks, every ~0.25–0.27 s).
         static let minGap: TimeInterval = 0.15
-        static let maxGap: TimeInterval = 0.65
-        static let lengthenBelowPx = 2.5
-        static let shortenAbovePx = 6.0
+        static let maxGap: TimeInterval = 2.2
+        static let desiredFlowPx = 8.0
+        static let comfortBandPx: ClosedRange<Double> = 6.0...14.0
+        /// Below this share of features surviving the forward–backward check, shorten.
+        static let minTrackedFraction = 0.3
+        /// Fewer moving vectors than this is "nothing measurably moving": lengthen.
+        static let minMovingVectors = 10
 
-        private(set) var targetGap: TimeInterval = PairPlanner.shortGap
+        private(set) var targetGap: TimeInterval = PairPlanner.shortestGap
 
         /// Index into `earlier` of the frame to pair with one taken at `time`, or nil.
         func partner(for time: TimeInterval, among earlier: [TimeInterval]) -> Int? {
@@ -1055,14 +1118,23 @@ enum CameraSeed {
             return best
         }
 
-        /// Feed the median moving flow of the last pair, in working-image pixels.
-        mutating func update(medianFlowPx: Double) {
-            guard medianFlowPx.isFinite else { return }
-            if medianFlowPx < PairPlanner.lengthenBelowPx {
-                targetGap = PairPlanner.longGap
-            } else if medianFlowPx > PairPlanner.shortenAbovePx {
-                targetGap = PairPlanner.shortGap
+        /// What the last pair showed: the gap it actually spanned, the median length of its moving
+        /// vectors in working-image pixels, how many there were, and the share of features tracked.
+        mutating func update(gapUsed: TimeInterval, medianFlowPx: Double, movingCount: Int,
+                             trackedFraction: Double) {
+            guard gapUsed.isFinite, gapUsed > 0 else { return }
+            let proposed: TimeInterval
+            if trackedFraction.isFinite, trackedFraction < PairPlanner.minTrackedFraction {
+                proposed = gapUsed / 2
+            } else if movingCount < PairPlanner.minMovingVectors || !medianFlowPx.isFinite || medianFlowPx <= 0 {
+                proposed = gapUsed * 2
+            } else if PairPlanner.comfortBandPx.contains(medianFlowPx) {
+                return
+            } else {
+                proposed = gapUsed * PairPlanner.desiredFlowPx / medianFlowPx
             }
+            let limited = min(proposed, gapUsed * 2)
+            targetGap = min(max(limited, PairPlanner.shortestGap), PairPlanner.longestGap)
         }
     }
 
@@ -1139,6 +1211,15 @@ enum CameraSeed {
             quantile(sorted: values.sorted(), 0.5)
         }
 
+        /// Halfway from one compass angle to another the short way round, in 0..<360. The track a
+        /// pair is compared against: across a two-second pair an aircraft in a rate-one turn has
+        /// moved 6°, and the FOE is the chord's direction, which is the midpoint course.
+        static func midpointDeg(_ a: Double, _ b: Double) -> Double {
+            var m = (a + AngularResponse.signedDelta(a, b) / 2).truncatingRemainder(dividingBy: 360)
+            if m < 0 { m += 360 }
+            return m
+        }
+
         /// Median and interquartile range of angles, unwrapped about the first so a spread that
         /// straddles ±180° is not read as 360° wide. The median is wrapped back to −180…180.
         static func angularMedianAndIQR(_ degrees: [Double]) -> (median: Double, iqr: Double)? {
@@ -1181,14 +1262,16 @@ final class CameraSeedRunner {
     private static let processingDelay: TimeInterval = 0.12
     /// Captures waiting for the worker. Past this the render thread skips rather than queues.
     private static let maxInFlight = 2
-    /// Earlier captures kept for pairing: enough to reach back half a second.
-    private static let keptCaptures = 3
+    /// Earlier frames kept for pairing. At one capture per ~0.25 s, eight reach back the 2.0 s the
+    /// pair planner may ask for. Held by value as packed luma: about 1.4 MB at 480×360.
+    private static let maxKeptFrames = 8
 
     private struct Working {
         let image: CameraSeed.GrayImage
         let pinhole: CameraSeed.Pinhole
     }
 
+    /// A frame on its way from the render thread to the worker.
     private struct Capture {
         let generation: Int
         let timestamp: TimeInterval
@@ -1197,6 +1280,16 @@ final class CameraSeedRunner {
         let cameraToWorld: simd_double3x3
         let inputs: Inputs
         let isLast: Bool
+    }
+
+    /// A frame kept back to be the older half of a later pair.
+    private struct KeptFrame {
+        let generation: Int
+        let timestamp: TimeInterval
+        let luma: CameraSeed.PackedImage
+        let pinhole: CameraSeed.Pinhole
+        let cameraToWorld: simd_double3x3
+        let inputs: Inputs
     }
 
     private let lock = NSLock()
@@ -1213,7 +1306,7 @@ final class CameraSeedRunner {
     private var inFlight = 0
 
     // Worker queue only.
-    private var kept: [Capture] = []
+    private var kept: [KeptFrame] = []
     private var planner = CameraSeed.PairPlanner()
     private var pairLimiter = CameraSeed.EventLimiter(minInterval: 0.5, repeatInterval: 2.0, maxEvents: 200)
     private var offsets: [Double] = []
@@ -1397,18 +1490,21 @@ final class CameraSeedRunner {
         }
         if capture.generation == current {
             let partnerIndex = planner.partner(for: capture.timestamp, among: kept.map { $0.timestamp })
-            let partner = partnerIndex.map { kept[$0] }
-            kept.append(capture)
-            if kept.count > CameraSeedRunner.keptCaptures {
-                kept.removeFirst(kept.count - CameraSeedRunner.keptCaptures)
+            if let partnerIndex { estimate(from: kept[partnerIndex], to: capture) }
+            kept.append(KeptFrame(generation: capture.generation, timestamp: capture.timestamp,
+                                  luma: CameraSeed.PackedImage(capture.image), pinhole: capture.pinhole,
+                                  cameraToWorld: capture.cameraToWorld, inputs: capture.inputs))
+            if kept.count > CameraSeedRunner.maxKeptFrames {
+                kept.removeFirst(kept.count - CameraSeedRunner.maxKeptFrames)
             }
-            if let partner { estimate(from: partner, to: capture) }
         }
         if capture.isLast { finish() }
     }
 
-    private func estimate(from a: Capture, to b: Capture) {
+    private func estimate(from a: KeptFrame, to b: Capture) {
         let gap = b.timestamp - a.timestamp
+        // The target that chose this pair, logged beside the gap it actually got.
+        let target = planner.targetGap
         lock.lock()
         let kind = convention.resolved
         let m1 = attitudes.matrix(at: a.timestamp)
@@ -1417,14 +1513,15 @@ final class CameraSeedRunner {
         lock.unlock()
 
         guard let kind else {
-            none("attitude_convention", b, gap: gap)
+            none("attitude_convention", b, gap: gap, target: target)
             return
         }
         guard let m1, let m2 else {
             // Positive means motion is ahead of the frame. Hundreds of seconds either way would
             // mean the two clocks are not the same clock.
             let lead = latestMotion.map { ($0 - b.timestamp) * 1000 } ?? .nan
-            none("attitude_gap", b, gap: gap, extra: "motion_lead_ms=" + CameraSeedRunner.fmt(lead, 0))
+            none("attitude_gap", b, gap: gap, target: target,
+                 extra: "motion_lead_ms=" + CameraSeedRunner.fmt(lead, 0))
             return
         }
 
@@ -1440,15 +1537,30 @@ final class CameraSeedRunner {
         let rotationAR = CameraSeed.Frames.rotationAngleDeg(arRotation)
         let rotationError = CameraSeed.Frames.rotationAngleDeg(arRotation.transpose * rotation)
 
-        let tracked = CameraSeed.Tracker.track(from: a.image, to: b.image, config: trackerConfig)
-        let samples = CameraSeed.Derotation.samples(tracks: tracked.tracks, pinhole1: a.pinhole,
-                                                    pinhole2: b.pinhole, rotation: rotation)
-        let focal = a.pinhole.fx
+        // Each track starts where the phone's rotation alone would put it, so a long pair with a
+        // wandering hand only has translation left to find.
+        let pinhole1 = a.pinhole
+        let pinhole2 = b.pinhole
+        let inverse = rotation.transpose
+        let tracked = CameraSeed.Tracker.track(
+            from: a.luma.image, to: b.image, config: trackerConfig,
+            predict: { CameraSeed.Derotation.rotatedPixel($0, from: pinhole1, to: pinhole2, rotation: rotation) },
+            predictBack: { CameraSeed.Derotation.rotatedPixel($0, from: pinhole2, to: pinhole1, rotation: inverse) })
+        let samples = CameraSeed.Derotation.samples(tracks: tracked.tracks, pinhole1: pinhole1,
+                                                    pinhole2: pinhole2, rotation: rotation)
+        let focal = pinhole1.fx
+        // The FOE is the direction of the chord between the two frames, so it is compared with the
+        // course halfway between them; `track_turn_deg` says how much that mattered.
+        let track = CameraSeed.Stats.midpointDeg(a.inputs.courseDeg, b.inputs.courseDeg)
+        let turn = AngularResponse.signedDelta(a.inputs.courseDeg, b.inputs.courseDeg)
         let result = CameraSeed.WorldEstimate.make(samples: samples, cameraToWorld: a.cameraToWorld,
-                                                   trackDeg: b.inputs.courseDeg,
+                                                   trackDeg: track,
                                                    config: CameraSeed.FOESolver.Config(focalPx: focal))
         let report = result.report
-        planner.update(medianFlowPx: report.movingCount >= 10 ? report.medianMovingFlow * focal : 0)
+        let trackedFraction = tracked.featureCount > 0
+            ? Double(tracked.tracks.count) / Double(tracked.featureCount) : .nan
+        planner.update(gapUsed: gap, medianFlowPx: report.medianMovingFlow * focal,
+                       movingCount: report.movingCount, trackedFraction: trackedFraction)
 
         let counts = [
             "features=\(tracked.featureCount)",
@@ -1471,7 +1583,7 @@ final class CameraSeedRunner {
                 "foe_elev_deg=" + CameraSeedRunner.fmt(result.foeElevationDeg, 1),
                 rotations,
             ].joined(separator: " ")
-            none(failure.rawValue, b, gap: gap, extra: extra)
+            none(failure.rawValue, b, gap: gap, target: target, extra: extra)
             return
         }
 
@@ -1494,20 +1606,25 @@ final class CameraSeedRunner {
             "med_flow_dps=" + CameraSeedRunner.fmt(degreesPerSecond, 2),
             "resid_px=" + CameraSeedRunner.fmt(report.rmsResidual * focal, 2),
             "gap_ms=" + CameraSeedRunner.fmt(gap * 1000, 0),
+            "gap_target_ms=" + CameraSeedRunner.fmt(target * 1000, 0),
             rotations,
             "speed_kt=" + CameraSeedRunner.fmt(b.inputs.speedKt, 1),
             "course=" + CameraSeedRunner.fmt(b.inputs.courseDeg, 1),
+            "track_mid=" + CameraSeedRunner.fmt(track, 1),
+            "track_turn_deg=" + CameraSeedRunner.fmt(turn, 1),
             "course_acc=" + CameraSeedRunner.fmt(b.inputs.courseAccuracyDeg, 1),
         ].joined(separator: " ")
         FlightRecorder.shared.record(event: "camera_seed", detail: detail)
     }
 
-    private func none(_ reason: String, _ capture: Capture, gap: TimeInterval, extra: String = "") {
+    private func none(_ reason: String, _ capture: Capture, gap: TimeInterval, target: TimeInterval,
+                      extra: String = "") {
         guard let held = pairLimiter.admit(reason, at: capture.timestamp) else { return }
         var parts = [
             "reason=" + reason,
             "held=\(held)",
             "gap_ms=" + CameraSeedRunner.fmt(gap * 1000, 0),
+            "gap_target_ms=" + CameraSeedRunner.fmt(target * 1000, 0),
         ]
         if !extra.isEmpty { parts.append(extra) }
         parts.append("speed_kt=" + CameraSeedRunner.fmt(capture.inputs.speedKt, 1))

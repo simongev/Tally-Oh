@@ -460,6 +460,40 @@ struct CameraSeedTests {
         #expect(Self.angleDeg(direction, expected) < 1.0)
     }
 
+    @Test func aLongPairWithAPhoneTurnIsTrackedFromTheIMUPrediction() throws {
+        // Two seconds apart the hand has turned 9° and the scene has expanded 4% about (92, 54).
+        // Image 2 at (x, y): undo the turn, then the expansion, and sample the texture there.
+        let pinhole = CameraSeed.Pinhole(fx: 140, fy: 140, cx: 80, cy: 60)
+        let turn = Self.rotation(axis: SIMD3<Double>(0.2, 1, 0.1), degrees: 9)
+        let inverse = turn.transpose
+        let centre = SIMD2<Double>(92, 54)
+        let scale = 1.04
+        let first = Self.image { Self.texture($0, $1) }
+        let second = Self.image { x, y in
+            let unturned = CameraSeed.Derotation.rotatedPixel(SIMD2<Double>(x, y), from: pinhole,
+                                                              to: pinhole, rotation: inverse)
+                ?? SIMD2<Double>(x, y)
+            return Self.texture(centre.x + (unturned.x - centre.x) / scale,
+                                centre.y + (unturned.y - centre.y) / scale)
+        }
+        let predicted = CameraSeed.Tracker.track(
+            from: first, to: second, config: Self.trackerConfig(),
+            predict: { CameraSeed.Derotation.rotatedPixel($0, from: pinhole, to: pinhole, rotation: turn) },
+            predictBack: { CameraSeed.Derotation.rotatedPixel($0, from: pinhole, to: pinhole, rotation: inverse) })
+        #expect(predicted.tracks.count >= 40)
+
+        let samples = CameraSeed.Derotation.samples(tracks: predicted.tracks, pinhole1: pinhole,
+                                                    pinhole2: pinhole, rotation: turn)
+        let report = CameraSeed.FOESolver.solve(samples, config: CameraSeed.FOESolver.Config(focalPx: 140))
+        let direction = try #require(report.direction)
+        let expected = simd_normalize(SIMD3<Double>((centre.x - 80) / 140, (centre.y - 60) / 140, 1))
+        #expect(Self.angleDeg(direction, expected) < 1.0)
+
+        // Without the prediction most of those tracks are simply lost.
+        let unpredicted = CameraSeed.Tracker.track(from: first, to: second, config: Self.trackerConfig())
+        #expect(unpredicted.tracks.count < predicted.tracks.count / 2)
+    }
+
     @Test func featurelessImageGivesNoTracks() {
         let flat = Self.image { _, _ in 90 }
         let output = CameraSeed.Tracker.track(from: flat, to: flat, config: Self.trackerConfig())
@@ -534,18 +568,85 @@ struct CameraSeedTests {
         #expect(Double(standard.maxCaptures) * standard.interval == 60)
     }
 
-    @Test func pairGapLengthensWhenTheGroundCrawls() {
+    /// The eight frames the runner keeps, one per quarter second, as seen from t = 10 s.
+    private static let keptLadder: [Double] = (1...8).reversed().map { 10.0 - 0.25 * Double($0) }
+
+    /// Run the planner against ground moving `pxPerSecond`, choosing each pair from the ladder.
+    /// Returns the last gap used.
+    private static func settle(_ planner: inout CameraSeed.PairPlanner, pxPerSecond: Double,
+                               pairs: Int = 8) -> Double {
+        var gap = Double.nan
+        for _ in 0..<pairs {
+            guard let index = planner.partner(for: 10.0, among: keptLadder) else { break }
+            gap = 10.0 - keptLadder[index]
+            planner.update(gapUsed: gap, medianFlowPx: pxPerSecond * gap, movingCount: 150,
+                           trackedFraction: 0.9)
+        }
+        return gap
+    }
+
+    @Test func pairGapReachesTwoSecondsWhenTheGroundCrawls() {
+        // FL403 at 480 kt out of a side window: about 0.5°/s, ~4 px/s at the working scale. A
+        // quarter-second pair would see 1 px of motion; two seconds sees 8.
         var planner = CameraSeed.PairPlanner()
-        let earlier = [9.5, 9.75]
-        #expect(planner.partner(for: 10.0, among: earlier) == 1)   // a quarter second
-        planner.update(medianFlowPx: 1.2)
-        #expect(planner.partner(for: 10.0, among: earlier) == 0)   // half a second
-        planner.update(medianFlowPx: 4)                            // inside the band: stays long
-        #expect(planner.partner(for: 10.0, among: earlier) == 0)
-        planner.update(medianFlowPx: 9)
-        #expect(planner.partner(for: 10.0, among: earlier) == 1)
-        #expect(planner.partner(for: 10.0, among: [8.0]) == nil)   // too old to pair with
+        #expect(planner.targetGap == 0.25)
+        let gap = Self.settle(&planner, pxPerSecond: 4)
+        #expect(planner.targetGap == 2.0)
+        #expect(gap == 2.0)
+        // The pair it then forms is with the oldest kept frame, two seconds back.
+        #expect(planner.partner(for: 10.0, among: Self.keptLadder) == 0)
+    }
+
+    @Test func pairGapStaysAtAQuarterSecondWhenTheGroundRaces() {
+        // A car's roadside: tens of pixels in a quarter second.
+        var planner = CameraSeed.PairPlanner()
+        let gap = Self.settle(&planner, pxPerSecond: 160)
+        #expect(gap == 0.25)
+        #expect(planner.targetGap == 0.25)
+
+        // And from two seconds, one fast pair brings it straight back down.
+        var long = CameraSeed.PairPlanner()
+        _ = Self.settle(&long, pxPerSecond: 4)
+        long.update(gapUsed: 2.0, medianFlowPx: 80, movingCount: 150, trackedFraction: 0.9)
+        #expect(long.targetGap == 0.25)
+    }
+
+    @Test func pairGapShortensWhenTracksAreLostAndLengthensWhenNothingMoves() {
+        var planner = CameraSeed.PairPlanner()
+        _ = Self.settle(&planner, pxPerSecond: 4)
+        // Most features lost: the motion outran the tracker.
+        planner.update(gapUsed: 2.0, medianFlowPx: .nan, movingCount: 3, trackedFraction: 0.1)
+        #expect(planner.targetGap == 1.0)
+
+        // Plenty tracked but nothing measurably moving: look further apart, a doubling at a time.
+        var still = CameraSeed.PairPlanner()
+        still.update(gapUsed: 0.25, medianFlowPx: .nan, movingCount: 0, trackedFraction: 0.9)
+        #expect(still.targetGap == 0.5)
+    }
+
+    @Test func pairsAreOnlyFormedWithinTheirBounds() {
+        let planner = CameraSeed.PairPlanner()
         #expect(planner.partner(for: 10.0, among: []) == nil)
+        #expect(planner.partner(for: 10.0, among: [7.5]) == nil)    // 2.5 s: too old
+        #expect(planner.partner(for: 10.0, among: [9.9]) == nil)    // 0.1 s: too close
+        #expect(planner.partner(for: 10.0, among: [7.87]) == 0)     // 2.13 s: capture jitter allowed
+    }
+
+    @Test func midpointCourseGoesTheShortWayRound() {
+        #expect(CameraSeed.Stats.midpointDeg(350, 10) == 0)
+        #expect(CameraSeed.Stats.midpointDeg(10, 350) == 0)
+        #expect(CameraSeed.Stats.midpointDeg(90, 100) == 95)
+        #expect(CameraSeed.Stats.midpointDeg(359, 359) == 359)
+    }
+
+    @Test func keptFramesArePackedToOneBytePerPixel() {
+        let image = CameraSeed.GrayImage(width: 5, height: 1, pixels: [0.25, 1.5, 254.7, 300, -3])
+        let packed = CameraSeed.PackedImage(image)
+        #expect(packed.bytes == [0, 2, 255, 255, 0])
+        let back = packed.image
+        #expect(back.width == 5)
+        #expect(back.height == 1)
+        #expect(back.pixels == [0, 2, 255, 255, 0])
     }
 
     @Test func noneEventsAreRateLimited() {
