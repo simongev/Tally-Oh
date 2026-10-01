@@ -1885,3 +1885,479 @@ struct GyroAzimuthIntegrator {
         lastTime = -.greatestFiniteMagnitude
     }
 }
+
+/// Holds the world's heading through ARKit's yaw jumps and through world resets in the air, using
+/// CoreMotion's attitude yaw as the witness ARKit cannot move.
+///
+/// **What the flight showed.** FL403, 2026-10-01, seeded at 15.6 s. At 21.8 s, across a
+/// `limited:features` episode, ARKit's azimuth jumped about 95° while the phone did not turn:
+/// `D = arAz − cmYaw` went from 5.4 to 100.4, and every marker swung with it. The anchor Gev took at
+/// 30 s corrected 99.7°, the gyro's own gap to within a degree. At 35.5–37.2 s it jumped again, by
+/// −62°. Separately, closing Settings in the air reset the world and re-seeded it from wherever the
+/// phone happened to point, in two of the three airborne sessions.
+///
+/// **The witness.** CoreMotion's attitude in its default `xArbitraryZVertical` frame: gyro fused by
+/// Apple and levelled by gravity, with no magnetometer, so neither the cabin's field nor ARKit's
+/// visual tracking reaches it. Its zero is arbitrary, so it is never read as a heading. Only `D` is
+/// used, ARKit's azimuth minus CoreMotion's for the same camera: a pan moves both and leaves `D`
+/// alone, ARKit's world rotating moves one. Not `GyroAzimuthIntegrator`, which discards whatever
+/// rotation happens during a sample gap.
+///
+/// Three uses:
+///
+/// - **Anchor constant `K`.** Every alignment (seed, anchor, ground correction) stores
+///   `K = offset + D`: true heading minus CoreMotion yaw, for the phone at that moment.
+/// - **Glitch hold.** Across every episode of non-normal tracking, `D` from the steady moment before
+///   is compared with `D` from the steady moment about half a second after. A change of `minStepDeg`
+///   or more is ARKit's world turning under a phone CoreMotion says did not turn, and the caller
+///   subtracts it from the offset. Slow drift during normal tracking is left alone: it is not a step,
+///   and chasing it would trade ARKit's drift for CoreMotion's, which nothing here can measure.
+/// - **Reset carry.** After a world reset with `K` in hand, the first steady normal frame gives the
+///   new world's offset outright, `K − D`, instead of asking the user to aim the phone again.
+///
+/// Pure and clock-agnostic: every time is the caller's sample time, one timebase throughout. The
+/// policy of *whether* to apply a hold (airborne, some alignment in force) stays with the caller.
+struct GyroYawHold {
+
+    /// One rendered frame.
+    struct Sample {
+        var time: TimeInterval
+        /// ARKit tracking is `.normal`. Anything else opens, or continues, an episode.
+        var isNormal: Bool
+        /// `D`, ARKit's azimuth minus CoreMotion's, or nil when either is unavailable: tracking not
+        /// normal, camera near vertical, or device motion silent.
+        var gapDeg: Double?
+        /// How fast CoreMotion's camera azimuth is turning, in degrees per second; NaN if unknown.
+        var azimuthRateDps: Double
+    }
+
+    /// CoreMotion's attitude matrix, element for element as `CMRotationMatrix` names them. Plain
+    /// numbers, so this type and its tests stay free of CoreMotion.
+    struct Rotation {
+        var m11, m12, m13: Double
+        var m21, m22, m23: Double
+        var m31, m32, m33: Double
+    }
+
+    enum Kind: String {
+        case glitch
+        case reset
+    }
+
+    /// Why an episode's step was not handed over to be applied. Logged as `reason=`.
+    enum Refusal: String {
+        /// Under `minStepDeg`: tracking came back where it left.
+        case small
+        /// No steady reading in the `maxReferenceAgeSeconds` before the episode.
+        case unsteadyBefore = "unsteady_before"
+        /// No steady reading within `maxAfterSeconds` after it.
+        case unsteadyAfter = "unsteady_after"
+        /// An alignment was taken during the episode. It was measured against the world as it came
+        /// back, so shifting it by the step would apply the step twice.
+        case realigned
+    }
+
+    /// What the caller should apply, or log. A glitch is applied as `offset −= deltaDeg`; a reset
+    /// as `offset = carriedOffsetDeg`.
+    struct Event {
+        var kind: Kind
+        /// Nil when the step should be applied.
+        var refusal: Refusal?
+        /// `D` after minus `D` before, the short way round. NaN when one end is unknown.
+        var deltaDeg: Double
+        /// For a reset this is the `D` that `K` implies for the old world, `K − offset before`.
+        var gapBeforeDeg: Double
+        var gapAfterDeg: Double
+        /// From the first non-normal frame to the first normal one after the last; for a reset, to
+        /// the frame the carry was taken on.
+        var episodeSeconds: TimeInterval
+        /// Reset only: the new world's offset, `K − D`.
+        var carriedOffsetDeg: Double?
+        /// Reset only: the offset in force before the reset, NaN if none. A glitch's caller knows its
+        /// own.
+        var offsetBeforeDeg: Double = .nan
+        /// Which alignment `K` came from, and how long before this event it was stored.
+        var anchorSource: TrackFollowingYawOffset.Source?
+        var anchorAgeSeconds: TimeInterval
+    }
+
+    /// Smallest step treated as ARKit's world turning. The spec's 3°: above the 2° that the
+    /// steadiness gate allows timing to put into a comparison, and well below the 62–95° steps
+    /// FL403 showed.
+    let minStepDeg: Double
+    /// How long after tracking returns before the "after" reading is taken. ARKit's pose is still
+    /// settling for a moment after it reports `.normal`; half a second is the spec's figure.
+    let settleSeconds: TimeInterval
+    /// Steady readings within this span at each end are combined by circular median, so one bad
+    /// frame cannot set the step. About fifteen frames at 60 Hz; a single row in a 1 Hz log.
+    let windowSeconds: TimeInterval
+    /// Fastest CoreMotion azimuth rate, in degrees per second, at which a frame counts as steady.
+    ///
+    /// `D` subtracts two azimuths taken at slightly different instants: ARKit's for the frame being
+    /// rendered and CoreMotion's latest 20 Hz sample. One motion period (50 ms) plus ARKit's
+    /// capture-to-render latency of a frame or so separate them, about 70 ms at worst, so a phone
+    /// turning at ω puts up to 0.07·ω of pure timing into `D`. At 15°/s that is about 1°, and a
+    /// comparison of two such readings is off by at most 2° — short of `minStepDeg`, so timing alone
+    /// cannot make a step. A hand holding a phone still trembles at a few degrees per second, so a
+    /// held phone passes and a scanning one does not.
+    let maxSteadyRateDps: Double
+    /// Oldest steady reading that may stand for "just before the episode". Slow drift in normal
+    /// tracking ran up to about 1°/s in FL403, so two seconds keeps that under the step threshold.
+    let maxReferenceAgeSeconds: TimeInterval
+    /// Latest, after the episode ends, that the "after" reading may begin. The same two seconds,
+    /// for the same reason.
+    let maxAfterSeconds: TimeInterval
+
+    init(minStepDeg: Double = 3.0,
+         settleSeconds: TimeInterval = 0.5,
+         windowSeconds: TimeInterval = 0.25,
+         maxSteadyRateDps: Double = 15.0,
+         maxReferenceAgeSeconds: TimeInterval = 2.0,
+         maxAfterSeconds: TimeInterval = 2.0) {
+        self.minStepDeg = minStepDeg
+        self.settleSeconds = settleSeconds
+        self.windowSeconds = windowSeconds
+        self.maxSteadyRateDps = maxSteadyRateDps
+        self.maxReferenceAgeSeconds = maxReferenceAgeSeconds
+        self.maxAfterSeconds = maxAfterSeconds
+    }
+
+    // MARK: State
+
+    /// `K`: true heading minus CoreMotion yaw, from the last alignment. Nil until one has been
+    /// taken, and again after device motion restarts, which re-zeroes CoreMotion's frame.
+    private(set) var anchorConstantDeg: Double?
+    private(set) var anchorSource: TrackFollowingYawOffset.Source?
+    private var anchorTime: TimeInterval = .nan
+
+    private struct Alignment {
+        var offsetDeg: Double
+        var source: TrackFollowingYawOffset.Source
+    }
+
+    private struct Episode {
+        var startedAt: TimeInterval
+        var gapBeforeDeg: Double?
+        var realigned: Alignment?
+    }
+
+    private struct Reset {
+        var carry: Bool
+        var offsetBeforeDeg: Double
+        /// When the reset's own non-normal frames began. Until one arrives, a normal frame is one
+        /// rendered from the world before the reset and still in flight.
+        var lostAt: TimeInterval?
+        /// Normal frames seen before any loss. A handful can be in flight; past `maxStaleFrames` the
+        /// reset is taken to have happened without a visible loss, rather than waiting forever.
+        var framesBeforeLoss: Int = 0
+    }
+
+    /// More normal frames than could ever be queued from the old world when a reset runs.
+    private static let maxStaleFrames = 30
+
+    private enum Phase {
+        case tracking
+        case limited(Episode)
+        case settling(Episode, endedAt: TimeInterval)
+        case collecting(Episode, endedAt: TimeInterval, firstAt: TimeInterval,
+                        readings: [(t: TimeInterval, gap: Double)])
+        case reset(Reset)
+    }
+
+    private var phase: Phase = .tracking
+    /// Steady normal readings spanning at most `windowSeconds`, newest last. Only ever holds
+    /// readings from the world as it stands now: cleared when an episode opens and at every reset.
+    private var recent: [(t: TimeInterval, gap: Double)] = []
+    /// Newest normal reading, steady or not, on the same terms.
+    private var latestGap: (t: TimeInterval, gap: Double)?
+    /// An alignment waiting for a `D` measured in the current world before it can become `K`.
+    private var pendingAlignment: Alignment?
+    private var latestTime: TimeInterval = .nan
+
+    var hasAnchorConstant: Bool { anchorConstantDeg != nil }
+
+    /// A reset is waiting for its first steady normal frame to carry `K` into the new world.
+    var isCarryPending: Bool {
+        if case .reset(let reset) = phase { return reset.carry }
+        return false
+    }
+
+    // MARK: Inputs
+
+    /// An alignment has just been applied: store `K` for it.
+    ///
+    /// During an episode it is held until the episode closes and paired with the `D` after it — and
+    /// the episode's step is then refused, since the alignment already describes the world as it
+    /// came back. During a reset it cancels the carry and waits for the new world's first reading.
+    mutating func recordAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source) {
+        guard offsetDeg.isFinite else { return }
+        let alignment = Alignment(offsetDeg: offsetDeg, source: source)
+        switch phase {
+        case .tracking:
+            if let gap = currentGapDeg {
+                store(alignment, gapDeg: gap, at: latestTime)
+            } else {
+                pendingAlignment = alignment
+            }
+        case .limited(var episode):
+            episode.realigned = alignment
+            phase = .limited(episode)
+        case .settling(var episode, let endedAt):
+            episode.realigned = alignment
+            phase = .settling(episode, endedAt: endedAt)
+        case .collecting(var episode, let endedAt, let firstAt, let readings):
+            episode.realigned = alignment
+            phase = .collecting(episode, endedAt: endedAt, firstAt: firstAt, readings: readings)
+        case .reset(var reset):
+            reset.carry = false
+            phase = .reset(reset)
+            pendingAlignment = alignment
+        }
+    }
+
+    /// The ARKit world was just rebuilt. Nothing measured in the old one carries over except `K`,
+    /// which describes CoreMotion and true north, not ARKit. `carry` asks for `K − D` at the first
+    /// steady normal frame; it is ignored when there is no `K`. `offsetBeforeDeg` (NaN if none) is
+    /// only for the log.
+    mutating func worldDidReset(offsetBeforeDeg: Double, carry: Bool) {
+        phase = .reset(Reset(carry: carry && anchorConstantDeg != nil,
+                             offsetBeforeDeg: offsetBeforeDeg,
+                             lostAt: nil))
+        recent.removeAll()
+        latestGap = nil
+        pendingAlignment = nil
+    }
+
+    /// Give up waiting for the carry. True if one was pending.
+    @discardableResult
+    mutating func abandonCarry() -> Bool {
+        guard case .reset(var reset) = phase, reset.carry else { return false }
+        reset.carry = false
+        phase = .reset(reset)
+        return true
+    }
+
+    /// Device motion stopped. Its next start begins a new reference frame with a new arbitrary zero,
+    /// so `K` and every reading taken against the old one are void.
+    mutating func invalidate() {
+        anchorConstantDeg = nil
+        anchorSource = nil
+        anchorTime = .nan
+        pendingAlignment = nil
+        recent.removeAll()
+        latestGap = nil
+        phase = .tracking
+    }
+
+    /// Feed one frame. Returns an event when an episode closes or a carry is ready.
+    mutating func add(_ sample: Sample) -> Event? {
+        latestTime = sample.time
+        var gap: Double?
+        if sample.isNormal, let raw = sample.gapDeg, raw.isFinite {
+            gap = AngularResponse.wrappedDeg(raw)
+        }
+        let steadyGap = isSteady(sample.azimuthRateDps) ? gap : nil
+
+        switch phase {
+        case .tracking:
+            track(sample, gap: gap, steadyGap: steadyGap)
+            return nil
+
+        case .limited(let episode):
+            if sample.isNormal { phase = .settling(episode, endedAt: sample.time) }
+            return nil
+
+        case .settling(let episode, let endedAt):
+            guard sample.isNormal else {
+                // Not over until tracking has held: a flap back to limited is the same episode.
+                phase = .limited(episode)
+                return nil
+            }
+            let sinceEnd = sample.time - endedAt
+            guard sinceEnd >= settleSeconds else { return nil }
+            if let steadyGap {
+                phase = .collecting(episode, endedAt: endedAt, firstAt: sample.time,
+                                    readings: [(t: sample.time, gap: steadyGap)])
+                return nil
+            }
+            guard sinceEnd > maxAfterSeconds else { return nil }
+            phase = .tracking
+            if let realigned = episode.realigned { pendingAlignment = realigned }
+            let event = Event(kind: .glitch, refusal: .unsteadyAfter, deltaDeg: .nan,
+                              gapBeforeDeg: episode.gapBeforeDeg ?? .nan, gapAfterDeg: .nan,
+                              episodeSeconds: endedAt - episode.startedAt,
+                              carriedOffsetDeg: nil, anchorSource: anchorSource,
+                              anchorAgeSeconds: sample.time - anchorTime)
+            track(sample, gap: gap, steadyGap: steadyGap)
+            return event
+
+        case .collecting(let episode, let endedAt, let firstAt, var readings):
+            if let steadyGap, sample.time - firstAt <= windowSeconds {
+                readings.append((t: sample.time, gap: steadyGap))
+                phase = .collecting(episode, endedAt: endedAt, firstAt: firstAt, readings: readings)
+                return nil
+            }
+            let event = close(episode, endedAt: endedAt, after: readings, at: sample.time)
+            // The readings that closed it are the freshest of the world as it stands, so they are the
+            // reference for whatever comes next — including an episode that opens on this very frame.
+            phase = .tracking
+            recent = readings
+            latestGap = readings.last
+            track(sample, gap: gap, steadyGap: steadyGap)
+            return event
+
+        case .reset(var reset):
+            guard let lostAt = reset.lostAt else {
+                if !sample.isNormal {
+                    reset.lostAt = sample.time
+                } else {
+                    reset.framesBeforeLoss += 1
+                    if reset.framesBeforeLoss > GyroYawHold.maxStaleFrames { reset.lostAt = sample.time }
+                }
+                phase = .reset(reset)
+                return nil
+            }
+            guard sample.isNormal else { return nil }
+            guard reset.carry else {
+                phase = .tracking
+                track(sample, gap: gap, steadyGap: steadyGap)
+                return nil
+            }
+            guard let steadyGap, let k = anchorConstantDeg else { return nil }
+            phase = .tracking
+            track(sample, gap: gap, steadyGap: steadyGap)
+            let impliedBefore = reset.offsetBeforeDeg.isFinite
+                ? AngularResponse.wrappedDeg(k - reset.offsetBeforeDeg) : Double.nan
+            return Event(kind: .reset, refusal: nil,
+                         deltaDeg: impliedBefore.isFinite
+                            ? AngularResponse.signedDelta(impliedBefore, steadyGap) : .nan,
+                         gapBeforeDeg: impliedBefore, gapAfterDeg: steadyGap,
+                         episodeSeconds: sample.time - lostAt,
+                         carriedOffsetDeg: AngularResponse.wrappedDeg(k - steadyGap),
+                         offsetBeforeDeg: reset.offsetBeforeDeg,
+                         anchorSource: anchorSource,
+                         anchorAgeSeconds: sample.time - anchorTime)
+        }
+    }
+
+    // MARK: Helpers
+
+    func isSteady(_ azimuthRateDps: Double) -> Bool {
+        azimuthRateDps.isFinite && abs(azimuthRateDps) <= maxSteadyRateDps
+    }
+
+    /// The best current `D`: the steady window if there is one, otherwise the newest reading.
+    private var currentGapDeg: Double? {
+        if !recent.isEmpty { return AngularResponse.circularMedianDeg(recent.map(\.gap)) }
+        return latestGap?.gap
+    }
+
+    private mutating func store(_ alignment: Alignment, gapDeg: Double, at time: TimeInterval) {
+        anchorConstantDeg = AngularResponse.wrappedDeg(alignment.offsetDeg + gapDeg)
+        anchorSource = alignment.source
+        anchorTime = time
+        pendingAlignment = nil
+    }
+
+    /// A frame while nothing is open: keep the references fresh, or open an episode.
+    private mutating func track(_ sample: Sample, gap: Double?, steadyGap: Double?) {
+        guard sample.isNormal else {
+            var reference: Double?
+            if let newest = recent.last, sample.time - newest.t <= maxReferenceAgeSeconds {
+                reference = AngularResponse.circularMedianDeg(recent.map(\.gap))
+            }
+            phase = .limited(Episode(startedAt: sample.time, gapBeforeDeg: reference, realigned: nil))
+            // What was measured before the episode describes a world that may no longer exist.
+            recent.removeAll()
+            latestGap = nil
+            return
+        }
+        if let gap { latestGap = (t: sample.time, gap: gap) }
+        if let steadyGap {
+            recent.append((t: sample.time, gap: steadyGap))
+            recent.removeAll { sample.time - $0.t > windowSeconds }
+        }
+        if let pending = pendingAlignment, let current = currentGapDeg {
+            store(pending, gapDeg: current, at: sample.time)
+        }
+    }
+
+    private mutating func close(_ episode: Episode,
+                                endedAt: TimeInterval,
+                                after readings: [(t: TimeInterval, gap: Double)],
+                                at time: TimeInterval) -> Event {
+        let after = AngularResponse.circularMedianDeg(readings.map(\.gap))
+        let before = episode.gapBeforeDeg ?? .nan
+        let delta = before.isFinite ? AngularResponse.signedDelta(before, after) : Double.nan
+        var refusal: Refusal?
+        if let realigned = episode.realigned {
+            store(realigned, gapDeg: after, at: readings.last?.t ?? time)
+            refusal = .realigned
+        } else if !delta.isFinite {
+            refusal = .unsteadyBefore
+        } else if abs(delta) < minStepDeg {
+            refusal = .small
+        }
+        return Event(kind: .glitch, refusal: refusal, deltaDeg: delta,
+                     gapBeforeDeg: before, gapAfterDeg: after,
+                     episodeSeconds: endedAt - episode.startedAt,
+                     carriedOffsetDeg: nil, anchorSource: anchorSource,
+                     anchorAgeSeconds: time - anchorTime)
+    }
+
+    // MARK: CoreMotion geometry
+
+    /// Azimuth of the back camera's line of sight in CoreMotion's reference frame, clockwise seen
+    /// from above (the same sense as ARKit's azimuth here), in (−180, 180]. Nil when the camera is
+    /// within about 12° of vertical — the same 0.2 horizontal-component floor ARKit's azimuth uses —
+    /// or when the inputs are inconsistent.
+    ///
+    /// **Not `CMAttitude.yaw`.** That is the first of three Euler angles, and with the phone held
+    /// upright — pitch near 90°, how this phone is always held — the decomposition is at gimbal lock
+    /// and its yaw swaps freely with roll. The line of sight is the device's −Z axis; its horizontal
+    /// direction in the reference frame is what turns with a pan, whatever the roll.
+    ///
+    /// **Which way the matrix maps.** CoreMotion documents `rotationMatrix` only as "the device's
+    /// attitude relative to the reference frame", which does not say whether it takes reference
+    /// coordinates to device coordinates or the reverse — and the two readings put the reference axes
+    /// in its columns or in its rows. Rather than stake the feature on a reading that cannot be checked
+    /// off the device, gravity settles it: `CMDeviceMotion.gravity` is documented in device
+    /// coordinates, and the reference frame's Z is vertical, so whichever reading puts the reference Z
+    /// along −gravity is the right one. The two coincide when the matrix is symmetric, so near the
+    /// boundary the choice does not matter.
+    static func cameraAzimuthDeg(rotation m: Rotation, gravity: SIMD3<Double>) -> Double? {
+        let gx = gravity.x, gy = gravity.y, gz = gravity.z
+        let norm = (gx * gx + gy * gy + gz * gz).squareRoot()
+        guard norm.isFinite, norm > 0.1 else { return nil }
+        let up = SIMD3<Double>(-gx / norm, -gy / norm, -gz / norm)
+        // Reference axes as columns (the matrix takes reference coordinates to device ones), or as
+        // rows (the reverse).
+        let zIfColumns = m.m13 * up.x + m.m23 * up.y + m.m33 * up.z
+        let zIfRows    = m.m31 * up.x + m.m32 * up.y + m.m33 * up.z
+        guard max(zIfColumns, zIfRows) > 0.9 else { return nil }
+        // The line of sight, device −Z, in reference coordinates. With the reference axes as columns
+        // the device's axes are the rows, so device Z is row 3; otherwise it is column 3.
+        let x: Double, y: Double
+        if zIfColumns >= zIfRows {
+            x = -m.m31
+            y = -m.m32
+        } else {
+            x = -m.m13
+            y = -m.m23
+        }
+        guard (x * x + y * y).squareRoot() > 0.2 else { return nil }
+        // Reference Z is up and the frame is right-handed, so counter-clockwise from above runs X to
+        // Y; clockwise is the negative of that.
+        return AngularResponse.wrappedDeg(atan2(-y, x) * 180 / .pi)
+    }
+
+    /// Rate between two successive azimuth samples, the short way round, in degrees per second. NaN
+    /// for a non-finite input or a gap outside (0, `maxGapSeconds`].
+    static func azimuthRateDps(fromDeg: Double, toDeg: Double, seconds: TimeInterval,
+                               maxGapSeconds: TimeInterval = 0.5) -> Double {
+        guard fromDeg.isFinite, toDeg.isFinite, seconds > 0, seconds <= maxGapSeconds else {
+            return .nan
+        }
+        return AngularResponse.signedDelta(fromDeg, toDeg) / seconds
+    }
+}
