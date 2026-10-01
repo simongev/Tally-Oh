@@ -191,8 +191,8 @@ struct AirborneSeedSettleTests {
         #expect(abs(result.estimate.azimuthSpreadDeg - 2.5) < 0.001)
     }
 
-    /// A turn so late that the samples after it do not span a window by the cap: the cap takes
-    /// those, not the steadier-looking reading pause before them.
+    /// A turn so late that the samples after it do not span a window by the cap, but which has
+    /// already settled at the nose: the cap takes those, not the steadier-looking reading pause.
     @Test func capWithALateTurnTakesThePostMoveSamplesNotTheReadingPause() throws {
         var seed = AirborneSeedSettle()
         seed.begin(cardShownAt: 0)
@@ -209,6 +209,50 @@ struct AirborneSeedSettleTests {
         #expect(result.estimate.sampleCount == 2)              // 4.85 and 5.05, only post-move
         #expect(abs(result.estimate.offsetDeg - (-0.5)) < 0.001)
         #expect(abs(result.estimate.azimuthSpreadDeg - 1.0) < 0.001)
+    }
+
+    /// QA round 2's repro. The turn starts at the cap, and its first two samples after leaving the
+    /// band — 134 and 125, on the way from 141 to 100 — read a spread of 9.0°, under the 10°
+    /// resample gate. Taken, that kept a seed 29.5° wrong. Not yet settled, so the cap waits for a
+    /// full window instead, which spans the turn, reads 32°, and is gone back for.
+    @Test func aLateTurnStillSwingingWaitsForAFullWindowAndIsResampled() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0)
+        let sideWindow: [Double] = (0..<24).map { $0 % 2 == 0 ? 140.0 : 142.5 }   // to 4.65
+        let turning: [Double] = [141, 134, 125, 112, 102]                       // 4.85 … 5.65
+        let atTheNose: [Double] = Array(repeating: 100.0, count: 6)
+        let published = run(&seed, azimuths: sideWindow + turning + atTheNose, track: 100)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .cap)
+        #expect(result.at >= 5.6 && result.at < 5.7)            // waited to 5.65, not 5.25
+        #expect(result.estimate.sampleCount == 4)               // 134, 125, 112, 102
+        #expect(abs(result.estimate.azimuthSpreadDeg - 32) < 0.001)
+        #expect(abs(result.estimate.offsetDeg - (-18.5)) < 0.001)
+        // Loose enough that the seed is replaced rather than kept.
+        #expect(result.estimate.azimuthSpreadDeg > SeedResamplePolicy.spreadGateDeg)
+        #expect(SeedResamplePolicy.shouldKeepResampling(spreadDeg: result.estimate.azimuthSpreadDeg,
+                                                        now: result.at,
+                                                        deadline: SeedResamplePolicy.windowSeconds))
+    }
+
+    /// The 128 variant from QA's port: 134 and 128 read 6.0° — further under the gate, and a seed
+    /// 31° wrong if taken. Same answer: wait, take the full window (24°), resample.
+    @Test func aSlowerLateTurnStillSwingingWaitsForAFullWindowAndIsResampled() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0)
+        let sideWindow: [Double] = (0..<24).map { $0 % 2 == 0 ? 140.0 : 142.5 }
+        let turning: [Double] = [141, 134, 128, 120, 110, 101]
+        let atTheNose: [Double] = Array(repeating: 100.0, count: 6)
+        let published = run(&seed, azimuths: sideWindow + turning + atTheNose, track: 100)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .cap)
+        #expect(result.at >= 5.6 && result.at < 5.7)
+        #expect(result.estimate.sampleCount == 4)               // 134, 128, 120, 110
+        #expect(abs(result.estimate.azimuthSpreadDeg - 24) < 0.001)
+        #expect(abs(result.estimate.offsetDeg - (-24)) < 0.001)
+        #expect(result.estimate.azimuthSpreadDeg > SeedResamplePolicy.spreadGateDeg)
     }
 
     /// One post-move sample has a spread of zero whatever it caught, which would slip under the

@@ -1057,15 +1057,23 @@ struct AirborneSeedSettle {
     /// turn is eligible, however steady, because stillness says nothing about aim.
     ///
     /// If the turn came so late that the samples after it do not yet span `settleSeconds`, the cap
-    /// takes all of them rather than reach back before the turn — once there are at least two. A
-    /// single sample has a spread of zero by construction, which would slip under
-    /// `SeedResamplePolicy`'s gate however mid-turn it was; two or more report how much the phone was
-    /// still moving, so a loose late seed is gone back for rather than kept.
+    /// takes them only if they have **already settled** — at least two, within `settleSpreadDeg` —
+    /// and otherwise waits until they span a full window. It never reaches back before the turn.
+    ///
+    /// The samples straight after a move are the turn's own slow start, and a short run of them can
+    /// read under `SeedResamplePolicy`'s 10° gate while the phone is still swinging: QA's round-2
+    /// stream took [134, 125] on the way from 141 to 100 and kept a seed 29.5° wrong at spread 9.0.
+    /// A full 0.6 s window across any real turn reads well over 10°, so a loose late seed is gone
+    /// back for rather than kept. The wait is at most about 0.6 s past the cap, and the cap sits at
+    /// least 2 s inside the watchdog. A single sample is never enough: its spread is zero by
+    /// construction, whatever it caught.
     private var capWindow: ClosedRange<Int>? {
         guard let moveStart = moveStartIndex else { return steadiestWindow(from: 0) }
         if let window = steadiestWindow(from: moveStart) { return window }
         let newest = samples.count - 1
-        return newest > moveStart ? moveStart...newest : nil
+        guard newest > moveStart else { return nil }
+        let settled = FlightDirectionAnchor.spreadDeg(samples[moveStart...newest].map(\.az)) <= settleSpreadDeg
+        return settled ? moveStart...newest : nil
     }
 
     /// The tightest-spread window spanning at least `settleSeconds` among samples from `first` on,
