@@ -1108,6 +1108,108 @@ enum SeedResamplePolicy {
     }
 }
 
+/// Whether to go back for an airborne seed when the aircraft leaves the ground.
+///
+/// **Why this exists.** The 2026-10-01 log (af4f1d6b): the app was opened in the cabin on the
+/// ground with the compass unusable (`hdg_acc` 25–40), so `seed_unavailable` fired at 10 s and the
+/// world fell back to `.gravityAndHeading`. The aircraft took off at 194 s and the app **never
+/// seeded from the track**; the whole climb ran on ARKit fusing a cabin compass, the alignment that
+/// once rotated a world 176°. Nothing ever asked again, because the seed is armed only when a world
+/// is born, and this world was born on the ground.
+///
+/// So at the ground-to-air transition a world with no trusted alignment is restarted in `.gravity`
+/// with the seed armed, and the card and settle capture run exactly as they do at any airborne
+/// start. "No trusted alignment" is the fallback, or no yaw source at all. It is never done over an
+/// anchor or a ground correction: both are measurements, and throwing either away for a seed would
+/// trade a known alignment for a guess.
+///
+/// **Waits rather than drops.** The world restart is rate-limited (three seconds between starts,
+/// against the reset storm that once froze the camera), and opening the app in the climb produces
+/// exactly the collision: `viewWillAppear` starts a world, and the first tick then flips the stale
+/// airborne estimate a fraction of a second later. A re-arm decided only at that instant would be
+/// suppressed and lost, so it stays pending until a restart is allowed, re-checking on every tick
+/// that nothing has aligned the world meanwhile. Landing cancels it.
+///
+/// Once per takeoff, and only at the transition. A world whose airborne seed later times out stays
+/// on the fallback, as before; re-arming on that would loop on a reference that is not arriving.
+struct AirborneSeedRearm {
+
+    /// Why the world is being re-seeded. Logged as `reason=` on `seed_rearmed`.
+    enum Reason: String {
+        /// The ground seed timed out and the world is on `.gravityAndHeading`.
+        case fallback
+        /// A `.gravity` world with no yaw source at all.
+        case noAlignment = "no_alignment"
+    }
+
+    /// What the caller should do this tick.
+    enum Action: Equatable {
+        case none
+        /// Restart the world now, in `.gravity`, with the seed armed.
+        case restartWorld(Reason)
+        /// The AR view is not running. Clear the fallback so its next start comes up in `.gravity`
+        /// with the seed armed — restarting a camera nobody is looking at would be wrong, and that
+        /// start is coming anyway when the view returns.
+        case armNextStart(Reason)
+    }
+
+    /// The world's alignment, as the caller sees it at the moment of asking.
+    struct World: Equatable {
+        /// The ground seed timed out and the world was handed to `.gravityAndHeading`.
+        var fellBackToHeading: Bool
+        /// Any offset source is in force: seed, ground correction or anchor.
+        var hasYawSource: Bool
+        /// An anchor is in force or being captured.
+        var anchorInForce: Bool
+        /// The ground compass correction has an offset, including one primed by a ground seed.
+        var groundCorrectionInForce: Bool
+        /// A seed capture is already armed or running in this world.
+        var seedPending: Bool
+    }
+
+    /// Why this world should be re-seeded, or nil if it should be left alone.
+    static func reason(for world: World) -> Reason? {
+        guard !world.anchorInForce, !world.groundCorrectionInForce else { return nil }
+        guard !world.seedPending else { return nil }
+        if world.fellBackToHeading { return .fallback }
+        if !world.hasYawSource { return .noAlignment }
+        return nil
+    }
+
+    /// The re-arm waiting for a restart to be allowed, if any.
+    private(set) var pending: Reason?
+
+    /// The aircraft has just left the ground.
+    mutating func tookOff(_ world: World) {
+        pending = AirborneSeedRearm.reason(for: world)
+    }
+
+    /// The aircraft is back on the ground: the compass seeds there, and nothing is owed.
+    mutating func landed() {
+        pending = nil
+    }
+
+    /// Called every tick. Re-checks the world, so an anchor or ground correction that arrives
+    /// while waiting cancels the re-arm instead of being thrown away by it.
+    mutating func next(_ world: World, sessionPaused: Bool, restartAllowed: Bool) -> Action {
+        guard pending != nil else { return .none }
+        guard let reason = AirborneSeedRearm.reason(for: world) else {
+            pending = nil
+            return .none
+        }
+        if sessionPaused {
+            pending = nil
+            return .armNextStart(reason)
+        }
+        guard restartAllowed else {
+            pending = reason
+            return .none
+        }
+        pending = nil
+        return .restartWorld(reason)
+    }
+}
+
 /// When to offer the compass calibration screen.
 ///
 /// **Why this needed writing at all.** Every alignment path on the ground rests on the

@@ -2124,6 +2124,63 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         return (speedKt > AirborneEstimate.groundSpeedKt, String(format: "gs%.0f", speedKt))
     }
 
+    // MARK: - Airborne seed re-arm
+
+    /// The re-seed owed by a takeoff from a world with no trusted alignment. See AirborneSeedRearm:
+    /// in log af4f1d6b a ground world fell back at 10 s and the whole climb ran on it.
+    private var seedRearm = AirborneSeedRearm()
+
+    /// This world's alignment, in the terms `AirborneSeedRearm` judges it by.
+    private var seedRearmWorld: AirborneSeedRearm.World {
+        AirborneSeedRearm.World(
+            fellBackToHeading: seedFallbackToHeading,
+            hasYawSource: worldYawSource != .none,
+            anchorInForce: hasFlightAnchor || anchorCaptureActive || worldYawSource == .anchor,
+            // `hasOffset` as well as the source: a ground seed primes the correction, and that is
+            // what `seedFollowerFromGroundCorrection` carries through the takeoff.
+            groundCorrectionInForce: worldYawSource == .ground || groundYaw.hasOffset,
+            seedPending: awaitingSeed || seedIsCapturing
+        )
+    }
+
+    /// Carry out a pending re-arm once it is allowed. Called every tick, straight after the airborne
+    /// transition that may have created it, and ahead of `updateStartupSeed` so a restarted world's
+    /// card goes up on the same tick.
+    private func applySeedRearmIfDue() {
+        // The same test `startARSession` applies, so a restart asked for here is never suppressed
+        // there and lost.
+        let restartAllowed = Date().timeIntervalSince(lastARSessionStart)
+            >= ARTrafficViewController.minARSessionRestartInterval
+        let action = seedRearm.next(seedRearmWorld,
+                                    sessionPaused: isARSessionPaused,
+                                    restartAllowed: restartAllowed)
+        let reason: AirborneSeedRearm.Reason
+        let mode: String
+        switch action {
+        case .none:
+            return
+        case .restartWorld(let why):
+            reason = why
+            mode = "restart"
+        case .armNextStart(let why):
+            reason = why
+            mode = "next_start"
+        }
+        // Before the restart, so the line precedes its `ar_session_start` and `src` says what the
+        // world was running on.
+        FlightRecorder.shared.record(
+            event: "seed_rearmed",
+            detail: String(format: "reason=%@ mode=%@ src=%@ gs=%.0fkt track=%.0f course_acc=%.1f",
+                           reason.rawValue, mode, worldYawSource.rawValue,
+                           lastGPSSpeedKt, lastGPSCourseDeg, lastGPSCourseAccuracy)
+        )
+        // `.gravity` for the next world, which is what makes `startARSession` arm the seed.
+        seedFallbackToHeading = false
+        if case .restartWorld = action {
+            startARSession(reason: "seed_rearm")
+        }
+    }
+
     private func updateVisualization() {
         // One snapshot drives the whole tick. Reading the estimator repeatedly would give
         // each consumer a slightly different dead-reckoned position within the same frame.
@@ -2153,6 +2210,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 // ground compass correction is a valid absolute anchor for the whole flight. This is
                 // what makes the correction automatic: a gate-to-gate flight needs no gesture.
                 pendingGroundSeed = true
+                // And if the ground left this world with no trusted alignment, go back for the
+                // airborne seed. See AirborneSeedRearm.
+                seedRearm.tookOff(seedRearmWorld)
             } else {
                 // Landed. The ground correction takes over again, measuring rather than following,
                 // and the alignment goes back to ARKit's — where the compass measures the phone and
@@ -2162,8 +2222,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 clearYawFollower(reason: "landed")
                 // A landed world seeds from the compass again, so let the fallback re-arm.
                 seedFallbackToHeading = false
+                seedRearm.landed()
             }
         }
+        applySeedRearmIfDue()
         let airborne = isAirborneEstimate
 
         // Establish the world's alignment, if this world has not got one yet.
