@@ -262,9 +262,12 @@ struct GyroYawHoldTests {
         feed(&hold, from: 0.01, count: 20, gap: 0.7)
         hold.recordAlignment(offsetDeg: 10, source: .anchor)
         hold.worldDidReset(offsetBeforeDeg: 10, carry: true)
-        #expect(hold.abandonCarry())
+        // Called outside `#expect`, which cannot take a mutating call.
+        let abandoned = hold.abandonCarry()
+        #expect(abandoned)
         #expect(!hold.isCarryPending)
-        #expect(!hold.abandonCarry())
+        let abandonedAgain = hold.abandonCarry()
+        #expect(!abandonedAgain)
 
         var events = lose(&hold, from: 1.01, count: 20)
         events += feed(&hold, from: 2.01, count: 40, gap: 37)
