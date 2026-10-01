@@ -144,19 +144,24 @@ final class FlightRecorder {
         /// should become rate-dependent. Read it with followGainR, as with every slope here.
         var followGain: Double?
         var followGainR: Double?
-        /// Integrated device-gyro azimuth — **the reference ARKit cannot corrupt.**
+        /// Inertial azimuth of the camera — **the reference ARKit cannot corrupt.** Logged as
+        /// `gyro_az_deg`.
         ///
-        /// Its absolute value is meaningless: gyro bias walks it over minutes. What matters is
-        /// `ar_heading_deg` minus this one. A pan moves both together, so the difference was
-        /// introduced in build 30 as the measurement that could finally separate "the world
-        /// rotated" from "the phone panned" — the question a flight ending 176° wrong could only
-        /// be answered about by hypothesis.
+        /// Its absolute value is meaningless. What matters is `ar_heading_deg` minus this one: a pan
+        /// moves both together, so any change in the difference is ARKit's world rotating — the
+        /// question a flight ending 176° wrong could only be answered about by hypothesis.
         ///
-        /// **It does not answer it, and build 38 stopped claiming it did.** On the ground, standing
-        /// still, this difference moved as much as 105° in one lift while the compass-versus-ARKit
-        /// witness moved independently of it (r ≈ 0 across three lifts). What it measures is the
-        /// gyro's own integration error, which grows with every sample gap the integrator drops.
-        /// See `checkGyroDivergence` for the numbers. Read it as gyro health, not as world motion.
+        /// **Since the gyro yaw hold, this is CoreMotion's attitude yaw** of the camera's line of
+        /// sight, in the default `xArbitraryZVertical` frame (see `GyroYawHold.cameraAzimuthDeg`).
+        /// Its zero is arbitrary and is re-set when device motion restarts after a background cycle;
+        /// it does not restart on a world reset, and it is written in every tracking state.
+        ///
+        /// **Before that it was `GyroAzimuthIntegrator`, and logs from then read differently.** That
+        /// integrator restarted at 0 on every world reset and dropped whatever rotation happened during
+        /// a sample gap, so on the ground, standing still, the difference moved as much as 105° in one
+        /// lift while the compass-versus-ARKit witness moved independently of it (r ≈ 0 across three
+        /// lifts). In those logs read it as gyro health, not as world motion — see
+        /// `checkGyroDivergence` for the numbers.
         var gyroAzimuthDeg: Double?
         /// How far the compass turned per degree the phone turned, over a rolling window.
         ///

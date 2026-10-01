@@ -399,7 +399,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         /// frozen yaw against a moving ARKit azimuth would read as the world turning.
         private static let maxAgeSeconds: TimeInterval = 0.25
 
-        func update(yawDeg newYaw: Double?, at time: TimeInterval) {
+        /// Whether the azimuth turns the way the vertical yaw rate says the phone turned. Fed here,
+        /// on the motion queue, because both rates come from the same sample; read on main. Kept
+        /// across `reset()`: a restart re-zeroes CoreMotion's frame, not the geometry being checked.
+        private var signGuard = GyroYawHold.SignGuard()
+
+        func update(yawDeg newYaw: Double?, witnessRateDps: Double, at time: TimeInterval) {
             lock.lock()
             defer { lock.unlock() }
             let previous = yawDeg
@@ -409,6 +414,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             receivedAt = ProcessInfo.processInfo.systemUptime
             rateDps = GyroYawHold.azimuthRateDps(fromDeg: previous, toDeg: yawDeg,
                                                  seconds: time - previousTime)
+            signGuard.add(azimuthRateDps: rateDps, witnessRateDps: witnessRateDps,
+                          seconds: time - previousTime)
+        }
+
+        /// The sign check as it stands: confirmed, disabled, and the turning behind each.
+        func signStatus() -> (confirmed: Bool, disabled: Bool,
+                              agreeingDeg: Double, disagreeingDeg: Double) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (signGuard.isConfirmed, signGuard.isDisabled,
+                    signGuard.agreeingDeg, signGuard.disagreeingDeg)
         }
 
         func snapshot() -> (yawDeg: Double, rateDps: Double) {
@@ -439,6 +455,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Covers the 1.4–2.4 s a reset takes to reach normal tracking, and several seconds more for the
     /// phone to come to rest, and still leaves the seed its own full timeout afterwards.
     private static let resetCarryTimeoutSeconds: TimeInterval = 8.0
+    /// So `yaw_hold_disabled` is written once, when the sign check first trips. Main thread.
+    private var loggedYawHoldDisabled = false
+    /// Render-thread throttle on posting hold samples to main: about 20 Hz, CoreMotion's own rate,
+    /// so the frames in between would only repeat its last yaw. A change of tracking state is posted
+    /// on the frame it happens, whatever the throttle says, so episode boundaries keep frame
+    /// accuracy. Render thread only.
+    private var lastHoldPostTime: TimeInterval = -.greatestFiniteMagnitude
+    private var lastHoldPostWasNormal = false
+    private static let holdPostIntervalSeconds: TimeInterval = 0.045
 
     /// How fast ARKit's azimuth drifts while the phone is genuinely still — the one alignment
     /// measurement obtainable in cruise, needing neither a compass nor a turn.
@@ -733,16 +758,18 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             let rate = motion.rotationRate
             let gravity = motion.gravity
             let aboutVertical = rate.x * gravity.x + rate.y * gravity.y + rate.z * gravity.z
-            self.verticalYawRateDps = aboutVertical * 180.0 / Double.pi
+            let verticalDps = aboutVertical * 180.0 / Double.pi
+            self.verticalYawRateDps = verticalDps
             // The camera's azimuth from the attitude, for GyroYawHold. See
-            // `GyroYawHold.cameraAzimuthDeg` for why not `attitude.yaw`.
+            // `GyroYawHold.cameraAzimuthDeg` for why not `attitude.yaw`. The vertical rate rides along
+            // as the witness its sign is checked against — see `GyroYawHold.SignGuard`.
             let m = motion.attitude.rotationMatrix
             let yaw = GyroYawHold.cameraAzimuthDeg(
                 rotation: GyroYawHold.Rotation(m11: m.m11, m12: m.m12, m13: m.m13,
                                                m21: m.m21, m22: m.m22, m23: m.m23,
                                                m31: m.m31, m32: m.m32, m33: m.m33),
                 gravity: SIMD3<Double>(gravity.x, gravity.y, gravity.z))
-            self.motionYaw.update(yawDeg: yaw, at: motion.timestamp)
+            self.motionYaw.update(yawDeg: yaw, witnessRateDps: verticalDps, at: motion.timestamp)
         }
     }
 
@@ -1646,8 +1673,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // `expireResetCarryIfDue` arms the seed after all.
         //
         // The airborne flag is trustworthy here, unlike in the note above: `K` exists only after an
-        // alignment, long after GPS has delivered, and a first start never has one.
+        // alignment, long after GPS has delivered, and a first start never has one. Nothing carries
+        // once CoreMotion's azimuth has failed its sign check (`GyroYawHold.SignGuard`).
         let carrying = isAirborneEstimate && yawHold.hasAnchorConstant
+            && !motionYaw.signStatus().disabled
         yawHold.worldDidReset(offsetBeforeDeg: offsetBeforeReset, carry: carrying)
         resetCarryDeadline = CACurrentMediaTime() + ARTrafficViewController.resetCarryTimeoutSeconds
         // Armed only for worlds the app aligns itself. A `.gravityAndHeading` ground world is
@@ -2322,8 +2351,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         applySeedRearmIfDue()
         let airborne = isAirborneEstimate
 
-        // A reset carry that never found a steady frame hands the world to the seed, ahead of the
-        // seed's own tick so the seed starts on this one.
+        // A reset carry that never found a steady frame, or whose azimuth failed the sign check,
+        // hands the world to the seed, ahead of the seed's own tick so the seed starts on this one.
+        checkYawSignGuard()
         expireResetCarryIfDue()
 
         // Establish the world's alignment, if this world has not got one yet.
@@ -3481,6 +3511,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 gapDeg = AngularResponse.signedDelta(motion.yawDeg, arAzimuthDeg)
             }
         }
+        // About 20 Hz, but a tracking change always goes on the frame it happens.
+        guard isNormal != lastHoldPostWasNormal
+                || time - lastHoldPostTime >= ARTrafficViewController.holdPostIntervalSeconds
+        else { return }
+        lastHoldPostTime = time
+        lastHoldPostWasNormal = isNormal
         let sample = GyroYawHold.Sample(time: time, isNormal: isNormal, gapDeg: gapDeg,
                                         azimuthRateDps: motion.rateDps)
         DispatchQueue.main.async { [weak self] in
@@ -3506,6 +3542,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     private func applyGlitchHold(_ event: GyroYawHold.Event) {
         let before = appliedWorldYawOffsetDeg
         var refusal = event.refusal?.rawValue
+        // CoreMotion's azimuth was caught turning the wrong way: every step it reads is suspect.
+        if refusal == nil, motionYaw.signStatus().disabled { refusal = "sign_disabled" }
         if refusal == nil, !isAirborneEstimate { refusal = "ground" }
         // Nothing to hold: no seed has landed yet, or ARKit's own compass fusion owns the world.
         if refusal == nil, worldYawSource == .none { refusal = "unaligned" }
@@ -3543,6 +3581,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// correction out, as an anchor does; a carried seed or ground correction primes it, as those do.
     private func applyResetCarry(_ event: GyroYawHold.Event) {
         guard let offset = event.carriedOffsetDeg, let source = event.anchorSource else { return }
+        // The sign check tripped while the carry waited: K − D would be built on a mirrored azimuth.
+        guard !motionYaw.signStatus().disabled else {
+            recordYawHold(event, refusal: "sign_disabled",
+                          offsetBeforeDeg: event.offsetBeforeDeg, offsetAfterDeg: Double.nan)
+            armSeedInsteadOfCarry()
+            return
+        }
         appliedWorldYawOffsetDeg = offset
         sceneManager?.worldYawOffsetDeg = offset
         switch source {
@@ -3573,14 +3618,36 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         yawHold.abandonCarry()
         FlightRecorder.shared.record(
             event: "yaw_hold",
-            detail: String(format: "kind=reset applied=0 reason=timeout timeout_s=%.0f k_src=%@ airborne=%d",
+            detail: String(format: "kind=reset applied=0 reason=timeout timeout_s=%.0f k_src=%@ airborne=%d sign_confirmed=%d",
                            ARTrafficViewController.resetCarryTimeoutSeconds,
-                           yawHold.anchorSource?.rawValue ?? "none", isAirborneEstimate ? 1 : 0)
+                           yawHold.anchorSource?.rawValue ?? "none", isAirborneEstimate ? 1 : 0,
+                           motionYaw.signStatus().confirmed ? 1 : 0)
         )
+        armSeedInsteadOfCarry()
+    }
+
+    /// The seed, armed where a carry would have aligned the world, with its own watchdog measured
+    /// from now rather than from the reset.
+    private func armSeedInsteadOfCarry() {
         let now = CACurrentMediaTime()
         awaitingSeed = shouldSeedThisWorld
         seedDeadline = now + ARTrafficViewController.seedReferenceTimeoutSeconds
         seedResampleDeadline = now + SeedResamplePolicy.windowSeconds
+    }
+
+    /// Say so, once, when the sign check trips — and stop a carry that is waiting, so the world is
+    /// seeded instead. From then on every glitch is refused and no reset carries.
+    private func checkYawSignGuard() {
+        guard !loggedYawHoldDisabled else { return }
+        let sign = motionYaw.signStatus()
+        guard sign.disabled else { return }
+        loggedYawHoldDisabled = true
+        FlightRecorder.shared.record(
+            event: "yaw_hold_disabled",
+            detail: String(format: "reason=sign agree_deg=%.0f disagree_deg=%.0f",
+                           sign.agreeingDeg, sign.disagreeingDeg)
+        )
+        if yawHold.abandonCarry() { armSeedInsteadOfCarry() }
     }
 
     /// One `yaw_hold` line per closed episode, carry or refusal. `dD` is the step in `D`; the offsets
@@ -3593,9 +3660,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                             offsetBeforeDeg, offsetAfterDeg, event.episodeSeconds,
                             event.gapBeforeDeg, event.gapAfterDeg)
         if let refusal { detail += " reason=\(refusal)" }
-        detail += String(format: " k_src=%@ k_age_s=%.0f airborne=%d",
+        detail += String(format: " k_src=%@ k_age_s=%.0f airborne=%d sign_confirmed=%d",
                          event.anchorSource?.rawValue ?? "none", event.anchorAgeSeconds,
-                         isAirborneEstimate ? 1 : 0)
+                         isAirborneEstimate ? 1 : 0, motionYaw.signStatus().confirmed ? 1 : 0)
         FlightRecorder.shared.record(event: "yaw_hold", detail: detail)
     }
 

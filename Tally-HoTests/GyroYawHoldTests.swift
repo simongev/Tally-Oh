@@ -333,6 +333,113 @@ struct GyroYawHoldTests {
         #expect(abs(event.deltaDeg) < 2)
     }
 
+    // MARK: - Sign guard
+
+    /// Feed `samples` CoreMotion samples 50 ms apart with the given rates; returns how many tripped.
+    @discardableResult
+    private func turn(_ guardian: inout GyroYawHold.SignGuard, azimuthDps: Double,
+                      witnessDps: Double, samples: Int) -> Int {
+        var trips = 0
+        for _ in 0..<samples {
+            if guardian.add(azimuthRateDps: azimuthDps, witnessRateDps: witnessDps, seconds: 0.05) {
+                trips += 1
+            }
+        }
+        return trips
+    }
+
+    /// Azimuth and witness turning together through a scan back and forth: confirmed once 90° has
+    /// agreed, and never disabled.
+    @Test func aCorrectSignIsConfirmedAndNeverDisabled() {
+        var guardian = GyroYawHold.SignGuard()
+        var trips = 0
+        for i in 0..<400 {   // 20 s of panning ±40°/s with a 4 s period
+            let rate = 40 * sin(2 * Double.pi * Double(i) * 0.05 / 4)
+            if guardian.add(azimuthRateDps: rate, witnessRateDps: rate, seconds: 0.05) { trips += 1 }
+        }
+        #expect(trips == 0)
+        #expect(!guardian.isDisabled)
+        #expect(guardian.isConfirmed)
+        #expect(guardian.disagreeingDeg == 0)
+        #expect(guardian.agreeingDeg > 90)
+    }
+
+    /// The case it exists for: a mirrored azimuth. Disabled after 90° of turning — three seconds of a
+    /// 30°/s pan — exactly once, and it stays disabled whatever follows.
+    @Test func aMirroredAzimuthDisablesTheHoldOnce() {
+        var guardian = GyroYawHold.SignGuard()
+        let early = turn(&guardian, azimuthDps: -30, witnessDps: 30, samples: 58)   // 87°
+        #expect(early == 0)
+        #expect(!guardian.isDisabled)
+        let late = turn(&guardian, azimuthDps: -30, witnessDps: 30, samples: 3)     // to 91.5°
+        #expect(late == 1)
+        #expect(guardian.isDisabled)
+        #expect(!guardian.isConfirmed)
+
+        let afterwards = turn(&guardian, azimuthDps: 30, witnessDps: 30, samples: 400)
+        #expect(afterwards == 0)
+        #expect(guardian.isDisabled)
+        #expect(!guardian.isConfirmed)
+    }
+
+    /// Slow turning is tremor as far as the sign goes: minutes of it, mirrored, decide nothing.
+    @Test func slowTurningSaysNothing() {
+        var guardian = GyroYawHold.SignGuard()
+        let trips = turn(&guardian, azimuthDps: -5, witnessDps: 5, samples: 2400)
+        #expect(trips == 0)
+        #expect(!guardian.isDisabled)
+        #expect(!guardian.isConfirmed)
+        #expect(guardian.disagreeingDeg == 0)
+    }
+
+    /// One turning sample in six legitimately disagreeing — a roll about a tilted line of sight, a
+    /// reversal straddling a sample — still confirms, and never disables.
+    @Test func occasionalDisagreementIsTolerated() {
+        var guardian = GyroYawHold.SignGuard()
+        var trips = 0
+        for i in 0..<400 {
+            let azimuth = i % 6 == 0 ? -30.0 : 30.0
+            if guardian.add(azimuthRateDps: azimuth, witnessRateDps: 30, seconds: 0.05) { trips += 1 }
+        }
+        #expect(trips == 0)
+        #expect(guardian.isConfirmed)
+        #expect(guardian.disagreeingDeg > 90)   // past the decision on its own, outweighed by agreement
+    }
+
+    /// Disagreement past 90° does not disable while agreement still outweighs it.
+    @Test func agreementOutweighsAStretchOfDisagreement() {
+        var guardian = GyroYawHold.SignGuard()
+        turn(&guardian, azimuthDps: -30, witnessDps: 30, samples: 56)    // 84° disagreeing
+        turn(&guardian, azimuthDps: 30, witnessDps: 30, samples: 140)    // 210° agreeing
+        let trips = turn(&guardian, azimuthDps: -30, witnessDps: 30, samples: 10)   // to 99°
+        #expect(trips == 0)
+        #expect(!guardian.isDisabled)
+        #expect(guardian.disagreeingDeg > 90)
+    }
+
+    /// An azimuth with nothing to do with the rotation splits about evenly, and that disables too.
+    @Test func anAzimuthUnrelatedToTheTurnDisables() {
+        var guardian = GyroYawHold.SignGuard()
+        var trips = 0
+        for i in 0..<400 {
+            let azimuth = i % 2 == 0 ? -30.0 : 30.0
+            if guardian.add(azimuthRateDps: azimuth, witnessRateDps: 30, seconds: 0.05) { trips += 1 }
+        }
+        #expect(trips == 1)
+        #expect(guardian.isDisabled)
+    }
+
+    /// Unknown rates and samples too far apart are not turning.
+    @Test func gapsAndUnknownRatesAreIgnored() {
+        var guardian = GyroYawHold.SignGuard()
+        guardian.add(azimuthRateDps: .nan, witnessRateDps: 30, seconds: 0.05)
+        guardian.add(azimuthRateDps: -30, witnessRateDps: .nan, seconds: 0.05)
+        guardian.add(azimuthRateDps: -30, witnessRateDps: 30, seconds: 1.0)
+        guardian.add(azimuthRateDps: -30, witnessRateDps: 30, seconds: 0)
+        #expect(guardian.agreeingDeg == 0)
+        #expect(guardian.disagreeingDeg == 0)
+    }
+
     // MARK: - CoreMotion geometry
 
     /// CoreMotion's matrix and gravity for a phone whose back camera looks along `headingDeg`,

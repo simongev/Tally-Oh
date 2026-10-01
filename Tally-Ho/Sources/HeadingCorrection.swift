@@ -2028,7 +2028,8 @@ struct GyroYawHold {
     /// settling for a moment after it reports `.normal`; half a second is the spec's figure.
     let settleSeconds: TimeInterval
     /// Steady readings within this span at each end are combined by circular median, so one bad
-    /// frame cannot set the step. About fifteen frames at 60 Hz; a single row in a 1 Hz log.
+    /// frame cannot set the step. About five samples at the 20 Hz the caller posts; a single row in
+    /// a 1 Hz log.
     let windowSeconds: TimeInterval
     /// Fastest CoreMotion azimuth rate, in degrees per second, at which a frame counts as steady.
     ///
@@ -2398,5 +2399,84 @@ struct GyroYawHold {
             return .nan
         }
         return AngularResponse.signedDelta(fromDeg, toDeg) / seconds
+    }
+}
+
+extension GyroYawHold {
+
+    /// Checks, against an independent witness, that CoreMotion's camera azimuth turns the same way
+    /// as ARKit's — the one assumption the whole hold rests on.
+    ///
+    /// **Why it is needed.** If the azimuth came out mirrored on a real device, every episode in which
+    /// the phone also turned would read a step of about twice the turn, and the hold would apply it as
+    /// a correction: catastrophic, and silent. The tests pin the geometry, but they cannot run on the
+    /// phone.
+    ///
+    /// **The witness** is the yaw rate the app already measures, `rotationRate · gravity`. Its sign
+    /// against ARKit is settled by flight logs: FL403's integral of it went 0 → −98° while ARKit's
+    /// azimuth went 0 → −93°. It comes from the same CoreMotion sample as the azimuth rate, so the two
+    /// are compared with no timing between them.
+    ///
+    /// **The rule.** Only samples where both rates exceed `minRateDps` count — real turning, not
+    /// tremor — and each contributes the witness's degrees turned to the agreeing or the disagreeing
+    /// side. The two rates legitimately differ: rolling the phone about a tilted line of sight turns
+    /// the witness and leaves the azimuth still, and a reversal straddles a sample. Those mostly fall
+    /// below the floor, and what does not is a small share of the turning, so:
+    ///
+    /// - **Disabled** — latched for the rest of the session — once `decisionDeg` of turning has
+    ///   disagreed *and* disagreement is at least half of all the turning counted. A mirror disagrees
+    ///   on every turning sample, so it trips within the first look around (90° at a 30°/s pan is three
+    ///   seconds); an azimuth unrelated to the rotation splits about evenly and trips too. A correct
+    ///   one cannot, because real yaw keeps agreement the majority.
+    /// - **Confirmed** once `decisionDeg` has agreed with at most a fifth as much disagreeing — 90°
+    ///   being one deliberate look around the cabin. Until then the hold still runs, as the logs say
+    ///   the sign is right; confirmation is reported, not required.
+    struct SignGuard {
+
+        /// Below this either rate is tremor or noise, and its sign says nothing.
+        let minRateDps: Double
+        /// Degrees of turning it takes to decide either way.
+        let decisionDeg: Double
+        /// Agreement must outweigh disagreement by this much to count as confirmed.
+        let confirmRatio: Double
+        /// A gap between samples longer than this is not one sample's turning.
+        let maxGapSeconds: TimeInterval
+
+        private(set) var agreeingDeg: Double = 0
+        private(set) var disagreeingDeg: Double = 0
+        private(set) var isDisabled = false
+
+        init(minRateDps: Double = 10, decisionDeg: Double = 90,
+             confirmRatio: Double = 4, maxGapSeconds: TimeInterval = 0.5) {
+            self.minRateDps = minRateDps
+            self.decisionDeg = decisionDeg
+            self.confirmRatio = confirmRatio
+            self.maxGapSeconds = maxGapSeconds
+        }
+
+        var isConfirmed: Bool {
+            !isDisabled && agreeingDeg >= decisionDeg && agreeingDeg >= confirmRatio * disagreeingDeg
+        }
+
+        /// Feed one CoreMotion sample: the azimuth's rate, the witness's rate, and the time since the
+        /// previous sample. True exactly once — on the sample that disables the hold.
+        @discardableResult
+        mutating func add(azimuthRateDps: Double, witnessRateDps: Double,
+                          seconds: TimeInterval) -> Bool {
+            guard !isDisabled,
+                  azimuthRateDps.isFinite, witnessRateDps.isFinite,
+                  seconds > 0, seconds <= maxGapSeconds,
+                  abs(azimuthRateDps) >= minRateDps, abs(witnessRateDps) >= minRateDps
+            else { return false }
+            let turned = abs(witnessRateDps) * seconds
+            if (azimuthRateDps > 0) == (witnessRateDps > 0) {
+                agreeingDeg += turned
+            } else {
+                disagreeingDeg += turned
+            }
+            guard disagreeingDeg >= decisionDeg, disagreeingDeg >= agreeingDeg else { return false }
+            isDisabled = true
+            return true
+        }
     }
 }
