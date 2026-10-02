@@ -1947,11 +1947,7 @@ struct GyroAzimuthIntegrator {
 /// Three uses:
 ///
 /// - **Anchor constant `K`.** Every alignment (seed, anchor, ground correction) stores
-///   `K = offset + D`: true heading minus CoreMotion yaw, for the phone at that moment. In the air it
-///   is then **refreshed from the live alignment** (`refreshAnchor`): the circular median of
-///   `offset + D` over the last `refreshWindowSeconds` of steady normal frames, so a reset carry
-///   bridges seconds of CoreMotion, never an hour of its drift. The alignment's own value is kept
-///   apart, unrefreshed, as `alignmentConstantDeg` — what a gyro-only heading would have used.
+///   `K = offset + D`: true heading minus CoreMotion yaw, for the phone at that moment.
 /// - **Glitch hold.** Across every episode of non-normal tracking, `D` from the steady moment before
 ///   is compared with `D` from the steady moment about half a second after. A change of `minStepDeg`
 ///   or more is ARKit's world turning under a phone CoreMotion says did not turn, and the caller
@@ -2057,42 +2053,28 @@ struct GyroYawHold {
     /// Latest, after the episode ends, that the "after" reading may begin. The same two seconds,
     /// for the same reason.
     let maxAfterSeconds: TimeInterval
-    /// How much of the live alignment the refreshed `K` is the median of. Five seconds of steady
-    /// frames averages hand tremor and ARKit's frame noise out, and a carry then bridges only the gap
-    /// since the last steady moment.
-    let refreshWindowSeconds: TimeInterval
 
     init(minStepDeg: Double = 3.0,
          settleSeconds: TimeInterval = 0.5,
          windowSeconds: TimeInterval = 0.25,
          maxSteadyRateDps: Double = 15.0,
          maxReferenceAgeSeconds: TimeInterval = 2.0,
-         maxAfterSeconds: TimeInterval = 2.0,
-         refreshWindowSeconds: TimeInterval = 5.0) {
+         maxAfterSeconds: TimeInterval = 2.0) {
         self.minStepDeg = minStepDeg
         self.settleSeconds = settleSeconds
         self.windowSeconds = windowSeconds
         self.maxSteadyRateDps = maxSteadyRateDps
         self.maxReferenceAgeSeconds = maxReferenceAgeSeconds
         self.maxAfterSeconds = maxAfterSeconds
-        self.refreshWindowSeconds = refreshWindowSeconds
     }
 
     // MARK: State
 
-    /// `K`: true heading minus CoreMotion yaw — from the last alignment, refreshed from the live one
-    /// in the air. What a reset carries. Nil until an alignment has been taken, and again after
-    /// device motion restarts, which re-zeroes CoreMotion's frame.
+    /// `K`: true heading minus CoreMotion yaw, from the last alignment. Nil until one has been
+    /// taken, and again after device motion restarts, which re-zeroes CoreMotion's frame.
     private(set) var anchorConstantDeg: Double?
     private(set) var anchorSource: TrackFollowingYawOffset.Source?
     private var anchorTime: TimeInterval = .nan
-    /// `K` as the last alignment measured it, never refreshed: the reference for `heading_compare`'s
-    /// gyro heading, which is evidence only.
-    private(set) var alignmentConstantDeg: Double?
-    private var alignmentTime: TimeInterval = .nan
-    /// `offset + D` from steady normal frames, spanning at most `refreshWindowSeconds`, since the last
-    /// alignment, episode or reset.
-    private var liveAnchor: [(t: TimeInterval, k: Double)] = []
 
     private struct Alignment {
         var offsetDeg: Double
@@ -2140,38 +2122,9 @@ struct GyroYawHold {
 
     var hasAnchorConstant: Bool { anchorConstantDeg != nil }
 
-    /// How long ago, on the samples' clock, `K` was stored or last refreshed. NaN without one.
+    /// How long ago, on the samples' clock, `K` was stored. NaN without one.
     func anchorAgeSeconds(at time: TimeInterval) -> Double {
         anchorConstantDeg == nil ? .nan : time - anchorTime
-    }
-
-    /// How long ago the last alignment was measured. NaN without one.
-    func alignmentAgeSeconds(at time: TimeInterval) -> Double {
-        alignmentConstantDeg == nil ? .nan : time - alignmentTime
-    }
-
-    /// Refresh `K` from the alignment in force, `liveOffsetDeg`, on this sample. The caller decides
-    /// when it applies — in the air, with an alignment in force and the sign check intact — and calls
-    /// it after `add` and after applying whatever `add` returned, so a held step is already in the
-    /// offset.
-    ///
-    /// **Frozen** outside the tracking phase — through an episode, its settle and its after-window,
-    /// and a reset — and on frames turning faster than `maxSteadyRateDps`. Across an episode D has
-    /// moved and the offset has not yet, so `offset + D` there is the glitch, not the alignment;
-    /// the readings start again after it. True when `K` moved.
-    @discardableResult
-    mutating func refreshAnchor(liveOffsetDeg: Double, from sample: Sample) -> Bool {
-        guard case .tracking = phase,
-              anchorConstantDeg != nil, pendingAlignment == nil,
-              liveOffsetDeg.isFinite, sample.isNormal, isSteady(sample.azimuthRateDps),
-              let raw = sample.gapDeg, raw.isFinite
-        else { return false }
-        let live = AngularResponse.wrappedDeg(liveOffsetDeg + AngularResponse.wrappedDeg(raw))
-        liveAnchor.append((t: sample.time, k: live))
-        liveAnchor.removeAll { sample.time - $0.t > refreshWindowSeconds }
-        anchorConstantDeg = AngularResponse.circularMedianDeg(liveAnchor.map(\.k))
-        anchorTime = sample.time
-        return true
     }
 
     /// A reset is waiting for its first steady normal frame to carry `K` into the new world.
@@ -2224,7 +2177,6 @@ struct GyroYawHold {
         recent.removeAll()
         latestGap = nil
         pendingAlignment = nil
-        liveAnchor.removeAll()
     }
 
     /// Give up waiting for the carry. True if one was pending.
@@ -2242,9 +2194,6 @@ struct GyroYawHold {
         anchorConstantDeg = nil
         anchorSource = nil
         anchorTime = .nan
-        alignmentConstantDeg = nil
-        alignmentTime = .nan
-        liveAnchor.removeAll()
         pendingAlignment = nil
         recent.removeAll()
         latestGap = nil
@@ -2358,11 +2307,7 @@ struct GyroYawHold {
         anchorConstantDeg = AngularResponse.wrappedDeg(alignment.offsetDeg + gapDeg)
         anchorSource = alignment.source
         anchorTime = time
-        alignmentConstantDeg = anchorConstantDeg
-        alignmentTime = time
         pendingAlignment = nil
-        // A new alignment: the live readings of the old one are not readings of it.
-        liveAnchor.removeAll()
     }
 
     /// A frame while nothing is open: keep the references fresh, or open an episode.
@@ -2376,7 +2321,6 @@ struct GyroYawHold {
             // What was measured before the episode describes a world that may no longer exist.
             recent.removeAll()
             latestGap = nil
-            liveAnchor.removeAll()
             return
         }
         if let gap { latestGap = (t: sample.time, gap: gap) }
@@ -2548,9 +2492,112 @@ extension GyroYawHold {
     }
 }
 
-// MARK: - CoreMotion at the frame's timestamp (issue #10)
+// MARK: - Continuous gyro heading (issue #10)
 
 extension GyroYawHold {
+
+    /// `D̄`: ARKit's azimuth minus CoreMotion's, smoothed for holding the heading continuously in the
+    /// air, where the offset becomes `K − D̄` and the true heading `cmYaw + K`.
+    ///
+    /// **Why continuous.** The step hold left slow drift alone, and on 2026-10-02 the climb showed
+    /// what that costs: D drifted 33.2° in two minutes of normal tracking (18:37:34 → 18:39:31.7)
+    /// while the aircraft held a track near 135°, and with the phone held still CoreMotion's yaw sat
+    /// at 110.1° for 48 s while ARKit's azimuth slid 158° → 143.5°. In straight cruise D stayed put
+    /// (net 0.5°, spread 2° over 18:58:46–19:00:38), and on Oct 1 the anchor agreed with the gyro to
+    /// about a degree after ARKit's 99° jump. In the air CoreMotion is the better witness.
+    ///
+    /// - **Median over `windowSeconds`** (1 s) of steady readings, circular, so a single bad frame
+    ///   cannot move the heading and a phone held still sees D's noise averaged out. At the 20 Hz the
+    ///   caller posts that is about twenty readings, and the heading lags ARKit's drift by half a
+    ///   second, which at the 0.3°/s the climb drifted is a sixth of a degree.
+    /// - **Frozen** — the last value held — while the phone turns faster than `maxSteadyRateDps`, the
+    ///   step hold's 15°/s, and while tracking is not normal. ARKit's azimuth means nothing then.
+    /// - **Settled** for `settleSeconds` after tracking returns, as the step hold is, and the readings
+    ///   from before the episode are dropped: a world that jumped must not be averaged with the one
+    ///   it jumped from. The step is absorbed when the first steady reading after the settle arrives —
+    ///   the same moment the step hold would apply it.
+    struct SmoothedGap {
+
+        let windowSeconds: TimeInterval
+        let settleSeconds: TimeInterval
+        let maxSteadyRateDps: Double
+
+        /// The current `D̄`, or nil until a steady reading has been taken.
+        private(set) var valueDeg: Double?
+        /// Whether the last sample left `valueDeg` where it was.
+        private(set) var isFrozen = true
+        private var readings: [(t: TimeInterval, gap: Double)] = []
+        private var normalSince: TimeInterval?
+
+        init(windowSeconds: TimeInterval = 1.0, settleSeconds: TimeInterval = 0.5,
+             maxSteadyRateDps: Double = 15.0) {
+            self.windowSeconds = windowSeconds
+            self.settleSeconds = settleSeconds
+            self.maxSteadyRateDps = maxSteadyRateDps
+        }
+
+        /// Feed one sample; returns `D̄` as it now stands.
+        @discardableResult
+        mutating func add(_ sample: Sample) -> Double? {
+            isFrozen = true
+            guard sample.isNormal else {
+                readings.removeAll()
+                normalSince = nil
+                return valueDeg
+            }
+            if normalSince == nil { normalSince = sample.time }
+            guard let since = normalSince, sample.time - since >= settleSeconds,
+                  let raw = sample.gapDeg, raw.isFinite,
+                  sample.azimuthRateDps.isFinite, abs(sample.azimuthRateDps) <= maxSteadyRateDps
+            else { return valueDeg }
+            readings.append((t: sample.time, gap: AngularResponse.wrappedDeg(raw)))
+            readings.removeAll { sample.time - $0.t > windowSeconds }
+            valueDeg = AngularResponse.circularMedianDeg(readings.map(\.gap))
+            isFrozen = false
+            return valueDeg
+        }
+
+        /// A new world, or a new CoreMotion frame: nothing measured before carries over.
+        mutating func reset() {
+            readings.removeAll()
+            normalSince = nil
+            valueDeg = nil
+            isFrozen = true
+        }
+    }
+
+    /// Which hold places the scene.
+    enum HeadingMode: String {
+        /// `offset = K − D̄`, written continuously.
+        case continuous
+        /// The offset from the last alignment, moved only by held steps — the behaviour before #10.
+        case step
+    }
+
+    /// Continuous only in the air, with an anchor constant, an alignment in force in this world, and
+    /// CoreMotion's sign not caught out. On the ground the compass correction owns the offset; with
+    /// the sign check tripped every reading of D is suspect; with no alignment there is nothing to
+    /// hold, and a reset carry establishes one first.
+    static func headingMode(airborne: Bool, hasAnchorConstant: Bool, signDisabled: Bool,
+                            aligned: Bool) -> HeadingMode {
+        airborne && hasAnchorConstant && !signDisabled && aligned ? .continuous : .step
+    }
+
+    /// The offset the continuous hold wants: `K − D̄`, in (−180, 180].
+    static func continuousOffsetDeg(anchorConstantDeg: Double, smoothedGapDeg: Double) -> Double {
+        AngularResponse.wrappedDeg(anchorConstantDeg - smoothedGapDeg)
+    }
+
+    /// Whether a continuous write is due: at most every `minIntervalSeconds` (20 Hz) and only for a
+    /// change of at least `minChangeDeg`, so a held heading does not rewrite the scene with noise.
+    static func shouldWriteOffset(currentDeg: Double, targetDeg: Double,
+                                  sinceLastWriteSeconds: TimeInterval,
+                                  minChangeDeg: Double = 0.1,
+                                  minIntervalSeconds: TimeInterval = 0.05) -> Bool {
+        guard currentDeg.isFinite, targetDeg.isFinite else { return false }
+        return sinceLastWriteSeconds >= minIntervalSeconds
+            && abs(AngularResponse.signedDelta(currentDeg, targetDeg)) >= minChangeDeg
+    }
 
     /// CoreMotion's yaw at `time`, interpolated between the samples either side of it — the short way
     /// across ±180° — rather than whichever 20 Hz sample came last. Up to one motion period separates
