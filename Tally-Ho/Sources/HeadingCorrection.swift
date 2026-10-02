@@ -863,7 +863,9 @@ struct StartupSeed {
 ///   read the card, turned to the nose and stopped. The offset is the median over that steady run.
 /// - **still:** the phone never turned, and at `stillSeconds` after the card is holding steady.
 ///   The user was already facing forward — or has not reacted, which nothing here can tell apart;
-///   2.5 s is the compromise between those two.
+///   2.0 s is the compromise between those two. It was 2.5 s until Gev's live check at FL405
+///   (2026-10-02, log 33e76400): already facing forward (`moved=1.0`, spread 1.0°), target "close to
+///   real airplane", and the still path was the whole of the wait.
 /// - **cap:** neither by `capSeconds`, typically a phone that never stops wobbling. Takes the
 ///   steadiest `settleSeconds` window seen — **but only since the phone left the band it started
 ///   in, if it ever did.** The pause while the card is read is the phone held wherever the user was
@@ -875,7 +877,7 @@ struct StartupSeed {
 /// read cannot have been obeyed.
 ///
 /// Typical timings at 5 Hz, from the card: a turn that ends by ~1.4 s publishes at ~2.1 s, since
-/// a run spanning 0.5 s takes four samples; a phone already forward publishes at 2.5 s.
+/// a run spanning 0.5 s takes four samples; a phone already forward publishes at 2.0 s.
 ///
 /// **One clock.** `begin`, `add` and `finish` must all be on the same timebase. The caller feeds
 /// samples on the render clock and shows the card on the main one, so it converts the card time
@@ -937,7 +939,7 @@ struct AirborneSeedSettle {
          moveThresholdDeg: Double = 5.0,
          settleSeconds: TimeInterval = 0.5,
          settleSpreadDeg: Double = 2.0,
-         stillSeconds: TimeInterval = 2.5,
+         stillSeconds: TimeInterval = 2.0,
          capSeconds: TimeInterval = 5.0) {
         self.minCardAgeSeconds = minCardAgeSeconds
         self.moveThresholdDeg = moveThresholdDeg
@@ -1968,6 +1970,10 @@ struct GyroYawHold {
         var gapDeg: Double?
         /// How fast CoreMotion's camera azimuth is turning, in degrees per second; NaN if unknown.
         var azimuthRateDps: Double
+        /// The two azimuths `gapDeg` was taken from, for the caller's `heading_compare` log. The hold
+        /// itself reads only `gapDeg`.
+        var arAzimuthDeg: Double? = nil
+        var cmYawDeg: Double? = nil
     }
 
     /// CoreMotion's attitude matrix, element for element as `CMRotationMatrix` names them. Plain
@@ -2115,6 +2121,11 @@ struct GyroYawHold {
     private var latestTime: TimeInterval = .nan
 
     var hasAnchorConstant: Bool { anchorConstantDeg != nil }
+
+    /// How long ago, on the samples' clock, `K` was stored. NaN without one.
+    func anchorAgeSeconds(at time: TimeInterval) -> Double {
+        anchorConstantDeg == nil ? .nan : time - anchorTime
+    }
 
     /// A reset is waiting for its first steady normal frame to carry `K` into the new world.
     var isCarryPending: Bool {
@@ -2478,5 +2489,202 @@ extension GyroYawHold {
             isDisabled = true
             return true
         }
+    }
+}
+
+// MARK: - Continuous gyro heading (issue #10)
+
+extension GyroYawHold {
+
+    /// `D̄`: ARKit's azimuth minus CoreMotion's, smoothed for holding the heading continuously in the
+    /// air, where the offset becomes `K − D̄` and the true heading `cmYaw + K`.
+    ///
+    /// **Why continuous.** The step hold left slow drift alone, and on 2026-10-02 the climb showed
+    /// what that costs: D drifted 33.2° in two minutes of normal tracking (18:37:34 → 18:39:31.7)
+    /// while the aircraft held a track near 135°, and with the phone held still CoreMotion's yaw sat
+    /// at 110.1° for 48 s while ARKit's azimuth slid 158° → 143.5°. In straight cruise D stayed put
+    /// (net 0.5°, spread 2° over 18:58:46–19:00:38), and on Oct 1 the anchor agreed with the gyro to
+    /// about a degree after ARKit's 99° jump. In the air CoreMotion is the better witness.
+    ///
+    /// - **Median over `windowSeconds`** (1 s) of steady readings, circular, so a single bad frame
+    ///   cannot move the heading and a phone held still sees D's noise averaged out. At the 20 Hz the
+    ///   caller posts that is about twenty readings, and the heading lags ARKit's drift by half a
+    ///   second, which at the 0.3°/s the climb drifted is a sixth of a degree.
+    /// - **Frozen** — the last value held — while the phone turns faster than `maxSteadyRateDps`, the
+    ///   step hold's 15°/s, and while tracking is not normal. ARKit's azimuth means nothing then.
+    /// - **Settled** for `settleSeconds` after tracking returns, as the step hold is, and the readings
+    ///   from before the episode are dropped: a world that jumped must not be averaged with the one
+    ///   it jumped from. The step is absorbed when the first steady reading after the settle arrives —
+    ///   the same moment the step hold would apply it.
+    struct SmoothedGap {
+
+        let windowSeconds: TimeInterval
+        let settleSeconds: TimeInterval
+        let maxSteadyRateDps: Double
+
+        /// The current `D̄`, or nil until a steady reading has been taken.
+        private(set) var valueDeg: Double?
+        /// Whether the last sample left `valueDeg` where it was.
+        private(set) var isFrozen = true
+        private var readings: [(t: TimeInterval, gap: Double)] = []
+        private var normalSince: TimeInterval?
+
+        init(windowSeconds: TimeInterval = 1.0, settleSeconds: TimeInterval = 0.5,
+             maxSteadyRateDps: Double = 15.0) {
+            self.windowSeconds = windowSeconds
+            self.settleSeconds = settleSeconds
+            self.maxSteadyRateDps = maxSteadyRateDps
+        }
+
+        /// Feed one sample; returns `D̄` as it now stands.
+        @discardableResult
+        mutating func add(_ sample: Sample) -> Double? {
+            isFrozen = true
+            guard sample.isNormal else {
+                readings.removeAll()
+                normalSince = nil
+                return valueDeg
+            }
+            if normalSince == nil { normalSince = sample.time }
+            guard let since = normalSince, sample.time - since >= settleSeconds,
+                  let raw = sample.gapDeg, raw.isFinite,
+                  sample.azimuthRateDps.isFinite, abs(sample.azimuthRateDps) <= maxSteadyRateDps
+            else { return valueDeg }
+            readings.append((t: sample.time, gap: AngularResponse.wrappedDeg(raw)))
+            readings.removeAll { sample.time - $0.t > windowSeconds }
+            valueDeg = AngularResponse.circularMedianDeg(readings.map(\.gap))
+            isFrozen = false
+            return valueDeg
+        }
+
+        /// A new world, or a new CoreMotion frame: nothing measured before carries over.
+        mutating func reset() {
+            readings.removeAll()
+            normalSince = nil
+            valueDeg = nil
+            isFrozen = true
+        }
+    }
+
+    /// Which hold places the scene.
+    enum HeadingMode: String {
+        /// `offset = K − D̄`, written continuously.
+        case continuous
+        /// The offset from the last alignment, moved only by held steps — the behaviour before #10.
+        case step
+    }
+
+    /// Continuous only in the air, with an anchor constant, an alignment in force in this world, and
+    /// CoreMotion's sign not caught out. On the ground the compass correction owns the offset; with
+    /// the sign check tripped every reading of D is suspect; with no alignment there is nothing to
+    /// hold, and a reset carry establishes one first.
+    static func headingMode(airborne: Bool, hasAnchorConstant: Bool, signDisabled: Bool,
+                            aligned: Bool) -> HeadingMode {
+        airborne && hasAnchorConstant && !signDisabled && aligned ? .continuous : .step
+    }
+
+    /// The offset the continuous hold wants: `K − D̄`, in (−180, 180].
+    static func continuousOffsetDeg(anchorConstantDeg: Double, smoothedGapDeg: Double) -> Double {
+        AngularResponse.wrappedDeg(anchorConstantDeg - smoothedGapDeg)
+    }
+
+    /// Whether a continuous write is due: at most every `minIntervalSeconds` (20 Hz) and only for a
+    /// change of at least `minChangeDeg`, so a held heading does not rewrite the scene with noise.
+    static func shouldWriteOffset(currentDeg: Double, targetDeg: Double,
+                                  sinceLastWriteSeconds: TimeInterval,
+                                  minChangeDeg: Double = 0.1,
+                                  minIntervalSeconds: TimeInterval = 0.05) -> Bool {
+        guard currentDeg.isFinite, targetDeg.isFinite else { return false }
+        return sinceLastWriteSeconds >= minIntervalSeconds
+            && abs(AngularResponse.signedDelta(currentDeg, targetDeg)) >= minChangeDeg
+    }
+
+    /// CoreMotion's yaw at `time`, interpolated between the samples either side of it — the short way
+    /// across ±180° — rather than whichever 20 Hz sample came last. Up to one motion period separates
+    /// an ARKit frame from the latest sample, and that is what put up to 1° of pure timing into D at
+    /// 15°/s; at the frame's own timestamp it is gone.
+    ///
+    /// Past the newest sample it extrapolates at the last pair's rate, at most
+    /// `maxExtrapolationSeconds`; before the oldest it holds the oldest within the same bound. Nil
+    /// further out either way, or with no usable sample. `samples` must be in time order.
+    static func interpolatedYawDeg(_ samples: [(t: TimeInterval, yawDeg: Double)],
+                                   at time: TimeInterval,
+                                   maxExtrapolationSeconds: TimeInterval = 0.1) -> Double? {
+        let usable = samples.filter { $0.t.isFinite && $0.yawDeg.isFinite }
+        guard time.isFinite, let first = usable.first, let last = usable.last else { return nil }
+        if time >= last.t {
+            let ahead = time - last.t
+            guard ahead <= maxExtrapolationSeconds else { return nil }
+            guard usable.count >= 2 else { return last.yawDeg }
+            let previous = usable[usable.count - 2]
+            let span = last.t - previous.t
+            guard span > 0 else { return last.yawDeg }
+            let rate = AngularResponse.signedDelta(previous.yawDeg, last.yawDeg) / span
+            return AngularResponse.wrappedDeg(last.yawDeg + rate * ahead)
+        }
+        if time <= first.t {
+            return first.t - time <= maxExtrapolationSeconds ? first.yawDeg : nil
+        }
+        for i in 1..<usable.count where usable[i].t >= time {
+            let a = usable[i - 1], b = usable[i]
+            let span = b.t - a.t
+            guard span > 0 else { return b.yawDeg }
+            let fraction = (time - a.t) / span
+            return AngularResponse.wrappedDeg(
+                a.yawDeg + AngularResponse.signedDelta(a.yawDeg, b.yawDeg) * fraction)
+        }
+        return last.yawDeg
+    }
+}
+
+// MARK: - Stuck-camera watchdog (issue #10)
+
+/// When to restart an ARKit session that has come up with no tracking at all.
+///
+/// **What it is for.** On 2026-10-02 closing Settings in the air reset the world, and three times
+/// out of three the session came back `unavailable` and stayed there — 137 s, 64 s and 16 s — until
+/// a second Settings open and close happened to restart it. The cause is not in the log: failures
+/// were only printed. Settings no longer resets the world, which removes the trigger seen; this is
+/// the backstop for any other way into the same state.
+///
+/// `.notAvailable` continuously for `stuckSeconds` — counted from the last start, which forces that
+/// state, or from its onset if it came later — with the view on screen and the session not paused,
+/// earns one restart — and no more than one per
+/// `minRestartIntervalSeconds`, so a session that cannot come back is not restarted into a storm.
+/// Four seconds is well past a healthy start (the same flight reached `limited:initializing` within
+/// 0.4 s of every start and `normal` within 3.8 s).
+struct ARSessionWatchdog {
+
+    let stuckSeconds: TimeInterval
+    let minRestartIntervalSeconds: TimeInterval
+
+    private var notAvailableSince: TimeInterval?
+    private var lastRestart: TimeInterval = -.greatestFiniteMagnitude
+
+    init(stuckSeconds: TimeInterval = 4.0, minRestartIntervalSeconds: TimeInterval = 10.0) {
+        self.stuckSeconds = stuckSeconds
+        self.minRestartIntervalSeconds = minRestartIntervalSeconds
+    }
+
+    /// A session start, whoever asked for it. A reset forces `.notAvailable` at once, so the clock
+    /// starts here; a start that comes back healthy clears it on the next tick.
+    mutating func sessionStarted(at time: TimeInterval) {
+        notAvailableSince = time
+    }
+
+    /// Called on the tick. Returns how long the session has been stuck when it should be restarted
+    /// now, nil otherwise. The caller does the restart, which counts as a start.
+    mutating func update(notAvailable: Bool, viewVisible: Bool, sessionPaused: Bool,
+                         at time: TimeInterval) -> TimeInterval? {
+        guard notAvailable, viewVisible, !sessionPaused else {
+            notAvailableSince = nil
+            return nil
+        }
+        let since = notAvailableSince ?? time
+        notAvailableSince = since
+        let stuck = time - since
+        guard stuck >= stuckSeconds, time - lastRestart >= minRestartIntervalSeconds else { return nil }
+        lastRestart = time
+        return stuck
     }
 }

@@ -8,6 +8,7 @@ import ARKit
 import CoreLocation
 import CoreMotion
 import Combine
+import AVFoundation
 
 // MARK: - Selection State
 
@@ -404,6 +405,16 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         /// across `reset()`: a restart re-zeroes CoreMotion's frame, not the geometry being checked.
         private var signGuard = GyroYawHold.SignGuard()
 
+        /// The last few samples on CoreMotion's clock, oldest first, so a frame can be given the yaw
+        /// at its own timestamp rather than the latest one. Eight at 20 Hz is 0.4 s, several frames'
+        /// worth of capture-to-render latency.
+        private var history: [(t: TimeInterval, yawDeg: Double)] = []
+        private static let historyCount = 8
+        /// Beyond this gap between a frame's timestamp and the newest sample the two cannot be on one
+        /// clock — `ARFrame.timestamp` and `CMLogItem.timestamp` both count from boot — and the newest
+        /// sample is used as before, with the gap reported so the log can show it.
+        static let maxClockGapSeconds: TimeInterval = 0.5
+
         func update(yawDeg newYaw: Double?, witnessRateDps: Double, at time: TimeInterval) {
             lock.lock()
             defer { lock.unlock() }
@@ -412,6 +423,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             yawDeg = newYaw ?? .nan
             timestamp = time
             receivedAt = ProcessInfo.processInfo.systemUptime
+            if yawDeg.isFinite {
+                history.append((t: time, yawDeg: yawDeg))
+                if history.count > MotionYawBox.historyCount { history.removeFirst() }
+            } else {
+                history.removeAll()
+            }
             rateDps = GyroYawHold.azimuthRateDps(fromDeg: previous, toDeg: yawDeg,
                                                  seconds: time - previousTime)
             signGuard.add(azimuthRateDps: rateDps, witnessRateDps: witnessRateDps,
@@ -427,13 +444,24 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                     signGuard.agreeingDeg, signGuard.disagreeingDeg)
         }
 
-        func snapshot() -> (yawDeg: Double, rateDps: Double) {
+        /// The yaw for a frame captured at `frameTime` (`ARFrame.timestamp`), interpolated between
+        /// the samples either side of it; the newest sample when there is no frame time or the clocks
+        /// disagree. `clockGapSeconds` is the frame time less the newest sample's, NaN without a frame.
+        func snapshot(at frameTime: TimeInterval?) -> (yawDeg: Double, rateDps: Double,
+                                                       clockGapSeconds: Double) {
             lock.lock()
             defer { lock.unlock() }
             guard receivedAt.isFinite,
                   ProcessInfo.processInfo.systemUptime - receivedAt <= MotionYawBox.maxAgeSeconds
-            else { return (.nan, .nan) }
-            return (yawDeg, rateDps)
+            else { return (.nan, .nan, .nan) }
+            guard let frameTime, frameTime.isFinite, timestamp.isFinite else {
+                return (yawDeg, rateDps, .nan)
+            }
+            let gap = frameTime - timestamp
+            guard abs(gap) <= MotionYawBox.maxClockGapSeconds,
+                  let interpolated = GyroYawHold.interpolatedYawDeg(history, at: frameTime)
+            else { return (yawDeg, rateDps, gap) }
+            return (interpolated, rateDps, gap)
         }
 
         func reset() {
@@ -443,6 +471,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             rateDps = .nan
             timestamp = .nan
             receivedAt = .nan
+            history.removeAll()
         }
     }
     private let motionYaw = MotionYawBox()
@@ -457,6 +486,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private static let resetCarryTimeoutSeconds: TimeInterval = 8.0
     /// So `yaw_hold_disabled` is written once, when the sign check first trips. Main thread.
     private var loggedYawHoldDisabled = false
+    /// `D̄` for the continuous hold (#10): a one-second circular median of steady readings, frozen
+    /// while the phone turns fast or tracking is not normal. Main thread, fed beside `yawHold`.
+    private var smoothedGap = GyroYawHold.SmoothedGap()
+    /// The offset the step hold alone would have in force — set by every alignment, moved by every
+    /// held step. Placement in the step mode; in the continuous mode it is only logged, as `ar_hdg`.
+    private var stepOnlyOffsetDeg: Double = 0
+    /// The mode last in force, so a change is logged once. Main thread.
+    private var headingMode: GyroYawHold.HeadingMode = .step
+    /// Sample-clock time of the last continuous write and the last `heading_compare` line.
+    private var lastContinuousWriteTime: TimeInterval = -.greatestFiniteMagnitude
+    private var lastHeadingCompareTime: TimeInterval = -.greatestFiniteMagnitude
+    /// Render thread only: `cm_clock_mismatch` is written once.
+    private var loggedMotionClockGap = false
+    /// Restarts a session stuck at `.notAvailable` (#10). Main thread, on the 4 Hz tick.
+    private var arWatchdog = ARSessionWatchdog()
     /// Render-thread throttle on posting hold samples to main: about 20 Hz, CoreMotion's own rate,
     /// so the frames in between would only repeat its last yaw. A change of tracking state is posted
     /// on the frame it happens, whatever the throttle says, so episode boundaries keep frame
@@ -1251,6 +1295,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // world after a background cycle is seeded afresh, as the FL403 96° measurement demands.
             self?.motionYaw.reset()
             self?.yawHold.invalidate()
+            self?.smoothedGap.reset()
             self?.yawDrift.closeRun()
             // The world's yaw does not survive the suspension, so the offset measured against it
             // must not either. Consumed by the next startARSession, whatever wakes it.
@@ -1509,6 +1554,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         lastARSessionStart = now
         isARSessionPaused = false
+        // Every start, resumed or reset, restarts the stuck-camera clock.
+        arWatchdog.sessionStarted(at: CACurrentMediaTime())
 
         // Named to avoid shadowing the `reason` parameter, which names the *call site*, not the
         // reset decision — the log carries both and they answer different questions.
@@ -1594,6 +1641,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             worldYawSource = .none
             appliedWorldYawOffsetDeg = 0
             sceneManager?.worldYawOffsetDeg = 0
+            stepOnlyOffsetDeg = 0
             // So the hint offers the alignment again rather than leaving the user to notice that
             // the one they gave has been withdrawn.
             alignPrompts.reset()
@@ -1688,6 +1736,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let carrying = isAirborneEstimate && yawHold.hasAnchorConstant
             && !motionYaw.signStatus().disabled
         yawHold.worldDidReset(offsetBeforeDeg: offsetBeforeReset, carry: carrying)
+        // The new world's D starts afresh; the continuous hold resumes once it has a reading, from
+        // the offset the carry (or the seed) put in force.
+        smoothedGap.reset()
+        stepOnlyOffsetDeg = 0
         resetCarryDeadline = CACurrentMediaTime() + ARTrafficViewController.resetCarryTimeoutSeconds
         // Armed only for worlds the app aligns itself. A `.gravityAndHeading` ground world is
         // already aligned by ARKit, so there is nothing to capture and no watchdog to trip.
@@ -1792,7 +1844,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             adsbOwnshipCallsign: adsbCallsign
         ) { [weak self] updated in
             guard let self else { return }
-            self.resumeARIfPaused()
+            self.resumeAfterSettings()
             let old = self.sceneManager?.settings
             var updatedSettings = updated
             updatedSettings.updateFilter()
@@ -1833,31 +1885,33 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .formSheet
-        // .formSheet doesn't hide the presenting view, so unlike .fullScreen
-        // (map, calibration) it never fires viewWillDisappear/viewWillAppear
-        // on us — meaning the AR session and HUD update loop would otherwise
-        // keep running full tilt underneath the sheet. Pause explicitly here
-        // and resume in presentationControllerDidDismiss(_:), which fires for
-        // both the Done button and an interactive swipe-down dismiss.
-        pauseARSession()
+        // .formSheet doesn't hide the presenting view, so unlike .fullScreen (map, calibration) it
+        // never fires viewWillDisappear/viewWillAppear on us. Only the 4 Hz HUD tick stops while it
+        // is up; it restarts in presentationControllerDidDismiss(_:), which fires for both the Done
+        // button and an interactive swipe-down dismiss.
+        //
+        // **The ARKit session keeps running (#10).** It used to be paused here and reset on the way
+        // back, and on 2026-10-02 that reset killed the camera three times out of three in the air:
+        // `resumeAfterModal why=airborne_reseed`, then `unavailable` about 3 s later for 137 s, 64 s
+        // and 16 s, until a second open and close happened to restart it. Keeping the session alive
+        // also keeps the world, its alignment and the gyro hold's readings, so closing Settings costs
+        // nothing at all — no reset carry, no seed.
         updateTimer?.invalidate()
         nav.presentationController?.delegate = self
         present(nav, animated: true)
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        resumeARIfPaused()
+        resumeAfterSettings()
     }
 
-    /// Resumes the AR session/update timer after Settings closes. Called
-    /// from both presentationControllerDidDismiss(_:) (covers an
-    /// interactive swipe-down dismiss) and the Settings onDismiss closure
-    /// below (covers the Done button) since it's not guaranteed which of
-    /// those fires for any given dismissal — resuming twice is harmless
-    /// (startARSession() just resets tracking again).
-    private func resumeARIfPaused() {
+    /// Restarts the HUD tick after Settings closes. The session was never paused, so nothing else is
+    /// owed — in particular no `startARSession`, whose reset is what stuck the camera in the air.
+    /// Called from both presentationControllerDidDismiss(_:) (an interactive swipe-down) and the
+    /// Settings onDismiss closure (the Done button), since either may fire; the guard makes the
+    /// second call a no-op.
+    private func resumeAfterSettings() {
         guard !(updateTimer?.isValid ?? false) else { return }
-        startARSession(reason: "resumeAfterModal")
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
@@ -2314,7 +2368,30 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
+    /// Restart a session stuck at `.notAvailable` (#10). Ahead of everything else on the tick, and
+    /// ahead of the position guard: a camera that never came back needs no GPS fix to be noticed.
+    private func checkARWatchdog() {
+        let notAvailable: Bool
+        if case .notAvailable = arTrackingState { notAvailable = true } else { notAvailable = false }
+        // On screen means this view is in a window, nothing full-screen is over it, and the camera
+        // is authorised — a first-launch permission prompt is not a stuck camera.
+        let visible = isViewLoaded && view.window != nil
+            && (presentedViewController == nil
+                || presentedViewController?.modalPresentationStyle == .formSheet)
+            && AVCaptureDevice.authorizationStatus(for: .video) == .authorized
+        guard let stuck = arWatchdog.update(notAvailable: notAvailable, viewVisible: visible,
+                                            sessionPaused: isARSessionPaused,
+                                            at: CACurrentMediaTime()) else { return }
+        FlightRecorder.shared.record(
+            event: "ar_watchdog_restart",
+            detail: String(format: "stuck_s=%.1f airborne=%d", stuck, isAirborneEstimate ? 1 : 0)
+        )
+        startARSession(reason: "watchdog")
+    }
+
     private func updateVisualization() {
+        checkARWatchdog()
+
         // One snapshot drives the whole tick. Reading the estimator repeatedly would give
         // each consumer a slightly different dead-reckoned position within the same frame.
         let state = ownshipEstimator.snapshot()
@@ -3315,10 +3392,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard let pov = arSceneView.pointOfView else { return }
         let t = pov.worldTransform
         let cam = SCNVector3(t.m41, t.m42, t.m43)
-        // CoreMotion's camera azimuth for this frame, read once: the published gyro azimuth below,
-        // and GyroYawHold's sample, must be the same reading. NaN while device motion is silent.
-        let motion = motionYaw.snapshot()
+        // CoreMotion's camera azimuth for this frame, read once and at the frame's own capture time:
+        // the published gyro azimuth below, and GyroYawHold's sample, must be the same reading. NaN
+        // while device motion is silent.
+        let frame = arSceneView.session.currentFrame
+        let motion = motionYaw.snapshot(at: frame?.timestamp)
         gyroAzimuthDeg = motion.yawDeg
+        if !loggedMotionClockGap, motion.clockGapSeconds.isFinite,
+           abs(motion.clockGapSeconds) > MotionYawBox.maxClockGapSeconds {
+            // Once: ARKit's frame times and CoreMotion's are meant to share the boot clock. If they do
+            // not, the yaw falls back to the newest sample, which is what it was before #10.
+            loggedMotionClockGap = true
+            FlightRecorder.shared.record(event: "cm_clock_mismatch",
+                                         detail: String(format: "gap_s=%.3f", motion.clockGapSeconds))
+        }
         // Before the position ticks, so this frame's markers are placed with this frame's
         // alignment. Deliberately not inside updateHUDLadder: that returns early when the HUD
         // is switched off, which would silently disable placement correction for anyone who
@@ -3326,7 +3413,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         updateWorldYawError(pov: pov, at: time)
         // Every frame, whatever the tracking state, unlike the call above: an episode is exactly
         // the frames that one skips.
-        sampleGyroYawHold(motion: motion, at: time)
+        sampleGyroYawHold(frame: frame, motion: motion, at: time)
         // Frozen while ARKit has no established world, so no garbage positions are written during
         // the window the markers are faded out for. At 60 Hz the first tick after recovery puts
         // everything right within one frame.
@@ -3513,19 +3600,24 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// the callback's state still read normal. The callback's state is kept as well, because a reset
     /// forces it to `.notAvailable` at once while the old session's last frame can go on saying
     /// `.normal` for a moment.
-    private func sampleGyroYawHold(motion: (yawDeg: Double, rateDps: Double), at time: TimeInterval) {
+    private func sampleGyroYawHold(frame: ARFrame?,
+                                   motion: (yawDeg: Double, rateDps: Double, clockGapSeconds: Double),
+                                   at time: TimeInterval) {
         var isNormal = false
         var gapDeg: Double?
+        var arAzimuth: Double?
         if case .normal = arTrackingState,
-           let camera = arSceneView.session.currentFrame?.camera,
+           let camera = frame?.camera,
            case .normal = camera.trackingState {
             isNormal = true
             let axis = camera.transform.columns.2
             let forward = SIMD3<Double>(-Double(axis.x), -Double(axis.y), -Double(axis.z))
-            // The same azimuth, and the same near-vertical floor, as `rawAzimuthDeg`.
+            // The same azimuth, and the same near-vertical floor, as `rawAzimuthDeg`. CoreMotion's
+            // yaw was taken at this frame's timestamp, so the two are of the same instant.
             if motion.yawDeg.isFinite,
                (forward.x * forward.x + forward.z * forward.z).squareRoot() > 0.2 {
                 let arAzimuthDeg = atan2(forward.x, -forward.z) * 180.0 / Double.pi
+                arAzimuth = arAzimuthDeg
                 gapDeg = AngularResponse.signedDelta(motion.yawDeg, arAzimuthDeg)
             }
         }
@@ -3536,19 +3628,94 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         lastHoldPostTime = time
         lastHoldPostWasNormal = isNormal
         let sample = GyroYawHold.Sample(time: time, isNormal: isNormal, gapDeg: gapDeg,
-                                        azimuthRateDps: motion.rateDps)
+                                        azimuthRateDps: motion.rateDps,
+                                        arAzimuthDeg: arAzimuth,
+                                        cmYawDeg: motion.yawDeg.isFinite ? motion.yawDeg : nil)
         DispatchQueue.main.async { [weak self] in
             self?.feedGyroYawHold(sample)
         }
     }
 
-    /// Main thread: run the hold, and apply whatever it hands back.
+    /// Main thread: run the hold, apply whatever it hands back, then hold the heading continuously if
+    /// this is the air.
     private func feedGyroYawHold(_ sample: GyroYawHold.Sample) {
-        guard let event = yawHold.add(sample) else { return }
-        switch event.kind {
-        case .glitch: applyGlitchHold(event)
-        case .reset:  applyResetCarry(event)
+        let event = yawHold.add(sample)
+        smoothedGap.add(sample)
+        if let event {
+            switch event.kind {
+            case .glitch: applyGlitchHold(event)
+            case .reset:  applyResetCarry(event)
+            }
         }
+        updateContinuousHeading(at: sample.time)
+        recordHeadingCompareIfDue(sample)
+    }
+
+    /// Which hold places the scene right now. See `GyroYawHold.headingMode`.
+    private var currentHeadingMode: GyroYawHold.HeadingMode {
+        GyroYawHold.headingMode(airborne: isAirborneEstimate,
+                                hasAnchorConstant: yawHold.hasAnchorConstant,
+                                signDisabled: motionYaw.signStatus().disabled,
+                                aligned: worldYawSource != .none)
+    }
+
+    /// **The continuous hold (#10).** In the air, with `K`, the offset is `K − D̄`, so what the user
+    /// sees is `cmYaw + K` and ARKit's drift in normal tracking — 33° in two minutes of the Oct 2
+    /// climb — no longer reaches the scene. Written through `shiftWorldYawOffset`, so the follower,
+    /// the anchor undo and a primed ground correction move with it, at most at 20 Hz and only for a
+    /// change of 0.1° or more. Steps and carries go on being detected as before; in this mode they
+    /// arrive through `D̄` and are not applied a second time.
+    private func updateContinuousHeading(at time: TimeInterval) {
+        let mode = currentHeadingMode
+        if mode != headingMode {
+            FlightRecorder.shared.record(
+                event: "heading_hold",
+                detail: String(format: "mode=%@ from=%@ airborne=%d k=%d sign_disabled=%d aligned=%d offset=%.1f step_offset=%.1f",
+                               mode.rawValue, headingMode.rawValue, isAirborneEstimate ? 1 : 0,
+                               yawHold.hasAnchorConstant ? 1 : 0,
+                               motionYaw.signStatus().disabled ? 1 : 0,
+                               worldYawSource != .none ? 1 : 0,
+                               appliedWorldYawOffsetDeg, stepOnlyOffsetDeg)
+            )
+            headingMode = mode
+        }
+        guard mode == .continuous,
+              let k = yawHold.anchorConstantDeg,
+              let smoothed = smoothedGap.valueDeg else { return }
+        let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: smoothed)
+        guard GyroYawHold.shouldWriteOffset(currentDeg: appliedWorldYawOffsetDeg, targetDeg: target,
+                                            sinceLastWriteSeconds: time - lastContinuousWriteTime)
+        else { return }
+        lastContinuousWriteTime = time
+        shiftWorldYawOffset(byDeg: AngularResponse.signedDelta(appliedWorldYawOffsetDeg, target))
+    }
+
+    /// About once a second in the air: ARKit's heading as the step hold alone would have placed it,
+    /// against the gyro's, `cmYaw + K`. Their difference is ARKit's drift since `K` was stored, plus
+    /// CoreMotion's — `k_age_s` says how long either has had.
+    private func recordHeadingCompareIfDue(_ sample: GyroYawHold.Sample) {
+        guard isAirborneEstimate, let ar = sample.arAzimuthDeg, let cm = sample.cmYawDeg,
+              sample.time - lastHeadingCompareTime >= 1.0 else { return }
+        lastHeadingCompareTime = sample.time
+        let arHeading = AngularResponse.wrappedDeg(ar + stepOnlyOffsetDeg)
+        let gyroHeading = yawHold.anchorConstantDeg.map { AngularResponse.wrappedDeg(cm + $0) } ?? .nan
+        let difference = gyroHeading.isFinite
+            ? AngularResponse.signedDelta(arHeading, gyroHeading) : Double.nan
+        FlightRecorder.shared.record(
+            event: "heading_compare",
+            detail: String(format: "ar_hdg=%.1f gyro_hdg=%.1f diff=%.1f k_src=%@ k_age_s=%.0f mode=%@ d=%.1f d_bar=%.1f offset=%.1f trk=%.1f",
+                           arHeading, gyroHeading, difference,
+                           yawHold.anchorSource?.rawValue ?? "none",
+                           yawHold.anchorAgeSeconds(at: sample.time), headingMode.rawValue,
+                           sample.gapDeg ?? Double.nan, smoothedGap.valueDeg ?? Double.nan,
+                           appliedWorldYawOffsetDeg, lastGPSCourseDeg)
+        )
+    }
+
+    /// An alignment has been applied: it becomes the anchor constant, and the step hold's offset.
+    private func noteAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source) {
+        yawHold.recordAlignment(offsetDeg: offsetDeg, source: source)
+        stepOnlyOffsetDeg = offsetDeg
     }
 
     /// Undo a step ARKit's world took during an episode: `offset −= ΔD`.
@@ -3565,9 +3732,23 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if refusal == nil, !isAirborneEstimate { refusal = "ground" }
         // Nothing to hold: no seed has landed yet, or ARKit's own compass fusion owns the world.
         if refusal == nil, worldYawSource == .none { refusal = "unaligned" }
-        if refusal == nil { shiftWorldYawOffset(byDeg: -event.deltaDeg) }
-        recordYawHold(event, refusal: refusal,
-                      offsetBeforeDeg: before, offsetAfterDeg: appliedWorldYawOffsetDeg)
+        guard refusal == nil else {
+            recordYawHold(event, refusal: refusal,
+                          offsetBeforeDeg: before, offsetAfterDeg: appliedWorldYawOffsetDeg)
+            return
+        }
+        // The step hold's own offset takes the step either way; in the continuous mode the scene has
+        // it already, through `D̄`, so only the step-only offset moves and the log reports that one.
+        let stepBefore = stepOnlyOffsetDeg
+        stepOnlyOffsetDeg = AngularResponse.wrappedDeg(stepOnlyOffsetDeg - event.deltaDeg)
+        if currentHeadingMode == .continuous {
+            recordYawHold(event, refusal: nil,
+                          offsetBeforeDeg: stepBefore, offsetAfterDeg: stepOnlyOffsetDeg)
+        } else {
+            shiftWorldYawOffset(byDeg: -event.deltaDeg)
+            recordYawHold(event, refusal: nil,
+                          offsetBeforeDeg: before, offsetAfterDeg: appliedWorldYawOffsetDeg)
+        }
     }
 
     /// Move the applied offset, together with everything that would otherwise put the old one back.
@@ -3622,6 +3803,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
         yawFollower.seed(offsetDeg: offset, trackDeg: lastGPSCourseDeg, source: source,
                          at: CACurrentMediaTime())
+        // `K` itself is unchanged: the carry is `K − D` by construction.
+        stepOnlyOffsetDeg = offset
         alignButton?.tintColor = hasFlightAnchor ? .systemGreen : .white
         // The world has an alignment again, so the scene may go solid.
         applyWorldUsabilityFade()
@@ -3666,6 +3849,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                            sign.agreeingDeg, sign.disagreeingDeg)
         )
         if yawHold.abandonCarry() { armSeedInsteadOfCarry() }
+        // Back to the step hold's offset: whatever the continuous hold made of a suspect azimuth goes.
+        let back = AngularResponse.signedDelta(appliedWorldYawOffsetDeg, stepOnlyOffsetDeg)
+        if worldYawSource != .none, abs(back) >= 0.05 { shiftWorldYawOffset(byDeg: back) }
     }
 
     /// One `yaw_hold` line per closed episode, carry or refusal. `dD` is the step in `D`; the offsets
@@ -3678,9 +3864,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                             offsetBeforeDeg, offsetAfterDeg, event.episodeSeconds,
                             event.gapBeforeDeg, event.gapAfterDeg)
         if let refusal { detail += " reason=\(refusal)" }
-        detail += String(format: " k_src=%@ k_age_s=%.0f airborne=%d sign_confirmed=%d",
+        detail += String(format: " k_src=%@ k_age_s=%.0f airborne=%d sign_confirmed=%d mode=%@",
                          event.anchorSource?.rawValue ?? "none", event.anchorAgeSeconds,
-                         isAirborneEstimate ? 1 : 0, motionYaw.signStatus().confirmed ? 1 : 0)
+                         isAirborneEstimate ? 1 : 0, motionYaw.signStatus().confirmed ? 1 : 0,
+                         currentHeadingMode.rawValue)
         FlightRecorder.shared.record(event: "yaw_hold", detail: detail)
     }
 
@@ -3718,7 +3905,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             appliedWorldYawOffsetDeg = offset
             sceneManager?.worldYawOffsetDeg = offset
             worldYawSource = .ground
-            yawHold.recordAlignment(offsetDeg: offset, source: .ground)
+            noteAlignment(offsetDeg: offset, source: .ground)
             // The follower is the single owner of the applied offset — `updateYawFollowing` writes
             // it to placement every tick — so a refinement that did not go through it would be
             // overwritten by the seed's value on the very next tick. Re-seeding keeps the two in
@@ -3944,7 +4131,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // median across many headings for accuracy.
         groundYaw.prime(offsetDeg: estimate.offsetDeg)
         // The anchor constant a later reset in the air carries over. See GyroYawHold.
-        yawHold.recordAlignment(offsetDeg: estimate.offsetDeg, source: .seed)
+        noteAlignment(offsetDeg: estimate.offsetDeg, source: .seed)
         // The reference for the divergence measurement. Any later change in (ARKit − gyro) is the
         // world rotating with the user's panning cancelled out.
         seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
@@ -4130,7 +4317,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                          source: .ground,
                          at: time)
         worldYawSource = .ground
-        yawHold.recordAlignment(offsetDeg: groundYaw.appliedOffsetDeg, source: .ground)
+        // **Not** an alignment, so `K` is left alone. Build 391 stored `K` again here, pairing the
+        // ground correction's offset with the D of this moment — but that offset was measured at the
+        // correction's last update, and ARKit had drifted 21° on the ground since (Oct 2: D 34.7 at
+        // the 18:36:20.9 correction, 56 at takeoff). Every carry that flight used the drifted K, 44.9;
+        // the correction's own, 22.7, matches the GPS track within 3° wherever the phone faced
+        // forward. `K` is stored where the measurement is made, in `updateGroundYawCorrection`, and
+        // the step-only offset was set there too.
         FlightRecorder.shared.record(
             event: "yaw_follow_seeded",
             detail: String(format: "src=ground offset=%.1f track=%.0f gs=%.0fkt",
@@ -4222,7 +4415,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                              source: .anchor,
                              at: CACurrentMediaTime())
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
-            yawHold.recordAlignment(offsetDeg: estimate.offsetDeg, source: .anchor)
+            noteAlignment(offsetDeg: estimate.offsetDeg, source: .anchor)
             FlightRecorder.shared.record(
                 event: "anchor_captured",
                 detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f",
@@ -4301,7 +4494,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             sceneManager?.worldYawOffsetDeg = offset
             // The restored alignment is the one a later reset should carry, not the undone anchor.
             if let source = prior.source {
-                yawHold.recordAlignment(offsetDeg: offset, source: source)
+                noteAlignment(offsetDeg: offset, source: source)
             }
         }
         FlightRecorder.shared.record(
@@ -4740,22 +4933,33 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // alert gets the screen to itself instead of being raised behind another one.
             if case .normal = camera.trackingState {
                 self.startDiagnosticAltimeterIfNeeded(trigger: "tracking_normal")
-                // The world is established, so the card has done its job. Confirmed rather than
-                // just cleared: the user held the phone still for a couple of seconds and deserves
-                // to be told that is what the app wanted.
-                if self.awaitingSeedConfirmation {
-                    self.awaitingSeedConfirmation = false
-                    self.showAlignBanner("Aligned with the aircraft", clearAfter: 2.0)
-                }
+                // The airborne card is *not* confirmed here any more. Tracking reaching normal said
+                // the card's job was done back when ARKit's own world was the seed; now the seed is
+                // captured after it, and confirming here cleared `awaitingSeedConfirmation`, flashed
+                // "Aligned with the aircraft" before anything was aligned, and let the next tick put
+                // the card up again with a fresh timestamp. That restamp is what held Gev's FL405
+                // seed to 4.34 s (log 33e76400: card up at 0.28 s, restamped at 1.64 s, still path
+                // 2.5 s later). `feedStartupSeed` confirms it, when the seed actually publishes.
             }
         }
     }
 
+    /// Recorded rather than printed (#10): the camera stuck three times on Oct 2 and the log could not
+    /// say why, because this only printed.
     func session(_ session: ARSession, didFailWithError error: Error) {
-        print("AR error: \(error.localizedDescription)")
+        let nsError = error as NSError
+        let code = (error as? ARError).map { $0.code.rawValue } ?? nsError.code
+        FlightRecorder.shared.record(
+            event: "ar_session_failed",
+            detail: String(format: "code=%d domain=%@ desc=%@", code, nsError.domain,
+                           error.localizedDescription)
+        )
     }
-    func sessionWasInterrupted(_ session: ARSession) { }
+    func sessionWasInterrupted(_ session: ARSession) {
+        FlightRecorder.shared.record(event: "ar_session_interrupted")
+    }
     func sessionInterruptionEnded(_ session: ARSession) {
+        FlightRecorder.shared.record(event: "ar_session_interruption_ended")
         startARSession(reason: "interruptionEnded")
     }
 }

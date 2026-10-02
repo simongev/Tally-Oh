@@ -86,13 +86,14 @@ struct AirborneSeedSettleTests {
         let result = try #require(published)
 
         #expect(result.estimate.path == .still)
-        #expect(result.at >= 2.5)
+        #expect(result.at >= 2.0 && result.at < 2.2)
     }
 
     // MARK: - Still
 
-    /// Already facing forward when the card went up: nothing to wait for but the 2.5 s allowance.
-    @Test func stillPathPublishesAtTwoAndAHalfSeconds() throws {
+    /// Already facing forward when the card went up: nothing to wait for but the 2.0 s allowance
+    /// (2.5 s until Gev's FL405 check, log 33e76400).
+    @Test func stillPathPublishesAtTwoSeconds() throws {
         var seed = AirborneSeedSettle()
         seed.begin(cardShownAt: 0)
         let jitter: [Double] = [0, 0.3, -0.2, 0.1, -0.3, 0.2]
@@ -101,9 +102,9 @@ struct AirborneSeedSettleTests {
         let result = try #require(published)
 
         #expect(result.estimate.path == .still)
-        // Steady from the first sample, so only the clock holds it: the first sample at or past 2.5 s.
-        #expect(result.at >= 2.5 && result.at < 2.7)
-        #expect(result.estimate.cardAgeSeconds >= 2.5)
+        // Steady from the first sample, so only the clock holds it: the first sample at or past 2.0 s.
+        #expect(result.at >= 2.0 && result.at < 2.2)
+        #expect(result.estimate.cardAgeSeconds >= 2.0)
         #expect(abs(result.estimate.offsetDeg - 30) < 0.5)
         #expect(result.estimate.movedDeg < 1.0)
     }
@@ -329,7 +330,29 @@ struct AirborneSeedSettleTests {
 
         #expect(result.estimate.path == .still)
         #expect(result.estimate.movedDeg < 1.0)
-        #expect(result.estimate.cardAgeSeconds >= 2.5)
+        #expect(result.estimate.cardAgeSeconds >= 2.0)
+    }
+
+    /// Gev's FL405 opening (2026-10-02, log 33e76400), as it runs now. The card goes up at 0.3 s, when
+    /// the track reference is known; ARKit reaches normal at 1.55 s and the first sample is fed about
+    /// 0.05 s later, at 5 Hz from there; the phone is already forward (`moved=1.0`). The still path
+    /// waits for the card to be 2.0 s old and for a 0.5 s run, so it publishes at the first sample past
+    /// 2.3 s — inside the 2.4 s bar. That flight published at 4.34 s, because the card was restamped
+    /// at 1.64 s and the still path waited 2.5 s from there.
+    @Test func fl405OpeningPublishesByTwoPointFourSeconds() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0.3)
+        let jitter: [Double] = [0, 0.4, -0.3, 0.6, -0.4, 0.2]   // within the logged 1.0° spread
+        let azimuths = (0..<20).map { 1.6 + jitter[$0 % jitter.count] }
+        let published = run(&seed, azimuths: azimuths, track: 294.3, from: 1.6)
+        let result = try #require(published)
+
+        #expect(result.estimate.path == .still)
+        #expect(result.at >= 2.3 && result.at < 2.41)
+        #expect(result.estimate.cardAgeSeconds >= 2.0)
+        #expect(result.estimate.movedDeg < 1.5)
+        // track − az: 294.3 − 1.6, the −67.4 the flight logged to within the jitter.
+        #expect(abs(AngularResponse.signedDelta(result.estimate.offsetDeg, -67.3)) < 1.0)
     }
 
     /// Same input, same number, same sign as `StartupSeed` — `track − arAzimuth`, which is what
