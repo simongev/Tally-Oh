@@ -465,6 +465,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var lastHoldPostWasNormal = false
     private static let holdPostIntervalSeconds: TimeInterval = 0.045
 
+    /// Shadow-mode camera seed (issue #8): the direction of travel from the view out of the
+    /// window, logged beside the offset in force. **Logs only** — it is handed plain values, holds
+    /// no reference back to this controller, and nothing it computes is applied. See CameraSeed.swift.
+    private let cameraSeed = CameraSeedRunner()
+
     /// How fast ARKit's azimuth drifts while the phone is genuinely still — the one alignment
     /// measurement obtainable in cruise, needing neither a compass nor a turn.
     private var yawDrift = YawDriftAccumulator()
@@ -770,6 +775,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                                                m31: m.m31, m32: m.m32, m33: m.m33),
                 gravity: SIMD3<Double>(gravity.x, gravity.y, gravity.z))
             self.motionYaw.update(yawDeg: yaw, witnessRateDps: verticalDps, at: motion.timestamp)
+            // Attitude for the camera seed's derotation. A no-op unless it is capturing.
+            self.cameraSeed.ingest(motion: motion)
         }
     }
 
@@ -1416,6 +1423,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private func pauseARSession() {
         arSceneView.session.pause()
         isARSessionPaused = true
+        cameraSeed.stop()
     }
 
     /// Whether a world has ever been built in this view, so the very first start always resets.
@@ -1552,6 +1560,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         config.providesAudioData = false
         let options: ARSession.RunOptions = resetting ? [.resetTracking, .removeExistingAnchors] : []
         arSceneView.session.run(config, options: options)
+        // A new or resumed world: the camera seed must not pair a frame from before it.
+        cameraSeed.start()
 
         // A session the OS suspended comes back with a different world yaw, even though it reports
         // as a resume. Measured at FL403: the phone pointed down the nose sat at ARKit azimuth
@@ -3327,6 +3337,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Deliberately still runs: the ladder and bank rose are derived from gravity, which was
         // never the thing ARKit gets wrong here, so they stay live and at full strength.
         updateHUDLadder(pov: pov)
+        // Shadow mode (issue #8). Returns at once except about four times a second while its gate
+        // is open; it copies what it needs from the frame and logs, and writes nothing here.
+        cameraSeed.offer(session: arSceneView.session, at: time, inputs: CameraSeedRunner.Inputs(
+            speedKt: lastGPSSpeedKt,
+            courseDeg: lastGPSCourseDeg,
+            courseAccuracyDeg: lastGPSCourseAccuracy,
+            activeOffsetDeg: appliedWorldYawOffsetDeg,
+            yawSource: worldYawSource.rawValue))
     }
 
     /// Measure how far ARKit's world frame sits from the compass, and whether the compass is
