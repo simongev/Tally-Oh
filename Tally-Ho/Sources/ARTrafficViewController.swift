@@ -1897,8 +1897,50 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // also keeps the world, its alignment and the gyro hold's readings, so closing Settings costs
         // nothing at all — no reset carry, no seed.
         updateTimer?.invalidate()
+        // …except the one job the old pause did that stopping the tick does not: throwing away a
+        // capture that measures where the phone is *aimed*. See `cancelAimedCapturesForSettings`.
+        cancelAimedCapturesForSettings()
         nav.presentationController?.delegate = self
         present(nav, animated: true)
+    }
+
+    /// Cancel every capture that measures where the phone is aimed, as the old pause-and-reset did
+    /// (QA, #10 round 1).
+    ///
+    /// The seed, its resample and the flight anchor are fed from the render thread, not the tick, so
+    /// with the session left running they would go on behind the sheet: `AirborneSeedSettle`'s still
+    /// path publishes at card + 2.0 s and its cap at 5 s, and whichever fired would take the offset
+    /// from wherever the phone pointed while Settings was read — card hidden — then store it as `K`,
+    /// for the continuous hold to keep for the rest of the world. Gev opened Settings 1.1 s after a
+    /// seed in b97771f3 and 3.2 s after one in 2b8e5508; a seed still on its cap path would have been
+    /// running.
+    ///
+    /// `awaitingSeed` stays set, and the card is forgotten, so the first tick after the sheet closes
+    /// puts up a fresh card and starts the capture again from its own time (`updateStartupSeed`).
+    /// The gyro hold and the ground compass correction keep running: they measure the phone, not
+    /// where it points, and a reset carry waiting for a steady frame is the gyro hold's.
+    private func cancelAimedCapturesForSettings() {
+        let seedWasCapturing = seedIsCapturing
+        let wasResampling = seedIsResampling
+        let anchorWasCapturing = anchorCaptureActive || flightAnchor.isCapturing
+        startupSeed.cancel()
+        cancelAirborneSeed()
+        seedIsResampling = false
+        awaitingSeedConfirmation = false
+        seedCardShownAt = .nan
+        if anchorWasCapturing {
+            flightAnchor.cancel()
+            anchorCaptureActive = false
+            finishAlignUI(message: "Alignment cancelled — tap ➤ to try again")
+            FlightRecorder.shared.record(event: "anchor_capture_failed", detail: "reason=settings_opened")
+        }
+        guard seedWasCapturing || wasResampling || anchorWasCapturing else { return }
+        FlightRecorder.shared.record(
+            event: "capture_cancelled",
+            detail: String(format: "reason=settings_opened seed=%d resample=%d anchor=%d awaiting_seed=%d",
+                           seedWasCapturing ? 1 : 0, wasResampling ? 1 : 0,
+                           anchorWasCapturing ? 1 : 0, awaitingSeed ? 1 : 0)
+        )
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
@@ -1912,6 +1954,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// second call a no-op.
     private func resumeAfterSettings() {
         guard !(updateTimer?.isValid ?? false) else { return }
+        // A seed cancelled by `cancelAimedCapturesForSettings` starts again on the next tick, and gets
+        // the watchdog time a reset used to give it. Without this the seed's 10 s, counted from the
+        // world's start, could run out behind the sheet and the first tick back would hand the world
+        // to `.gravityAndHeading` instead of seeding it. Never shortened.
+        if awaitingSeed {
+            seedDeadline = max(seedDeadline,
+                               CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds)
+        }
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }

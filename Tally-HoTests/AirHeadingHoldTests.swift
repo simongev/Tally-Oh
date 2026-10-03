@@ -168,6 +168,69 @@ struct AirHeadingHoldTests {
         #expect(worst < 0.7)
     }
 
+    // MARK: - Settings interrupting a capture (QA round 1)
+
+    /// Settings opens 2.2 s into an airborne seed, with the still path due at 2.3 s. The capture is
+    /// cancelled; behind the sheet the phone points 70° off the nose for six seconds and nothing comes
+    /// of it. When the sheet closes the first tick puts up a fresh card, and the seed is the aim after
+    /// it — not the one behind the sheet, and not the samples from before it either.
+    @Test func aSeedCancelledForSettingsPublishesOnlyTheAimAfterTheFreshCard() throws {
+        var seed = AirborneSeedSettle()
+        seed.begin(cardShownAt: 0.3)
+        var early: AirborneSeedSettle.Estimate?
+        for t in stride(from: 1.6, to: 2.2, by: 0.2) {        // facing forward, not yet due
+            seed.add(arAzimuthDeg: 100, trackDeg: 100, at: t)
+            if let e = seed.finish(at: t) { early = e }
+        }
+        #expect(early == nil)
+
+        seed.cancel()                                          // Settings opens at 2.2 s
+        var behindTheSheet: AirborneSeedSettle.Estimate?
+        for t in stride(from: 2.25, to: 8.3, by: 0.2) {        // aimed out of a side window
+            seed.add(arAzimuthDeg: 170, trackDeg: 100, at: t)
+            if let e = seed.finish(at: t) { behindTheSheet = e }
+        }
+        #expect(behindTheSheet == nil)
+        #expect(!seed.isCapturing)
+
+        seed.begin(cardShownAt: 8.4)                           // closed: a fresh card
+        // A frame rendered behind the sheet but dispatched after the close predates the card.
+        seed.add(arAzimuthDeg: 170, trackDeg: 100, at: 8.35)
+        var published: (estimate: AirborneSeedSettle.Estimate, at: Double)?
+        for t in stride(from: 8.45, to: 14.0, by: 0.2) {       // facing forward again
+            seed.add(arAzimuthDeg: 100, trackDeg: 100, at: t)
+            if let e = seed.finish(at: t) { published = (estimate: e, at: t); break }
+        }
+        let result = try #require(published)
+        #expect(result.estimate.path == .still)
+        #expect(result.at >= 10.4 && result.at < 10.6)         // the fresh card + 2.0 s
+        #expect(abs(result.estimate.offsetDeg) < 1e-9)         // the forward aim, not −70
+        #expect(result.estimate.movedDeg < 1e-9)
+    }
+
+    /// The flight anchor and a ground or resample capture, cancelled the same way, can no longer
+    /// publish anything, however long they are fed or polled afterwards.
+    @Test func cancelledAnchorAndStartupCapturesCannotPublish() {
+        var anchor = FlightDirectionAnchor()
+        anchor.begin(at: 0)
+        for i in 0..<10 { anchor.add(arAzimuthDeg: 100, trackDeg: 100, at: Double(i) * 0.2) }
+        anchor.cancel()
+        for i in 10..<30 { anchor.add(arAzimuthDeg: 170, trackDeg: 100, at: Double(i) * 0.2) }
+        let anchorResult = anchor.finish(at: 6)
+        #expect(!anchor.isCapturing)
+        #expect(anchor.progress(at: 6) == 0)
+        if case .success = anchorResult { Issue.record("a cancelled anchor capture published") }
+
+        var startup = StartupSeed()
+        startup.begin(reference: .track)
+        for i in 0..<10 { startup.add(arAzimuthDeg: 100, referenceDeg: 100, at: 0.05 + Double(i) * 0.2) }
+        startup.cancel()
+        for i in 10..<20 { startup.add(arAzimuthDeg: 170, referenceDeg: 100, at: 0.05 + Double(i) * 0.2) }
+        let startupResult = startup.finish(at: 4.0)
+        #expect(startupResult == nil)
+        #expect(!startup.isCapturing)
+    }
+
     // MARK: - CoreMotion at the frame's timestamp
 
     @Test func interpolatesBetweenSamplesTheShortWay() throws {
