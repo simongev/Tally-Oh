@@ -447,21 +447,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         /// The yaw for a frame captured at `frameTime` (`ARFrame.timestamp`), interpolated between
         /// the samples either side of it; the newest sample when there is no frame time or the clocks
         /// disagree. `clockGapSeconds` is the frame time less the newest sample's, NaN without a frame.
+        /// `frameYawDeg` is the interpolated yaw alone, nil whenever it could not be had — what the
+        /// continuous hold uses (#11), since a newest-sample stand-in is exactly what it must not use.
         func snapshot(at frameTime: TimeInterval?) -> (yawDeg: Double, rateDps: Double,
-                                                       clockGapSeconds: Double) {
+                                                       clockGapSeconds: Double, frameYawDeg: Double?) {
             lock.lock()
             defer { lock.unlock() }
             guard receivedAt.isFinite,
                   ProcessInfo.processInfo.systemUptime - receivedAt <= MotionYawBox.maxAgeSeconds
-            else { return (.nan, .nan, .nan) }
+            else { return (.nan, .nan, .nan, nil) }
             guard let frameTime, frameTime.isFinite, timestamp.isFinite else {
-                return (yawDeg, rateDps, .nan)
+                return (yawDeg, rateDps, .nan, nil)
             }
             let gap = frameTime - timestamp
             guard abs(gap) <= MotionYawBox.maxClockGapSeconds,
                   let interpolated = GyroYawHold.interpolatedYawDeg(history, at: frameTime)
-            else { return (yawDeg, rateDps, gap) }
-            return (interpolated, rateDps, gap)
+            else { return (yawDeg, rateDps, gap, nil) }
+            return (interpolated, rateDps, gap, interpolated)
         }
 
         func reset() {
@@ -486,16 +488,31 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private static let resetCarryTimeoutSeconds: TimeInterval = 8.0
     /// So `yaw_hold_disabled` is written once, when the sign check first trips. Main thread.
     private var loggedYawHoldDisabled = false
-    /// `D̄` for the continuous hold (#10): a one-second circular median of steady readings, frozen
-    /// while the phone turns fast or tracking is not normal. Main thread, fed beside `yawHold`.
-    private var smoothedGap = GyroYawHold.SmoothedGap()
+    /// `D` for the continuous hold (#11): a three-frame circular median, fed from every frame with a
+    /// camera in any tracking state, and held only for the reasons in `GyroYawHold.frameHold`. Main
+    /// thread, fed beside `yawHold`.
+    private var frameGap = GyroYawHold.FrameGap()
+    /// The newest usable frame `D` and its sample time, for pairing an airborne alignment with the `D`
+    /// of its own moment (`noteAlignment`). Main thread.
+    private var latestFrameGap: (t: TimeInterval, deg: Double)?
+    private var latestSampleTime: TimeInterval = -.greatestFiniteMagnitude
+    /// Whether the continuous hold places the scene (#11): written on main, read on the render thread
+    /// to post every frame and to keep targets drawn in limited tracking. One word, like the other
+    /// cross-thread scalars here.
+    private var airHoldActive = false
+    /// `CACurrentMediaTime()` at the last session start, for the hold's start guard. Written on main,
+    /// read on the render thread.
+    private var holdSessionStartedAt: TimeInterval = -.greatestFiniteMagnitude
+    /// The newest frame's `timestamp` when the session was last started. A frame no newer than this
+    /// was captured before the start — the last session's, however late it is rendered — and the
+    /// start guard holds it. Written on main, read on the render thread.
+    private var leftoverFrameTimestamp: TimeInterval = -.greatestFiniteMagnitude
     /// The offset the step hold alone would have in force — set by every alignment, moved by every
     /// held step. Placement in the step mode; in the continuous mode it is only logged, as `ar_hdg`.
     private var stepOnlyOffsetDeg: Double = 0
     /// The mode last in force, so a change is logged once. Main thread.
     private var headingMode: GyroYawHold.HeadingMode = .step
-    /// Sample-clock time of the last continuous write and the last `heading_compare` line.
-    private var lastContinuousWriteTime: TimeInterval = -.greatestFiniteMagnitude
+    /// Sample-clock time of the last `heading_compare` line.
     private var lastHeadingCompareTime: TimeInterval = -.greatestFiniteMagnitude
     /// Render thread only: `cm_clock_mismatch` is written once.
     private var loggedMotionClockGap = false
@@ -1295,7 +1312,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // world after a background cycle is seeded afresh, as the FL403 96° measurement demands.
             self?.motionYaw.reset()
             self?.yawHold.invalidate()
-            self?.smoothedGap.reset()
+            self?.frameGap.reset()
+            self?.latestFrameGap = nil
             self?.yawDrift.closeRun()
             // The world's yaw does not survive the suspension, so the offset measured against it
             // must not either. Consumed by the next startARSession, whatever wakes it.
@@ -1441,6 +1459,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// align the world, badly but not arbitrarily.
     private var worldIsAligned: Bool { worldYawSource != .none || seedFallbackToHeading }
 
+    /// Whether the scene is drawn and its positions ticked in this tracking state. On the ground and
+    /// whenever the continuous hold is off, exactly `worldIsUsableForDisplay` (normal,
+    /// `limited:features`, `limited:motion`). In the air with the continuous hold placing the scene,
+    /// every limited state (#11) — `initializing` and `relocalizing` too, which is where a night cabin
+    /// sits for seconds after each start: the heading is `cmYaw + K` whatever ARKit's yaw is doing,
+    /// and pitch and roll are gravity's. `.notAvailable` is still faded — there is no camera. Read on
+    /// the render thread; `airHoldActive` is a one-word flag written on main.
+    private func worldIsShown(_ state: ARCamera.TrackingState) -> Bool {
+        var notAvailable = false
+        if case .notAvailable = state { notAvailable = true }
+        return GyroYawHold.worldUsableForDisplay(baseUsable: worldIsUsableForDisplay(state),
+                                                 notAvailable: notAvailable,
+                                                 continuousHoldActive: airHoldActive)
+    }
+
     /// Fade the scene to match whether its world is usable. Runs from the tracking-state callback.
     ///
     /// `rootNode.opacity` propagates down the scene graph, so this covers aircraft and airports in
@@ -1450,7 +1483,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     ///
     /// The HUD is a UIKit overlay and is untouched.
     private func applyWorldUsabilityFade() {
-        let target: CGFloat = (worldIsUsableForDisplay(arTrackingState) && worldIsAligned)
+        let target: CGFloat = (worldIsShown(arTrackingState) && worldIsAligned)
             ? 1.0 : ARTrafficViewController.unusableWorldOpacity
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isViewLoaded else { return }
@@ -1554,8 +1587,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         lastARSessionStart = now
         isARSessionPaused = false
-        // Every start, resumed or reset, restarts the stuck-camera clock.
+        // Every start, resumed or reset, restarts the stuck-camera clock and the hold's start guard.
         arWatchdog.sessionStarted(at: CACurrentMediaTime())
+        holdSessionStartedAt = CACurrentMediaTime()
+        // ARKit's own clock, so no assumption that it shares one with `CACurrentMediaTime`.
+        leftoverFrameTimestamp = arSceneView.session.currentFrame?.timestamp ?? -.greatestFiniteMagnitude
 
         // Named to avoid shadowing the `reason` parameter, which names the *call site*, not the
         // reset decision — the log carries both and they answer different questions.
@@ -1738,7 +1774,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         yawHold.worldDidReset(offsetBeforeDeg: offsetBeforeReset, carry: carrying)
         // The new world's D starts afresh; the continuous hold resumes once it has a reading, from
         // the offset the carry (or the seed) put in force.
-        smoothedGap.reset()
+        frameGap.reset()
+        latestFrameGap = nil
         stepOnlyOffsetDeg = 0
         resetCarryDeadline = CACurrentMediaTime() + ARTrafficViewController.resetCarryTimeoutSeconds
         // Armed only for worlds the app aligns itself. A `.gravityAndHeading` ground world is
@@ -2602,7 +2639,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             event: "first_target",
             detail: String(format: "t=%.2fs rendered=%d stale=%d ar=%@ faded=%d",
                            elapsed, renderedCount, staleCount, arTrackingStateDescription,
-                           worldIsUsableForDisplay(arTrackingState) ? 0 : 1)
+                           worldIsShown(arTrackingState) ? 0 : 1)
         )
     }
 
@@ -3466,8 +3503,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         sampleGyroYawHold(frame: frame, motion: motion, at: time)
         // Frozen while ARKit has no established world, so no garbage positions are written during
         // the window the markers are faded out for. At 60 Hz the first tick after recovery puts
-        // everything right within one frame.
-        if worldIsUsableForDisplay(arTrackingState) {
+        // everything right within one frame. In the air under the continuous hold, limited tracking
+        // is drawn and so ticked too (#11) — targets sit around the camera, not the world origin.
+        if worldIsShown(arTrackingState) {
             sceneManager?.tickAircraftPositions(cameraWorldPosition: cam)
             sceneManager?.tickAirportPositions(cameraWorldPosition: cam)
         }
@@ -3651,28 +3689,59 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// forces it to `.notAvailable` at once while the old session's last frame can go on saying
     /// `.normal` for a moment.
     private func sampleGyroYawHold(frame: ARFrame?,
-                                   motion: (yawDeg: Double, rateDps: Double, clockGapSeconds: Double),
+                                   motion: (yawDeg: Double, rateDps: Double, clockGapSeconds: Double,
+                                            frameYawDeg: Double?),
                                    at time: TimeInterval) {
         var isNormal = false
         var gapDeg: Double?
         var arAzimuth: Double?
-        if case .normal = arTrackingState,
-           let camera = frame?.camera,
-           case .normal = camera.trackingState {
-            isNormal = true
+        // Any state with a camera, normal or limited, gives an azimuth (#11). `.notAvailable` — the
+        // callback's, forced at every reset, or the frame's own — does not.
+        let sessionAvailable: Bool
+        if case .notAvailable = arTrackingState { sessionAvailable = false } else { sessionAvailable = true }
+        if sessionAvailable, let camera = frame?.camera {
+            var frameAvailable = true
+            if case .notAvailable = camera.trackingState { frameAvailable = false }
+            if case .normal = arTrackingState, case .normal = camera.trackingState { isNormal = true }
             let axis = camera.transform.columns.2
             let forward = SIMD3<Double>(-Double(axis.x), -Double(axis.y), -Double(axis.z))
-            // The same azimuth, and the same near-vertical floor, as `rawAzimuthDeg`. CoreMotion's
-            // yaw was taken at this frame's timestamp, so the two are of the same instant.
-            if motion.yawDeg.isFinite,
-               (forward.x * forward.x + forward.z * forward.z).squareRoot() > 0.2 {
-                let arAzimuthDeg = atan2(forward.x, -forward.z) * 180.0 / Double.pi
-                arAzimuth = arAzimuthDeg
-                gapDeg = AngularResponse.signedDelta(motion.yawDeg, arAzimuthDeg)
+            // The same azimuth, and the same near-vertical floor, as `rawAzimuthDeg`.
+            if frameAvailable, (forward.x * forward.x + forward.z * forward.z).squareRoot() > 0.2 {
+                arAzimuth = atan2(forward.x, -forward.z) * 180.0 / Double.pi
             }
         }
-        // About 20 Hz, but a tracking change always goes on the frame it happens.
-        guard isNormal != lastHoldPostWasNormal
+        // The step hold reads normal frames only, exactly as before.
+        if isNormal, let arAzimuth, motion.yawDeg.isFinite {
+            gapDeg = AngularResponse.signedDelta(motion.yawDeg, arAzimuth)
+        }
+        // The continuous hold reads every frame with a camera, held only for the reasons in
+        // `GyroYawHold.frameHold`; CoreMotion is the yaw interpolated to this frame's capture time.
+        var frameGapDeg: Double?
+        var leftover = false
+        if let frame, frame.timestamp <= leftoverFrameTimestamp { leftover = true }
+        let hold = GyroYawHold.frameHold(hasCamera: arAzimuth != nil,
+                                         secondsSinceStart: CACurrentMediaTime() - holdSessionStartedAt,
+                                         isLeftoverFrame: leftover,
+                                         motionGapSeconds: motion.clockGapSeconds,
+                                         motionYawDeg: motion.frameYawDeg)
+        if hold == nil, let arAzimuth, let cm = motion.frameYawDeg {
+            frameGapDeg = AngularResponse.signedDelta(cm, arAzimuth)
+        }
+        // The airborne seed may capture in limited tracking (#11); normal frames reach it through
+        // `updateWorldYawError` as before. Not from a frame the start guard or a clock mismatch holds:
+        // those can be the last session's, measured in a world that no longer exists.
+        if !isNormal, let arAzimuth, airborneSeedArmed, isAirborneEstimate,
+           hold != .startGuard, hold != .clockMismatch {
+            let gyro = motion.yawDeg
+            DispatchQueue.main.async { [weak self] in
+                self?.feedStartupSeed(arAzimuthDeg: arAzimuth, gyroAzimuthDeg: gyro, at: time,
+                                      limitedFrame: true)
+            }
+        }
+        // Every frame while the continuous hold places the scene: an ARKit step stays on screen until
+        // the three-frame median turns over, 33 ms at 60 Hz against 100 ms at 20 Hz. Otherwise about
+        // 20 Hz, a tracking change always on the frame it happens.
+        guard airHoldActive || isNormal != lastHoldPostWasNormal
                 || time - lastHoldPostTime >= ARTrafficViewController.holdPostIntervalSeconds
         else { return }
         lastHoldPostTime = time
@@ -3680,7 +3749,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let sample = GyroYawHold.Sample(time: time, isNormal: isNormal, gapDeg: gapDeg,
                                         azimuthRateDps: motion.rateDps,
                                         arAzimuthDeg: arAzimuth,
-                                        cmYawDeg: motion.yawDeg.isFinite ? motion.yawDeg : nil)
+                                        cmYawDeg: motion.yawDeg.isFinite ? motion.yawDeg : nil,
+                                        frameGapDeg: frameGapDeg)
         DispatchQueue.main.async { [weak self] in
             self?.feedGyroYawHold(sample)
         }
@@ -3690,7 +3760,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// this is the air.
     private func feedGyroYawHold(_ sample: GyroYawHold.Sample) {
         let event = yawHold.add(sample)
-        smoothedGap.add(sample)
+        frameGap.add(gapDeg: sample.frameGapDeg, at: sample.time)
+        latestSampleTime = sample.time
+        if let gap = sample.frameGapDeg { latestFrameGap = (t: sample.time, deg: gap) }
         if let event {
             switch event.kind {
             case .glitch: applyGlitchHold(event)
@@ -3709,13 +3781,22 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                 aligned: worldYawSource != .none)
     }
 
-    /// **The continuous hold (#10).** In the air, with `K`, the offset is `K − D̄`, so what the user
-    /// sees is `cmYaw + K` and ARKit's drift in normal tracking — 33° in two minutes of the Oct 2
-    /// climb — no longer reaches the scene. Written through `shiftWorldYawOffset`, so the follower,
-    /// the anchor undo and a primed ground correction move with it, at most at 20 Hz and only for a
-    /// change of 0.1° or more. Steps and carries go on being detected as before; in this mode they
-    /// arrive through `D̄` and are not applied a second time.
+    /// **The continuous hold (#10, #11).** In the air, with `K`, the offset is `K − D`, every frame
+    /// and in every tracking state with a camera, so what the user sees is `cmYaw + K` and nothing
+    /// ARKit's yaw does — drift in normal tracking, steps, 120° of rotation through a minute of
+    /// limited flapping — reaches the scene. `D` is the three-frame median; it holds only on stale
+    /// CoreMotion, a clock mismatch, or a start's first 0.3 s. Written through `shiftWorldYawOffset`,
+    /// so the follower, the anchor undo and a primed ground correction move with it, for any change of
+    /// 0.1° or more. Steps and carries go on being detected as before; in this mode they arrive
+    /// through `D` and are not applied a second time.
     private func updateContinuousHeading(at time: TimeInterval) {
+        // After an airborne reset with `K`, the first usable frame is the carry — in limited tracking
+        // too, which is where a night cabin spends the seconds after a start.
+        if worldYawSource == .none, isAirborneEstimate, yawHold.isCarryPending,
+           !motionYaw.signStatus().disabled,
+           let k = yawHold.anchorConstantDeg, let gap = frameGap.valueDeg {
+            applyContinuousCarry(anchorConstantDeg: k, gapDeg: gap, at: time)
+        }
         let mode = currentHeadingMode
         if mode != headingMode {
             FlightRecorder.shared.record(
@@ -3728,16 +3809,53 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                appliedWorldYawOffsetDeg, stepOnlyOffsetDeg)
             )
             headingMode = mode
+            airHoldActive = mode == .continuous
+            // Targets in limited tracking are drawn in this mode and not in the other.
+            applyWorldUsabilityFade()
         }
         guard mode == .continuous,
               let k = yawHold.anchorConstantDeg,
-              let smoothed = smoothedGap.valueDeg else { return }
-        let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: smoothed)
-        guard GyroYawHold.shouldWriteOffset(currentDeg: appliedWorldYawOffsetDeg, targetDeg: target,
-                                            sinceLastWriteSeconds: time - lastContinuousWriteTime)
+              let gap = frameGap.valueDeg else { return }
+        let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: gap)
+        guard GyroYawHold.shouldWriteOffset(currentDeg: appliedWorldYawOffsetDeg, targetDeg: target)
         else { return }
-        lastContinuousWriteTime = time
         shiftWorldYawOffset(byDeg: AngularResponse.signedDelta(appliedWorldYawOffsetDeg, target))
+    }
+
+    /// The reset carry, taken by the continuous hold at the first usable frame rather than waiting
+    /// for the hold's first steady *normal* one: `K − D` is the heading whatever ARKit is doing, and
+    /// at night normal tracking can be seconds away. Does what `applyResetCarry` does, and tells the
+    /// hold its carry is spoken for.
+    private func applyContinuousCarry(anchorConstantDeg k: Double, gapDeg gap: Double, at time: TimeInterval) {
+        guard let source = yawHold.anchorSource else { return }
+        let offset = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: gap)
+        yawHold.abandonCarry()
+        appliedWorldYawOffsetDeg = offset
+        sceneManager?.worldYawOffsetDeg = offset
+        switch source {
+        case .anchor:
+            worldYawSource = .anchor
+            hasFlightAnchor = true
+            groundYaw.reset()
+        case .seed:
+            worldYawSource = .seed
+            groundYaw.prime(offsetDeg: offset)
+        case .ground:
+            worldYawSource = .ground
+            groundYaw.prime(offsetDeg: offset)
+        }
+        yawFollower.seed(offsetDeg: offset, trackDeg: lastGPSCourseDeg, source: source,
+                         at: CACurrentMediaTime())
+        stepOnlyOffsetDeg = offset
+        alignButton?.tintColor = hasFlightAnchor ? .systemGreen : .white
+        applyWorldUsabilityFade()
+        FlightRecorder.shared.record(
+            event: "yaw_hold",
+            detail: String(format: "kind=reset applied=1 path=frame offset_after=%.1f d=%.1f since_start_s=%.2f tracking=%@ k_src=%@ k_age_s=%.0f airborne=1",
+                           offset, gap, CACurrentMediaTime() - holdSessionStartedAt,
+                           arTrackingStateDescription, source.rawValue,
+                           yawHold.anchorAgeSeconds(at: time))
+        )
     }
 
     /// About once a second in the air: ARKit's heading as the step hold alone would have placed it,
@@ -3753,18 +3871,25 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             ? AngularResponse.signedDelta(arHeading, gyroHeading) : Double.nan
         FlightRecorder.shared.record(
             event: "heading_compare",
-            detail: String(format: "ar_hdg=%.1f gyro_hdg=%.1f diff=%.1f k_src=%@ k_age_s=%.0f mode=%@ d=%.1f d_bar=%.1f offset=%.1f trk=%.1f",
+            detail: String(format: "ar_hdg=%.1f gyro_hdg=%.1f diff=%.1f k_src=%@ k_age_s=%.0f mode=%@ d=%.1f d_frame=%.1f offset=%.1f trk=%.1f tracking=%@",
                            arHeading, gyroHeading, difference,
                            yawHold.anchorSource?.rawValue ?? "none",
                            yawHold.anchorAgeSeconds(at: sample.time), headingMode.rawValue,
-                           sample.gapDeg ?? Double.nan, smoothedGap.valueDeg ?? Double.nan,
-                           appliedWorldYawOffsetDeg, lastGPSCourseDeg)
+                           sample.frameGapDeg ?? sample.gapDeg ?? Double.nan,
+                           frameGap.valueDeg ?? Double.nan,
+                           appliedWorldYawOffsetDeg, lastGPSCourseDeg, arTrackingStateDescription)
         )
     }
 
-    /// An alignment has been applied: it becomes the anchor constant, and the step hold's offset.
+    /// An alignment has been applied: it becomes the anchor constant, and the step hold's offset. In
+    /// the air it is paired with the frame `D` of its own moment, which exists in limited tracking
+    /// too (#11); on the ground the hold pairs it from normal frames, as before.
     private func noteAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source) {
-        yawHold.recordAlignment(offsetDeg: offsetDeg, source: source)
+        var gap: Double?
+        if isAirborneEstimate, let latest = latestFrameGap, latestSampleTime - latest.t <= 0.2 {
+            gap = latest.deg
+        }
+        yawHold.recordAlignment(offsetDeg: offsetDeg, source: source, gapDeg: gap)
         stepOnlyOffsetDeg = offsetDeg
     }
 
@@ -4083,11 +4208,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             seedCardShownAt = CACurrentMediaTime()
         }
 
-        guard worldIsUsableForDisplay(arTrackingState) else { return }
-
         // No reference yet — GPS or the compass will deliver one shortly, and the deadline above
         // covers the case where neither ever does.
         guard let reference = seedReference else { return }
+
+        // Normal tracking, as before — except the airborne track capture, which may start in limited
+        // tracking (#11). In the night log 3500faa7 the two foreground seeds waited for normal, reached
+        // 3.1 s and 1.7 s after the start against `limited:initializing` at 0.7 s and 0.3 s, with the
+        // card already up; they published at 5.2 s and 3.0 s. `.notAvailable` still waits; there is no
+        // camera.
+        var notAvailable = false
+        if case .notAvailable = arTrackingState { notAvailable = true }
+        guard GyroYawHold.seedMayCapture(trackReference: reference.kind == .track && isAirborneEstimate,
+                                         baseUsable: worldIsUsableForDisplay(arTrackingState),
+                                         notAvailable: notAvailable) else { return }
 
         // The track needs the user to have obeyed the card, so it waits for the phone to settle;
         // the compass measures the phone and needs nothing, so it keeps the one-second capture.
@@ -4102,8 +4236,15 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// Feed and close the capture. Called on the main thread from the render dispatch, with the same
     /// uncorrected azimuth the anchor uses — the offset being measured *is* the correction, so a
     /// corrected azimuth would be measuring it against itself.
-    private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval) {
+    ///
+    /// `limitedFrame` marks a sample from a frame in limited tracking (#11). Only the airborne capture
+    /// takes those — the track reference is measured against where ARKit says the phone points, which
+    /// it says in limited tracking too, and at night normal can be seconds away. The compass capture
+    /// and the ground keep waiting for normal, as before.
+    private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval,
+                                 limitedFrame: Bool = false) {
         guard awaitingSeed || seedIsResampling, seedIsCapturing else { return }
+        if limitedFrame && !(airborneSeedArmed && isAirborneEstimate) { return }
         guard let reference = seedReference else {
             // The reference went away mid-capture; the samples already taken were measured against
             // it, so they go with it.
@@ -4972,7 +5113,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             event: "ar_tracking_state",
             detail: String(format: "%@ t=%.2fs targets_faded=%d aligned=%d%@",
                            arTrackingStateDescription, elapsedSinceLift,
-                           (worldIsUsableForDisplay(camera.trackingState) && worldIsAligned) ? 0 : 1,
+                           (worldIsShown(camera.trackingState) && worldIsAligned) ? 0 : 1,
                            worldIsAligned ? 1 : 0, recovery)
         )
         DispatchQueue.main.async {

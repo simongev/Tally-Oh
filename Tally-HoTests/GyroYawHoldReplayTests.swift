@@ -218,13 +218,13 @@ struct GyroYawHoldReplayTests {
         #expect(abs(AngularResponse.signedDelta(truth, unheld)) > 50)
     }
 
-    /// Issue #10's continuous hold on the same flight: at 30 s, before the anchor, `K − D̄` from the
+    /// Issue #10's continuous hold on the same flight: at 30 s, before the anchor, `K − D` from the
     /// 15.6 s seed lands 0.9° from the 114.3 the anchor then measured, where the step hold alone
     /// (above) lands 4.6° away — the pre-episode drift it leaves alone is exactly what the continuous
     /// hold removes.
     @Test func fl403ContinuousHoldLandsOnTheAnchor() throws {
         var hold = GyroYawHold()
-        var smoothed = GyroYawHold.SmoothedGap()
+        var frameGap = GyroYawHold.FrameGap()
         hold.worldDidReset(offsetBeforeDeg: .nan, carry: false)
         var lastGyro: (t: Double, deg: Double)?
         var atThirty: Double?
@@ -234,17 +234,18 @@ struct GyroYawHoldReplayTests {
                 if let last = lastGyro { rate = AngularResponse.signedDelta(last.deg, gyro) / (row.t - last.t) }
                 lastGyro = (t: row.t, deg: gyro)
             }
-            var gap: Double?
-            if row.normal, let az = row.az, let gyro = row.gyro { gap = AngularResponse.signedDelta(gyro, az) }
-            let sample = GyroYawHold.Sample(time: row.t, isNormal: row.normal, gapDeg: gap,
-                                            azimuthRateDps: rate)
+            var frame: Double?
+            if let az = row.az, let gyro = row.gyro { frame = AngularResponse.signedDelta(gyro, az) }
+            let sample = GyroYawHold.Sample(time: row.t, isNormal: row.normal,
+                                            gapDeg: row.normal ? frame : nil,
+                                            azimuthRateDps: rate, frameGapDeg: frame)
             _ = hold.add(sample)
-            smoothed.add(sample)
+            frameGap.add(gapDeg: sample.frameGapDeg, at: row.t)
             if let align = row.align, align.source == .seed {
                 hold.recordAlignment(offsetDeg: align.offsetDeg, source: .seed)
             }
-            if abs(row.t - 30.01) < 1e-6, let k = hold.anchorConstantDeg, let d = smoothed.valueDeg {
-                atThirty = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: d)
+            if abs(row.t - 30.01) < 1e-6, let k = hold.anchorConstantDeg, let d = frameGap.valueDeg {
+                atThirty = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: d)
             }
         }
         let offset = try #require(atThirty)

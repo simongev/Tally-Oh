@@ -2,12 +2,13 @@
 //  AirHeadingHoldTests.swift
 //  Tally-HoTests
 //
-//  Issue #10: the continuous gyro heading in the air, and the stuck-camera watchdog.
+//  Issues #10 and #11: the continuous gyro heading in the air, and the stuck-camera watchdog.
 //
-//  - `SmoothedGap` (D̄): a one-second circular median of steady readings, frozen while the phone
-//    turns fast or tracking is not normal, settled after an episode.
+//  - `FrameGap` (D): a three-frame circular median of every frame's D, in any tracking state, frames
+//    older than 0.1 s dropped. No freeze on turns or tracking state (#11).
 //  - The mode policy: continuous only in the air, with K, an alignment, and the sign check intact;
-//    otherwise the step hold exactly as before. The write rule: 20 Hz at most, 0.1° at least.
+//    otherwise the step hold exactly as before. The write rule: any change of 0.1° or more, no rate
+//    cap (#11).
 //  - CoreMotion interpolated to the frame's timestamp.
 //  - The watchdog's policy.
 //  - The 2026-10-02 climb, row for row: D drifts 33.2° in normal tracking and the held heading
@@ -20,20 +21,14 @@ import Foundation
 
 struct AirHeadingHoldTests {
 
-    private func sample(_ t: Double, normal: Bool = true, gap: Double?, rate: Double = 1.0) -> GyroYawHold.Sample {
-        GyroYawHold.Sample(time: t, isNormal: normal, gapDeg: normal ? gap : nil,
-                           azimuthRateDps: normal ? rate : .nan)
-    }
-
-    /// Feed `count` samples 50 ms apart from `t0`; returns D̄ after the last.
+    /// Feed `count` frames `spacing` apart from `t0`; returns D after the last.
     @discardableResult
-    private func feed(_ filter: inout GyroYawHold.SmoothedGap, from t0: Double, count: Int,
-                      normal: Bool = true, rate: Double = 1.0,
-                      gapAt: (Double) -> Double?) -> Double? {
+    private func feed(_ filter: inout GyroYawHold.FrameGap, from t0: Double, count: Int,
+                      spacing: Double = 1.0 / 60.0, gapAt: (Double) -> Double?) -> Double? {
         var value: Double?
         for i in 0..<count {
-            let t = t0 + Double(i) * 0.05
-            value = filter.add(sample(t, normal: normal, gap: gapAt(t), rate: rate))
+            let t = t0 + Double(i) * spacing
+            value = filter.add(gapDeg: gapAt(t), at: t)
         }
         return value
     }
@@ -42,64 +37,63 @@ struct AirHeadingHoldTests {
         abs(AngularResponse.signedDelta(a, b)) <= tolerance
     }
 
-    // MARK: - D̄
+    // MARK: - D, frame by frame
 
-    /// Drifting at 0.3°/s — the climb's rate — D̄ follows half a second behind: the median of the last
-    /// second is its middle.
-    @Test func smoothedGapFollowsDriftHalfASecondBehind() throws {
-        var filter = GyroYawHold.SmoothedGap()
-        let value = feed(&filter, from: 0.01, count: 200, gapAt: { 0.3 * $0 })   // to 9.96 s
-        let smoothed = try #require(value)
-        #expect(abs(smoothed - 0.3 * (9.96 - 0.5)) < 0.05)
-        #expect(!filter.isFrozen)
-    }
-
-    /// One wild frame in a steady second does not move the median.
-    @Test func oneBadFrameDoesNotMoveIt() throws {
-        var filter = GyroYawHold.SmoothedGap()
-        feed(&filter, from: 0.01, count: 40, gapAt: { _ in 10 })
-        filter.add(sample(2.01, gap: 40))
-        let value = feed(&filter, from: 2.06, count: 3, gapAt: { _ in 10 })
-        #expect(abs(try #require(value) - 10) < 1e-9)
-    }
-
-    /// Faster than 15°/s the readings are timing noise: D̄ holds. Once steady again it follows.
-    @Test func freezesWhileThePhoneTurnsFast() throws {
-        var filter = GyroYawHold.SmoothedGap()
-        feed(&filter, from: 0.01, count: 40, gapAt: { _ in 10 })
-        let turning = feed(&filter, from: 2.01, count: 20, rate: 40, gapAt: { _ in 30 })
-        #expect(abs(try #require(turning) - 10) < 1e-9)
-        #expect(filter.isFrozen)
-        let after = feed(&filter, from: 3.01, count: 40, gapAt: { _ in 30 })
-        #expect(abs(try #require(after) - 30) < 1e-9)
-    }
-
-    /// Through an episode D̄ holds; after it, nothing until tracking has held for the settle, and then
-    /// the new world's D alone — never a median of the world before and the world after.
-    @Test func freezesThroughAnEpisodeAndSettles() throws {
-        var filter = GyroYawHold.SmoothedGap()
-        feed(&filter, from: 0.01, count: 40, gapAt: { _ in 10 })
-        let during = feed(&filter, from: 2.01, count: 20, normal: false, gapAt: { _ in nil })
+    /// One wild frame among steady ones does not move the median of three.
+    @Test func oneBadFrameIsDropped() throws {
+        var filter = GyroYawHold.FrameGap()
+        feed(&filter, from: 0, count: 30, gapAt: { _ in 10 })
+        let during = filter.add(gapDeg: 40, at: 0.5)
         #expect(abs(try #require(during) - 10) < 1e-9)
-        let settling = feed(&filter, from: 3.01, count: 9, gapAt: { _ in 40 })   // to 3.41 s
-        #expect(abs(try #require(settling) - 10) < 1e-9)
-        let settled = feed(&filter, from: 3.56, count: 1, gapAt: { _ in 40 })
-        #expect(abs(try #require(settled) - 40) < 1e-9)
+        let after = feed(&filter, from: 0.5 + 1.0 / 60.0, count: 2, gapAt: { _ in 10 })
+        #expect(abs(try #require(after) - 10) < 1e-9)
+    }
+
+    /// An ARKit step reaches D on the second frame after it: 33 ms at 60 Hz, where #10's one-second
+    /// median took half a second.
+    @Test func aStepReachesDTwoFramesLater() throws {
+        var filter = GyroYawHold.FrameGap()
+        feed(&filter, from: 0, count: 30, gapAt: { _ in 10 })
+        let first = filter.add(gapDeg: 40, at: 0.5)
+        #expect(abs(try #require(first) - 10) < 1e-9)
+        let second = filter.add(gapDeg: 40, at: 0.5 + 1.0 / 60.0)
+        #expect(abs(try #require(second) - 40) < 1e-9)
+    }
+
+    /// Frames more than 0.1 s apart are each taken alone: no median across seconds, so a sparse stream
+    /// — a 1 Hz log, or frames resuming after a hold — follows every frame.
+    @Test func framesOlderThanATenthOfASecondAgeOut() throws {
+        var filter = GyroYawHold.FrameGap()
+        let values = [10.0, 40.0, 25.0, -60.0].enumerated().map { i, gap in
+            filter.add(gapDeg: gap, at: Double(i))
+        }
+        #expect(values.compactMap { $0 } == [10.0, 40.0, 25.0, -60.0])
+    }
+
+    /// A held frame (nil, or non-finite) keeps D where it was; nothing before the first frame.
+    @Test func aHeldFrameKeepsD() throws {
+        var filter = GyroYawHold.FrameGap()
+        let beforeAny = filter.add(gapDeg: nil, at: 0)
+        #expect(beforeAny == nil)
+        feed(&filter, from: 0.1, count: 5, gapAt: { _ in 10 })
+        let held = feed(&filter, from: 0.3, count: 30, gapAt: { _ in nil })
+        #expect(abs(try #require(held) - 10) < 1e-9)
+        let nan = filter.add(gapDeg: .nan, at: 1.0)
+        #expect(abs(try #require(nan) - 10) < 1e-9)
     }
 
     @Test func resetForgetsEverything() {
-        var filter = GyroYawHold.SmoothedGap()
-        feed(&filter, from: 0.01, count: 40, gapAt: { _ in 10 })
+        var filter = GyroYawHold.FrameGap()
+        feed(&filter, from: 0, count: 10, gapAt: { _ in 10 })
         filter.reset()
         #expect(filter.valueDeg == nil)
-        #expect(filter.isFrozen)
     }
 
-    /// Readings straddling ±180 median to the seam, not to 0.
-    @Test func smoothedGapStaysOnTheSeam() throws {
-        var filter = GyroYawHold.SmoothedGap()
-        let value = feed(&filter, from: 0.01, count: 40, gapAt: { t in
-            Int((t * 20).rounded()) % 2 == 0 ? 179.8 : -179.9
+    /// Frames straddling ±180 median to the seam, not to 0.
+    @Test func frameGapStaysOnTheSeam() throws {
+        var filter = GyroYawHold.FrameGap()
+        let value = feed(&filter, from: 0, count: 31, gapAt: { t in
+            Int((t * 60).rounded()) % 2 == 0 ? 179.8 : -179.9
         })
         #expect(abs(abs(try #require(value)) - 180) < 0.5)
     }
@@ -121,51 +115,86 @@ struct AirHeadingHoldTests {
                                         signDisabled: false, aligned: false) == .step)
     }
 
-    /// K − D̄, wrapped.
-    @Test func continuousOffsetIsKMinusSmoothedGapWrapped() {
-        #expect(abs(GyroYawHold.continuousOffsetDeg(anchorConstantDeg: 22.7, smoothedGapDeg: 56.6)
+    /// K − D, wrapped.
+    @Test func continuousOffsetIsKMinusDWrapped() {
+        #expect(abs(GyroYawHold.continuousOffsetDeg(anchorConstantDeg: 22.7, gapDeg: 56.6)
                     - (-33.9)) < 1e-9)
-        #expect(abs(GyroYawHold.continuousOffsetDeg(anchorConstantDeg: -170, smoothedGapDeg: 20)
+        #expect(abs(GyroYawHold.continuousOffsetDeg(anchorConstantDeg: -170, gapDeg: 20)
                     - 170) < 1e-9)
     }
 
-    /// At most 20 Hz, at least 0.1°, the short way across the seam.
-    @Test func writesAtMostTwentyHertzAndOnlyForATenthOfADegree() {
-        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 10.05, sinceLastWriteSeconds: 1))
-        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 10.2, sinceLastWriteSeconds: 1))
-        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 12, sinceLastWriteSeconds: 0.03))
-        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 12, sinceLastWriteSeconds: 0.05))
-        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 179.9, targetDeg: -179.8, sinceLastWriteSeconds: 1))
-        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: 179.98, targetDeg: -179.98, sinceLastWriteSeconds: 1))
-        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: .nan, targetDeg: 10, sinceLastWriteSeconds: 1))
+    /// At least 0.1°, the short way across the seam, and no rate cap: two writes a frame apart are
+    /// both due.
+    @Test func writesForATenthOfADegreeWithNoRateCap() {
+        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 10.05))
+        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 10, targetDeg: 10.2))
+        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 10.2, targetDeg: 12))
+        #expect(GyroYawHold.shouldWriteOffset(currentDeg: 179.9, targetDeg: -179.8))
+        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: 179.98, targetDeg: -179.98))
+        #expect(!GyroYawHold.shouldWriteOffset(currentDeg: .nan, targetDeg: 10))
     }
 
-    /// The whole loop on a phone held still while ARKit drifts 20°: written as the view controller
-    /// writes it, the heading the user sees stays on cmYaw + K.
-    @Test func theOffsetFollowsKMinusSmoothedGap() throws {
-        var filter = GyroYawHold.SmoothedGap()
+    /// The whole loop as the view controller runs it, at 60 Hz, on a phone held still while tracking
+    /// flaps between normal and limited every 0.3 s and ARKit's azimuth turns 2°/s under it — 20° in
+    /// ten seconds, in both states. Every frame is used (nothing in `frameHold` holds it), and the
+    /// heading the user sees stays on `cmYaw + K`: one frame of median lag (0.03°) plus the 0.1° write
+    /// step.
+    @Test func theOffsetFollowsKMinusDThroughLimitedTracking() throws {
+        var filter = GyroYawHold.FrameGap()
         let k = 22.7, cmYaw = 110.1
         var offset = -12.0
-        var lastWrite = -Double.greatestFiniteMagnitude
         var worst = 0.0
-        for i in 0..<400 {   // 20 s at 20 Hz, ARKit drifting −1°/s
-            let t = 0.01 + Double(i) * 0.05
-            let gap = 48.0 - 1.0 * t
-            filter.add(sample(t, gap: gap, rate: 0.5))
-            guard let smoothed = filter.valueDeg else { continue }
-            let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: smoothed)
-            if GyroYawHold.shouldWriteOffset(currentDeg: offset, targetDeg: target,
-                                             sinceLastWriteSeconds: t - lastWrite) {
-                offset = target
-                lastWrite = t
-            }
-            if t > 2 {
-                let seen = AngularResponse.wrappedDeg(gap + cmYaw + offset)   // arAz + offset
+        var usedLimited = 0
+        for i in 0..<600 {
+            let t = Double(i) / 60.0
+            let limited = (i / 18) % 2 == 1      // 0.3 s blocks
+            let arAz = AngularResponse.wrappedDeg(158.0 + 2.0 * t)
+            let hold = GyroYawHold.frameHold(hasCamera: true, secondsSinceStart: 5 + t,
+                                             motionGapSeconds: 0.02, motionYawDeg: cmYaw)
+            #expect(hold == nil)
+            filter.add(gapDeg: hold == nil ? AngularResponse.signedDelta(cmYaw, arAz) : nil, at: t)
+            if limited, hold == nil { usedLimited += 1 }
+            let gap = try #require(filter.valueDeg)
+            let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: gap)
+            if GyroYawHold.shouldWriteOffset(currentDeg: offset, targetDeg: target) { offset = target }
+            if i >= 2 {
+                let seen = AngularResponse.wrappedDeg(arAz + offset)
                 worst = max(worst, abs(AngularResponse.signedDelta(cmYaw + k, seen)))
             }
         }
-        // Half a second of median lag at 1°/s, plus the 0.1° write step.
-        #expect(worst < 0.7)
+        #expect(usedLimited == 294)
+        #expect(worst < 0.15)
+    }
+
+    /// CoreMotion stops for 0.4 s while ARKit turns 10°: D holds, so the offset holds and the scene
+    /// goes with ARKit for that moment, as it would with no gyro at all. Fresh samples put it back on
+    /// `cmYaw + K` two frames later.
+    @Test func staleCoreMotionHoldsTheOffset() throws {
+        var filter = GyroYawHold.FrameGap()
+        let k = 22.7, cmYaw = 110.1
+        var offset = -12.0
+        var offsetsWhileStale: [Double] = []
+        var lastMotion = 0.0
+        var seenAfter: Double?
+        for i in 0..<180 {
+            let t = Double(i) / 60.0
+            let stale = i >= 60 && i < 84          // 1.0 s to 1.4 s
+            if !stale { lastMotion = t }
+            let arAz = t < 1.0 ? 158.0 : (stale ? 158.0 + 25.0 * (t - 1.0) : 168.0)
+            let hold = GyroYawHold.frameHold(hasCamera: true, secondsSinceStart: 5 + t,
+                                             motionGapSeconds: t - lastMotion,
+                                             motionYawDeg: stale ? nil : cmYaw)
+            if stale, t - lastMotion > 0.1 { #expect(hold == .staleMotion) }
+            filter.add(gapDeg: hold == nil ? AngularResponse.signedDelta(cmYaw, arAz) : nil, at: t)
+            guard let gap = filter.valueDeg else { continue }
+            let target = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: gap)
+            if GyroYawHold.shouldWriteOffset(currentDeg: offset, targetDeg: target) { offset = target }
+            if stale { offsetsWhileStale.append(offset) }
+            if t > 1.6 { seenAfter = AngularResponse.wrappedDeg(arAz + offset) }
+        }
+        let first = try #require(offsetsWhileStale.first)
+        #expect(offsetsWhileStale.allSatisfy { abs($0 - first) < 1e-9 })
+        #expect(near(try #require(seenAfter), cmYaw + k, 0.1))
     }
 
     // MARK: - Settings interrupting a capture (QA round 1)
@@ -554,9 +583,11 @@ struct AirHeadingHoldTests {
 
     /// The climb replayed as the view controller runs it. K is the 18:36:20.9 ground correction's:
     /// offset −12.0 against D 34.7, applied after the first row. The step-only offset starts there.
+    /// D for the continuous hold is each frame's own: the rows are a second apart, so the three-frame
+    /// median never spans two of them. The fixture has no azimuth on limited rows, so those hold.
     private func replayOct2() -> (k: Double?, points: [Point]) {
         var hold = GyroYawHold()
-        var smoothed = GyroYawHold.SmoothedGap()
+        var frameGap = GyroYawHold.FrameGap()
         var k: Double?
         var step = -12.0
         var lastGyro: (t: Double, deg: Double)?
@@ -567,13 +598,15 @@ struct AirHeadingHoldTests {
                 if let last = lastGyro { rate = AngularResponse.signedDelta(last.deg, gyro) / (row.t - last.t) }
                 lastGyro = (t: row.t, deg: gyro)
             }
-            var gap: Double?
-            if row.normal, let az = row.az, let gyro = row.gyro { gap = AngularResponse.signedDelta(gyro, az) }
-            let s = GyroYawHold.Sample(time: row.t, isNormal: row.normal, gapDeg: gap, azimuthRateDps: rate)
+            var frame: Double?
+            if let az = row.az, let gyro = row.gyro { frame = AngularResponse.signedDelta(gyro, az) }
+            let gap = row.normal ? frame : nil
+            let s = GyroYawHold.Sample(time: row.t, isNormal: row.normal, gapDeg: gap, azimuthRateDps: rate,
+                                       frameGapDeg: frame)
             if let event = hold.add(s), event.kind == .glitch, event.refusal == nil, row.air {
                 step = AngularResponse.wrappedDeg(step - event.deltaDeg)
             }
-            smoothed.add(s)
+            frameGap.add(gapDeg: s.frameGapDeg, at: row.t)
             if i == 0 {
                 hold.recordAlignment(offsetDeg: -12.0, source: .ground)
                 k = hold.anchorConstantDeg
@@ -582,8 +615,8 @@ struct AirHeadingHoldTests {
             let mode = GyroYawHold.headingMode(airborne: row.air, hasAnchorConstant: true,
                                                signDisabled: false, aligned: true)
             var offset = step
-            if mode == .continuous, let value = smoothed.valueDeg {
-                offset = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: value)
+            if mode == .continuous, let value = frameGap.valueDeg {
+                offset = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: value)
             }
             points.append(Point(t: row.t, air: row.air, gap: gap, track: track,
                                 held: AngularResponse.wrappedDeg(az + offset),
@@ -598,11 +631,10 @@ struct AirHeadingHoldTests {
     }
 
     /// The acceptance bar. 18:37:34.214 → 18:39:31.718, normal tracking but for the last few seconds:
-    /// D drifts 33.2°, and the held heading stays on the gyro's — within 1.25° everywhere, the
-    /// median's half-second lag and the frozen value after the final flaps — where build 391 showed
-    /// ARKit's. Against GPS track (which carries the climb's changing drift angle, and a 40° turn at
-    /// the end that the phone turned with) the held heading keeps within a 10.4° band; build 391's
-    /// swept 47.2°.
+    /// D drifts 33.2°, and the held heading is the gyro's on every row — exactly, now that D is the
+    /// frame's own (#10's one-second median lagged by up to 1.25°) — where build 391 showed ARKit's.
+    /// Against GPS track (which carries the climb's changing drift angle, and a 40° turn at the end
+    /// that the phone turned with) the held heading keeps within a 10.4° band; build 391's swept 47.2°.
     @Test func oct2ClimbHeldHeadingStaysOnTheGyroWhileDDrifts33Degrees() throws {
         let run = replayOct2()
         #expect(abs(try #require(run.k) - 22.7) < 0.05)
@@ -611,7 +643,7 @@ struct AirHeadingHoldTests {
         let first = try #require(climb.first), last = try #require(climb.last)
         #expect(abs((first.gap - last.gap) - 33.2) < 0.05)
         let offGyro = climb.map { abs(AngularResponse.signedDelta($0.gyroHeading, $0.held)) }
-        #expect((offGyro.max() ?? .infinity) <= 1.3)
+        #expect((offGyro.max() ?? .infinity) < 1e-6)
         let heldVsTrack = climb.map { AngularResponse.signedDelta($0.track, $0.held) }
         let stepVsTrack = climb.map { AngularResponse.signedDelta($0.track, $0.step) }
         #expect(spread(heldVsTrack) < 11)
@@ -619,13 +651,14 @@ struct AirHeadingHoldTests {
     }
 
     /// 18:38:14 → 18:39:02 the phone did not move — CoreMotion's yaw read 110.1° for 48 s — and D slid
-    /// 14.9° (48.3 → 33.4). The held heading moves 0.7°; build 391's moved 15°.
+    /// 14.9° (48.3 → 33.4). The held heading moves 0.1°, CoreMotion's own last digit; build 391's
+    /// moved 15°.
     @Test func oct2PhoneHeldStillHeadingHeldStill() throws {
         let still = replayOct2().points.filter { $0.t >= 2294.2 && $0.t <= 2342.5 }
         #expect(still.count == 44)
         let first = try #require(still.first), last = try #require(still.last)
         #expect(abs((first.gap - last.gap) - 14.9) < 0.05)
-        #expect(spread(still.map(\.held)) < 1.0)
+        #expect(spread(still.map(\.held)) < 0.15)
         #expect(spread(still.map(\.step)) > 14)
     }
 
@@ -820,12 +853,13 @@ struct AirHeadingHoldTests {
     }
 
     /// The cruise replayed as the view controller runs it in the air: K only at the seed (−94.6 against
-    /// D −2.0, so −96.6), carries at the resets, the continuous offset `K − D̄` once D̄ exists. Returns
-    /// the steady normal points, and each carry's seam — the heading shown after it less the one shown
-    /// before the reset, carried on by what CoreMotion says the phone did meanwhile.
+    /// D −2.0, so −96.6), the continuous offset `K − D` on every frame once aligned, and each reset's
+    /// carry at the first frame with a D. Returns the normal points, and each carry's seam — the heading
+    /// shown after it less the one shown before the reset, carried on by what CoreMotion says the
+    /// phone did meanwhile.
     private func replayCruise() -> (points: [CruisePoint], seams: [Double], k: Double?) {
         var hold = GyroYawHold()
-        var smoothed = GyroYawHold.SmoothedGap()
+        var frameGap = GyroYawHold.FrameGap()
         hold.worldDidReset(offsetBeforeDeg: .nan, carry: false)   // the 19:30:42.9 foreground reset
         var offset = 0.0, step = 0.0
         var aligned = false
@@ -842,7 +876,7 @@ struct AirHeadingHoldTests {
                 hold.recordAlignment(offsetDeg: seedOffset, source: .seed)
             case .reset:
                 hold.worldDidReset(offsetBeforeDeg: aligned ? offset : .nan, carry: hold.hasAnchorConstant)
-                smoothed.reset()
+                frameGap.reset()
                 aligned = false
                 offset = 0
                 step = 0
@@ -852,12 +886,29 @@ struct AirHeadingHoldTests {
                     if let last = lastGyro { rate = AngularResponse.signedDelta(last.deg, gyro) / (t - last.t) }
                     lastGyro = (t: t, deg: gyro)
                 }
-                var gap: Double?
-                if normal, let az, let gyro { gap = AngularResponse.signedDelta(gyro, az) }
-                let s = GyroYawHold.Sample(time: t, isNormal: normal, gapDeg: gap, azimuthRateDps: rate)
+                var frame: Double?
+                if let az, let gyro { frame = AngularResponse.signedDelta(gyro, az) }
+                let gap = normal ? frame : nil
+                let s = GyroYawHold.Sample(time: t, isNormal: normal, gapDeg: gap, azimuthRateDps: rate,
+                                           frameGapDeg: frame)
+                // The order `feedGyroYawHold` runs in: the step hold first, whose carry wins when the
+                // first frame with a D is a steady normal one (as both of these are); otherwise the
+                // continuous hold's carry at that frame, whatever the tracking state. Either way it is
+                // `K − D` for the same frame.
                 let event = hold.add(s)
-                smoothed.add(s)
-                if let event, event.kind == .reset, let carried = event.carriedOffsetDeg {
+                frameGap.add(gapDeg: s.frameGapDeg, at: t)
+                var carried: Double?
+                if let event, event.kind == .reset, let offsetCarried = event.carriedOffsetDeg {
+                    carried = offsetCarried
+                } else if let event, event.kind == .glitch, event.refusal == nil, aligned {
+                    step = AngularResponse.wrappedDeg(step - event.deltaDeg)
+                }
+                if carried == nil, !aligned, hold.isCarryPending,
+                   let k = hold.anchorConstantDeg, let value = frameGap.valueDeg {
+                    carried = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: value)
+                    hold.abandonCarry()
+                }
+                if let carried {
                     offset = carried
                     step = carried
                     aligned = true
@@ -866,13 +917,11 @@ struct AirHeadingHoldTests {
                             before.heading + AngularResponse.signedDelta(before.gyro, gyro))
                         seams.append(AngularResponse.signedDelta(expected, AngularResponse.wrappedDeg(az + carried)))
                     }
-                } else if let event, event.kind == .glitch, event.refusal == nil, aligned {
-                    step = AngularResponse.wrappedDeg(step - event.deltaDeg)
                 }
                 let mode = GyroYawHold.headingMode(airborne: true, hasAnchorConstant: hold.hasAnchorConstant,
                                                    signDisabled: false, aligned: aligned)
-                if mode == .continuous, let k = hold.anchorConstantDeg, let value = smoothed.valueDeg {
-                    offset = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, smoothedGapDeg: value)
+                if mode == .continuous, let k = hold.anchorConstantDeg, let value = frameGap.valueDeg {
+                    offset = GyroYawHold.continuousOffsetDeg(anchorConstantDeg: k, gapDeg: value)
                 }
                 if aligned, normal, let az, let gyro, let gap {
                     lastShown = (heading: AngularResponse.wrappedDeg(az + offset), gyro: gyro)
@@ -887,18 +936,17 @@ struct AirHeadingHoldTests {
     /// The steps the CTO first read as gyro drift. With the phone still — CoreMotion 8.6° → 8.4° —
     /// ARKit's azimuth stepped +1.8° at 19:33:04.8 and +2.7° at 19:33:10.3, both in normal tracking,
     /// so the step hold never saw an episode and build 391's heading moved 4.8° and stayed there. The
-    /// held heading moves 0.2° over the same rows.
+    /// held heading moves 0.2° over the same rows — CoreMotion's own 8.4–8.5.
     ///
-    /// In the app the one-second median switches to a step's new value half a second after it, so
-    /// for that half-second the heading is off by the step; the log's rows, a second apart, fall on
-    /// either side of that.
+    /// In the app the three-frame median takes a step two frames after it, 33 ms at 60 Hz; #10's
+    /// one-second median took half a second.
     @Test func cruiseStepsInNormalTrackingAreHeld() throws {
         let points = replayCruise().points.filter { $0.t >= 1983.7 && $0.t <= 2000.4 }
         #expect(points.count == 16)
         let first = try #require(points.first), last = try #require(points.last)
         #expect(abs((last.gap - first.gap) - 5.0) < 0.05)
         let held = points.map(\.held), step = points.map(\.step)
-        #expect((held.max() ?? 0) - (held.min() ?? 0) <= 0.5)
+        #expect((held.max() ?? 0) - (held.min() ?? 0) <= 0.25)
         #expect((step.max() ?? 0) - (step.min() ?? 0) > 4.5)
     }
 
