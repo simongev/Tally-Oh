@@ -8,6 +8,10 @@
 //  takeoff now re-arms such a world, that it never throws away an anchor or a ground correction,
 //  and that a restart the rate limit refuses is waited for rather than lost.
 //
+//  #12: an alignment the ground compass measured is not trusted in the air (336276c7: 46.6° out 5.5
+//  minutes after takeoff), so a takeoff over one arms the airborne seed in place — with a ground K,
+//  and not with a seed or anchor K.
+//
 
 import Testing
 @testable import Tally_Ho
@@ -46,8 +50,9 @@ struct AirborneSeedRearmTests {
 
     // MARK: - When it must not
 
-    /// A ground correction is a measurement; a seed is a guess. Never trade one for the other — not
-    /// even on a fallback world, where the correction is all that is holding it.
+    /// A ground correction in force that the ground compass did not measure for this alignment — primed
+    /// by a track seed or a carry — is never traded for a restart, not even on a fallback world. (One the
+    /// compass did measure gets the in-place seed instead: see the #12 tests below.)
     @Test func aGroundCorrectionInForceIsNeverRearmed() {
         var onFallback = fellBack
         onFallback.groundCorrectionInForce = true
@@ -175,5 +180,98 @@ struct AirborneSeedRearmTests {
         rearm.tookOff(fellBack)
         let action19 = rearm.next(fellBack, sessionPaused: false, restartAllowed: true)
         #expect(action19 == .restartWorld(.fallback))
+    }
+
+    // MARK: - A ground-compass alignment in the air (#12)
+
+    /// The 336276c7 world at takeoff: the ground correction in force, measured by the cabin compass,
+    /// and its K what the air hold would carry.
+    private let compassAligned = AirborneSeedRearm.World(fellBackToHeading: false,
+                                                         hasYawSource: true,
+                                                         anchorInForce: false,
+                                                         groundCorrectionInForce: true,
+                                                         seedPending: false,
+                                                         alignedByGroundCompass: true)
+
+    /// A ground K: the airborne seed is armed in place at takeoff — no restart, so the compass
+    /// alignment stays until the seed lands — and only once.
+    @Test func aGroundCompassAlignmentArmsTheSeedInPlaceAtTakeoff() {
+        #expect(AirborneSeedRearm.reason(for: compassAligned) == .groundCompass)
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(compassAligned)
+        let first = rearm.next(compassAligned, sessionPaused: false, restartAllowed: false)
+        #expect(first == .armSeedInPlace(.groundCompass))
+        #expect(rearm.pending == nil)
+        let again = rearm.next(compassAligned, sessionPaused: false, restartAllowed: true)
+        #expect(again == .none)
+    }
+
+    /// A compass seed is the ground compass too, primed correction or not.
+    @Test func aCompassSeedIsTreatedAsTheGroundCompass() {
+        var seeded = unaligned
+        seeded.hasYawSource = true
+        seeded.alignedByGroundCompass = true
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(seeded)
+        let action = rearm.next(seeded, sessionPaused: false, restartAllowed: true)
+        #expect(action == .armSeedInPlace(.groundCompass))
+    }
+
+    /// A seed K (the track) or an anchor K: nothing, whatever correction is primed beside it.
+    @Test func aSeedOrAnchorKIsNotRearmed() {
+        var trackSeeded = compassAligned
+        trackSeeded.alignedByGroundCompass = false           // the track seed primed the correction
+        #expect(AirborneSeedRearm.reason(for: trackSeeded) == nil)
+        var anchored = compassAligned
+        anchored.anchorInForce = true                        // an anchor always wins
+        #expect(AirborneSeedRearm.reason(for: anchored) == nil)
+        for world in [trackSeeded, anchored] {
+            var rearm = AirborneSeedRearm()
+            rearm.tookOff(world)
+            let action = rearm.next(world, sessionPaused: false, restartAllowed: true)
+            #expect(action == .none)
+            #expect(rearm.pending == nil)
+        }
+    }
+
+    /// A seed already on its way is not doubled.
+    @Test func aCompassWorldWithASeedOnItsWayIsLeftAlone() {
+        var pending = compassAligned
+        pending.seedPending = true
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(pending)
+        let action = rearm.next(pending, sessionPaused: false, restartAllowed: true)
+        #expect(action == .none)
+    }
+
+    /// The AR view is not running: wait — the start that comes when it returns carries the compass
+    /// alignment on — and arm the seed once it is.
+    @Test func aPausedSessionWaitsAndArmsInPlaceWhenBack() {
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(compassAligned)
+        let paused = rearm.next(compassAligned, sessionPaused: true, restartAllowed: true)
+        #expect(paused == .none)
+        #expect(rearm.pending == .groundCompass)
+        let back = rearm.next(compassAligned, sessionPaused: false, restartAllowed: false)
+        #expect(back == .armSeedInPlace(.groundCompass))
+    }
+
+    /// An anchor taken while the re-arm waits wins, and landing cancels it.
+    @Test func anAnchorOrALandingCancelsAWaitingCompassRearm() {
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(compassAligned)
+        _ = rearm.next(compassAligned, sessionPaused: true, restartAllowed: true)
+        var anchored = compassAligned
+        anchored.anchorInForce = true
+        let afterAnchor = rearm.next(anchored, sessionPaused: false, restartAllowed: true)
+        #expect(afterAnchor == .none)
+        #expect(rearm.pending == nil)
+
+        var landing = AirborneSeedRearm()
+        landing.tookOff(compassAligned)
+        _ = landing.next(compassAligned, sessionPaused: true, restartAllowed: true)
+        landing.landed()
+        let afterLanding = landing.next(compassAligned, sessionPaused: false, restartAllowed: true)
+        #expect(afterLanding == .none)
     }
 }

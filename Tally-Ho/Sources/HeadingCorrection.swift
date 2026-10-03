@@ -1202,6 +1202,15 @@ enum SeedResamplePolicy {
 ///
 /// Once per takeoff, and only at the transition. A world whose airborne seed later times out stays
 /// on the fallback, as before; re-arming on that would loop on a reference that is not arriving.
+///
+/// **A ground-compass alignment is not trusted in the air (#12).** The compass measures the phone on
+/// the ground, but in a cabin it measures the airframe as much as the phone: in 336276c7 the ground
+/// correction that went up with the aircraft (compass response 1.26, r 0.81) was 46.6° out by Gev's
+/// align 5.5 minutes after takeoff. So a world whose alignment the ground compass measured — the
+/// ground correction, or a compass seed — gets the airborne seed armed at takeoff, card and settle,
+/// **in place**: no restart, and the compass alignment and its `K` stay in force until the seed
+/// lands, or for good if it never does. An anchor still always wins, and a seed already on its way
+/// is never doubled.
 struct AirborneSeedRearm {
 
     /// Why the world is being re-seeded. Logged as `reason=` on `seed_rearmed`.
@@ -1210,6 +1219,8 @@ struct AirborneSeedRearm {
         case fallback
         /// A `.gravity` world with no yaw source at all.
         case noAlignment = "no_alignment"
+        /// The alignment in force was measured by the ground compass (#12).
+        case groundCompass = "ground_compass"
     }
 
     /// What the caller should do this tick.
@@ -1221,6 +1232,9 @@ struct AirborneSeedRearm {
         /// with the seed armed — restarting a camera nobody is looking at would be wrong, and that
         /// start is coming anyway when the view returns.
         case armNextStart(Reason)
+        /// Arm the airborne seed in this world, now, with no restart. The alignment in force stays
+        /// until the seed lands.
+        case armSeedInPlace(Reason)
     }
 
     /// The world's alignment, as the caller sees it at the moment of asking.
@@ -1235,12 +1249,16 @@ struct AirborneSeedRearm {
         var groundCorrectionInForce: Bool
         /// A seed capture is already armed or running in this world.
         var seedPending: Bool
+        /// The alignment in force was measured by the ground compass: a ground correction, or a
+        /// compass seed (#12). False for an anchor, a track seed, or no alignment.
+        var alignedByGroundCompass: Bool = false
     }
 
     /// Why this world should be re-seeded, or nil if it should be left alone.
     static func reason(for world: World) -> Reason? {
-        guard !world.anchorInForce, !world.groundCorrectionInForce else { return nil }
-        guard !world.seedPending else { return nil }
+        guard !world.anchorInForce, !world.seedPending else { return nil }
+        if world.alignedByGroundCompass { return .groundCompass }
+        guard !world.groundCorrectionInForce else { return nil }
         if world.fellBackToHeading { return .fallback }
         if !world.hasYawSource { return .noAlignment }
         return nil
@@ -1266,6 +1284,16 @@ struct AirborneSeedRearm {
         guard let reason = AirborneSeedRearm.reason(for: world) else {
             pending = nil
             return .none
+        }
+        // In place, so nothing to rate-limit. A paused session waits instead: the start that comes
+        // when the view returns carries the compass alignment on, and the seed is armed then.
+        if reason == .groundCompass {
+            guard !sessionPaused else {
+                pending = reason
+                return .none
+            }
+            pending = nil
+            return .armSeedInPlace(reason)
         }
         if sessionPaused {
             pending = nil

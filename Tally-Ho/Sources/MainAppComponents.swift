@@ -925,6 +925,45 @@ class ARSceneManager {
     /// matching how the other cross-thread scalars here are handled.
     var worldYawOffsetDeg: Double = 0
 
+    /// The air attitude hold (#12): the rotation about the camera every placed position goes
+    /// through, `R_ar · R_true⁻¹`, with the yaw offset it was built against. Nil — the yaw-only
+    /// placement — on the ground and whenever the hold is off. Written on the render thread once a
+    /// frame, read there by the ticks and on main by the 4 Hz passes, so it travels under its own lock.
+    private let attitudeLock = NSLock()
+    private var attitudeHold: (rotation: simd_float3x3, offsetDeg: Double)?
+
+    func setAttitudeHold(rotation: simd_float3x3?, placementOffsetDeg: Double) {
+        attitudeLock.lock()
+        attitudeHold = rotation.map { (rotation: $0, offsetDeg: placementOffsetDeg) }
+        attitudeLock.unlock()
+    }
+
+    /// The yaw offset placement uses this frame, and the attitude correction if the hold is on.
+    func placementAttitude() -> (offsetDeg: Double, rotation: simd_float3x3?) {
+        attitudeLock.lock()
+        defer { attitudeLock.unlock() }
+        if let hold = attitudeHold { return (offsetDeg: hold.offsetDeg, rotation: hold.rotation) }
+        return (offsetDeg: worldYawOffsetDeg, rotation: nil)
+    }
+
+    /// Put a marker at a scaled position, turned about the camera by the attitude correction when
+    /// there is one — and the marker itself turned with it, so an airport's cone stands on the true
+    /// vertical and a label sits above its marker along it. Rings and labels are billboards and face
+    /// the camera regardless. Without a correction the marker is left exactly as the yaw-only
+    /// placement always left it: an orientation is written only to undo one the hold put there.
+    private func place(_ node: SCNNode, at p: SCNVector3, about cam: SCNVector3, rotation: simd_float3x3?) {
+        node.simdPosition = AttitudeHold.placed(simd_float3(p.x, p.y, p.z),
+                                                about: simd_float3(cam.x, cam.y, cam.z),
+                                                rotation: rotation)
+        if let rotation {
+            node.simdOrientation = simd_quatf(rotation)
+        } else if node.simdOrientation.vector != ARSceneManager.identityOrientation.vector {
+            node.simdOrientation = ARSceneManager.identityOrientation
+        }
+    }
+
+    private static let identityOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+
     /// Airport node snapshot for the 60 Hz airport tick — analogous to tickNodeSnapshot.
     /// Protected by nodesLock: written on the main thread at 4 Hz (end of updateAirports),
     /// read on the SceneKit thread at 60 Hz (tickAirportPositions).
@@ -971,6 +1010,7 @@ class ARSceneManager {
         nodesLock.lock()
         let nodeSnapshot = tickNodeSnapshot
         nodesLock.unlock()
+        let placement = placementAttitude()
 
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
@@ -986,10 +1026,10 @@ class ARSceneManager {
                 userAltitude: userAlt,
                 userHeading: 0,
                 cameraWorldPosition: cameraWorldPosition,
-                worldYawOffsetDeg: worldYawOffsetDeg
+                worldYawOffsetDeg: placement.offsetDeg
             )
             let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraWorldPosition)
-            node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
+            place(node, at: scaled, about: cameraWorldPosition, rotation: placement.rotation)
         }
     }
 
@@ -1004,6 +1044,7 @@ class ARSceneManager {
         nodesLock.lock()
         let snapshot = tickAirportSnapshot
         nodesLock.unlock()
+        let placement = placementAttitude()
 
         var userLoc = liveUserLocation
         var userAlt = liveUserAltitude
@@ -1020,10 +1061,10 @@ class ARSceneManager {
                 userAltitude:        userAlt,
                 userHeading:         0,
                 cameraWorldPosition: cameraWorldPosition,
-                worldYawOffsetDeg: worldYawOffsetDeg
+                worldYawOffsetDeg: placement.offsetDeg
             )
             let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
-            entry.node.simdPosition = simd_float3(scaled.x, scaled.y, scaled.z)
+            place(entry.node, at: scaled, about: cameraWorldPosition, rotation: placement.rotation)
         }
     }
 
@@ -1052,6 +1093,9 @@ class ARSceneManager {
         var currentIDs = Set<String>()
         var visibleAircraft: [Aircraft] = []
         var nodesAdded = false
+        // The same placement the 60 Hz tick uses, attitude hold included (#12), so a node placed here
+        // between two ticks is not drawn for a frame without it.
+        let placement = placementAttitude()
         /// Hard ceiling on concurrent aircraft nodes. Each aircraft = 3 SceneKit nodes
         /// (cone + ring plane + label plane), each with a GPU texture.
         ///
@@ -1120,7 +1164,7 @@ class ARSceneManager {
                 userAltitude: userAltitude,
                 userHeading: userHeading,
                 cameraWorldPosition: cameraWorldPosition,
-                worldYawOffsetDeg: worldYawOffsetDeg
+                worldYawOffsetDeg: placement.offsetDeg
             )
 
             let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
@@ -1152,6 +1196,9 @@ class ARSceneManager {
                     tcasLevel: tcasLevel,
                     isStale: isStale
                 )
+                if placement.rotation != nil {
+                    place(node, at: node.position, about: cameraWorldPosition, rotation: placement.rotation)
+                }
                 SCNTransaction.begin()
                 SCNTransaction.disableActions = true
                 sceneView?.scene.rootNode.addChildNode(node)
@@ -1259,6 +1306,7 @@ class ARSceneManager {
         let visibleIDs = Set(nearby.map { $0.icao })
 
         var airportNodesAdded = false
+        let placement = placementAttitude()
         for airport in nearby {
             let rawPos = CalculationsLogic.calculateAirportARPosition(
                 airportCoord: airport.coordinate,
@@ -1267,7 +1315,7 @@ class ARSceneManager {
                 userAltitude: userAltitude,
                 userHeading: userHeading,
                 cameraWorldPosition: cameraWorldPosition,
-                worldYawOffsetDeg: worldYawOffsetDeg
+                worldYawOffsetDeg: placement.offsetDeg
             )
             let distNM = CalculationsLogic.distanceInNauticalMiles(
                 from: userLocation,
@@ -1277,7 +1325,7 @@ class ARSceneManager {
             if let existing = airportNodes[airport.icao] {
                 existing.isHidden = false
                 let scaled = ARComponentFactory.scaledAirportPosition(rawPos, relativeTo: cameraWorldPosition)
-                existing.position = scaled
+                place(existing, at: scaled, about: cameraWorldPosition, rotation: placement.rotation)
                 let labelNode = existing.childNode(withName: "label", recursively: false)
                 if let lbl = labelNode, let plane = lbl.geometry as? SCNPlane {
                     let newText = ARComponentFactory.buildAirportLabelText(
@@ -1329,6 +1377,9 @@ class ARSceneManager {
                     cameraWorldPosition: cameraWorldPosition,
                     settings: settings
                 )
+                if placement.rotation != nil {
+                    place(node, at: node.position, about: cameraWorldPosition, rotation: placement.rotation)
+                }
                 SCNTransaction.begin()
                 SCNTransaction.disableActions = true
                 sceneView?.scene.rootNode.addChildNode(node)

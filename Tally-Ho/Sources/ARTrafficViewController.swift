@@ -410,14 +410,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         /// worth of capture-to-render latency.
         private var history: [(t: TimeInterval, yawDeg: Double)] = []
         private static let historyCount = 8
+        /// The whole attitude beside the yaw (#12): device → reference, the reading chosen by gravity
+        /// (`AttitudeHold.deviceToReference`), on the same clock and with the same depth.
+        private var attitudeHistory: [(t: TimeInterval, q: simd_quatd)] = []
         /// Beyond this gap between a frame's timestamp and the newest sample the two cannot be on one
         /// clock — `ARFrame.timestamp` and `CMLogItem.timestamp` both count from boot — and the newest
         /// sample is used as before, with the gap reported so the log can show it.
         static let maxClockGapSeconds: TimeInterval = 0.5
 
-        func update(yawDeg newYaw: Double?, witnessRateDps: Double, at time: TimeInterval) {
+        func update(yawDeg newYaw: Double?, witnessRateDps: Double,
+                    deviceToReference: simd_double3x3?, at time: TimeInterval) {
             lock.lock()
             defer { lock.unlock() }
+            if let attitude = deviceToReference, time.isFinite {
+                if let last = attitudeHistory.last, time <= last.t {
+                    // Out of order or repeated: not a sample to interpolate across.
+                } else {
+                    attitudeHistory.append((t: time, q: simd_quatd(attitude)))
+                    if attitudeHistory.count > MotionYawBox.historyCount { attitudeHistory.removeFirst() }
+                }
+            } else {
+                attitudeHistory.removeAll()
+            }
             let previous = yawDeg
             let previousTime = timestamp
             yawDeg = newYaw ?? .nan
@@ -466,6 +480,21 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             return (interpolated, rateDps, gap, interpolated)
         }
 
+        /// CoreMotion's attitude (device → reference) at a frame's timestamp, slerped, under exactly the
+        /// conditions `snapshot` gives `frameYawDeg` under: a live stream, the two clocks agreeing, and
+        /// the frame inside what interpolation may reach. Nil otherwise (#12).
+        func attitude(at frameTime: TimeInterval?) -> simd_double3x3? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard receivedAt.isFinite,
+                  ProcessInfo.processInfo.systemUptime - receivedAt <= MotionYawBox.maxAgeSeconds,
+                  let frameTime, frameTime.isFinite, timestamp.isFinite,
+                  abs(frameTime - timestamp) <= MotionYawBox.maxClockGapSeconds,
+                  let q = AttitudeHold.interpolatedAttitude(attitudeHistory, at: frameTime)
+            else { return nil }
+            return simd_double3x3(q)
+        }
+
         func reset() {
             lock.lock()
             defer { lock.unlock() }
@@ -474,6 +503,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             timestamp = .nan
             receivedAt = .nan
             history.removeAll()
+            attitudeHistory.removeAll()
         }
     }
     private let motionYaw = MotionYawBox()
@@ -507,6 +537,32 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// was captured before the start — the last session's, however late it is rendered — and the
     /// start guard holds it. Written on main, read on the render thread.
     private var leftoverFrameTimestamp: TimeInterval = -.greatestFiniteMagnitude
+    /// The yaw hold's `K` for the render thread's attitude hold (#12): NaN unless the continuous hold
+    /// is placing the scene. Written on main with `airHoldActive`, read on the render thread; one word.
+    private var holdAnchorConstantDeg: Double = .nan
+    /// The bank a coordinated turn would need, from the GPS course's rate of turn (#12, shadow and the
+    /// runtime check's level gate). NaN when unknown. Written on main on each fix, read on the render
+    /// thread; one word.
+    private var gpsBankDeg: Double = .nan
+    /// Main thread: the course history `gpsBankDeg` comes from.
+    private var gpsTurnRate = AttitudeHold.TurnRate()
+    /// Render thread only: whether `R_true` and ARKit agree about up while ARKit's level is fresh.
+    private var attitudeCheck = AttitudeHold.Check()
+    /// Render thread only: the session start the check last saw, so a new world restarts its count
+    /// without the main thread touching render-thread state.
+    private var attitudeCheckSessionStamp: TimeInterval = .nan
+    /// Render thread only: when `attitude_compare` was last written.
+    private var lastAttitudeCompareTime: TimeInterval = -.greatestFiniteMagnitude
+    /// Render thread only: the attitude hold as this frame placed the scene, for the HUD ladder. Nil
+    /// when placement is yaw-only.
+    private var attitudeThisFrame: (correction: simd_double3x3, trueCameraToWorld: simd_double3x3)?
+    /// Render thread only: so the hold's on/off transitions are logged once each.
+    private var attitudeHoldWasActive = false
+    /// Render thread only: the last correction the hold placed with, the offset it was built against
+    /// and when, for a CoreMotion gap of a sample or two.
+    private var lastAttitudeHold: (correction: simd_double3x3, offsetDeg: Double, time: TimeInterval)?
+    /// How long the last correction stands in when CoreMotion misses samples.
+    private static let attitudeHoldGraceSeconds: TimeInterval = 0.5
     /// The offset the step hold alone would have in force — set by every alignment, moved by every
     /// held step. Placement in the step mode; in the continuous mode it is only logged, as `ar_hdg`.
     private var stepOnlyOffsetDeg: Double = 0
@@ -834,12 +890,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // `GyroYawHold.cameraAzimuthDeg` for why not `attitude.yaw`. The vertical rate rides along
             // as the witness its sign is checked against — see `GyroYawHold.SignGuard`.
             let m = motion.attitude.rotationMatrix
-            let yaw = GyroYawHold.cameraAzimuthDeg(
-                rotation: GyroYawHold.Rotation(m11: m.m11, m12: m.m12, m13: m.m13,
-                                               m21: m.m21, m22: m.m22, m23: m.m23,
-                                               m31: m.m31, m32: m.m32, m33: m.m33),
-                gravity: SIMD3<Double>(gravity.x, gravity.y, gravity.z))
-            self.motionYaw.update(yawDeg: yaw, witnessRateDps: verticalDps, at: motion.timestamp)
+            let rotation = GyroYawHold.Rotation(m11: m.m11, m12: m.m12, m13: m.m13,
+                                                m21: m.m21, m22: m.m22, m23: m.m23,
+                                                m31: m.m31, m32: m.m32, m33: m.m33)
+            let gravityVector = SIMD3<Double>(gravity.x, gravity.y, gravity.z)
+            let yaw = GyroYawHold.cameraAzimuthDeg(rotation: rotation, gravity: gravityVector)
+            // The whole attitude rides along for the air attitude hold (#12), read the same way round.
+            self.motionYaw.update(yawDeg: yaw, witnessRateDps: verticalDps,
+                                  deviceToReference: AttitudeHold.deviceToReference(rotation, gravity: gravityVector),
+                                  at: motion.timestamp)
             // Attitude for the camera seed's derotation. A no-op unless it is capturing.
             self.cameraSeed.ingest(motion: motion)
         }
@@ -1316,6 +1375,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // world after a background cycle is seeded afresh, as the FL403 96° measurement demands.
             self?.motionYaw.reset()
             self?.yawHold.invalidate()
+            self?.holdAnchorConstantDeg = .nan
             self?.frameGap.reset()
             self?.latestFrameGap = nil
             self?.yawDrift.closeRun()
@@ -1784,7 +1844,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         resetCarryDeadline = CACurrentMediaTime() + ARTrafficViewController.resetCarryTimeoutSeconds
         // Armed only for worlds the app aligns itself. A `.gravityAndHeading` ground world is
         // already aligned by ARKit, so there is nothing to capture and no watchdog to trip.
-        awaitingSeed = shouldSeedThisWorld && !carrying
+        // A seed armed in place over a compass alignment (#12) survives the reset: the carry brings that
+        // alignment across, and the seed still goes on to replace it.
+        // Without a carry the new world is unaligned, and its seed is an ordinary one again.
+        awaitingSeed = shouldSeedThisWorld && (!carrying || seedRearmedInPlace)
+        if !(awaitingSeed && carrying) { seedRearmedInPlace = false }
         awaitingSeedConfirmation = false
         startupSeed.cancel()
         cancelAirborneSeed()
@@ -2405,6 +2469,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// The re-seed owed by a takeoff from a world with no trusted alignment. See AirborneSeedRearm:
     /// in log af4f1d6b a ground world fell back at 10 s and the whole climb ran on it.
     private var seedRearm = AirborneSeedRearm()
+    /// Whether the last alignment came from the ground compass — the ground correction, or a compass
+    /// seed — which the air re-seeds over at takeoff (#12). Main thread.
+    private var alignmentMeasuredByCompass = false
+    /// An airborne seed armed in place over a compass alignment (#12): the world and its `K` stay
+    /// until it lands, and a timeout keeps them rather than falling back. Main thread.
+    private var seedRearmedInPlace = false
 
     /// This world's alignment, in the terms `AirborneSeedRearm` judges it by.
     private var seedRearmWorld: AirborneSeedRearm.World {
@@ -2417,7 +2487,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             groundCorrectionInForce: worldYawSource == .ground || groundYaw.hasOffset,
             // A reset carry on its way is an alignment arriving, as a pending seed is. False whenever
             // there is no anchor constant, so without one the re-arm sees exactly what it always did.
-            seedPending: awaitingSeed || seedIsCapturing || yawHold.isCarryPending
+            seedPending: awaitingSeed || seedIsCapturing || yawHold.isCarryPending,
+            alignedByGroundCompass: alignmentMeasuredByCompass
+                && (worldYawSource != .none || yawHold.hasAnchorConstant)
         )
     }
 
@@ -2443,6 +2515,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         case .armNextStart(let why):
             reason = why
             mode = "next_start"
+        case .armSeedInPlace(let why):
+            reason = why
+            mode = "in_place"
         }
         // Before the restart, so the line precedes its `ar_session_start` and `src` says what the
         // world was running on.
@@ -2452,11 +2527,45 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                            reason.rawValue, mode, worldYawSource.rawValue,
                            lastGPSSpeedKt, lastGPSCourseDeg, lastGPSCourseAccuracy)
         )
+        if case .armSeedInPlace = action {
+            armSeedInPlace()
+            return
+        }
         // `.gravity` for the next world, which is what makes `startARSession` arm the seed.
         seedFallbackToHeading = false
         if case .restartWorld = action {
             startARSession(reason: "seed_rearm")
         }
+    }
+
+    /// Arm the airborne seed in this world, over a compass alignment that stays in force — and its
+    /// `K` with it — until the seed lands (#12). The card and the settle capture run exactly as at
+    /// an airborne start; `updateStartupSeed` puts the card up on this same tick. A timeout keeps the
+    /// world as it is rather than falling back.
+    private func armSeedInPlace() {
+        seedRearmedInPlace = true
+        awaitingSeed = true
+        awaitingSeedConfirmation = false
+        startupSeed.cancel()
+        cancelAirborneSeed()
+        seedCardShownAt = .nan
+        seedClockSkew = .nan
+        seedIsResampling = false
+        // The first capture of this re-arm takes the world, as the first capture of any world does.
+        bestSeedSpreadDeg = nil
+        lastSeedSampleTime = 0
+        let now = CACurrentMediaTime()
+        seedResampleDeadline = now + SeedResamplePolicy.windowSeconds
+        seedDeadline = now + ARTrafficViewController.seedReferenceTimeoutSeconds
+    }
+
+    /// Stop waiting for an in-place seed, leaving the world exactly as it is.
+    private func endSeedInPlace() {
+        seedRearmedInPlace = false
+        awaitingSeed = false
+        awaitingSeedConfirmation = false
+        startupSeed.cancel()
+        cancelAirborneSeed()
     }
 
     /// Restart a session stuck at `.notAvailable` (#10). Ahead of everything else on the tick, and
@@ -2524,6 +2633,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 // A landed world seeds from the compass again, so let the fallback re-arm.
                 seedFallbackToHeading = false
                 seedRearm.landed()
+                // An in-place airborne seed still waiting has nothing to measure against on the
+                // ground; the compass alignment it waited over stays, as on any landing (#12).
+                if seedRearmedInPlace { endSeedInPlace() }
             }
         }
         applySeedRearmIfDue()
@@ -3033,6 +3145,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             } else { targetCoord = nil; targetAlt = 0 }
 
             guard let coord = targetCoord else { offScreenArrowView.hide(); return }
+            // Placed exactly as the markers are this frame, attitude hold included (#12).
+            let placement = sceneManager?.placementAttitude()
             let rawPos = CalculationsLogic.calculateARPosition(
                 targetCoord:      coord,
                 targetAltitude:   targetAlt,
@@ -3040,9 +3154,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 userAltitude:     activeAltitude,
                 userHeading:      userHeading,
                 cameraWorldPosition: cameraPos,
-                worldYawOffsetDeg: appliedWorldYawOffsetDeg
+                worldYawOffsetDeg: placement?.offsetDeg ?? appliedWorldYawOffsetDeg
             )
-            worldPos = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
+            let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
+            let held = AttitudeHold.placed(SIMD3<Float>(scaled.x, scaled.y, scaled.z),
+                                           about: SIMD3<Float>(cameraPos.x, cameraPos.y, cameraPos.z),
+                                           rotation: placement?.rotation)
+            worldPos = SCNVector3(held.x, held.y, held.z)
         } else {
             offScreenArrowView.hide()
             return
@@ -3490,6 +3608,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let motion = motionYaw.snapshot(at: frame?.timestamp)
         gyroAzimuthDeg = motion.yawDeg
         frameMotionYawDeg = motion.frameYawDeg
+        // Before anything places or projects, so this frame's targets, ladder and arrows share one
+        // attitude (#12).
+        updateAttitudeHold(frame: frame, motion: motion, at: time)
         if !loggedMotionClockGap, motion.clockGapSeconds.isFinite,
            abs(motion.clockGapSeconds) > MotionYawBox.maxClockGapSeconds {
             // Once: ARKit's frame times and CoreMotion's are meant to share the boot clock. If they do
@@ -3686,6 +3807,125 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         }
     }
 
+    // MARK: - Air attitude hold (#12)
+
+    /// The camera's whole attitude from CoreMotion in the air. Render thread, once a frame, ahead of
+    /// everything that places or projects.
+    ///
+    /// Builds `R_true` (`AttitudeHold.trueCameraToWorld`) from CoreMotion's attitude at the frame's
+    /// timestamp, runs the runtime check, writes `attitude_compare` about once a second in the air,
+    /// and hands placement its correction `R_ar · R_true⁻¹` with the yaw offset it was built against —
+    /// or nil, which is the yaw-only placement: always on the ground, and in the air whenever the yaw
+    /// hold is not placing the scene or the check has not confirmed the chain.
+    private func updateAttitudeHold(frame: ARFrame?,
+                                    motion: (yawDeg: Double, rateDps: Double, clockGapSeconds: Double,
+                                             frameYawDeg: Double?),
+                                    at time: TimeInterval) {
+        if attitudeCheckSessionStamp != holdSessionStartedAt {
+            attitudeCheckSessionStamp = holdSessionStartedAt
+            attitudeCheck.sessionStarted()
+        }
+        // Read once, and handed to placement with the correction built against it, so the two can
+        // never disagree within a frame whatever the main thread writes meanwhile.
+        let offset = sceneManager?.worldYawOffsetDeg ?? 0
+        var placementOffset = offset
+        var hold: (correction: simd_double3x3, trueCameraToWorld: simd_double3x3)?
+        defer {
+            attitudeThisFrame = hold
+            sceneManager?.setAttitudeHold(rotation: hold.map { AttitudeHold.float($0.correction) },
+                                          placementOffsetDeg: placementOffset)
+        }
+        guard let frame else {
+            noteAttitudeHold(active: false, tiltDeg: .nan)
+            return
+        }
+        var available = true
+        if case .notAvailable = arTrackingState { available = false }
+        if case .notAvailable = frame.camera.trackingState { available = false }
+        guard available else {
+            noteAttitudeHold(active: false, tiltDeg: .nan)
+            return
+        }
+        let arRotation = CameraSeed.Frames.rotation(of: frame.camera.transform)
+        guard let deviceToReference = motionYaw.attitude(at: frame.timestamp) else {
+            // CoreMotion missed a sample or two. The correction is ARKit's slowly drifting error, not
+            // the phone's motion, so the last one holds for a moment instead of every target jumping
+            // by the whole of that error and back — with the offset it was built against.
+            if let last = lastAttitudeHold,
+               time - last.time <= ARTrafficViewController.attitudeHoldGraceSeconds,
+               AttitudeHold.isActive(airHoldActive: airHoldActive && holdAnchorConstantDeg.isFinite,
+                                     check: attitudeCheck.state) {
+                placementOffset = last.offsetDeg
+                hold = (correction: last.correction, trueCameraToWorld: last.correction.transpose * arRotation)
+            } else {
+                noteAttitudeHold(active: false, tiltDeg: .nan)
+            }
+            return
+        }
+
+        // Pitch and roll do not depend on K, so the check and the comparison run without one.
+        let k = holdAnchorConstantDeg
+        let trueRotation = AttitudeHold.trueCameraToWorld(deviceToReference: deviceToReference,
+                                                          anchorConstantDeg: k.isFinite ? k : 0,
+                                                          placementOffsetDeg: k.isFinite ? offset : 0)
+        let tilt = AttitudeHold.tiltDiscrepancyDeg(arRotation, trueRotation)
+
+        var isNormal = false
+        if case .normal = arTrackingState, case .normal = frame.camera.trackingState { isNormal = true }
+        let sinceStart = CACurrentMediaTime() - holdSessionStartedAt
+        if let decided = attitudeCheck.add(
+            discrepancyDeg: tilt, isNormal: isNormal, secondsSinceStart: sinceStart,
+            rateDps: motion.rateDps,
+            level: AttitudeHold.levelForCheck(airborne: isAirborneEstimate, groundSpeedKt: lastGPSSpeedKt,
+                                              gpsBankDeg: gpsBankDeg),
+            at: time) {
+            FlightRecorder.shared.record(
+                event: decided == .confirmed ? "attitude_hold_confirmed" : "attitude_hold_disabled",
+                detail: String(format: "median_tilt=%.1f n=%d limit=%.1f since_start_s=%.1f airborne=%d gs=%.0fkt gps_bank=%.1f",
+                               attitudeCheck.decidedMedianDeg, attitudeCheck.decidedSampleCount,
+                               attitudeCheck.maxDiscrepancyDeg, sinceStart, isAirborneEstimate ? 1 : 0,
+                               lastGPSSpeedKt, gpsBankDeg)
+            )
+        }
+
+        let active = AttitudeHold.isActive(airHoldActive: airHoldActive && k.isFinite,
+                                           check: attitudeCheck.state)
+        if isAirborneEstimate, time - lastAttitudeCompareTime >= 1.0 {
+            lastAttitudeCompareTime = time
+            let arPitch = AttitudeHold.pitchDeg(arRotation), cmPitch = AttitudeHold.pitchDeg(trueRotation)
+            let arRoll = AttitudeHold.rollDeg(arRotation), cmRoll = AttitudeHold.rollDeg(trueRotation)
+            var rollDelta = Double.nan
+            if let arRoll, let cmRoll { rollDelta = AngularResponse.signedDelta(arRoll, cmRoll) }
+            FlightRecorder.shared.record(
+                event: "attitude_compare",
+                detail: String(format: "ar_pitch=%.1f cm_pitch=%.1f d_pitch=%.1f ar_roll=%.1f cm_roll=%.1f d_roll=%.1f tilt=%.1f gps_bank=%.1f hold=%d check=%@ tracking=%@",
+                               arPitch, cmPitch, cmPitch - arPitch, arRoll ?? Double.nan,
+                               cmRoll ?? Double.nan, rollDelta, tilt, gpsBankDeg, active ? 1 : 0,
+                               attitudeCheck.state.rawValue, arTrackingStateDescription)
+            )
+        }
+        noteAttitudeHold(active: active, tiltDeg: tilt)
+        guard active else {
+            lastAttitudeHold = nil
+            return
+        }
+        let correction = AttitudeHold.correction(arCameraToWorld: arRotation, trueCameraToWorld: trueRotation)
+        hold = (correction: correction, trueCameraToWorld: trueRotation)
+        lastAttitudeHold = (correction: correction, offsetDeg: offset, time: time)
+    }
+
+    /// Logs the attitude hold going on or off, once each way. Render thread.
+    private func noteAttitudeHold(active: Bool, tiltDeg: Double) {
+        guard active != attitudeHoldWasActive else { return }
+        attitudeHoldWasActive = active
+        FlightRecorder.shared.record(
+            event: "attitude_hold",
+            detail: String(format: "mode=%@ tilt=%.1f check=%@ air_hold=%d airborne=%d tracking=%@",
+                           active ? "on" : "off", tiltDeg, attitudeCheck.state.rawValue,
+                           airHoldActive ? 1 : 0, isAirborneEstimate ? 1 : 0, arTrackingStateDescription)
+        )
+    }
+
     // MARK: - Gyro yaw hold
 
     /// Measure `D` for this frame and post it to the hold. Render thread.
@@ -3822,6 +4062,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // Targets in limited tracking are drawn in this mode and not in the other.
             applyWorldUsabilityFade()
         }
+        // `K` for the attitude hold on the render thread (#12), NaN whenever this hold is not placing
+        // the scene.
+        holdAnchorConstantDeg = (mode == .continuous ? yawHold.anchorConstantDeg : nil) ?? .nan
         guard mode == .continuous,
               let k = yawHold.anchorConstantDeg,
               let gap = frameGap.valueDeg else { return }
@@ -3896,8 +4139,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// the anchor, #11 QA round 1) stores that `K`; anything else is paired with the frame `D` of its
     /// own moment, which exists in limited tracking too. On the ground the hold pairs it from normal
     /// frames, as before, and `anchorConstantDeg` is ignored.
+    ///
+    /// `measuredByCompass` says the alignment came from the ground compass — the ground correction,
+    /// or a compass seed — which the air does not trust (#12, `AirborneSeedRearm`).
     private func noteAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source,
-                               anchorConstantDeg: Double? = nil) {
+                               anchorConstantDeg: Double? = nil, measuredByCompass: Bool) {
+        alignmentMeasuredByCompass = measuredByCompass
         var gap: Double?
         var k: Double?
         if isAirborneEstimate {
@@ -4098,7 +4345,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             appliedWorldYawOffsetDeg = offset
             sceneManager?.worldYawOffsetDeg = offset
             worldYawSource = .ground
-            noteAlignment(offsetDeg: offset, source: .ground)
+            noteAlignment(offsetDeg: offset, source: .ground, measuredByCompass: true)
             // The follower is the single owner of the applied offset — `updateYawFollowing` writes
             // it to placement every tick — so a refinement that did not go through it would be
             // overwritten by the seed's value on the very next tick. Re-seeding keeps the two in
@@ -4188,6 +4435,22 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // reference was present the whole time and the watchdog never armed. A `.gravity` world with
         // no alignment then had no recovery path at all, and the ground test read 192° out for the
         // whole session. A watchdog that catches one of the ways a thing can fail is not a watchdog.
+        // A seed armed in place over a compass alignment (#12) gives up by keeping that alignment: the
+        // world is aligned already, just not by anything the air trusts, so there is nothing to fall
+        // back to and no reason to restart.
+        if seedRearmedInPlace, CACurrentMediaTime() >= seedDeadline {
+            FlightRecorder.shared.record(
+                event: "seed_unavailable",
+                detail: String(format: "gs=%.0fkt course_acc=%.1f hdg=%.0f hdg_acc=%.0f airborne=%d had_ref=%d capturing=%d in_place=1 kept=%@",
+                               lastGPSSpeedKt, lastGPSCourseAccuracy, lastTrueHeading,
+                               lastHeadingAccuracy, isAirborneEstimate ? 1 : 0,
+                               seedReference == nil ? 0 : 1, seedIsCapturing ? 1 : 0,
+                               worldYawSource.rawValue)
+            )
+            endSeedInPlace()
+            return
+        }
+
         if !seedFallbackToHeading, CACurrentMediaTime() >= seedDeadline {
             // Recorded before the state is torn down, so `capturing` says what was actually
             // happening rather than reading 0 because this line just cancelled it.
@@ -4327,6 +4590,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         bestSeedSpreadDeg = estimate.azimuthSpreadDeg
         awaitingSeed = false
+        // An in-place re-arm's seed has landed: the compass alignment it waited over is replaced now.
+        seedRearmedInPlace = false
         seedFallbackToHeading = false
         worldYawSource = .seed
         appliedWorldYawOffsetDeg = estimate.offsetDeg
@@ -4345,7 +4610,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         groundYaw.prime(offsetDeg: estimate.offsetDeg)
         // The anchor constant a later reset in the air carries over. See GyroYawHold.
         noteAlignment(offsetDeg: estimate.offsetDeg, source: .seed,
-                      anchorConstantDeg: estimate.anchorConstantDeg)
+                      anchorConstantDeg: estimate.anchorConstantDeg,
+                      measuredByCompass: estimate.referenceKind == .compass)
         // The reference for the divergence measurement. Any later change in (ARKit − gyro) is the
         // world rotating with the user's panning cancelled out.
         seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
@@ -4638,7 +4904,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                              at: CACurrentMediaTime())
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
             noteAlignment(offsetDeg: estimate.offsetDeg, source: .anchor,
-                          anchorConstantDeg: estimate.anchorConstantDeg)
+                          anchorConstantDeg: estimate.anchorConstantDeg, measuredByCompass: false)
             FlightRecorder.shared.record(
                 event: "anchor_captured",
                 detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f k_window=%.1f",
@@ -4718,7 +4984,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             sceneManager?.worldYawOffsetDeg = offset
             // The restored alignment is the one a later reset should carry, not the undone anchor.
             if let source = prior.source {
-                noteAlignment(offsetDeg: offset, source: source)
+                // A restored ground correction is the compass's; a restored seed is taken as the air's.
+                noteAlignment(offsetDeg: offset, source: source, measuredByCompass: source == .ground)
             }
         }
         FlightRecorder.shared.record(
@@ -4990,7 +5257,18 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // ARKit looks along local -Z; that axis in world space is the negative of
         // the transform's third column (same convention used for the off-screen
         // arrow's behind-camera check elsewhere in this file).
-        let forwardRaw = SIMD3<Float>(-camTransform.columns.2.x, -camTransform.columns.2.y, -camTransform.columns.2.z)
+        //
+        // In the air under the attitude hold (#12) the ladder is built for the true attitude instead —
+        // CoreMotion's forward, against CoreMotion's level — and each point goes through the same
+        // correction about the camera as the targets, so ARKit's own pitch and roll never reach it and
+        // the bank rose, derived from the projected horizon below, follows.
+        let attitude = attitudeThisFrame
+        let correction = attitude.map { AttitudeHold.float($0.correction) }
+        var forwardRaw = SIMD3<Float>(-camTransform.columns.2.x, -camTransform.columns.2.y, -camTransform.columns.2.z)
+        if let attitude {
+            let forward = -attitude.trueCameraToWorld.columns.2
+            forwardRaw = SIMD3<Float>(Float(forward.x), Float(forward.y), Float(forward.z))
+        }
 
         // Direction for the fixed off-screen-horizon arrow, if the horizon
         // line itself turns out not to be visible below: forwardRaw.y < 0
@@ -5029,8 +5307,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             // Behind-camera guard via dot product (projectPoint's z is unreliable
             // for this — same technique used for the off-screen arrow elsewhere).
             guard simd_dot(forwardRaw, p1 - camPos) > 0, simd_dot(forwardRaw, p2 - camPos) > 0 else { return nil }
-            let sp1 = arSceneView.projectPoint(SCNVector3(p1.x, p1.y, p1.z))
-            let sp2 = arSceneView.projectPoint(SCNVector3(p2.x, p2.y, p2.z))
+            let q1 = AttitudeHold.placed(p1, about: camPos, rotation: correction)
+            let q2 = AttitudeHold.placed(p2, about: camPos, rotation: correction)
+            let sp1 = arSceneView.projectPoint(SCNVector3(q1.x, q1.y, q1.z))
+            let sp2 = arSceneView.projectPoint(SCNVector3(q2.x, q2.y, q2.z))
             return (CGPoint(x: CGFloat(sp1.x), y: CGFloat(sp1.y)), CGPoint(x: CGFloat(sp2.x), y: CGFloat(sp2.y)))
         }
 
@@ -5351,6 +5631,12 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         // heading-bias learning needs the same course/accuracy validity signal.
         lastGPSCourseDeg = loc.course
         lastGPSCourseAccuracy = loc.courseAccuracy
+        // The bank a coordinated turn would need, for `attitude_compare` and the attitude check (#12).
+        gpsTurnRate.add(courseDeg: loc.course, courseAccuracyDeg: loc.courseAccuracy,
+                        at: loc.timestamp.timeIntervalSince1970)
+        gpsBankDeg = loc.speed >= 0
+            ? AttitudeHold.gpsBankDeg(groundSpeedKt: loc.speed * 1.944, turnRateDps: gpsTurnRate.rateDps)
+            : .nan
 
         // ── Position and velocity into the single estimator ───────────────────────────
         // Pushed with this fix's own timestamp, so extrapolation between fixes is anchored to
