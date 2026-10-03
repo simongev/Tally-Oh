@@ -65,8 +65,12 @@ struct CaptureAnchorConstantTests {
     /// over a 1.2 s run; K is the window's own, within the noise. The old pairing was 1.1° out: the
     /// run's median sits 0.6 s before the newest D.
     @Test func stillPathKIsTheWindowsOwn() throws {
-        let run = try #require(settle(h: { _, _ in CaptureAnchorConstantTests.track + CaptureAnchorConstantTests.aim },
-                                      w: { 20 + 1.6 * $0 }))
+        let heading: (Double, Int) -> Double = { _, _ in
+            CaptureAnchorConstantTests.track + CaptureAnchorConstantTests.aim
+        }
+        let world: (Double) -> Double = { t in 20.0 + 1.6 * t }
+        let result = settle(h: heading, w: world)
+        let run = try #require(result)
         #expect(run.estimate.path == .still)
         #expect(abs(run.t - 2.1) < 1e-9)
         #expect(off(try #require(run.estimate.anchorConstantDeg)) <= 0.2)
@@ -77,12 +81,15 @@ struct CaptureAnchorConstantTests {
     /// moved path publishes at 1.9 s over the four samples after the turn; K is theirs. The old pairing
     /// was 0.8° out.
     @Test func movedPathKIsTheWindowsOwn() throws {
-        let run = try #require(settle(h: { t, _ in
-            let track = CaptureAnchorConstantTests.track
-            if t < 0.8 { return track + 50 }
-            if t < 1.2 { return track + 50 - 49 * (t - 0.8) / 0.4 }
+        let heading: (Double, Int) -> Double = { t, _ in
+            let track: Double = CaptureAnchorConstantTests.track
+            if t < 0.8 { return track + 50.0 }
+            if t < 1.2 { return track + 50.0 - 49.0 * (t - 0.8) / 0.4 }
             return track + CaptureAnchorConstantTests.aim
-        }, w: { 20 + 3.0 * $0 }))
+        }
+        let world: (Double) -> Double = { t in 20.0 + 3.0 * t }
+        let result = settle(h: heading, w: world)
+        let run = try #require(result)
         #expect(run.estimate.path == .moved)
         #expect(abs(run.t - 1.9) < 1e-9)
         #expect(run.estimate.sampleCount == 4)
@@ -95,12 +102,20 @@ struct CaptureAnchorConstantTests {
     /// 2°/s and then 4°/s. Nothing settles, the cap at 5.1 s takes the 0.3–0.9 s window, 4.2 s old,
     /// and ARKit has turned 17° since. K is still the window's own; the old pairing was 17.3° out.
     @Test func capPathKIsTheWindowsOwnHoweverOld() throws {
-        let run = try #require(settle(h: { t, k in
-            let track = CaptureAnchorConstantTests.track, aim = CaptureAnchorConstantTests.aim
-            if t < 0.2 { return track + 50 }
+        let heading: (Double, Int) -> Double = { t, k in
+            let track: Double = CaptureAnchorConstantTests.track
+            let aim: Double = CaptureAnchorConstantTests.aim
+            if t < 0.2 { return track + 50.0 }
             if t < 1.0 { return track + aim }
-            return track + aim + (k % 2 == 0 ? 3 : -3)
-        }, w: { t in t < 1.0 ? 20 + 2 * t : 21.8 + 4 * (t - 0.9) }))
+            let wobble: Double = k % 2 == 0 ? 3.0 : -3.0
+            return track + aim + wobble
+        }
+        let world: (Double) -> Double = { t in
+            if t < 1.0 { return 20.0 + 2.0 * t }
+            return 21.8 + 4.0 * (t - 0.9)
+        }
+        let result = settle(h: heading, w: world)
+        let run = try #require(result)
         #expect(run.estimate.path == .cap)
         #expect(abs(run.t - 5.1) < 1e-9)
         #expect(run.estimate.sampleCount == 4)
@@ -176,27 +191,22 @@ struct CaptureAnchorConstantTests {
 
     /// The median of `reference − cmYaw` over the samples that have CoreMotion, if at least half do.
     @Test func windowKNeedsCoreMotionOnHalfTheSamples() throws {
-        let none = GyroYawHold.windowAnchorConstantDeg([(referenceDeg: 92.8, cmYawDeg: nil),
-                                                        (referenceDeg: 92.8, cmYawDeg: nil)])
-        #expect(none == nil)
-        let quarter = GyroYawHold.windowAnchorConstantDeg([(referenceDeg: 92.8, cmYawDeg: -35.4),
-                                                           (referenceDeg: 92.8, cmYawDeg: nil),
-                                                           (referenceDeg: 92.8, cmYawDeg: nil),
-                                                           (referenceDeg: 92.8, cmYawDeg: nil)])
-        #expect(quarter == nil)
-        let half = GyroYawHold.windowAnchorConstantDeg([(referenceDeg: 92.8, cmYawDeg: -35.4),
-                                                        (referenceDeg: 92.8, cmYawDeg: nil),
-                                                        (referenceDeg: 92.8, cmYawDeg: -35.2),
-                                                        (referenceDeg: 92.8, cmYawDeg: .nan)])
+        typealias Pair = (referenceDeg: Double, cmYawDeg: Double?)
+        let noneSamples: [Pair] = [(92.8, nil), (92.8, nil)]
+        #expect(GyroYawHold.windowAnchorConstantDeg(noneSamples) == nil)
+        let quarterSamples: [Pair] = [(92.8, -35.4), (92.8, nil), (92.8, nil), (92.8, nil)]
+        #expect(GyroYawHold.windowAnchorConstantDeg(quarterSamples) == nil)
+        let halfSamples: [Pair] = [(92.8, -35.4), (92.8, nil), (92.8, -35.2), (92.8, Double.nan)]
+        let half = GyroYawHold.windowAnchorConstantDeg(halfSamples)
         #expect(abs(try #require(half) - 128.1) < 1e-9)
-        #expect(GyroYawHold.windowAnchorConstantDeg([]) == nil)
+        let empty: [Pair] = []
+        #expect(GyroYawHold.windowAnchorConstantDeg(empty) == nil)
     }
 
     /// Constants straddling ±180 median to the seam, not to 0.
     @Test func windowKStaysOnTheSeam() throws {
-        let k = GyroYawHold.windowAnchorConstantDeg([(referenceDeg: 100, cmYawDeg: -79.5),
-                                                     (referenceDeg: 100, cmYawDeg: -80.5),
-                                                     (referenceDeg: 100, cmYawDeg: -79.9)])
+        let samples: [(referenceDeg: Double, cmYawDeg: Double?)] = [(100, -79.5), (100, -80.5), (100, -79.9)]
+        let k = GyroYawHold.windowAnchorConstantDeg(samples)
         #expect(abs(abs(try #require(k)) - 180) < 1)
     }
 
