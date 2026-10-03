@@ -3913,7 +3913,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             return
         }
         // The step hold's own offset takes the step either way; in the continuous mode the scene has
-        // it already, through `D̄`, so only the step-only offset moves and the log reports that one.
+        // it already, through `D`, so only the step-only offset moves and the log reports that one.
         let stepBefore = stepOnlyOffsetDeg
         stepOnlyOffsetDeg = AngularResponse.wrappedDeg(stepOnlyOffsetDeg - event.deltaDeg)
         if currentHeadingMode == .continuous {
