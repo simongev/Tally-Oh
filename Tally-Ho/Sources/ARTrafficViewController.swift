@@ -693,6 +693,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// world's own rotation, free of whatever the user did with the phone. Written on the render
     /// thread every frame, read on main; NaN while device motion is silent.
     private var gyroAzimuthDeg: Double = .nan
+    /// CoreMotion's yaw interpolated to this frame's timestamp, nil when it could not be — the yaw the
+    /// continuous hold's `D` uses. Recorded with each seed and anchor sample so a capture's `K` is
+    /// measured over its own samples (`GyroYawHold.windowAnchorConstantDeg`). Render thread only.
+    private var frameMotionYawDeg: Double?
 
     /// Whether the OS suspended the ARSession since the last start. Set when the app backgrounds and
     /// consumed by the next `startARSession`, which withdraws the offset — a resumed session reports
@@ -3485,6 +3489,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let frame = arSceneView.session.currentFrame
         let motion = motionYaw.snapshot(at: frame?.timestamp)
         gyroAzimuthDeg = motion.yawDeg
+        frameMotionYawDeg = motion.frameYawDeg
         if !loggedMotionClockGap, motion.clockGapSeconds.isFinite,
            abs(motion.clockGapSeconds) > MotionYawBox.maxClockGapSeconds {
             // Once: ARKit's frame times and CoreMotion's are meant to share the boot clock. If they do
@@ -3622,9 +3627,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Feed a running anchor capture with the same *uncorrected* azimuth the estimators use.
         // Uncorrected on purpose: the offset being captured is exactly the correction, so feeding
         // a corrected azimuth would be measuring a correction against itself.
+        // CoreMotion at this frame's timestamp goes with it, for the capture's own `K`.
+        let frameCMYaw = frameMotionYawDeg
         if anchorCaptureActive {
             DispatchQueue.main.async { [weak self] in
-                self?.updateFlightAnchorCapture(arAzimuthDeg: rawAzimuthDeg, at: time)
+                self?.updateFlightAnchorCapture(arAzimuthDeg: rawAzimuthDeg, cmYawDeg: frameCMYaw, at: time)
             }
         }
 
@@ -3646,7 +3653,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if awaitingSeed || seedGyroReferenceDeg.isFinite {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.feedStartupSeed(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz, at: time)
+                self.feedStartupSeed(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz,
+                                     cmYawDeg: frameCMYaw, at: time)
                 self.checkGyroDivergence(arAzimuthDeg: rawAzimuthDeg, gyroAzimuthDeg: gyroAz)
             }
         }
@@ -3733,9 +3741,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if !isNormal, let arAzimuth, airborneSeedArmed, isAirborneEstimate,
            hold != .startGuard, hold != .clockMismatch {
             let gyro = motion.yawDeg
+            let cmYaw = motion.frameYawDeg
             DispatchQueue.main.async { [weak self] in
-                self?.feedStartupSeed(arAzimuthDeg: arAzimuth, gyroAzimuthDeg: gyro, at: time,
-                                      limitedFrame: true)
+                self?.feedStartupSeed(arAzimuthDeg: arAzimuth, gyroAzimuthDeg: gyro, cmYawDeg: cmYaw,
+                                      at: time, limitedFrame: true)
             }
         }
         // Every frame while the continuous hold places the scene: an ARKit step stays on screen until
@@ -3881,15 +3890,24 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         )
     }
 
-    /// An alignment has been applied: it becomes the anchor constant, and the step hold's offset. In
-    /// the air it is paired with the frame `D` of its own moment, which exists in limited tracking
-    /// too (#11); on the ground the hold pairs it from normal frames, as before.
-    private func noteAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source) {
+    /// An alignment has been applied: it becomes the anchor constant, and the step hold's offset.
+    ///
+    /// In the air, a capture that measured `K` over its own samples (`anchorConstantDeg`: the seeds and
+    /// the anchor, #11 QA round 1) stores that `K`; anything else is paired with the frame `D` of its
+    /// own moment, which exists in limited tracking too. On the ground the hold pairs it from normal
+    /// frames, as before, and `anchorConstantDeg` is ignored.
+    private func noteAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source,
+                               anchorConstantDeg: Double? = nil) {
         var gap: Double?
-        if isAirborneEstimate, let latest = latestFrameGap, latestSampleTime - latest.t <= 0.2 {
-            gap = latest.deg
+        var k: Double?
+        if isAirborneEstimate {
+            if let windowK = anchorConstantDeg, windowK.isFinite {
+                k = windowK
+            } else if let latest = latestFrameGap, latestSampleTime - latest.t <= 0.2 {
+                gap = latest.deg
+            }
         }
-        yawHold.recordAlignment(offsetDeg: offsetDeg, source: source, gapDeg: gap)
+        yawHold.recordAlignment(offsetDeg: offsetDeg, source: source, gapDeg: gap, anchorConstantDeg: k)
         stepOnlyOffsetDeg = offsetDeg
     }
 
@@ -4241,8 +4259,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// takes those — the track reference is measured against where ARKit says the phone points, which
     /// it says in limited tracking too, and at night normal can be seconds away. The compass capture
     /// and the ground keep waiting for normal, as before.
-    private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, at time: TimeInterval,
-                                 limitedFrame: Bool = false) {
+    ///
+    /// `cmYawDeg` is CoreMotion's yaw at the sample's frame timestamp (nil when there is none), kept
+    /// with the sample so the seed's `K` is measured over its own window.
+    private func feedStartupSeed(arAzimuthDeg: Double, gyroAzimuthDeg: Double, cmYawDeg: Double?,
+                                 at time: TimeInterval, limitedFrame: Bool = false) {
         guard awaitingSeed || seedIsResampling, seedIsCapturing else { return }
         if limitedFrame && !(airborneSeedArmed && isAirborneEstimate) { return }
         guard let reference = seedReference else {
@@ -4262,12 +4283,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         let estimate: StartupSeed.Estimate
         let settled: AirborneSeedSettle.Estimate?
         if airborneSeedArmed {
-            guard let published = feedAirborneSeed(arAzimuthDeg: arAzimuthDeg,
+            guard let published = feedAirborneSeed(arAzimuthDeg: arAzimuthDeg, cmYawDeg: cmYawDeg,
                                                    reference: reference, at: time) else { return }
             settled = published
             estimate = published.seed
         } else {
-            startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees, at: time)
+            startupSeed.add(arAzimuthDeg: arAzimuthDeg, referenceDeg: reference.degrees,
+                            cmYawDeg: cmYawDeg, at: time)
 
             // Polled, as the flight anchor's caller polls it. `finish` is a no-op before this point,
             // but asking only when the hold is complete keeps the two capture flows reading the same
@@ -4322,7 +4344,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // median across many headings for accuracy.
         groundYaw.prime(offsetDeg: estimate.offsetDeg)
         // The anchor constant a later reset in the air carries over. See GyroYawHold.
-        noteAlignment(offsetDeg: estimate.offsetDeg, source: .seed)
+        noteAlignment(offsetDeg: estimate.offsetDeg, source: .seed,
+                      anchorConstantDeg: estimate.anchorConstantDeg)
         // The reference for the divergence measurement. Any later change in (ARKit − gyro) is the
         // world rotating with the user's panning cancelled out.
         seedGyroReferenceDeg = angleDifferenceDeg(from: gyroAzimuthDeg, to: arAzimuthDeg)
@@ -4347,6 +4370,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                              settled.path.rawValue, settled.cardAgeSeconds, settled.movedDeg,
                              seedClockSkew)
         }
+        // The capture's own `K` (#11), in the air only so a ground line reads as it always has. NaN when
+        // too few samples had CoreMotion, and `K` was paired with the frame `D` instead.
+        if isAirborneEstimate {
+            detail += String(format: " k_window=%.1f", estimate.anchorConstantDeg ?? Double.nan)
+        }
         FlightRecorder.shared.record(event: "seed_captured", detail: detail)
 
         armSeedResampleIfWorthwhile(spreadDeg: estimate.azimuthSpreadDeg,
@@ -4365,6 +4393,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// milliseconds, against a one-second minimum.
     private func feedAirborneSeed(
         arAzimuthDeg: Double,
+        cmYawDeg: Double?,
         reference: (kind: StartupSeed.Reference, degrees: Double),
         at time: TimeInterval
     ) -> AirborneSeedSettle.Estimate? {
@@ -4385,7 +4414,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                     - seedClockSkew
             )
         }
-        airborneSeed.add(arAzimuthDeg: arAzimuthDeg, trackDeg: reference.degrees, at: time)
+        airborneSeed.add(arAzimuthDeg: arAzimuthDeg, trackDeg: reference.degrees, cmYawDeg: cmYawDeg,
+                         at: time)
         guard let published = airborneSeed.finish(at: time) else { return nil }
         airborneSeedArmed = false
         return published
@@ -4562,7 +4592,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     ///
     /// Samples at ~5 Hz rather than 60: hand wobble is correlated over about a second, so the extra
     /// readings are copies of the same look and only make the median look better-founded than it is.
-    private func updateFlightAnchorCapture(arAzimuthDeg: Double, at time: TimeInterval) {
+    private func updateFlightAnchorCapture(arAzimuthDeg: Double, cmYawDeg: Double?, at time: TimeInterval) {
         guard anchorCaptureActive else { return }
         if !flightAnchor.isCapturing { flightAnchor.begin(at: time) }
 
@@ -4578,7 +4608,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
 
         if time - lastAnchorSampleTime >= 0.2 {
             lastAnchorSampleTime = time
-            flightAnchor.add(arAzimuthDeg: arAzimuthDeg, trackDeg: lastGPSCourseDeg, at: time)
+            flightAnchor.add(arAzimuthDeg: arAzimuthDeg, trackDeg: lastGPSCourseDeg, cmYawDeg: cmYawDeg,
+                             at: time)
         }
 
         guard flightAnchor.progress(at: time) >= 1.0 else { return }
@@ -4606,12 +4637,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                              source: .anchor,
                              at: CACurrentMediaTime())
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
-            noteAlignment(offsetDeg: estimate.offsetDeg, source: .anchor)
+            noteAlignment(offsetDeg: estimate.offsetDeg, source: .anchor,
+                          anchorConstantDeg: estimate.anchorConstantDeg)
             FlightRecorder.shared.record(
                 event: "anchor_captured",
-                detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f",
+                detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f k_window=%.1f",
                                estimate.offsetDeg, estimate.sampleCount, estimate.seconds,
-                               estimate.azimuthSpreadDeg, estimate.trackSpreadDeg, worldYawErrorDeg)
+                               estimate.azimuthSpreadDeg, estimate.trackSpreadDeg, worldYawErrorDeg,
+                               estimate.anchorConstantDeg ?? Double.nan)
             )
 
             // A capture the follower disagrees with is the shape of the FL317 mis-aim: the phone was

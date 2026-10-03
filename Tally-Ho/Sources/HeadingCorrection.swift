@@ -617,6 +617,9 @@ struct FlightDirectionAnchor {
         /// recorded because they are the reasons a hold is accepted or thrown away.
         var azimuthSpreadDeg: Double
         var trackSpreadDeg: Double
+        /// `K` measured over the same samples: see `GyroYawHold.windowAnchorConstantDeg`. Nil when
+        /// too few samples came with a CoreMotion yaw.
+        var anchorConstantDeg: Double? = nil
     }
 
     /// `Error` because `Result`'s failure type requires it; the raw string is what the log records.
@@ -644,7 +647,7 @@ struct FlightDirectionAnchor {
     let maxTrackSpreadDeg: Double
 
     private var startTime: TimeInterval?
-    private var samples: [(t: TimeInterval, offset: Double, az: Double, track: Double)] = []
+    private var samples: [(t: TimeInterval, offset: Double, az: Double, track: Double, cmYaw: Double?)] = []
 
     init(minSeconds: TimeInterval = 3.0,
          minSamples: Int = 8,
@@ -674,13 +677,16 @@ struct FlightDirectionAnchor {
         samples.removeAll()
     }
 
-    /// Feed one reading. Ignored unless a hold is running.
-    mutating func add(arAzimuthDeg: Double, trackDeg: Double, at time: TimeInterval) {
+    /// Feed one reading. Ignored unless a hold is running. `cmYawDeg` is CoreMotion's yaw at the same
+    /// frame's timestamp, nil when there is none; it is only for the estimate's `anchorConstantDeg`.
+    mutating func add(arAzimuthDeg: Double, trackDeg: Double, cmYawDeg: Double? = nil,
+                      at time: TimeInterval) {
         guard startTime != nil, arAzimuthDeg.isFinite, trackDeg.isFinite else { return }
         samples.append((t: time,
                         offset: AngularResponse.signedDelta(arAzimuthDeg, trackDeg),
                         az: arAzimuthDeg,
-                        track: trackDeg))
+                        track: trackDeg,
+                        cmYaw: cmYawDeg))
     }
 
     /// Close the hold and either publish an offset or say why not. Clears either way, so a refused
@@ -704,7 +710,9 @@ struct FlightDirectionAnchor {
                                  sampleCount: samples.count,
                                  seconds: seconds,
                                  azimuthSpreadDeg: azSpread,
-                                 trackSpreadDeg: trackSpread))
+                                 trackSpreadDeg: trackSpread,
+                                 anchorConstantDeg: GyroYawHold.windowAnchorConstantDeg(
+                                    samples.map { (referenceDeg: $0.track, cmYawDeg: $0.cmYaw) })))
     }
 
     /// Max minus min of a wrapping angle series, unwrapped against the first sample so a hold that
@@ -764,6 +772,9 @@ struct StartupSeed {
         var sampleCount: Int
         var seconds: TimeInterval
         var azimuthSpreadDeg: Double
+        /// `K` measured over the same samples as the offset: see
+        /// `GyroYawHold.windowAnchorConstantDeg`. Nil when too few came with a CoreMotion yaw.
+        var anchorConstantDeg: Double? = nil
     }
 
     /// A second is enough at 5 Hz, and short enough that the aircraft's turn inside it is
@@ -773,7 +784,7 @@ struct StartupSeed {
 
     private(set) var reference: Reference?
     private var startTime: TimeInterval?
-    private var samples: [(offset: Double, az: Double)] = []
+    private var samples: [(offset: Double, az: Double, referenceDeg: Double, cmYaw: Double?)] = []
 
     init(minSeconds: TimeInterval = 1.0, minSamples: Int = 5) {
         self.minSeconds = minSeconds
@@ -792,11 +803,16 @@ struct StartupSeed {
         samples.removeAll()
     }
 
-    mutating func add(arAzimuthDeg: Double, referenceDeg: Double, at time: TimeInterval) {
+    /// `cmYawDeg`: CoreMotion's yaw at the same frame's timestamp, nil when there is none. Only for
+    /// the estimate's `anchorConstantDeg`.
+    mutating func add(arAzimuthDeg: Double, referenceDeg: Double, cmYawDeg: Double? = nil,
+                      at time: TimeInterval) {
         guard reference != nil, arAzimuthDeg.isFinite, referenceDeg.isFinite else { return }
         if startTime == nil { startTime = time }
         samples.append((offset: AngularResponse.signedDelta(arAzimuthDeg, referenceDeg),
-                        az: arAzimuthDeg))
+                        az: arAzimuthDeg,
+                        referenceDeg: referenceDeg,
+                        cmYaw: cmYawDeg))
     }
 
     mutating func cancel() {
@@ -842,7 +858,9 @@ struct StartupSeed {
                         referenceKind: reference,
                         sampleCount: samples.count,
                         seconds: seconds,
-                        azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(samples.map(\.az)))
+                        azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(samples.map(\.az)),
+                        anchorConstantDeg: GyroYawHold.windowAnchorConstantDeg(
+                            samples.map { (referenceDeg: $0.referenceDeg, cmYawDeg: $0.cmYaw) }))
     }
 }
 
@@ -905,6 +923,9 @@ struct AirborneSeedSettle {
         var azimuthSpreadDeg: Double
         /// Furthest the phone got from where it was when samples began — how far the user turned.
         var movedDeg: Double
+        /// `K` over the window the offset is the median of: see `GyroYawHold.windowAnchorConstantDeg`.
+        /// Nil when too few of the window's samples came with a CoreMotion yaw.
+        var anchorConstantDeg: Double? = nil
 
         /// The same measurement in the shape the rest of the seed plumbing already consumes, so
         /// `SeedResamplePolicy` and everything after it are fed exactly as they were.
@@ -913,7 +934,8 @@ struct AirborneSeedSettle {
                                  referenceKind: .track,
                                  sampleCount: sampleCount,
                                  seconds: windowSeconds,
-                                 azimuthSpreadDeg: azimuthSpreadDeg)
+                                 azimuthSpreadDeg: azimuthSpreadDeg,
+                                 anchorConstantDeg: anchorConstantDeg)
         }
     }
 
@@ -933,7 +955,7 @@ struct AirborneSeedSettle {
 
     private var cardShownAt: TimeInterval?
     private var capAt: TimeInterval = .infinity
-    private var samples: [(t: TimeInterval, offset: Double, az: Double)] = []
+    private var samples: [(t: TimeInterval, offset: Double, az: Double, track: Double, cmYaw: Double?)] = []
 
     init(minCardAgeSeconds: TimeInterval = 1.0,
          moveThresholdDeg: Double = 5.0,
@@ -970,13 +992,18 @@ struct AirborneSeedSettle {
     }
 
     /// Feed one reading. Ignored unless a capture is running, and ignored if it predates the card —
-    /// a phone position from before the card was up cannot be an answer to it.
-    mutating func add(arAzimuthDeg: Double, trackDeg: Double, at time: TimeInterval) {
+    /// a phone position from before the card was up cannot be an answer to it. `cmYawDeg` is
+    /// CoreMotion's yaw at the same frame's timestamp, nil when there is none; it is only for the
+    /// estimate's `anchorConstantDeg` and never affects which window is taken.
+    mutating func add(arAzimuthDeg: Double, trackDeg: Double, cmYawDeg: Double? = nil,
+                      at time: TimeInterval) {
         guard let cardShownAt, time >= cardShownAt,
               arAzimuthDeg.isFinite, trackDeg.isFinite else { return }
         samples.append((t: time,
                         offset: AngularResponse.signedDelta(arAzimuthDeg, trackDeg),
-                        az: arAzimuthDeg))
+                        az: arAzimuthDeg,
+                        track: trackDeg,
+                        cmYaw: cmYawDeg))
     }
 
     /// Publish the seed, or nil if none of the paths is satisfied yet.
@@ -1013,7 +1040,9 @@ struct AirborneSeedSettle {
                         windowSeconds: samples[chosen.window.upperBound].t
                             - samples[chosen.window.lowerBound].t,
                         azimuthSpreadDeg: FlightDirectionAnchor.spreadDeg(window.map(\.az)),
-                        movedDeg: moved)
+                        movedDeg: moved,
+                        anchorConstantDeg: GyroYawHold.windowAnchorConstantDeg(
+                            window.map { (referenceDeg: $0.track, cmYawDeg: $0.cmYaw) }))
     }
 
     /// Furthest any sample got from the first, in degrees, unwrapped so a phone straddling north is
@@ -2152,10 +2181,16 @@ struct GyroYawHold {
     /// `D` after it — and the episode's step is then refused, since the alignment already describes
     /// the world as it came back. During a reset it cancels the carry and waits for the new world's
     /// first reading.
+    ///
+    /// With `anchorConstantDeg` — `K` measured by the capture itself, over the same samples as its
+    /// offset (`windowAnchorConstantDeg`) — that `K` is stored exactly, as if `gapDeg` were
+    /// `K − offset`. It takes precedence over `gapDeg`.
     mutating func recordAlignment(offsetDeg: Double, source: TrackFollowingYawOffset.Source,
-                                  gapDeg: Double? = nil) {
+                                  gapDeg: Double? = nil, anchorConstantDeg: Double? = nil) {
         guard offsetDeg.isFinite else { return }
         let alignment = Alignment(offsetDeg: offsetDeg, source: source)
+        var gapDeg = gapDeg
+        if let k = anchorConstantDeg, k.isFinite { gapDeg = AngularResponse.signedDelta(offsetDeg, k) }
         if let gap = gapDeg, gap.isFinite {
             store(alignment, gapDeg: AngularResponse.wrappedDeg(gap), at: latestTime)
             switch phase {
@@ -2619,6 +2654,25 @@ extension GyroYawHold {
             return .staleMotion
         }
         return nil
+    }
+
+    /// `K` for an alignment captured over a window of samples: the circular median of
+    /// `reference − cmYaw` over the very samples the capture's offset is the median of, each with
+    /// CoreMotion's yaw at its own frame's timestamp. Nil when fewer than half of them have one, and
+    /// the caller then pairs the offset with the newest frame `D` as before.
+    ///
+    /// **Why not offset + the newest D (#11, QA round 1).** The offset is a median over a window;
+    /// `D` at the moment the capture publishes is a different instant. With ARKit's yaw moving under
+    /// a still phone the two disagree by however far ARKit turned between them: QA simulated a median
+    /// 1.3° (max 2.3°) on the still and moved paths, and 12.4° on a cap whose window was seconds old.
+    /// `reference − cmYaw` is the same `K` taken sample by sample, and ARKit does not enter it at all.
+    static func windowAnchorConstantDeg(_ samples: [(referenceDeg: Double, cmYawDeg: Double?)]) -> Double? {
+        let constants = samples.compactMap { sample -> Double? in
+            guard let cm = sample.cmYawDeg, cm.isFinite, sample.referenceDeg.isFinite else { return nil }
+            return AngularResponse.signedDelta(cm, sample.referenceDeg)
+        }
+        guard !constants.isEmpty, constants.count * 2 >= samples.count else { return nil }
+        return AngularResponse.circularMedianDeg(constants)
     }
 
     /// Which hold places the scene.
