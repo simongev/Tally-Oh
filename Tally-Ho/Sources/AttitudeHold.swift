@@ -283,6 +283,9 @@ enum AttitudeHold {
         let maxRateDps: Double
 
         private(set) var state: State = .pending
+        /// Confirmed from a record of an earlier run on this build and device (`MappingConfirmation`)
+        /// rather than by this run's frames.
+        private(set) var confirmedFromRecord = false
         /// The median that decided it; NaN until then.
         private(set) var decidedMedianDeg: Double = .nan
         private(set) var decidedSampleCount = 0
@@ -300,6 +303,19 @@ enum AttitudeHold {
             self.sampleIntervalSeconds = sampleIntervalSeconds
             self.maxSessionAgeSeconds = maxSessionAgeSeconds
             self.maxRateDps = maxRateDps
+        }
+
+        /// The state as the log writes it: `confirmed_before` when a record confirmed it.
+        var logDescription: String { confirmedFromRecord ? "confirmed_before" : state.rawValue }
+
+        /// An earlier run on this build and device confirmed the chain (`MappingConfirmation`): skip the
+        /// check. Nothing this run's frames show can then disable the hold — which is the point, since
+        /// a disagreement after a confirmed chain is the flight, not the code.
+        mutating func confirmFromRecord() {
+            guard state == .pending else { return }
+            state = .confirmed
+            confirmedFromRecord = true
+            samples.removeAll()
         }
 
         /// A new world: frames from the last one were measured against a level that has gone.
@@ -335,6 +351,58 @@ enum AttitudeHold {
             state = median <= maxDiscrepancyDeg ? .confirmed : .disabled
             samples.removeAll()
             return state
+        }
+    }
+
+    /// A confirmed check, remembered for the build and device it was made on (#12, QA round 1).
+    ///
+    /// What the check verifies is code and the device's axis conventions, not the flight. So once a
+    /// run confirms it, later runs of the same build on the same model of phone skip the check and
+    /// use the hold at once — which covers the app opened while taxiing, where no world is ever fresh
+    /// while stopped or level, and a world whose first seconds happen to be flown hard. A new build or
+    /// another device model checks again. Only a confirmation is stored: a disable is never
+    /// remembered, and never erases one that was.
+    ///
+    /// Kept in an internal `UserDefaults` key. It is not a setting, so it is not in
+    /// `ARVisualizationSettings` or the settings table.
+    struct MappingConfirmation {
+        static let defaultsKey = "TallyOh.attitudeHold.mappingConfirmed"
+
+        /// `CFBundleVersion`, which CI sets from the workflow run.
+        let build: String
+        /// The hardware model identifier (`utsname.machine`, e.g. `iPhone16,1`).
+        let deviceModel: String
+
+        /// What a stored confirmation must equal to cover this run.
+        var identity: String { "build=\(build) model=\(deviceModel)" }
+
+        /// Both parts known. Without them nothing is stored or trusted.
+        var isUsable: Bool {
+            !build.trimmingCharacters(in: .whitespaces).isEmpty
+                && !deviceModel.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+
+        /// Whether a stored value confirms this build on this device model.
+        func isConfirmed(stored: String?) -> Bool {
+            isUsable && stored == identity
+        }
+
+        /// What to store once the check has decided: this identity on a confirmation, nothing
+        /// otherwise.
+        func valueToStore(after state: Check.State) -> String? {
+            state == .confirmed && isUsable ? identity : nil
+        }
+
+        func isConfirmed(in defaults: UserDefaults) -> Bool {
+            isConfirmed(stored: defaults.string(forKey: MappingConfirmation.defaultsKey))
+        }
+
+        /// Store the confirmation, if `state` is one. Returns whether anything was written.
+        @discardableResult
+        func record(_ state: Check.State, in defaults: UserDefaults) -> Bool {
+            guard let value = valueToStore(after: state) else { return false }
+            defaults.set(value, forKey: MappingConfirmation.defaultsKey)
+            return true
         }
     }
 

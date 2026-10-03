@@ -1308,6 +1308,28 @@ struct AirborneSeedRearm {
     }
 }
 
+extension AirborneSeedRearm {
+
+    /// Whether an anchor just captured ends the seed still on its way in this world (#12, QA round 1).
+    ///
+    /// The takeoff card puts an in-place seed on screen at the moment a user is most likely to press
+    /// align, so the two overlap. Left running, the seed — or a steadier resample after it — could land
+    /// after the anchor and replace the anchor's offset and `K` while `hasFlightAnchor` still read
+    /// true; and an ordinary seed still waiting would reach its watchdog and restart the world into the
+    /// fallback, anchor and all. The anchor is the measurement the user asked for, so it ends whatever
+    /// seed is waiting, capturing or resampling.
+    static func anchorEndsSeed(seedWaiting: Bool, resampling: Bool) -> Bool {
+        seedWaiting || resampling
+    }
+
+    /// Whether a seed capture that has just closed may take the world. Never over an anchor in force in
+    /// the air — the cancel above makes that unreachable, and this keeps it so. On the ground an anchor
+    /// flag can outlive the anchor (it clears at the next world), and the ground seeds as it always has.
+    static func seedMayTakeWorld(airborne: Bool, anchorInForce: Bool) -> Bool {
+        !(airborne && anchorInForce)
+    }
+}
+
 /// When to offer the compass calibration screen.
 ///
 /// **Why this needed writing at all.** Every alignment path on the ground rests on the

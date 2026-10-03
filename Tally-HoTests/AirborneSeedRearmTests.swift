@@ -274,4 +274,33 @@ struct AirborneSeedRearmTests {
         let afterLanding = landing.next(compassAligned, sessionPaused: false, restartAllowed: true)
         #expect(afterLanding == .none)
     }
+
+    // MARK: - An anchor ends the seed (#12, QA round 1)
+
+    /// Gev presses align while the takeoff card's in-place seed is still waiting: the anchor ends that
+    /// seed — waiting, capturing or resampling — and no seed may take the world over the anchor after
+    /// it. With the anchor in force the takeoff owes nothing more.
+    @Test func anAnchorEndsTheInPlaceSeedAndNoSeedReplacesIt() {
+        var rearm = AirborneSeedRearm()
+        rearm.tookOff(compassAligned)
+        let armed = rearm.next(compassAligned, sessionPaused: false, restartAllowed: true)
+        #expect(armed == .armSeedInPlace(.groundCompass))
+
+        // The seed is waiting (or resampling after a loose first capture) when the anchor lands.
+        #expect(AirborneSeedRearm.anchorEndsSeed(seedWaiting: true, resampling: false))
+        #expect(AirborneSeedRearm.anchorEndsSeed(seedWaiting: false, resampling: true))
+        #expect(!AirborneSeedRearm.anchorEndsSeed(seedWaiting: false, resampling: false))
+
+        // A capture closing after the anchor is refused in the air…
+        #expect(!AirborneSeedRearm.seedMayTakeWorld(airborne: true, anchorInForce: true))
+        #expect(AirborneSeedRearm.seedMayTakeWorld(airborne: true, anchorInForce: false))
+        // …but not on the ground, where the anchor flag only clears at the next world.
+        #expect(AirborneSeedRearm.seedMayTakeWorld(airborne: false, anchorInForce: true))
+
+        var anchored = compassAligned
+        anchored.anchorInForce = true
+        #expect(AirborneSeedRearm.reason(for: anchored) == nil)
+        let after = rearm.next(anchored, sessionPaused: false, restartAllowed: true)
+        #expect(after == .none)
+    }
 }

@@ -311,6 +311,88 @@ struct AttitudeHoldTests {
         #expect(!AttitudeHold.levelForCheck(airborne: false, groundSpeedKt: 20, gpsBankDeg: 0))
     }
 
+    // MARK: - A confirmation remembered (QA round 1)
+
+    private func scratchDefaults() -> UserDefaults {
+        let name = "AttitudeHoldTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return defaults
+    }
+
+    /// A confirmation covers exactly the build and device model it was made on.
+    @Test func aConfirmationCoversOnlyItsBuildAndModel() {
+        let here = AttitudeHold.MappingConfirmation(build: "394", deviceModel: "iPhone16,1")
+        let stored = here.valueToStore(after: .confirmed)
+        #expect(stored == "build=394 model=iPhone16,1")
+        #expect(here.isConfirmed(stored: stored))
+        #expect(!AttitudeHold.MappingConfirmation(build: "395", deviceModel: "iPhone16,1").isConfirmed(stored: stored))
+        #expect(!AttitudeHold.MappingConfirmation(build: "394", deviceModel: "iPhone17,2").isConfirmed(stored: stored))
+        #expect(!here.isConfirmed(stored: nil))
+    }
+
+    /// Only a confirmation is ever stored: a disable or a pending check writes nothing, so a disable
+    /// can neither be remembered nor erase an earlier confirmation.
+    @Test func onlyConfirmationsAreStored() {
+        let here = AttitudeHold.MappingConfirmation(build: "394", deviceModel: "iPhone16,1")
+        #expect(here.valueToStore(after: .disabled) == nil)
+        #expect(here.valueToStore(after: .pending) == nil)
+
+        let defaults = scratchDefaults()
+        let disabledWrote = here.record(.disabled, in: defaults)
+        #expect(!disabledWrote)
+        #expect(!here.isConfirmed(in: defaults))
+        let confirmedWrote = here.record(.confirmed, in: defaults)
+        #expect(confirmedWrote)
+        #expect(here.isConfirmed(in: defaults))
+        let laterDisable = here.record(.disabled, in: defaults)
+        #expect(!laterDisable)
+        #expect(here.isConfirmed(in: defaults))
+    }
+
+    /// A new build checks again; once it confirms, the record is its own and the old build's is gone.
+    @Test func aNewBuildChecksAgain() {
+        let defaults = scratchDefaults()
+        let old = AttitudeHold.MappingConfirmation(build: "393", deviceModel: "iPhone16,1")
+        let new = AttitudeHold.MappingConfirmation(build: "394", deviceModel: "iPhone16,1")
+        old.record(.confirmed, in: defaults)
+        #expect(!new.isConfirmed(in: defaults))
+        new.record(.confirmed, in: defaults)
+        #expect(new.isConfirmed(in: defaults))
+        #expect(!old.isConfirmed(in: defaults))
+    }
+
+    /// Without a build number or a model, nothing is trusted and nothing is stored.
+    @Test func anUnknownBuildOrModelIsNeverTrusted() {
+        let noBuild = AttitudeHold.MappingConfirmation(build: "", deviceModel: "iPhone16,1")
+        let noModel = AttitudeHold.MappingConfirmation(build: "394", deviceModel: " ")
+        for identity in [noBuild, noModel] {
+            #expect(!identity.isUsable)
+            #expect(identity.valueToStore(after: .confirmed) == nil)
+            #expect(!identity.isConfirmed(stored: identity.identity))
+        }
+    }
+
+    /// Confirmed from the record, the check is skipped: the hold is on at once, and no disagreement this
+    /// run's frames show — the flight, not the code — can disable it.
+    @Test func aRememberedConfirmationSkipsTheCheck() {
+        var check = AttitudeHold.Check()
+        check.confirmFromRecord()
+        #expect(check.state == .confirmed)
+        #expect(check.confirmedFromRecord)
+        #expect(check.logDescription == "confirmed_before")
+        #expect(AttitudeHold.isActive(airHoldActive: true, check: check.state))
+        let decided = run(&check, discrepancy: 25, seconds: 4)
+        #expect(decided == nil)
+        #expect(check.state == .confirmed)
+        // A disabled check stays disabled: a record never overrides this run's own verdict.
+        var disabled = AttitudeHold.Check()
+        let verdict = run(&disabled, discrepancy: 25, seconds: 4)
+        #expect(verdict == .disabled)
+        disabled.confirmFromRecord()
+        #expect(disabled.state == .disabled)
+    }
+
     // MARK: - The ground, and the air without the hold
 
     /// On the ground — or in the air with the yaw hold off — placement is the yaw-only one, bit for

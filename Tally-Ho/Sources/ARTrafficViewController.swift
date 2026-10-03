@@ -563,6 +563,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var lastAttitudeHold: (correction: simd_double3x3, offsetDeg: Double, time: TimeInterval)?
     /// How long the last correction stands in when CoreMotion misses samples.
     private static let attitudeHoldGraceSeconds: TimeInterval = 0.5
+    /// This build on this model of phone, which a confirmed check is remembered for (#12).
+    private let mappingConfirmation = AttitudeHold.MappingConfirmation(
+        build: ARTrafficViewController.buildNumber(),
+        deviceModel: ARTrafficViewController.hardwareModel())
+    /// Render thread only: whether the stored confirmation has been read into the check yet.
+    private var attitudeCheckPrimed = false
+
+    private static func buildNumber() -> String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+    }
+
+    /// The hardware model identifier, e.g. `iPhone16,1`; the simulated one in the Simulator.
+    private static func hardwareModel() -> String {
+        if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
+            return simulated
+        }
+        var info = utsname()
+        uname(&info)
+        return withUnsafeBytes(of: &info.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    }
     /// The offset the step hold alone would have in force — set by every alignment, moved by every
     /// held step. Placement in the step mode; in the continuous mode it is only logged, as `ar_hdg`.
     private var stepOnlyOffsetDeg: Double = 0
@@ -2559,8 +2581,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         seedDeadline = now + ARTrafficViewController.seedReferenceTimeoutSeconds
     }
 
-    /// Stop waiting for an in-place seed, leaving the world exactly as it is.
-    private func endSeedInPlace() {
+    /// An anchor has just been captured: end the seed still waiting, capturing or resampling in this
+    /// world, if any, and say so. See `AirborneSeedRearm.anchorEndsSeed`.
+    private func endSeedForAnchor() {
+        let waiting = awaitingSeed || seedIsCapturing
+        guard AirborneSeedRearm.anchorEndsSeed(seedWaiting: waiting, resampling: seedIsResampling) else { return }
+        FlightRecorder.shared.record(
+            event: "seed_cancelled",
+            detail: String(format: "reason=anchor in_place=%d waiting=%d resampling=%d",
+                           seedRearmedInPlace ? 1 : 0, waiting ? 1 : 0, seedIsResampling ? 1 : 0)
+        )
+        seedIsResampling = false
+        endPendingSeed()
+    }
+
+    /// Stop the seed this world is waiting for — in place or not — leaving the world's alignment exactly
+    /// as it is: no fallback, no restart.
+    private func endPendingSeed() {
         seedRearmedInPlace = false
         awaitingSeed = false
         awaitingSeedConfirmation = false
@@ -2635,7 +2672,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 seedRearm.landed()
                 // An in-place airborne seed still waiting has nothing to measure against on the
                 // ground; the compass alignment it waited over stays, as on any landing (#12).
-                if seedRearmedInPlace { endSeedInPlace() }
+                if seedRearmedInPlace { endPendingSeed() }
             }
         }
         applySeedRearmIfDue()
@@ -3821,6 +3858,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                     motion: (yawDeg: Double, rateDps: Double, clockGapSeconds: Double,
                                              frameYawDeg: Double?),
                                     at time: TimeInterval) {
+        // Once per run: an earlier run of this build on this model of phone may already have
+        // confirmed the chain, and then there is nothing to check.
+        if !attitudeCheckPrimed {
+            attitudeCheckPrimed = true
+            let confirmedBefore = mappingConfirmation.isConfirmed(in: .standard)
+            if confirmedBefore { attitudeCheck.confirmFromRecord() }
+            FlightRecorder.shared.record(
+                event: "attitude_hold_check",
+                detail: String(format: "skipped=%d reason=%@ build=%@ model=%@",
+                               confirmedBefore ? 1 : 0,
+                               confirmedBefore ? "confirmed_before" : "not_confirmed_on_this_build",
+                               mappingConfirmation.build, mappingConfirmation.deviceModel)
+            )
+        }
         if attitudeCheckSessionStamp != holdSessionStartedAt {
             attitudeCheckSessionStamp = holdSessionStartedAt
             attitudeCheck.sessionStarted()
@@ -3879,12 +3930,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             level: AttitudeHold.levelForCheck(airborne: isAirborneEstimate, groundSpeedKt: lastGPSSpeedKt,
                                               gpsBankDeg: gpsBankDeg),
             at: time) {
+            // A confirmation is remembered for this build and model; a disable never is.
+            let stored = mappingConfirmation.record(decided, in: .standard)
             FlightRecorder.shared.record(
                 event: decided == .confirmed ? "attitude_hold_confirmed" : "attitude_hold_disabled",
-                detail: String(format: "median_tilt=%.1f n=%d limit=%.1f since_start_s=%.1f airborne=%d gs=%.0fkt gps_bank=%.1f",
+                detail: String(format: "median_tilt=%.1f n=%d limit=%.1f since_start_s=%.1f airborne=%d gs=%.0fkt gps_bank=%.1f stored=%d",
                                attitudeCheck.decidedMedianDeg, attitudeCheck.decidedSampleCount,
                                attitudeCheck.maxDiscrepancyDeg, sinceStart, isAirborneEstimate ? 1 : 0,
-                               lastGPSSpeedKt, gpsBankDeg)
+                               lastGPSSpeedKt, gpsBankDeg, stored ? 1 : 0)
             )
         }
 
@@ -3901,7 +3954,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                 detail: String(format: "ar_pitch=%.1f cm_pitch=%.1f d_pitch=%.1f ar_roll=%.1f cm_roll=%.1f d_roll=%.1f tilt=%.1f gps_bank=%.1f hold=%d check=%@ tracking=%@",
                                arPitch, cmPitch, cmPitch - arPitch, arRoll ?? Double.nan,
                                cmRoll ?? Double.nan, rollDelta, tilt, gpsBankDeg, active ? 1 : 0,
-                               attitudeCheck.state.rawValue, arTrackingStateDescription)
+                               attitudeCheck.logDescription, arTrackingStateDescription)
             )
         }
         noteAttitudeHold(active: active, tiltDeg: tilt)
@@ -3921,7 +3974,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         FlightRecorder.shared.record(
             event: "attitude_hold",
             detail: String(format: "mode=%@ tilt=%.1f check=%@ air_hold=%d airborne=%d tracking=%@",
-                           active ? "on" : "off", tiltDeg, attitudeCheck.state.rawValue,
+                           active ? "on" : "off", tiltDeg, attitudeCheck.logDescription,
                            airHoldActive ? 1 : 0, isAirborneEstimate ? 1 : 0, arTrackingStateDescription)
         )
     }
@@ -4447,7 +4500,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                seedReference == nil ? 0 : 1, seedIsCapturing ? 1 : 0,
                                worldYawSource.rawValue)
             )
-            endSeedInPlace()
+            endPendingSeed()
             return
         }
 
@@ -4575,6 +4628,20 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // Build 36 overwrote unconditionally, so the *last* capture won rather than the best. In the
         // airliner log four captures landed in four seconds with spreads 38.0, 34.7, 50.0, 29.8 and
         // offsets spanning 48°; the steadiest happening to come last was luck.
+        // Never over an anchor in the air (#12): the anchor's capture ends the seed, and this keeps a
+        // capture closing in the same breath from undoing that.
+        guard AirborneSeedRearm.seedMayTakeWorld(
+            airborne: isAirborneEstimate,
+            anchorInForce: hasFlightAnchor || worldYawSource == .anchor) else {
+            FlightRecorder.shared.record(
+                event: "seed_rejected",
+                detail: String(format: "reason=anchor az_spread=%.1f offset=%.1f",
+                               estimate.azimuthSpreadDeg, estimate.offsetDeg)
+            )
+            seedIsResampling = false
+            endPendingSeed()
+            return
+        }
         guard SeedResamplePolicy.shouldApply(spreadDeg: estimate.azimuthSpreadDeg,
                                              bestAppliedSpreadDeg: bestSeedSpreadDeg) else {
             FlightRecorder.shared.record(
@@ -4905,6 +4972,9 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             sceneManager?.worldYawOffsetDeg = estimate.offsetDeg
             noteAlignment(offsetDeg: estimate.offsetDeg, source: .anchor,
                           anchorConstantDeg: estimate.anchorConstantDeg, measuredByCompass: false)
+            // The anchor ends any seed still on its way — the takeoff's in-place seed above all — so
+            // none can land later over it (#12).
+            endSeedForAnchor()
             FlightRecorder.shared.record(
                 event: "anchor_captured",
                 detail: String(format: "offset=%.1f n=%d secs=%.1f az_spread=%.1f track_spread=%.1f world_yaw_corr=%.1f k_window=%.1f",
