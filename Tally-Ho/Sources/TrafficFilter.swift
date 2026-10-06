@@ -22,15 +22,23 @@ import CoreLocation
 /// behave exactly as before while "Only traffic within ±10,000 ft" is on:
 ///
 /// 1. **Candidates** (`isCandidate`): the cheap cull the view controller runs over everything
-///    received, on the raw reported position: ground traffic, Max Distance and ownship. Its output
-///    also feeds TCAS, the flight log and the pressure-altitude estimate, which is why it stops at
-///    these three rules.
+///    received, on the raw reported position: ownship, ground traffic and Max Distance.
 /// 2. **Display** (`verdict`): every rule, on the dead-reckoned position and the altitude converted
 ///    into the viewer's own datum, which is where the scene draws the target.
 ///
 /// A target is shown when it passes both. `judge` and `displayed` apply both stages in one call
 /// and serve the map and the off-screen arrow. The scene manager receives the candidates and runs
 /// `verdict` on each, which comes to the same thing; `TrafficFilterTests` checks that it does.
+///
+/// Two rules sit above the rest, in both stages (#13):
+///
+/// - **Ownship is never shown**, whatever else is true of it — not even as a TCAS threat, which it
+///   can only be to itself.
+/// - **A TCAS threat (TA or RA) is always shown** otherwise, past every display rule: the Show
+///   Aircraft master switch, ground traffic, Max Distance, the callsign filter and the altitude
+///   band. Real TCAS pops a threat up whatever the display is set to, and the traffic most worth
+///   seeing must never be the traffic a setting hid. With no threats the filter is exactly the
+///   pre-#13 one.
 ///
 /// A value type with no SceneKit or UIKit dependency. The only clock it reads is the one
 /// `CalculationsLogic.predictedPosition` reads.
@@ -43,10 +51,10 @@ struct TrafficFilter {
     /// Why a target is not shown. Cases are listed in the order `judge` checks them, so the reason
     /// given is the first rule the target fails.
     enum Exclusion: Equatable, CaseIterable {
+        /// The user's own aircraft. See `isOwnship`.
+        case ownship
         /// Show Aircraft is off.
         case aircraftHidden
-        /// The user's own aircraft, identified by ownship id or by the "I'm Flying" callsign.
-        case ownship
         /// Ground traffic while Show Aircraft on Ground is off.
         case groundTraffic
         /// Further than Max Distance.
@@ -101,23 +109,36 @@ struct TrafficFilter {
     let settings: ARVisualizationSettings
     /// Whether the user is flying. The altitude band applies only in the air.
     let airborne: Bool
-    /// The user's own aircraft by id (hex), when something has identified it. Hidden in addition
-    /// to `settings.wifiOwnshipCallsign`; either one matching is enough.
+    /// The user's own aircraft by id (hex): the selection #13 resolves from a manual pick, the
+    /// receiver's ownship address or the automatic match. See `isOwnship`.
     let ownshipID: String?
+    /// This tick's TCAS threats, TA and RA, by id. Shown past every display rule but ownship.
+    let threatIDs: Set<String>
 
-    init(settings: ARVisualizationSettings, airborne: Bool, ownshipID: String? = nil) {
+    init(settings: ARVisualizationSettings, airborne: Bool, ownshipID: String? = nil,
+         threatIDs: Set<String> = []) {
         self.settings = settings
         self.airborne = airborne
         self.ownshipID = ownshipID
+        self.threatIDs = threatIDs
     }
 
     /// Whether the altitude band culls anything right now: in the air, with the setting on.
     var altitudeBandActive: Bool { airborne && settings.limitTrafficToAltitudeBand }
 
+    /// The user's own aircraft: by `ownshipID` when there is one, which is the only thing #13's
+    /// selection ever hands over — keyed by address, so another aircraft sharing the callsign is not
+    /// hidden with it. Only without an id does the "I'm Flying" callsign decide, which is how the
+    /// app worked before #13 and how a pick still works in the moments before it resolves to an id.
     func isOwnship(_ aircraft: Aircraft) -> Bool {
-        if let ownshipID, aircraft.id == ownshipID { return true }
-        if let callsign = settings.wifiOwnshipCallsign, aircraft.callsign == callsign { return true }
+        if let ownshipID { return aircraft.id == ownshipID }
+        if let callsign = settings.wifiOwnshipCallsign { return aircraft.callsign == callsign }
         return false
+    }
+
+    /// A TCAS threat that is not ownship. Ownship cannot be a threat to itself.
+    func isThreat(_ aircraft: Aircraft) -> Bool {
+        threatIDs.contains(aircraft.id) && !isOwnship(aircraft)
     }
 
     // MARK: - Stage 1: candidates
@@ -125,10 +146,11 @@ struct TrafficFilter {
     /// The rule the cheap cull rejects a target for, or nil if it is a candidate. Uses the raw
     /// reported position, exactly as the pre-filter always has.
     func candidateExclusion(_ aircraft: Aircraft, near coordinate: CLLocationCoordinate2D) -> Exclusion? {
+        if isOwnship(aircraft) { return .ownship }
+        if isThreat(aircraft) { return nil }
         if !settings.showGroundAircraft && aircraft.isGroundTraffic { return .groundTraffic }
         let distNM = CalculationsLogic.distanceInNauticalMiles(from: coordinate, to: aircraft.coordinate)
         if distNM > settings.aircraftMaxDistance { return .beyondMaxDistance }
-        if isOwnship(aircraft) { return .ownship }
         return nil
     }
 
@@ -167,8 +189,10 @@ struct TrafficFilter {
 
     /// The display rules on geometry already worked out. Every rule in one place.
     func exclusion(for aircraft: Aircraft, distanceNM: Double, verticalSeparationFt: Double) -> Exclusion? {
-        if !settings.showAircraft { return .aircraftHidden }
         if isOwnship(aircraft) { return .ownship }
+        // A threat passes every rule below, the master switch included (#13).
+        if isThreat(aircraft) { return nil }
+        if !settings.showAircraft { return .aircraftHidden }
         // The source's own on-ground flag where there is one; altitude alone misclassified traffic
         // at high-elevation airports. See `Aircraft.isGroundTraffic`.
         if !settings.showGroundAircraft && aircraft.isGroundTraffic { return .groundTraffic }
@@ -191,8 +215,8 @@ struct TrafficFilter {
     /// Judge a target against every rule, both stages. What the map and the off-screen arrow use.
     func judge(_ aircraft: Aircraft, from observer: Observer) -> Verdict {
         let display = verdict(for: aircraft, from: observer)
-        // Show Aircraft off explains everything else, so it is named first.
-        guard settings.showAircraft else { return display }
+        // Ownship and Show Aircraft off explain everything else, so they are named first.
+        if display.exclusion == .ownship || display.exclusion == .aircraftHidden { return display }
         guard let early = candidateExclusion(aircraft, near: observer.coordinate) else { return display }
         return Verdict(aircraft: aircraft, coordinate: display.coordinate,
                        placementAltitudeFt: display.placementAltitudeFt,

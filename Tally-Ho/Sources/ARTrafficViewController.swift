@@ -133,6 +133,22 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         didSet { sceneManager?.lastAirportComputeLocation = nil }
     }
     private var currentTCASEvaluation: TCASEvaluation = .clear
+    /// Advisory hysteresis and threat ranking (#13). Reset whenever TCAS stops running.
+    private var advisoryTracker = TCASSystem.AdvisoryTracker()
+    /// The threat TCAS last auto-selected. A new primary threat re-selects; when the threats clear,
+    /// only a selection TCAS itself made is released — never one the user made since.
+    private var tcasAutoSelectedID: String?
+
+    // MARK: - Ownship identification (#13)
+
+    /// Matches the traffic against the ownship estimate while airborne on internet traffic.
+    private var ownshipMatcher = OwnshipMatcher()
+    /// The Settings "I'm Flying" callsign `manualOwnshipID` was resolved from. Settings stores a
+    /// callsign; it is turned into an id once and the id is what is held.
+    private var manualOwnshipCallsign: String?
+    private var manualOwnshipID: String?
+    /// The aircraft hidden as the user's own, with how it was identified. Main thread.
+    private var ownshipSelection: OwnshipSelection?
 
     var seedLocation: CLLocation?
 
@@ -2124,15 +2140,20 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - Display filter (#14)
 
-    /// The display rules as they stand now: the settings, whether we are flying, and who we are.
-    /// One filter for the AR scene, the map and the off-screen arrow, so none of them can show
-    /// what the others would not.
+    /// The display rules as they stand now: the settings, whether we are flying, who we are and
+    /// what TCAS is calling. One filter for the AR scene, the map, the off-screen arrow and its
+    /// note, so none of them can show what the others would not.
     ///
-    /// Ownship is the "I'm Flying" callsign (in the settings) for now. #13 publishes an `ownshipID`;
-    /// once it lands it is passed here as `ownshipID:`, and all three paths hide it at once.
+    /// Ownship is #13's resolved selection — manual pick, receiver address or automatic match, by
+    /// id — so all four hide it at once. Threats are the latest TCAS evaluation's, so all four show
+    /// a TA or RA wherever it is and whatever the display settings say.
+    ///
+    /// Call after `updateOwnshipSelection` and the TCAS pass on the tick, so both are this tick's.
     private func currentTrafficFilter() -> TrafficFilter {
         TrafficFilter(settings: sceneManager?.settings ?? ARVisualizationSettings(),
-                      airborne: isAirborneEstimate)
+                      airborne: isAirborneEstimate,
+                      ownshipID: ownshipSelection?.id,
+                      threatIDs: Set(currentTCASEvaluation.threats.keys))
     }
 
     /// The viewer as the filter sees it, from one estimator snapshot: the same position, altitude
@@ -2762,20 +2783,26 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // this tick's markers are drawn with the offset this tick's heading calls for.
         updateYawFollowing()
 
-        // Pre-filter by distance and basic visibility before touching SceneKit.
-        // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
-        // rather than iterating all stored aircraft on the main thread every tick.
-        // The rules are TrafficFilter's (#14) — ground traffic, Max Distance on the reported
-        // position, and ownship — the same filter the map and the off-screen arrow use.
-        //
-        // Only the user's own aircraft is ever hidden, and only once they have identified it.
-        // Blanket-hiding everything within 2 NM used to stand in for that, but nearby traffic
-        // is the traffic that matters most — suppressing it to mask one aircraft costs far
-        // more than it saves, and it hid close targets before the user had any way to choose.
-        let trafficFilter = currentTrafficFilter()
-        let aircraftList = trafficFilter.candidates(connectionLogic.detectedAircraft.values, near: loc)
+        let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
+        let traffic = Array(connectionLogic.detectedAircraft.values)
+        // Exactly the list the datum fit and the flight recorder have always been given: in range,
+        // less a manual "I'm Flying" pick by callsign. Kept as it was so identifying ownship
+        // automatically (#13) cannot move any placement input — the user's own aircraft is the
+        // best datum sample there is, sitting at our own altitude. It is the shared filter's
+        // candidate stage with no resolved id and no threats, which is build 394's pre-filter rule
+        // for rule (#14, `TrafficFilterTests.withTheBandOnARShowsExactlyWhatBuild394Showed`).
+        let manualCallsign = currentSettings.wifiOwnshipCallsign
+        let datumTraffic = TrafficFilter(settings: currentSettings, airborne: airborne)
+            .candidates(traffic, near: loc)
 
-        updateOwnshipPressureAltitude(aircraft: aircraftList, ownAltitudeFt: altitude)
+        updateOwnshipPressureAltitude(aircraft: datumTraffic, ownAltitudeFt: altitude)
+
+        // Which aircraft is the user's own: their pick, the receiver's address, or the automatic
+        // match. Only that aircraft is ever hidden. Blanket-hiding everything within 2 NM used to
+        // stand in for this, but nearby traffic is the traffic that matters most.
+        let ownshipID = updateOwnshipSelection(traffic: traffic, state: state, altitudeFt: altitude,
+                                               geoidSeparationFt: geoidSep, airborne: airborne,
+                                               manualCallsign: manualCallsign)
 
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
@@ -2785,28 +2812,44 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             cameraPos = .init()
         }
 
-        // Evaluate TCAS only when airborne (> 200 ft). On the ground the proximity
-        // of parked/taxiing aircraft would cause constant false TA/RA alerts.
+        // Evaluate TCAS only when airborne. On the ground the proximity of parked/taxiing
+        // aircraft would cause constant false TA/RA alerts.
         let tcas: TCASEvaluation
         if airborne {
-            // Use the estimator's own velocity so the alerting geometry matches the geometry
-            // the markers are drawn with, whichever source is currently authoritative.
-            tcas = TCASSystem.evaluate(
-                aircraft: aircraftList,
-                userLocation: loc,
-                userAltitude: altitude,
-                userTrack: state.hasVelocity ? state.trackDeg : userHeading,
-                userGroundSpeed: state.hasVelocity ? state.groundSpeedKt : 0,
-                userVerticalRate: state.verticalRateFpm,
-                geoidSeparationFt: geoidSep,
-                datumFit: latestDatumFit
+            // Every aircraft except ownship, including those the display filters hide (#13). The
+            // matcher's provisional pick is left out as well, so the user's own aircraft cannot
+            // light the frame in the few seconds before it is confirmed.
+            let excludedID = ownshipID ?? ownshipMatcher.provisionalID
+            let tcasTraffic = traffic.filter { $0.id != excludedID }
+            // The estimator's own velocity, so the alerting geometry matches the geometry the
+            // markers are drawn with, whichever source is currently authoritative.
+            let own = TCASSystem.OwnState(
+                coordinate: loc,
+                altitudeFt: altitude,
+                trackDeg: state.hasVelocity ? state.trackDeg : userHeading,
+                groundSpeedKt: state.hasVelocity ? state.groundSpeedKt : 0,
+                verticalRateFpm: state.verticalRateFpm,
+                heightAboveGroundFt: heightAboveNearestFieldFt
             )
+            let pass = TCASSystem.assess(aircraft: tcasTraffic, own: own,
+                                         geoidSeparationFt: geoidSep, datumFit: latestDatumFit)
+            tcas = advisoryTracker.update(pass.assessments, sensitivityLevel: pass.sensitivity.number,
+                                          at: CACurrentMediaTime())
         } else {
-            // Ground mode — clear any active TCAS alert and pass empty evaluation
+            // Ground mode — clear any active TCAS alert, and any advisory still being held.
+            advisoryTracker.reset()
             tcas = .clear
         }
         currentTCASEvaluation = tcas
-        applyTCASOverlay(tcas)
+        applyTCASDisplay(tcas)
+
+        // What is drawn: the shared filter's candidates (#14) — in range, less ownship, plus every
+        // threat wherever it is (#13). The scene manager's verdict lets threats past the remaining
+        // rules too, and the map, the arrow and its note use the same filter, so all agree. As a
+        // pre-filter before touching SceneKit it also keeps the loop in updateAircraft small
+        // (≤ maxDistance aircraft) rather than every stored aircraft on the main thread each tick.
+        let trafficFilter = currentTrafficFilter()
+        let aircraftList = trafficFilter.candidates(traffic, near: loc)
 
         sceneManager?.updateAircraft(
             aircraftList,
@@ -2831,18 +2874,117 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         updateAlignButtonVisibility()
         noteFirstTargetIfNeeded(renderedCount: sceneManager?.renderedAircraftCount ?? 0)
-        recordFlightSampleIfDue(state: state, aircraft: aircraftList)
+        recordFlightSampleIfDue(state: state, aircraft: datumTraffic)
 
         // Update off-screen arrows at 4 Hz alongside the rest of the visualization.
         // Previously these ran at 60 Hz inside renderer(_:updateAtTime:); at 4 Hz
         // the arrow positions are more than accurate enough (aircraft move < 0.1 NM
         // between ticks) and this saves a significant chunk of CPU/RAM each second.
         if case .selected(let nodeID) = selectionState {
-            updateOffScreenArrow(for: nodeID, filter: trafficFilter, observer: trafficObserver(state))
+            // A selected threat is pointed at by its TCAS arrow, in the advisory's colour, rather
+            // than by the white selection arrow (#13). It always has a node — the filter shows a
+            // threat past every rule and the scene never caps one — so it never needs the note.
+            let selectedThreat = nodeID.hasPrefix("aircraft_")
+                && tcas.threats[String(nodeID.dropFirst("aircraft_".count))] != nil
+            if selectedThreat {
+                offScreenArrowView.hide()
+                hideSelectionNote()
+            } else {
+                updateOffScreenArrow(for: nodeID, filter: trafficFilter, observer: trafficObserver(state))
+            }
         }
         updateTCASArrows()
         updateMetarAgeLabel()
         updateStatusLabel()
+    }
+
+    // MARK: - Ownship identification (#13)
+
+    /// Decide which aircraft is the user's own this tick, log any change, and return its id.
+    ///
+    /// A manual pick in Settings wins, then the receiver's ownship address, then the automatic
+    /// match (`OwnshipSelection.resolve`). The automatic match runs only while airborne with neither
+    /// of the others in force; on the ground a confirmed match is kept but nothing new is acquired.
+    private func updateOwnshipSelection(
+        traffic: [Aircraft],
+        state: OwnshipSnapshot,
+        altitudeFt: Double,
+        geoidSeparationFt: Double?,
+        airborne: Bool,
+        manualCallsign: String?
+    ) -> String? {
+        // The manual pick: resolved to the nearest aircraft carrying the callsign, once, then
+        // held by id until the setting changes.
+        if manualCallsign != manualOwnshipCallsign {
+            manualOwnshipCallsign = manualCallsign
+            manualOwnshipID = nil
+        }
+        if let callsign = manualCallsign, manualOwnshipID == nil {
+            manualOwnshipID = OwnshipSelection.nearestID(withCallsign: callsign, in: traffic,
+                                                         near: state.coordinate)
+        }
+
+        let adsbID = connectionLogic.ownshipID
+        if manualCallsign != nil || adsbID != nil {
+            // Told, so not inferring: the automatic match stands down entirely.
+            if ownshipMatcher.selectedID != nil || ownshipMatcher.provisionalID != nil {
+                ownshipMatcher.reset()
+            }
+        } else if airborne {
+            let own = OwnshipMatcher.OwnState(coordinate: state.coordinate, altitudeFt: altitudeFt,
+                                              groundSpeedKt: state.groundSpeedKt,
+                                              trackDeg: state.trackDeg, hasVelocity: state.hasVelocity)
+            let candidates = traffic.compactMap {
+                OwnshipMatcher.candidate(from: $0, ownAltitudeFt: altitudeFt,
+                                         geoidSeparationFt: geoidSeparationFt, datumFit: latestDatumFit)
+            }
+            let event = ownshipMatcher.update(own: own, candidates: candidates,
+                                              at: Date().timeIntervalSinceReferenceDate)
+            if case .released(let id, let reason)? = event {
+                FlightRecorder.shared.record(event: "ownship_released",
+                                             detail: "source=auto id=\(id) reason=\(reason)")
+            }
+        } else {
+            ownshipMatcher.suspendAcquisition()
+        }
+
+        let resolved = OwnshipSelection.resolve(manualID: manualOwnshipID, adsbID: adsbID,
+                                                autoID: ownshipMatcher.selectedID)
+        if resolved != ownshipSelection {
+            ownshipSelection = resolved
+            logOwnshipSelection(resolved, traffic: traffic, manualCallsign: manualCallsign)
+        }
+        return resolved?.id
+    }
+
+    /// One `ownship_selected` line per change: the source, the id, the match quality and how many
+    /// candidates there were — what a flight in busy airspace needs to show whether the pick held.
+    private func logOwnshipSelection(_ selection: OwnshipSelection?, traffic: [Aircraft],
+                                     manualCallsign: String?) {
+        guard let selection else {
+            FlightRecorder.shared.record(event: "ownship_selected", detail: "source=none")
+            return
+        }
+        let callsign = traffic.first(where: { $0.id == selection.id })?.callsign ?? "-"
+        let detail: String
+        switch selection.source {
+        case .auto:
+            if let match = ownshipMatcher.selected {
+                detail = String(format: "source=auto id=%@ callsign=%@ q=%.2f dpos_nm=%.2f dalt_ft=%.0f dgs_kt=%.0f dtrk_deg=%.0f candidates=%d",
+                                selection.id, callsign, match.quality, match.horizontalNM,
+                                match.altitudeFt, match.groundSpeedKt, match.trackDeg,
+                                ownshipMatcher.selectedCandidateCount)
+            } else {
+                detail = "source=auto id=\(selection.id) callsign=\(callsign)"
+            }
+        case .manual:
+            let sharing = traffic.filter { $0.callsign == manualCallsign }.count
+            detail = "source=manual id=\(selection.id) callsign=\(manualCallsign ?? callsign) q=- candidates=\(sharing)"
+        case .adsb:
+            let adsbCallsign = connectionLogic.ownshipData?.callsign ?? callsign
+            detail = "source=adsb id=\(selection.id) callsign=\(adsbCallsign) q=- candidates=-"
+        }
+        FlightRecorder.shared.record(event: "ownship_selected", detail: detail)
     }
 
     // MARK: - Flight Recorder
@@ -3363,9 +3505,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - TCAS Off-Screen Arrows
 
-    /// For every active TCAS threat that is not the auto-selected node,
-    /// draws a colored edge chevron when the aircraft is off-screen.
-    /// On-screen threats already have a colored TCAS ring; no overlay needed.
+    /// For every active TCAS threat, selected or not, draws an edge chevron in the advisory's
+    /// colour when the aircraft is off-screen — the selected threat included, so the most urgent
+    /// one is not the only threat pointed at in white (#13).
+    /// On-screen threats already have their enlarged ring; no overlay needed.
     /// Called from the 4 Hz update loop — not the 60 Hz renderer callback.
     private func updateTCASArrows() {
         let tcas = currentTCASEvaluation
@@ -3379,9 +3522,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         for (id, level) in tcas.threats {
             let nodeID = "aircraft_\(id)"
-            // Skip the auto-selected node — its arrow is handled by updateOffScreenArrow
-            if case .selected(let sel) = selectionState, sel == nodeID { continue }
-
             guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else { continue }
 
             let projected = arSceneView.projectPoint(node.worldPosition)
@@ -3409,9 +3549,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // On-screen threats don't need an overlay — the ring is enough.
             guard !onScreen else { continue }
 
-            let color: UIColor = level == .resolutionAdvisory
-                ? UIColor(red: 1.0, green: 0.15, blue: 0.0, alpha: 1.0)  // RA — vivid red
-                : UIColor(red: 1.0, green: 0.6,  blue: 0.0, alpha: 1.0)  // TA — amber
+            // The frame's colours, so an arrow and the frame never disagree: TA yellow, RA red.
+            let color = ARComponentFactory.tcasAlertColor(for: level)
 
             let (edgePoint, angle) = screenEdgePoint(
                 projected: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
@@ -3427,45 +3566,52 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - TCAS Overlay
 
-    private func applyTCASOverlay(_ tcas: TCASEvaluation) {
+    /// The screen frame and the auto-selection (#13).
+    ///
+    /// Targets stay red; the frame carries the advisory — yellow for a TA, red for an RA. The most
+    /// urgent threat is auto-selected, and the existing selection appearance dims every other
+    /// non-threat target to yellow behind it. Nothing is hidden: the RA isolation that used to
+    /// remove all other traffic from the screen is gone.
+    private func applyTCASDisplay(_ tcas: TCASEvaluation) {
         let newLevel = tcas.overallLevel
-        let levelChanged = newLevel != lastAppliedTCASLevel
-        lastAppliedTCASLevel = newLevel
+        if newLevel != lastAppliedTCASLevel {
+            lastAppliedTCASLevel = newLevel
+            tcasOverlayView.layer.borderColor = ARComponentFactory.tcasAlertColor(for: newLevel).cgColor
+            FlightRecorder.shared.record(event: "tcas_level", detail: tcasLogDetail(tcas))
+        }
 
-        switch newLevel {
-        case .none:
-            tcasOverlayView.layer.borderColor = UIColor.clear.cgColor
-            // Returning to normal — restore all aircraft visibility and clear auto-selection
-            if levelChanged {
-                sceneManager?.setRAFilterActive(false, threatIDs: [])
+        if let primary = tcas.primaryThreatID {
+            // Re-selected only when the primary threat changes, so a user who taps away from it
+            // during an advisory is not pulled straight back four times a second.
+            if primary != tcasAutoSelectedID {
+                tcasAutoSelectedID = primary
+                applySelection(nodeID: "aircraft_\(primary)")
+                FlightRecorder.shared.record(event: "tcas_primary", detail: tcasLogDetail(tcas))
+            }
+        } else if let previous = tcasAutoSelectedID {
+            tcasAutoSelectedID = nil
+            // Release only the selection TCAS made, never one the user has made since.
+            if selectionState == .selected(nodeID: "aircraft_\(previous)") {
                 clearSelection()
             }
-
-        case .trafficAdvisory:
-            tcasOverlayView.layer.borderColor =
-                UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.85).cgColor
-            // Restore full aircraft visibility (RA isolation may have been active)
-            if levelChanged {
-                sceneManager?.setRAFilterActive(false, threatIDs: [])
-                // Auto-select the primary (closest) TA threat aircraft
-                if let primaryID = tcas.threats.keys.first {
-                    applySelection(nodeID: "aircraft_\(primaryID)")
-                }
-            }
-
-        case .resolutionAdvisory:
-            tcasOverlayView.layer.borderColor = UIColor.red.cgColor
-            // Hide all non-threat aircraft — show only RA/TA targets
-            let threatIDs = Set(tcas.threats.keys)
-            sceneManager?.setRAFilterActive(true, threatIDs: threatIDs)
-            if levelChanged {
-                // Auto-select the primary RA threat
-                if let primaryID = tcas.threats.first(where: { $0.value == .resolutionAdvisory })?.key
-                    ?? tcas.threats.keys.first {
-                    applySelection(nodeID: "aircraft_\(primaryID)")
-                }
-            }
         }
+    }
+
+    /// The advisory, its sensitivity level and the primary threat's geometry, for the log — the
+    /// numbers a flight needs to judge TA/RA timing against what was seen out of the window.
+    private func tcasLogDetail(_ tcas: TCASEvaluation) -> String {
+        let sl = tcas.sensitivityLevel.map { String($0) } ?? "-"
+        guard let primary = tcas.primaryThreatID else {
+            return "level=\(tcas.overallLevel.shortName) sl=\(sl) threats=0"
+        }
+        let level = tcas.threats[primary]?.shortName ?? "-"
+        let tau = tcas.threatTausS[primary] ?? .infinity
+        let tauText = tau.isFinite ? String(format: "%.1f", tau) : "inf"
+        let range = tcas.threatRangesNM[primary] ?? .nan
+        let callsign = connectionLogic.detectedAircraft[primary]?.callsign ?? "-"
+        return String(format: "level=%@ sl=%@ threats=%d primary=%@ callsign=%@ primary_level=%@ tau_s=%@ range_nm=%.2f",
+                      tcas.overallLevel.shortName, sl, tcas.threats.count, primary, callsign,
+                      level, tauText, range)
     }
 
     // MARK: - HUD
@@ -3650,16 +3796,28 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         lines.append("📷 \(arStateStr)")
 
-        // TCAS status
+        // TCAS status — the same colours as the frame and the arrows: TA yellow, RA red.
+        let slText = currentTCASEvaluation.sensitivityLevel.map { "  SL\($0)" } ?? ""
         switch currentTCASEvaluation.overallLevel {
         case .none:
             break
         case .trafficAdvisory:
             let count = currentTCASEvaluation.threats.count
-            lines.append("⚠️ TCAS TA: \(count) aircraft")
+            lines.append("⚠️ TCAS TA: \(count) aircraft\(slText)")
         case .resolutionAdvisory:
             let raCount = currentTCASEvaluation.threats.values.filter { $0 == .resolutionAdvisory }.count
-            lines.append("🔴 TCAS RA: \(raCount) aircraft")
+            let taCount = currentTCASEvaluation.threats.count - raCount
+            let taText = taCount > 0 ? " (+\(taCount) TA)" : ""
+            lines.append("🔴 TCAS RA: \(raCount) aircraft\(taText)\(slText)")
+        }
+
+        // Which aircraft is hidden as the user's own, and how it was found (#13).
+        if let selection = ownshipSelection {
+            let callsign = connectionLogic.detectedAircraft[selection.id]?.callsign ?? selection.id
+            lines.append("🙋 Ownship: \(callsign) [\(selection.id)] \(selection.source.rawValue)")
+        } else if let provisional = ownshipMatcher.provisionalID {
+            let callsign = connectionLogic.detectedAircraft[provisional]?.callsign ?? provisional
+            lines.append("🙋 Ownship: matching \(callsign)… (\(ownshipMatcher.candidateCount) candidate(s))")
         }
 
         // Traffic

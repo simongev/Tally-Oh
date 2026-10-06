@@ -271,6 +271,91 @@ struct TrafficFilterTests {
         #expect(filter().isOwnship(aircraft(northNM: 0.01)) == false)
     }
 
+    /// #13's selection hands over an id, keyed by address. Once there is one, the callsign no longer
+    /// decides: another aircraft that happens to share it stays visible.
+    @Test func ownshipIdTakesPrecedenceOverTheCallsign() {
+        let f = filter(ownshipID: "abc123") { $0.wifiOwnshipCallsign = "SWA2024" }
+        let mine = aircraft(id: "abc123", callsign: "SWA2024", northNM: 0.05)
+        let namesake = aircraft(id: "def456", callsign: "SWA2024", northNM: 3)
+        #expect(exclusion(mine, f) == .ownship)
+        #expect(exclusion(namesake, f) == nil)
+    }
+
+    // MARK: - TCAS threats (#13)
+
+    /// A TA or RA is shown past every display rule. Here: 31,000 ft below a cruising viewer, far
+    /// outside the band.
+    @Test func threatOutsideTheBandIsShown() {
+        let obs = observer(altitudeFt: 36_000)
+        let low = aircraft(id: "threat1", northNM: 2, altitude: 5_000)
+        let plain = filter(airborne: true)
+        #expect(exclusion(low, plain, observer: obs) == .outsideAltitudeBand)
+
+        let withThreat = TrafficFilter(settings: settings(), airborne: true, threatIDs: ["threat1"])
+        #expect(withThreat.isThreat(low))
+        #expect(withThreat.verdict(for: low, from: obs).exclusion == nil)
+        #expect(exclusion(low, withThreat, observer: obs) == nil)
+        let shownIDs: [String] = withThreat.displayed([low], from: obs).map { $0.aircraft.id }
+        #expect(shownIDs == ["threat1"])
+    }
+
+    /// Every other rule gives way to a threat too: Max Distance (on the report and dead-reckoned),
+    /// ground traffic and the callsign filter.
+    @Test func threatPassesEveryOtherDisplayRule() {
+        let obs = observer(altitudeFt: 36_000)
+        let s = settings { $0.aircraftMaxDistance = 10; $0.callsignFilter = "UAL" }
+        let far = aircraft(id: "far", callsign: "UAL1", northNM: 30)
+        let grounded = aircraft(id: "grounded", callsign: "UAL2", northNM: 2, altitude: 20)
+        let otherCallsign = aircraft(id: "other", callsign: "DAL3", northNM: 2)
+
+        let plain = TrafficFilter(settings: s, airborne: true)
+        #expect(exclusion(far, plain, observer: obs) == .beyondMaxDistance)
+        #expect(exclusion(grounded, plain, observer: obs) == .groundTraffic)
+        #expect(exclusion(otherCallsign, plain, observer: obs) == .callsignFilter)
+
+        let f = TrafficFilter(settings: s, airborne: true, threatIDs: ["far", "grounded", "other"])
+        for ac in [far, grounded, otherCallsign] {
+            #expect(f.isCandidate(ac, near: Self.here))
+            #expect(f.verdict(for: ac, from: obs).exclusion == nil)
+            #expect(exclusion(ac, f, observer: obs) == nil)
+        }
+    }
+
+    /// Approved for #13: the master switch gives way to a threat as well, as a real TCAS display
+    /// pops a threat up whatever it is set to. Everything else stays hidden.
+    @Test func threatShownWithShowAircraftOff() {
+        let obs = observer(altitudeFt: 36_000)
+        let s = settings { $0.showAircraft = false }
+        let threat = aircraft(id: "threat1", northNM: 3)
+        let bystander = aircraft(id: "bystander", northNM: 3)
+        let f = TrafficFilter(settings: s, airborne: true, threatIDs: ["threat1"])
+        #expect(exclusion(threat, f, observer: obs) == nil)
+        #expect(exclusion(bystander, f, observer: obs) == .aircraftHidden)
+        let shownIDs: [String] = f.displayed([threat, bystander], from: obs).map { $0.aircraft.id }
+        #expect(shownIDs == ["threat1"])
+    }
+
+    /// Ownship is never shown, even listed as a threat — which it could only be to itself.
+    @Test func ownshipIsNeverShownEvenAsAThreat() {
+        let obs = observer(altitudeFt: 36_000)
+        let mine = aircraft(id: "abc123", callsign: "SWA2024", northNM: 0.02, altitude: 36_000)
+
+        let byIDThreat = TrafficFilter(settings: settings(), airborne: true,
+                                       ownshipID: "abc123", threatIDs: ["abc123"])
+        #expect(byIDThreat.isThreat(mine) == false)
+        #expect(byIDThreat.candidateExclusion(mine, near: Self.here) == .ownship)
+        #expect(byIDThreat.verdict(for: mine, from: obs).exclusion == .ownship)
+        #expect(exclusion(mine, byIDThreat, observer: obs) == .ownship)
+        #expect(byIDThreat.displayed([mine], from: obs).isEmpty)
+
+        // Identified by the "I'm Flying" callsign alone, with Show Aircraft off on top.
+        let s = settings { $0.wifiOwnshipCallsign = "SWA2024"; $0.showAircraft = false }
+        let byCallsignThreat = TrafficFilter(settings: s, airborne: true, threatIDs: ["abc123"])
+        #expect(byCallsignThreat.isThreat(mine) == false)
+        #expect(exclusion(mine, byCallsignThreat, observer: obs) == .ownship)
+        #expect(byCallsignThreat.displayed([mine], from: obs).isEmpty)
+    }
+
     @Test func everyExclusionHasItsOwnNote() {
         let notes = TrafficFilter.Exclusion.allCases.map { $0.noteText }
         #expect(notes.allSatisfy { !$0.isEmpty })
@@ -395,19 +480,28 @@ struct TrafficFilterTests {
     /// and off.
     @Test func mapShowsExactlyWhatARShows() {
         let obs = observer(altitudeFt: 36_000)
+        // No threats; threats culled by several different rules; and ownship listed as a threat.
+        let threatSets: [Set<String>] = [[], ["near-low", "far", "parked", "inbound-edge"], ["mine", "near-high"]]
         for var s in settingsVariants {
             for band in [true, false] {
                 s.limitTrafficToAltitudeBand = band
                 for airborne in [true, false] {
-                    let f = TrafficFilter(settings: s, airborne: airborne, ownshipID: "near-co-alt")
-                    let map: [String] = f.displayed(mixedFleet, from: obs).map { $0.aircraft.id }
-                    let candidates = f.candidates(mixedFleet, near: obs.coordinate)
-                    let verdicts = candidates.map { f.verdict(for: $0, from: obs) }
-                    let ar: [String] = verdicts.filter { $0.isShown }.map { $0.aircraft.id }
-                    let mapSet = Set(map)
-                    let arSet = Set(ar)
-                    #expect(mapSet == arSet)
-                    #expect(map.count == mapSet.count)
+                    for threats in threatSets {
+                        let f = TrafficFilter(settings: s, airborne: airborne, ownshipID: "mine",
+                                              threatIDs: threats)
+                        let map: [String] = f.displayed(mixedFleet, from: obs).map { $0.aircraft.id }
+                        let candidates = f.candidates(mixedFleet, near: obs.coordinate)
+                        let verdicts = candidates.map { f.verdict(for: $0, from: obs) }
+                        let ar: [String] = verdicts.filter { $0.isShown }.map { $0.aircraft.id }
+                        let mapSet = Set(map)
+                        let arSet = Set(ar)
+                        #expect(mapSet == arSet)
+                        #expect(map.count == mapSet.count)
+                        // Every threat but ownship is on both, whatever the settings.
+                        let expectedThreats = threats.subtracting(["mine"])
+                        #expect(expectedThreats.isSubset(of: mapSet))
+                        #expect(!mapSet.contains("mine"))
+                    }
                 }
             }
         }
@@ -435,10 +529,13 @@ struct TrafficFilterTests {
     @Test func judgeAgreesWithDisplayed() {
         let obs = observer(altitudeFt: 36_000)
         for s in settingsVariants {
-            let f = TrafficFilter(settings: s, airborne: true)
-            let shown = Set(f.displayed(mixedFleet, from: obs).map { $0.aircraft.id })
-            for ac in mixedFleet {
-                #expect(f.judge(ac, from: obs).isShown == shown.contains(ac.id))
+            let threatSets: [Set<String>] = [[], ["near-low", "far", "mine"]]
+            for threats in threatSets {
+                let f = TrafficFilter(settings: s, airborne: true, threatIDs: threats)
+                let shown = Set(f.displayed(mixedFleet, from: obs).map { $0.aircraft.id })
+                for ac in mixedFleet {
+                    #expect(f.judge(ac, from: obs).isShown == shown.contains(ac.id))
+                }
             }
         }
     }

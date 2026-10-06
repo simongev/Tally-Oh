@@ -102,7 +102,11 @@ class ARComponentFactory {
 
     // Default (no selection): all rings are RED — the most visible colour on a sky background.
     // When a selection is active: selected ring stays RED, all other rings dim to YELLOW
-    // so the selected target stands out clearly.
+    // so the selected target stands out clearly — except TCAS threats, which stay RED (#13).
+    //
+    // Threat rings are red at every level; TA and RA are told apart by the ring's size and the
+    // screen frame's colour (TA yellow, RA red), never by turning a target amber. "Targets stay
+    // red" — an amber ring read as the yellow of a dimmed, unselected target.
 
     private static let ringImageNormal: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadius),
@@ -112,7 +116,7 @@ class ARComponentFactory {
     private static let ringImageTA: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusTA),
         thickness:   CGFloat(aircraftRingThicknessTA),
-        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0))    // amber for TA
+        color: UIColor(red: 1.0, green: 0.15, blue: 0.15, alpha: 1.0))  // red — larger ring for TA
 
     private static let ringImageRA: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusRA),
@@ -137,7 +141,7 @@ class ARComponentFactory {
     private static let ringImageTAStale: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusTA),
         thickness:   CGFloat(aircraftRingThicknessTA),
-        color: UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0), dashed: true)
+        color: UIColor(red: 1.0, green: 0.15, blue: 0.15, alpha: 1.0), dashed: true)
 
     private static let ringImageRAStale: UIImage = makeRingImage(
         outerRadius: CGFloat(aircraftRingRadiusRA),
@@ -215,6 +219,29 @@ class ARComponentFactory {
         m.writesToDepthBuffer  = false
         return m
     }()
+
+    /// Yellow, for a non-threat ring while another target is selected. Shared like the others,
+    /// so it must never be mutated; it replaces the per-node copies the dimming used to make.
+    private static let ringMaterialDimmed: SCNMaterial = {
+        let m = SCNMaterial()
+        m.diffuse.contents  = ringImageSelected
+        m.emission.contents = ringImageSelected
+        m.isDoubleSided     = true
+        m.transparencyMode  = .aOne
+        m.readsFromDepthBuffer = false
+        m.writesToDepthBuffer  = false
+        return m
+    }()
+
+    /// The ring material for a level, staleness and selection state.
+    ///
+    /// `dimmed` is "another target is selected and this one is not". It turns ordinary traffic
+    /// yellow; a TCAS threat ignores it and stays red (#13), because a threat must never look like
+    /// background traffic, whichever target the user — or TCAS itself — has selected.
+    static func ringMaterial(for level: TCASAlertLevel, isStale: Bool = false, dimmed: Bool) -> SCNMaterial {
+        if dimmed && level == .none { return ringMaterialDimmed }
+        return ringMaterial(for: level, isStale: isStale)
+    }
 
     static func ringMaterial(for level: TCASAlertLevel, isStale: Bool = false) -> SCNMaterial {
         if isStale {
@@ -303,18 +330,14 @@ class ARComponentFactory {
 
     // MARK: - TCAS Colors
 
-    /// Ring color and glow for a given TCAS alert level.
-    static func aircraftRingColors(for tcasLevel: TCASAlertLevel) -> (fill: UIColor, glow: UIColor) {
-        switch tcasLevel {
-        case .none:
-            return (UIColor(red: 1, green: 0.15, blue: 0.15, alpha: 1),
-                    UIColor(red: 1, green: 0.2,  blue: 0.2,  alpha: 0.6))
-        case .trafficAdvisory:
-            return (UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 1.0),
-                    UIColor(red: 1.0, green: 0.6, blue: 0.0, alpha: 0.8))
-        case .resolutionAdvisory:
-            return (UIColor(red: 1.0, green: 0.2, blue: 0.0, alpha: 1.0),
-                    UIColor(red: 1.0, green: 0.3, blue: 0.0, alpha: 1.0))
+    /// The one colour per advisory level shared by the screen frame and the off-screen arrows
+    /// (#13): TA yellow, RA red, clear when there is no advisory. Target rings are not coloured by
+    /// this — they stay red at every level.
+    static func tcasAlertColor(for level: TCASAlertLevel) -> UIColor {
+        switch level {
+        case .none:               return .clear
+        case .trafficAdvisory:    return UIColor(red: 1.0, green: 0.82, blue: 0.0, alpha: 1.0)
+        case .resolutionAdvisory: return UIColor(red: 1.0, green: 0.1,  blue: 0.1, alpha: 1.0)
         }
     }
 
@@ -475,7 +498,8 @@ class ARComponentFactory {
     /// Ring colour rules:
     ///   - No selection active  → all rings RED (default, `ringMaterial` / `ringImageNormal`)
     ///   - Selection active, this node IS selected   → ring stays RED + scale up
-    ///   - Selection active, this node is NOT selected → ring dims to YELLOW (`ringImageSelected`)
+    ///   - Selection active, this node is NOT selected → ring dims to YELLOW (`ringImageSelected`),
+    ///     unless it is a TCAS threat, which stays RED (#13)
     ///
     /// - Parameters:
     ///   - selected:     True only when this specific container is the chosen target.
@@ -501,23 +525,14 @@ class ARComponentFactory {
                 // The ring plane uses a *shared* SCNMaterial per TCAS level.
                 // NEVER mutate the shared material directly — clone for any per-node override.
                 let levelRaw = node.accessibilityLabel.flatMap { Int($0) } ?? 0
-                let level    = TCASAlertLevel(rawValue: levelRaw) ?? .none
+                let level: TCASAlertLevel = TCASAlertLevel(rawValue: levelRaw) ?? TCASAlertLevel.none
 
-                if hasSelection && !selected {
-                    // A different node is selected — dim this ring to yellow so the
-                    // selected target stands out. Clone to avoid mutating the shared material.
-                    if let existing = plane.materials.first {
-                        let copy = existing.copy() as! SCNMaterial
-                        copy.diffuse.contents  = ringImageSelected   // yellow
-                        copy.emission.contents = ringImageSelected
-                        plane.materials = [copy]
-                    }
-                } else {
-                    // Either no selection is active (all rings red) or this IS the selected
-                    // node (selected ring stays red). Restore the shared red material,
-                    // preserving the dashed/stale appearance if applicable.
-                    plane.materials = [ringMaterial(for: level, isStale: isStale)]
-                }
+                // A different node is selected: ordinary traffic dims to yellow so the selected
+                // target stands out, while a TCAS threat stays red (#13). Otherwise — no
+                // selection, or this IS the selected node — the shared red material, dashed if
+                // stale.
+                plane.materials = [ringMaterial(for: level, isStale: isStale,
+                                                dimmed: hasSelection && !selected)]
             }
         }
         SCNTransaction.commit()
@@ -721,10 +736,18 @@ class ARComponentFactory {
             }
         }
 
+        // NOTE: selectedNodeID stores the full node name ("aircraft_<id>"), not the bare aircraft id.
+        let isSelected = selectedNodeID == "aircraft_\(aircraft.id)"
+        let isDimmed = selectedNodeID != nil && !isSelected
+
         // Update ring size/material only when TCAS level or staleness changes.
         // "accessibilityLabel" stays a pure numeric level tag ("0"/"1"/"2") since
         // applySelectedAppearance parses it as Int; staleness is tracked separately
         // via "ringMatTag" so either change alone triggers a material refresh.
+        //
+        // The material honours the selection too. A level change used to swap in the shared red
+        // material unconditionally, so a TA clearing while another target was selected left that
+        // one ring red among yellow ones until the selection next changed.
         if let ringNode = node.childNode(withName: "ring", recursively: false) {
             let levelTag = String(tcasLevel.rawValue)   // "0" = none, "1" = TA, "2" = RA
             let combinedTag = levelTag + (isStale ? "s" : "")
@@ -740,8 +763,8 @@ class ARComponentFactory {
                         plane.width  = newSize
                         plane.height = newSize
                     }
-                    // Swap to the shared material for this level/staleness combination
-                    plane.materials = [ringMaterial(for: tcasLevel, isStale: isStale)]
+                    // Swap to the shared material for this level/staleness/selection combination
+                    plane.materials = [ringMaterial(for: tcasLevel, isStale: isStale, dimmed: isDimmed)]
                     SCNTransaction.commit()
                 }
             }
@@ -749,10 +772,8 @@ class ARComponentFactory {
 
         // Update distance-based scale at 4 Hz so it stays current as the aircraft moves.
         // The selected node is always rendered at scale 1.0; all others use the distance factor.
-        // NOTE: selectedNodeID stores the full node name ("aircraft_<id>"), not the bare aircraft id.
         let distScale = markerDistanceScale(distanceNM)
         node.setValue(NSNumber(value: distScale), forKey: "distanceScale")
-        let isSelected = selectedNodeID == "aircraft_\(aircraft.id)"
         let s: Float = isSelected ? 1.0 : distScale
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
@@ -974,10 +995,6 @@ class ARSceneManager {
     /// read on the SceneKit thread at 60 Hz (tickAirportPositions).
     private var tickAirportSnapshot: [(airport: Airport, node: SCNNode)] = []
 
-    /// When true, only aircraft whose IDs are in raFilterThreatIDs are shown.
-    private var raFilterActive: Bool = false
-    private var raFilterThreatIDs: Set<String> = []
-
     // Airport stable-set cache — recomputed only when the user moves >0.1 NM,
     // not on every 4 Hz tick. GPS jitter within a stationary position previously
     // caused slightly different airports to win the distance-sort cap each tick,
@@ -995,9 +1012,11 @@ class ARSceneManager {
     // MARK: - 60 Hz Position Update
 
     func tickAircraftPositions(cameraWorldPosition: SCNVector3) {
-        guard settings.showAircraft else { return }
-
         let aircraft = liveAircraft
+        // With aircraft switched off the 4 Hz pass leaves only TCAS threats here (#13), and
+        // nothing at all when there are none.
+        guard settings.showAircraft || !aircraft.isEmpty else { return }
+
         var userLoc = liveUserLocation
         var userAlt = liveUserAltitude
         var geoidSep = liveGeoidSeparationFt
@@ -1019,7 +1038,6 @@ class ARSceneManager {
 
         for ac in aircraft {
             guard let node = nodeSnapshot[ac.id], !node.isHidden else { continue }
-            if raFilterActive && !raFilterThreatIDs.contains(ac.id) { continue }
             let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
             let targetAlt = CalculationsLogic.placementAltitude(
                 for: ac, targetAltitude: predAlt, userAltitudeFt: userAlt,
@@ -1087,7 +1105,14 @@ class ARSceneManager {
         datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) {
         let onGround = !filter.airborne
-        guard settings.showAircraft else {
+        // TCAS threats are drawn whatever the display filters say (#13). A TA or RA is the traffic
+        // the user most needs to see, so neither the master switch, the range, callsign and ground
+        // filters, the ±10,000 ft band nor the node caps below may hide one. The display rules let
+        // them through in `TrafficFilter` (#14), so the map, the arrow and the note agree; the node
+        // caps are this loop's own, and skip them here.
+        let threatIDs = filter.threatIDs
+
+        guard settings.showAircraft || !threatIDs.isEmpty else {
             nodesLock.lock()
             let all = Array(aircraftNodes.values)
             nodesLock.unlock()
@@ -1116,26 +1141,33 @@ class ARSceneManager {
         let maxNewNodesPerTick = 20
         var newNodesThisTick   = 0
 
-        // Every display rule — ground traffic, Max Distance, the callsign filter and the altitude
-        // band — is `TrafficFilter.verdict`, the same test the 2D map and the off-screen arrow use
-        // (#14). It judges each target at the dead-reckoned position and converted altitude the
-        // marker is drawn at, and hands both back, so the cull and the placement cannot disagree:
-        // mixing the raw reported coordinate into the cull with the predicted one in placement
-        // caused pop-in, pop-out and wrong depth stacking whenever a fast target's report was stale.
+        // Every display rule — the master switch, ownship, ground traffic, Max Distance, the
+        // callsign filter, the altitude band and the threat bypass — is `TrafficFilter.verdict`,
+        // the same test the 2D map and the off-screen arrow use (#14). It judges each target at the
+        // dead-reckoned position and converted altitude the marker is drawn at, and hands both
+        // back, so the cull and the placement cannot disagree: mixing the raw reported coordinate
+        // into the cull with the predicted one in placement caused pop-in, pop-out and wrong depth
+        // stacking whenever a fast target's report was stale.
         let observer = TrafficFilter.Observer(coordinate: userLocation, altitudeFt: userAltitude,
                                               geoidSeparationFt: geoidSeparationFt, datumFit: datumFit)
 
-        // Nearest first. Both the node ceiling and the per-tick creation limit stop partway
-        // through this loop, so whatever order it runs in decides which aircraft get drawn.
-        // Dictionary order is arbitrary, which in dense airspace meant the closest traffic
+        // Threats first, then nearest first. Both the node ceiling and the per-tick creation limit
+        // stop partway through this loop, so whatever order it runs in decides which aircraft get
+        // drawn. Dictionary order is arbitrary, which in dense airspace meant the closest traffic
         // could be dropped in favour of traffic twenty miles away.
-        let shownNearestFirst = aircraft
+        let shownInOrder = aircraft
             .map { filter.verdict(for: $0, from: observer) }
             .filter { $0.isShown }
-            .sorted { $0.distanceNM < $1.distanceNM }
+            .sorted { lhs, rhs in
+                let lhsThreat = threatIDs.contains(lhs.aircraft.id)
+                let rhsThreat = threatIDs.contains(rhs.aircraft.id)
+                if lhsThreat != rhsThreat { return lhsThreat }
+                return lhs.distanceNM < rhs.distanceNM
+            }
 
-        for shown in shownNearestFirst {
+        for shown in shownInOrder {
             let ac        = shown.aircraft
+            let isThreat  = threatIDs.contains(ac.id)
             let predCoord = shown.coordinate
             let targetAlt = shown.placementAltitudeFt
             let distNM    = shown.distanceNM
@@ -1154,11 +1186,13 @@ class ARSceneManager {
                 worldYawOffsetDeg: placement.offsetDeg
             )
 
-            let tcasLevel = tcasEvaluation.threats[ac.id] ?? .none
+            let tcasLevel: TCASAlertLevel = tcasEvaluation.threats[ac.id] ?? TCASAlertLevel.none
 
             if let existing = aircraftNodes[ac.id] {
-                // In RA isolation mode only show threat aircraft
-                existing.isHidden = raFilterActive && !raFilterThreatIDs.contains(ac.id)
+                // Nothing that reaches this point is hidden. An RA used to hide every non-threat
+                // aircraft here; that isolation is gone (#13) — other traffic dims to yellow
+                // behind the auto-selected threat instead, and stays visible.
+                existing.isHidden = false
                 ARComponentFactory.updateAircraftMarker(
                     node: existing,
                     aircraft: ac,
@@ -1169,9 +1203,11 @@ class ARSceneManager {
                     isStale: isStale
                 )
             } else {
-                // Enforce hard total-node cap and per-tick creation rate limit
-                guard aircraftNodes.count < maxTotalNodes else { continue }
-                guard newNodesThisTick < maxNewNodesPerTick else { continue }
+                // Enforce hard total-node cap and per-tick creation rate limit — never on a threat.
+                if !isThreat {
+                    guard aircraftNodes.count < maxTotalNodes else { continue }
+                    guard newNodesThisTick < maxNewNodesPerTick else { continue }
+                }
                 newNodesThisTick += 1
 
                 let node = ARComponentFactory.createAircraftMarker(
@@ -1469,29 +1505,6 @@ class ARSceneManager {
             return airportNodes[icao]
         }
         return nil
-    }
-
-    // MARK: - RA Filter (Resolution Advisory isolation)
-
-    /// Activates or deactivates RA isolation mode.
-    /// When active, only aircraft in `threatIDs` are visible; all others are hidden.
-    func setRAFilterActive(_ active: Bool, threatIDs: Set<String>) {
-        raFilterActive    = active
-        raFilterThreatIDs = threatIDs
-
-        nodesLock.lock()
-        let snapshot = aircraftNodes
-        nodesLock.unlock()
-
-        for (id, node) in snapshot {
-            if active {
-                node.isHidden = !threatIDs.contains(id)
-            } else {
-                // Restore — the next updateAircraft tick will set visibility correctly,
-                // but unhide immediately so there's no flash when returning to normal.
-                node.isHidden = false
-            }
-        }
     }
 
     // MARK: Clear
