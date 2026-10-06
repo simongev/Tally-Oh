@@ -141,8 +141,9 @@ class ConnectionLogic: ObservableObject {
     /// always the closest N. Bounds the dictionary that is copied on every update tick;
     /// beyond this, additional distant traffic adds cost without adding awareness.
     private let maxInternetAircraft = 100
-    /// Timestamp of the most recent internet fetch request — used to compute
-    /// dynamic extrapolation latency in the dead-reckoning position predictor.
+    /// Timestamp of the most recent internet fetch request. Diagnostic only: nothing reads it,
+    /// and in particular the dead-reckoning predictor does not — it extrapolates each aircraft
+    /// from its own `lastUpdate`, which is the report's time (fetch time minus "seen_pos").
     private(set) var lastInternetFetchTime: Date?
 
     // MARK: Private — Cleanup
@@ -473,9 +474,26 @@ class ConnectionLogic: ObservableObject {
         mergeInternetAircraft(list)
     }
 
-    private func mergeInternetAircraft(_ list: [Aircraft]) {
-        let fetchTime = Date()
+    /// Fold one fetch's aircraft into the store, keyed by id.
+    ///
+    /// `lastUpdate` arrives as the report's own time — when the server last had a position, not
+    /// when we fetched it (ADSBLolClient subtracts "seen_pos") — and is kept as is: the predictor
+    /// extrapolates from it, and overwriting it with the fetch time used to throw that age away,
+    /// drawing every internet target a second or more behind where it was.
+    ///
+    /// Because the time is now the report's, a report can be older than the one already stored
+    /// for the same aircraft: the calibration-screen preload landing after a regular fetch, or two
+    /// fetches answered out of order. The newer report always wins.
+    static func merge(_ updates: [String: Aircraft], into store: [String: Aircraft]) -> [String: Aircraft] {
+        var merged = store
+        for (id, incoming) in updates {
+            if let stored = merged[id], stored.lastUpdate > incoming.lastUpdate { continue }
+            merged[id] = incoming
+        }
+        return merged
+    }
 
+    private func mergeInternetAircraft(_ list: [Aircraft]) {
         // ── Step 1: snapshot — must happen on the main thread ──────────────────────
         // detectedAircraft, ownshipData, and currentLocation are @Published properties
         // owned by the main thread.  Reading them from the URLSession background callback
@@ -495,7 +513,7 @@ class ConnectionLogic: ObservableObject {
                 guard let self else { return }
 
                 var updates: [String: Aircraft] = [:]
-                for var ac in list {
+                for ac in list {
                     // Pre-filter by distance — aircraft outside render range are never stored.
                     if let ownLoc {
                         let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
@@ -518,7 +536,8 @@ class ConnectionLogic: ObservableObject {
                     // hundred stored aircraft were an arbitrary hundred, and once full no
                     // new aircraft could enter for 90 seconds — so the nearest traffic, the
                     // traffic that matters most, was routinely the traffic left out.
-                    ac.lastUpdate = fetchTime
+                    //
+                    // `lastUpdate` is left as the report's own time; see `merge`.
                     updates[ac.id] = ac
                 }
 
@@ -527,8 +546,7 @@ class ConnectionLogic: ObservableObject {
                 // ── Step 3: merge on main thread — one @Published fire ──────────────
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    var merged = self.detectedAircraft
-                    for (id, ac) in updates { merged[id] = ac }
+                    var merged = ConnectionLogic.merge(updates, into: self.detectedAircraft)
 
                     // Enforce the cap by keeping the closest aircraft, so a nearer target can
                     // always displace a more distant one. Aircraft received earlier that have

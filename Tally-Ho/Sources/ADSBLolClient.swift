@@ -131,7 +131,24 @@ class ADSBLolClient {
         return d
     }()
 
-    private static func parseResponse(_ data: Data) throws -> [Aircraft] {
+    /// Longest report age taken from "seen_pos", in seconds.
+    ///
+    /// A negative age would date a report in the future: never stale, never pruned, a dead target
+    /// kept alive. An absurd one is a server fault, not a measurement. A live ADS-B position is
+    /// normally a second or two old, so anything past 60 s is treated as 60 s: already dashed as
+    /// stale (past `staleAircraftAgeSeconds`), and pruned 90 s after the feed stops serving it.
+    static let maxReportAgeSeconds: TimeInterval = 60
+
+    /// How old a position already was when the server sent it: "seen_pos" clamped to
+    /// [0, `maxReportAgeSeconds`]. Zero when the field is absent.
+    static func reportAge(seenPos: Double?) -> TimeInterval {
+        guard let seenPos, !seenPos.isNaN else { return 0 }
+        return min(max(seenPos, 0), maxReportAgeSeconds)
+    }
+
+    /// Decode a response. `now` is when it was received; each aircraft's `lastUpdate` is
+    /// `now` minus its report age, which the store keeps (ConnectionLogic.merge).
+    static func parseResponse(_ data: Data, now: Date = Date()) throws -> [Aircraft] {
         let response: Response
         do {
             response = try decoder.decode(Response.self, from: data)
@@ -143,13 +160,13 @@ class ADSBLolClient {
         result.reserveCapacity(response.ac.count)
 
         for entry in response.ac {
-            guard let parsed = makeAircraft(from: entry) else { continue }
+            guard let parsed = makeAircraft(from: entry, now: now) else { continue }
             result.append(parsed)
         }
         return result
     }
 
-    private static func makeAircraft(from e: AircraftEntry) -> Aircraft? {
+    private static func makeAircraft(from e: AircraftEntry, now: Date) -> Aircraft? {
         let icao = e.hex.uppercased()
         guard !icao.isEmpty, let lat = e.lat, let lon = e.lon else { return nil }
 
@@ -176,7 +193,10 @@ class ADSBLolClient {
         // this, lastUpdate would only reflect local parse time, understating
         // true position age and causing predictedPosition()'s dead-reckoning to
         // lag behind a fast-moving aircraft's real current position.
-        let positionStaleness = e.seenPos ?? 0
+        //
+        // It only does that if it survives to the store: ConnectionLogic used to overwrite this
+        // with the fetch time on merge, which threw the age away (fixed alongside the clamp).
+        let positionStaleness = reportAge(seenPos: e.seenPos)
 
         return Aircraft(
             id:           icao,
@@ -188,7 +208,7 @@ class ADSBLolClient {
             track:        e.track ?? 0,
             groundSpeed:  e.gs    ?? 0,
             verticalRate: verticalRate,
-            lastUpdate:   Date().addingTimeInterval(-positionStaleness),
+            lastUpdate:   now.addingTimeInterval(-positionStaleness),
             source:       .internet,
             isOnGround:       isOnGround,
             hasValidAltitude: reportedAltitude != nil,
