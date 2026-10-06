@@ -164,7 +164,8 @@ struct TrafficFilterTests {
         #expect(exclusion(noAlt, f, observer: observer(altitudeFt: 36_000)) == nil)
         // The guard itself, on a separation that would cull a target that had reported one.
         #expect(f.exclusion(for: noAlt, distanceNM: 5, verticalSeparationFt: 36_000) == nil)
-        let reported = aircraft(altitude: 0)
+        // Airborne and reporting (0 ft would be ground traffic, which the ground rule takes first).
+        let reported = aircraft(altitude: 1_000)
         #expect(f.exclusion(for: reported, distanceNM: 5, verticalSeparationFt: 36_000) == .outsideAltitudeBand)
     }
 

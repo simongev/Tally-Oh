@@ -51,7 +51,7 @@ extension ARVisualizationSettings {
         s.showAircraftDistance = d["showAircraftDistance"] as? Bool   ?? s.showAircraftDistance
         s.showGroundAircraft   = d["showGroundAircraft"]   as? Bool   ?? s.showGroundAircraft
         s.limitTrafficToAltitudeBand = d["limitTrafficToAltitudeBand"] as? Bool ?? s.limitTrafficToAltitudeBand
-        s.showAirports        = d["showAirports"]         as? Bool   ?? s.showAirports
+        s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
         s.showMediumAirports   = d["showMediumAirports"]   as? Bool   ?? s.showMediumAirports
