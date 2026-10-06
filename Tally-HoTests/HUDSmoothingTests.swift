@@ -269,9 +269,9 @@ struct HUDSmoothingTests {
         tape.setTarget(260)
         #expect(tape.value == 250)
         var shown = 250.0
-        for _ in 0..<15 { shown = try #require(tape.step(dt: 1.0 / 60)) }   // 0.25 s
+        for _ in 0..<15 { let stepped = tape.step(dt: 1.0 / 60); shown = try #require(stepped) }   // 0.25 s
         #expect(abs(shown - (250 + 10 * (1 - exp(-1)))) < 1e-6)
-        for _ in 0..<300 { shown = try #require(tape.step(dt: 1.0 / 60)) }
+        for _ in 0..<300 { let stepped = tape.step(dt: 1.0 / 60); shown = try #require(stepped) }
         #expect(shown == 260)
         #expect(tape.isSettled)
     }
@@ -282,8 +282,8 @@ struct HUDSmoothingTests {
         a.setTarget(100); b.setTarget(100)
         a.setTarget(130); b.setTarget(130)
         var va = 0.0, vb = 0.0
-        for _ in 0..<30 { va = try #require(a.step(dt: 1.0 / 60)) }
-        for _ in 0..<60 { vb = try #require(b.step(dt: 1.0 / 120)) }
+        for _ in 0..<30 { let stepped = a.step(dt: 1.0 / 60); va = try #require(stepped) }
+        for _ in 0..<60 { let stepped = b.step(dt: 1.0 / 120); vb = try #require(stepped) }
         #expect(abs(va - vb) < 1e-9)
     }
 
