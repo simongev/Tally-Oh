@@ -77,6 +77,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var settingsButton: UIButton!
     private var mapButton: UIButton!
     private var backButton: UIButton!
+    /// Says why a selected target has no AR node, in place of an arrow pointing at nothing (#14).
+    private var selectionNoteLabel: UILabel!
     private var offScreenArrowView: OffScreenArrowView!
     private var hudOverlayView: HUDOverlayView!
     /// Ground speed from the phone's own GPS (knots), updated on every location
@@ -1036,9 +1038,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         startARSession(reason: "viewWillAppear")
         beginLiftSession(reason: "viewWillAppear")
 
-        // The map is presented .fullScreen, so viewWillDisappear fires while it is shown
-        // (pausing the AR session, invalidating the timer). Restart everything here so
-        // the AR view is fully live again when it reappears.
+        // Anything presented .fullScreen over this view (the calibration screen) fires
+        // viewWillDisappear while it is shown, pausing the AR session and invalidating the
+        // timer. Restart everything here so the AR view is fully live again when it reappears.
+        // The map and Settings do not come through here: neither pauses the session (#10, #14).
 
         // Restart the 4 Hz update loop if it was invalidated while we were away.
         if !(updateTimer?.isValid ?? false) {
@@ -1163,6 +1166,27 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             backButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             backButton.widthAnchor.constraint(equalToConstant: 48),
             backButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        // "Filtered out" note under the back button, shown only while the selected target has no
+        // AR node. Not interactive, so it never takes a tap meant for the scene.
+        selectionNoteLabel = UILabel()
+        selectionNoteLabel.translatesAutoresizingMaskIntoConstraints = false
+        selectionNoteLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+        selectionNoteLabel.textColor = .white
+        selectionNoteLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        selectionNoteLabel.numberOfLines = 0
+        selectionNoteLabel.layer.cornerRadius = 8
+        selectionNoteLabel.layer.masksToBounds = true
+        selectionNoteLabel.isUserInteractionEnabled = false
+        selectionNoteLabel.isHidden = true
+        view.addSubview(selectionNoteLabel)
+
+        NSLayoutConstraint.activate([
+            selectionNoteLabel.topAnchor.constraint(equalTo: backButton.bottomAnchor, constant: 8),
+            selectionNoteLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            selectionNoteLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.7),
+            selectionNoteLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 32)
         ])
 
         statusLeadingToEdge = statusLabel.leadingAnchor.constraint(
@@ -1521,9 +1545,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var lastARSessionStart: Date = .distantPast
 
     /// Whether the session is currently paused. A paused session only resumes by being run
-    /// again, so the rate limit must never suppress that call — the app pauses whenever the
-    /// map or Settings is shown, and returning from either within the interval would otherwise
-    /// leave the camera stopped: the very failure this limit exists to prevent.
+    /// again, so the rate limit must never suppress that call — the app pauses whenever this
+    /// view leaves the screen (the calibration screen, for one), and returning within the interval
+    /// would otherwise leave the camera stopped: the very failure this limit exists to prevent.
     private var isARSessionPaused = true
 
     /// Opacity the AR content is held at while ARKit has no established world.
@@ -1971,7 +1995,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             adsbOwnshipCallsign: adsbCallsign
         ) { [weak self] updated in
             guard let self else { return }
-            self.resumeAfterSettings()
+            self.resumeAfterOverlay()
             let old = self.sceneManager?.settings
             var updatedSettings = updated
             updatedSettings.updateFilter()
@@ -2002,6 +2026,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 updatedSettings.showCallsign        != old?.showCallsign        ||
                 updatedSettings.showAircraftType    != old?.showAircraftType    ||
                 updatedSettings.wifiOwnshipCallsign != old?.wifiOwnshipCallsign
+            // The altitude band is left out on purpose: the next tick adds or removes exactly the
+            // targets it changes (new nodes through the per-tick creation cap), and a rebuild would
+            // blink every other marker for nothing.
 
             if airportSettingsChanged {
                 self.sceneManager?.clearAirports()
@@ -2012,10 +2039,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .formSheet
-        // .formSheet doesn't hide the presenting view, so unlike .fullScreen (map, calibration) it
+        // .formSheet doesn't hide the presenting view, so unlike .fullScreen (calibration) it
         // never fires viewWillDisappear/viewWillAppear on us. Only the 4 Hz HUD tick stops while it
         // is up; it restarts in presentationControllerDidDismiss(_:), which fires for both the Done
-        // button and an interactive swipe-down dismiss.
+        // button and an interactive swipe-down dismiss. The map does the same (#14, `showMap`).
         //
         // **The ARKit session keeps running (#10).** It used to be paused here and reset on the way
         // back, and on 2026-10-02 that reset killed the camera three times out of three in the air:
@@ -2025,14 +2052,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // nothing at all — no reset carry, no seed.
         updateTimer?.invalidate()
         // …except the one job the old pause did that stopping the tick does not: throwing away a
-        // capture that measures where the phone is *aimed*. See `cancelAimedCapturesForSettings`.
-        cancelAimedCapturesForSettings()
+        // capture that measures where the phone is *aimed*. See `cancelAimedCaptures(reason:)`.
+        cancelAimedCaptures(reason: "settings_opened")
         nav.presentationController?.delegate = self
         present(nav, animated: true)
     }
 
     /// Cancel every capture that measures where the phone is aimed, as the old pause-and-reset did
-    /// (QA, #10 round 1).
+    /// (QA, #10 round 1). Called when Settings or the map goes up over a running session; `reason`
+    /// is what the log records (`settings_opened`, `map_opened`).
     ///
     /// The seed, its resample and the flight anchor are fed from the render thread, not the tick, so
     /// with the session left running they would go on behind the sheet: `AirborneSeedSettle`'s still
@@ -2046,7 +2074,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// puts up a fresh card and starts the capture again from its own time (`updateStartupSeed`).
     /// The gyro hold and the ground compass correction keep running: they measure the phone, not
     /// where it points, and a reset carry waiting for a steady frame is the gyro hold's.
-    private func cancelAimedCapturesForSettings() {
+    private func cancelAimedCaptures(reason: String) {
         let seedWasCapturing = seedIsCapturing
         let wasResampling = seedIsResampling
         let anchorWasCapturing = anchorCaptureActive || flightAnchor.isCapturing
@@ -2059,29 +2087,29 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             flightAnchor.cancel()
             anchorCaptureActive = false
             finishAlignUI(message: "Alignment cancelled — tap ➤ to try again")
-            FlightRecorder.shared.record(event: "anchor_capture_failed", detail: "reason=settings_opened")
+            FlightRecorder.shared.record(event: "anchor_capture_failed", detail: "reason=\(reason)")
         }
         guard seedWasCapturing || wasResampling || anchorWasCapturing else { return }
         FlightRecorder.shared.record(
             event: "capture_cancelled",
-            detail: String(format: "reason=settings_opened seed=%d resample=%d anchor=%d awaiting_seed=%d",
-                           seedWasCapturing ? 1 : 0, wasResampling ? 1 : 0,
+            detail: String(format: "reason=%@ seed=%d resample=%d anchor=%d awaiting_seed=%d",
+                           reason, seedWasCapturing ? 1 : 0, wasResampling ? 1 : 0,
                            anchorWasCapturing ? 1 : 0, awaitingSeed ? 1 : 0)
         )
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        resumeAfterSettings()
+        resumeAfterOverlay()
     }
 
-    /// Restarts the HUD tick after Settings closes. The session was never paused, so nothing else is
-    /// owed — in particular no `startARSession`, whose reset is what stuck the camera in the air.
-    /// Called from both presentationControllerDidDismiss(_:) (an interactive swipe-down) and the
-    /// Settings onDismiss closure (the Done button), since either may fire; the guard makes the
-    /// second call a no-op.
-    private func resumeAfterSettings() {
+    /// Restarts the HUD tick after Settings or the map closes. The session was never paused, so
+    /// nothing else is owed — in particular no `startARSession`, whose reset is what stuck the camera
+    /// in the air. For Settings it is called from both presentationControllerDidDismiss(_:) (an
+    /// interactive swipe-down) and the onDismiss closure (the Done button), since either may fire;
+    /// the guard makes the second call a no-op.
+    private func resumeAfterOverlay() {
         guard !(updateTimer?.isValid ?? false) else { return }
-        // A seed cancelled by `cancelAimedCapturesForSettings` starts again on the next tick, and gets
+        // A seed cancelled by `cancelAimedCaptures(reason:)` starts again on the next tick, and gets
         // the watchdog time a reset used to give it. Without this the seed's 10 s, counted from the
         // world's start, could run out behind the sheet and the first tick back would hand the world
         // to `.gravityAndHeading` instead of seeding it. Never shortened.
@@ -2094,53 +2122,94 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
-    /// Returns the aircraft list to show on the 2D map.
-    /// Applies the WiFi ownship callsign filter (same as the AR view) so the user's
-    /// own aircraft is not shown on the map once they have identified it in Settings.
-    /// Nothing else is hidden here: the map is used specifically to identify nearby
-    /// aircraft, so close traffic always appears.
-    private func mapFilteredAircraft() -> [Aircraft] {
-        var list = Array(connectionLogic.detectedAircraft.values)
-        if let ownCallsign = sceneManager?.settings.wifiOwnshipCallsign {
-            list = list.filter { $0.callsign != ownCallsign }
-        }
-        return list
+    // MARK: - Display filter (#14)
+
+    /// The display rules as they stand now: the settings, whether we are flying, and who we are.
+    /// One filter for the AR scene, the map and the off-screen arrow, so none of them can show
+    /// what the others would not.
+    ///
+    /// Ownship is the "I'm Flying" callsign (in the settings) for now. #13 publishes an `ownshipID`;
+    /// once it lands it is passed here as `ownshipID:`, and all three paths hide it at once.
+    private func currentTrafficFilter() -> TrafficFilter {
+        TrafficFilter(settings: sceneManager?.settings ?? ARVisualizationSettings(),
+                      airborne: isAirborneEstimate)
     }
 
-    @objc private func showMap() {
-        guard let loc = activeLocation else { return }
-        let settings = sceneManager?.settings ?? ARVisualizationSettings()
+    /// The viewer as the filter sees it, from one estimator snapshot: the same position, altitude
+    /// and datum conversion the scene places targets with.
+    private func trafficObserver(_ state: OwnshipSnapshot) -> TrafficFilter.Observer {
+        TrafficFilter.Observer(coordinate: state.coordinate,
+                               altitudeFt: state.displayAltitudeFt,
+                               geoidSeparationFt: state.hasGeoidSeparation ? state.geoidSeparationFt : nil,
+                               datumFit: latestDatumFit)
+    }
 
-        // Apply the same WiFi ownship filter used in the AR view so the user's own
-        // aircraft (identified via the "I'm Flying" setting) is hidden on the map too.
-        let aircraft = mapFilteredAircraft()
+    /// What the 2D map shows: exactly the aircraft and airports the AR scene can show (#14).
+    ///
+    /// The map used to apply only the ownship callsign, so it offered traffic beyond Max Distance,
+    /// outside the altitude band or on the ground, and selecting one left an arrow pointing at a
+    /// target the scene would never draw. Same filter and same viewer as the 4 Hz tick now; the
+    /// map's own 10–50 NM range only zooms.
+    private func mapContent() -> (aircraft: [TrafficFilter.Verdict], airports: [Airport],
+                                  location: CLLocationCoordinate2D)? {
+        let state = ownship
+        guard state.hasPosition else { return nil }
+        let filter = currentTrafficFilter()
+        return (
+            aircraft: filter.displayed(connectionLogic.detectedAircraft.values, from: trafficObserver(state)),
+            airports: filter.shownAirports(airports, from: state.coordinate,
+                                           limit: ARSceneManager.maxAirportNodes),
+            location: state.coordinate
+        )
+    }
+
+    /// Show the map over a running AR session (#14).
+    ///
+    /// It used to be presented `.fullScreen`, which fires viewWillDisappear (pause) and then
+    /// viewWillAppear (`startARSession`, a reset) on the way back. Every map round trip threw the
+    /// world away: a target picked on the map came back at 25% opacity and unaligned until the
+    /// carry or the seed landed, while its UIKit arrow was drawn in full the whole time.
+    ///
+    /// `.overFullScreen` leaves this view in the hierarchy, so neither callback fires and ARKit is
+    /// neither paused nor reset — the Settings pattern from #10. Only the 4 Hz HUD tick stops, and
+    /// the captures that measure where the phone is aimed are cancelled, since the phone is
+    /// pointing at a map rather than at the sky. The tick restarts when the map has gone.
+    @objc private func showMap() {
+        guard presentedViewController == nil, let content = mapContent() else { return }
 
         let vc = MapViewController(
-            userLocation: loc,
+            userLocation: content.location,
             userHeading: userHeading,
-            aircraft: aircraft,
-            airports: airports,
-            settings: settings
+            aircraft: content.aircraft,
+            airports: content.airports
         )
 
-        // Provide fresh data every live-update tick, applying the same ownship filter.
+        // Fresh data every live-update tick, through the same filter.
         vc.dataProvider = { [weak self] in
-            guard let self, let loc = self.activeLocation else { return nil }
+            guard let self, let content = self.mapContent() else { return nil }
             return (
-                aircraft: self.mapFilteredAircraft(),
-                airports: self.airports,
-                location: loc,
+                aircraft: content.aircraft,
+                airports: content.airports,
+                location: content.location,
                 heading: self.userHeading
             )
         }
 
-        // When the user taps an item on the map, dismiss the map and select it in the AR view
+        // When the user taps an item on the map, dismiss the map and select it in the AR view.
         vc.onSelect = { [weak self] nodeID in
+            FlightRecorder.shared.record(event: "map_selection", detail: nodeID)
             self?.applySelection(nodeID: nodeID)
+        }
+        vc.onDismissed = { [weak self] in
+            FlightRecorder.shared.record(event: "map_closed")
+            self?.resumeAfterOverlay()
         }
 
         let nav = UINavigationController(rootViewController: vc)
-        nav.modalPresentationStyle = .fullScreen
+        nav.modalPresentationStyle = .overFullScreen
+        updateTimer?.invalidate()
+        cancelAimedCaptures(reason: "map_opened")
+        FlightRecorder.shared.record(event: "map_opened")
         present(nav, animated: true)
     }
 
@@ -2254,6 +2323,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private func applySelection(nodeID: String) {
         selectionState = .selected(nodeID: nodeID)
         sceneManager?.setSelection(nodeID: nodeID)
+        // The next tick decides afresh whether the new target needs a note (updateOffScreenArrow).
+        hideSelectionNote()
         updateSelectionUI(active: true)
 
         // If an airport was tapped, fetch and show its METAR
@@ -2269,6 +2340,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         selectionState = .none
         sceneManager?.setSelection(nodeID: nil)
         offScreenArrowView.hide()
+        hideSelectionNote()
         updateSelectionUI(active: false)
         hideMetarPanel()
     }
@@ -2693,21 +2765,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // Pre-filter by distance and basic visibility before touching SceneKit.
         // This keeps the loop in updateAircraft small (≤ maxDistance aircraft)
         // rather than iterating all stored aircraft on the main thread every tick.
-        let currentSettings = sceneManager?.settings ?? ARVisualizationSettings()
-        let maxDist = currentSettings.aircraftMaxDistance
-        let showGround = currentSettings.showGroundAircraft
+        // The rules are TrafficFilter's (#14) — ground traffic, Max Distance on the reported
+        // position, and ownship — the same filter the map and the off-screen arrow use.
+        //
         // Only the user's own aircraft is ever hidden, and only once they have identified it.
         // Blanket-hiding everything within 2 NM used to stand in for that, but nearby traffic
         // is the traffic that matters most — suppressing it to mask one aircraft costs far
         // more than it saves, and it hid close targets before the user had any way to choose.
-        let ownCallsign = currentSettings.wifiOwnshipCallsign
-        let aircraftList = connectionLogic.detectedAircraft.values.filter { ac in
-            guard showGround || !ac.isGroundTraffic else { return false }
-            let distNM = CalculationsLogic.distanceInNauticalMiles(from: loc, to: ac.coordinate)
-            guard distNM <= maxDist else { return false }
-            if let ownCallsign, ac.callsign == ownCallsign { return false }
-            return true
-        }
+        let trafficFilter = currentTrafficFilter()
+        let aircraftList = trafficFilter.candidates(connectionLogic.detectedAircraft.values, near: loc)
 
         updateOwnshipPressureAltitude(aircraft: aircraftList, ownAltitudeFt: altitude)
 
@@ -2749,7 +2815,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userHeading: userHeading,
             cameraWorldPosition: cameraPos,
             tcasEvaluation: tcas,
-            onGround: !airborne,
+            filter: trafficFilter,
             geoidSeparationFt: geoidSep,
             datumFit: latestDatumFit
         )
@@ -2758,7 +2824,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userLocation: loc,
             userAltitude: altitude,
             userHeading: userHeading,
-            cameraWorldPosition: cameraPos
+            cameraWorldPosition: cameraPos,
+            filter: trafficFilter
         )
         connectionLogic.updateLocation(loc, altitudeFeet: altitude)
 
@@ -2771,7 +2838,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // the arrow positions are more than accurate enough (aircraft move < 0.1 NM
         // between ticks) and this saves a significant chunk of CPU/RAM each second.
         if case .selected(let nodeID) = selectionState {
-            updateOffScreenArrow(for: nodeID)
+            updateOffScreenArrow(for: nodeID, filter: trafficFilter, observer: trafficObserver(state))
         }
         updateTCASArrows()
         updateMetarAgeLabel()
@@ -3139,11 +3206,15 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     // MARK: - Off-Screen Arrow
 
-    private func updateOffScreenArrow(for nodeID: String) {
-        // Prefer the live AR SceneKit node (exact 3D position already in world space).
-        // Fall back to computing the AR world position from GPS coordinates so that
-        // targets selected from the 2D map still get a directional arrow even when
-        // they have no AR node (e.g. outside aircraftMaxDistance, filtered from scene).
+    /// Point the edge arrow at the selected target, or say why there is nothing to point at.
+    ///
+    /// The arrow is drawn only towards a live AR node (#14). It used to fall back to a position
+    /// computed from GPS when there was none, so that targets picked on the 2D map got an arrow even
+    /// when the scene had filtered them out. That fallback is what left an arrow with no target at
+    /// the end of it, for good. The map now offers only what the scene draws (`mapContent`), and a
+    /// selected target with no node gets a short note naming the rule that hides it instead.
+    private func updateOffScreenArrow(for nodeID: String, filter: TrafficFilter,
+                                      observer: TrafficFilter.Observer) {
         let cameraPos: SCNVector3
         if let pov = arSceneView.pointOfView {
             let t = pov.worldTransform
@@ -3152,56 +3223,13 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             cameraPos = .init()
         }
 
-        let worldPos: SCNVector3
-        if let node = sceneManager?.node(forID: nodeID), !node.isHidden {
-            worldPos = node.worldPosition
-        } else if let loc = activeLocation {
-            // No AR node — derive direction from GPS.
-            let targetCoord: CLLocationCoordinate2D?
-            let targetAlt: Double
-            if nodeID.hasPrefix("aircraft_") {
-                let id = String(nodeID.dropFirst("aircraft_".count))
-                if let ac = connectionLogic.detectedAircraft[id] {
-                    targetCoord = ac.coordinate
-                    // Same datum conversion the marker itself is placed with, so an arrow and the
-                    // target it points at never disagree about which way is up.
-                    let state = ownshipEstimator.snapshot()
-                    targetAlt = CalculationsLogic.geometricPlacementAltitude(
-                        for: ac,
-                        reportedAltitudeFt: ac.altitude,
-                        geoidSeparationFt: state.hasGeoidSeparation ? state.geoidSeparationFt : nil,
-                        datumFit: latestDatumFit
-                    )
-                } else { targetCoord = nil; targetAlt = 0 }
-            } else if nodeID.hasPrefix("airport_") {
-                let icao = String(nodeID.dropFirst("airport_".count))
-                if let ap = airports.first(where: { $0.icao == icao }) {
-                    targetCoord = ap.coordinate
-                    targetAlt   = ap.elevation
-                } else { targetCoord = nil; targetAlt = 0 }
-            } else { targetCoord = nil; targetAlt = 0 }
-
-            guard let coord = targetCoord else { offScreenArrowView.hide(); return }
-            // Placed exactly as the markers are this frame, attitude hold included (#12).
-            let placement = sceneManager?.placementAttitude()
-            let rawPos = CalculationsLogic.calculateARPosition(
-                targetCoord:      coord,
-                targetAltitude:   targetAlt,
-                userCoord:        loc,
-                userAltitude:     activeAltitude,
-                userHeading:      userHeading,
-                cameraWorldPosition: cameraPos,
-                worldYawOffsetDeg: placement?.offsetDeg ?? appliedWorldYawOffsetDeg
-            )
-            let scaled = ARComponentFactory.scaledPosition(rawPos, relativeTo: cameraPos)
-            let held = AttitudeHold.placed(SIMD3<Float>(scaled.x, scaled.y, scaled.z),
-                                           about: SIMD3<Float>(cameraPos.x, cameraPos.y, cameraPos.z),
-                                           rotation: placement?.rotation)
-            worldPos = SCNVector3(held.x, held.y, held.z)
-        } else {
+        guard let node = sceneManager?.node(forID: nodeID), !node.isHidden else {
             offScreenArrowView.hide()
+            showSelectionNote(selectionNote(for: nodeID, filter: filter, observer: observer))
             return
         }
+        hideSelectionNote()
+        let worldPos = node.worldPosition
 
         let projected  = arSceneView.projectPoint(worldPos)
         let screenSize = arSceneView.bounds.size
@@ -3242,6 +3270,45 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             margin: 40
         )
         offScreenArrowView.show(angle: angle, center: edgePoint)
+    }
+
+    /// What to say about a selected target that has no AR node: the rule that hides it, from the
+    /// same filter the scene used this tick.
+    ///
+    /// A target can pass every rule and still have no node: the scene caps aircraft nodes at 200 and
+    /// creates at most 20 a tick, and caps airports at the nearest 30. Rare, and said plainly.
+    private func selectionNote(for nodeID: String, filter: TrafficFilter,
+                               observer: TrafficFilter.Observer) -> String {
+        if nodeID.hasPrefix("aircraft_") {
+            let id = String(nodeID.dropFirst("aircraft_".count))
+            guard let ac = connectionLogic.detectedAircraft[id] else { return "Target no longer reported" }
+            let name = ac.callsign.isEmpty ? id.uppercased() : ac.callsign
+            if let why = filter.judge(ac, from: observer).exclusion {
+                return "\(name) filtered out: \(why.noteText)"
+            }
+            return "\(name) not drawn in AR yet"
+        }
+        if nodeID.hasPrefix("airport_") {
+            let icao = String(nodeID.dropFirst("airport_".count))
+            if let ap = airports.first(where: { $0.icao == icao }),
+               !filter.isAirportShown(ap, from: observer.coordinate) {
+                return "\(icao) filtered out: airport settings"
+            }
+            return "\(icao) not drawn in AR"
+        }
+        return "Filtered out of AR"
+    }
+
+    private func showSelectionNote(_ text: String) {
+        guard let selectionNoteLabel else { return }
+        let padded = "  \(text)  "
+        if selectionNoteLabel.text != padded { selectionNoteLabel.text = padded }
+        if selectionNoteLabel.isHidden { selectionNoteLabel.isHidden = false }
+    }
+
+    private func hideSelectionNote() {
+        guard let selectionNoteLabel, !selectionNoteLabel.isHidden else { return }
+        selectionNoteLabel.isHidden = true
     }
 
     /// Exponential moving average for angles, handling the 0°/360° wraparound.

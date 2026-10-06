@@ -789,6 +789,11 @@ struct ARVisualizationSettings {
     /// When false (default), aircraft at or below 50 ft AGL are hidden (ground traffic).
     var showGroundAircraft: Bool = false
 
+    /// "Only traffic within ±10,000 ft". In the air, hide traffic more than
+    /// `TrafficFilter.altitudeBandFt` above or below. On (default) is what the app always did; off
+    /// shows all traffic at any altitude. Never applies on the ground (#14).
+    var limitTrafficToAltitudeBand: Bool = true
+
     /// Callsign of the user's own aircraft when flying on WiFi.
     /// When nil (default), all aircraft within 2 NM are hidden.
     /// When set, only the aircraft with this callsign is hidden and all others are visible.
@@ -1077,10 +1082,11 @@ class ARSceneManager {
         userHeading: Double,
         cameraWorldPosition: SCNVector3 = .init(),
         tcasEvaluation: TCASEvaluation = .clear,
-        onGround: Bool = false,
+        filter: TrafficFilter,
         geoidSeparationFt: Double? = nil,
         datumFit: AltitudeDatumOffset.DatumFit? = nil
     ) {
+        let onGround = !filter.airborne
         guard settings.showAircraft else {
             nodesLock.lock()
             let all = Array(aircraftNodes.values)
@@ -1110,48 +1116,29 @@ class ARSceneManager {
         let maxNewNodesPerTick = 20
         var newNodesThisTick   = 0
 
+        // Every display rule — ground traffic, Max Distance, the callsign filter and the altitude
+        // band — is `TrafficFilter.verdict`, the same test the 2D map and the off-screen arrow use
+        // (#14). It judges each target at the dead-reckoned position and converted altitude the
+        // marker is drawn at, and hands both back, so the cull and the placement cannot disagree:
+        // mixing the raw reported coordinate into the cull with the predicted one in placement
+        // caused pop-in, pop-out and wrong depth stacking whenever a fast target's report was stale.
+        let observer = TrafficFilter.Observer(coordinate: userLocation, altitudeFt: userAltitude,
+                                              geoidSeparationFt: geoidSeparationFt, datumFit: datumFit)
+
         // Nearest first. Both the node ceiling and the per-tick creation limit stop partway
         // through this loop, so whatever order it runs in decides which aircraft get drawn.
         // Dictionary order is arbitrary, which in dense airspace meant the closest traffic
         // could be dropped in favour of traffic twenty miles away.
-        let aircraftNearestFirst = aircraft
-            .map { (aircraft: $0,
-                    distNM: CalculationsLogic.distanceInNauticalMiles(
-                        from: userLocation,
-                        to: CalculationsLogic.predictedPosition(for: $0, aheadSeconds: 0).coordinate)) }
-            .sorted { $0.distNM < $1.distNM }
-            .map { $0.aircraft }
+        let shownNearestFirst = aircraft
+            .map { filter.verdict(for: $0, from: observer) }
+            .filter { $0.isShown }
+            .sorted { $0.distanceNM < $1.distanceNM }
 
-        for ac in aircraftNearestFirst {
-            // Filter out ground aircraft unless the user has enabled them. Uses the source's
-            // own on-ground flag where available; the altitude threshold alone misclassified
-            // traffic at high-elevation airports.
-            if !settings.showGroundAircraft && ac.isGroundTraffic { continue }
-
-            // Cull/order/label using the same dead-reckoned position the marker is
-            // actually drawn at — mixing the raw last-reported coordinate here with
-            // the predicted coordinate below caused pop-in/pop-out and wrong depth
-            // stacking whenever a report was stale and the aircraft fast-moving.
-            let (predCoord, predAlt) = CalculationsLogic.predictedPosition(for: ac, aheadSeconds: 0)
-            // Converted into the viewer's own vertical datum before anything compares the two.
-            // The separation filter below is one of those comparisons: against an unconverted
-            // pressure altitude it read ~1,900 ft of separation at cruise for co-altitude
-            // traffic, which is most of the 10,000 ft budget spent on a datum mismatch.
-            let targetAlt = CalculationsLogic.placementAltitude(
-                for: ac, targetAltitude: predAlt, userAltitudeFt: userAltitude,
-                geoidSeparationFt: geoidSeparationFt, datumFit: datumFit)
-            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: predCoord)
-            guard distNM <= settings.aircraftMaxDistance else { continue }
-            guard settings.passes(callsign: ac.callsign) else { continue }
-            // While airborne, traffic more than 10,000ft above/below the user's own
-            // altitude isn't relevant for visual traffic awareness — e.g. no reason to
-            // show 5,000ft traffic while cruising at 40,000ft.
-            //
-            // Only applied to targets that actually reported an altitude. A target whose
-            // altitude is unknown carries a placeholder zero, which at cruise would read as
-            // 35,000 ft of separation and cull it — hiding traffic precisely because the
-            // source said nothing about its altitude, rather than because it is far away.
-            if !onGround, ac.hasValidAltitude, abs(targetAlt - userAltitude) > 10_000 { continue }
+        for shown in shownNearestFirst {
+            let ac        = shown.aircraft
+            let predCoord = shown.coordinate
+            let targetAlt = shown.placementAltitudeFt
+            let distNM    = shown.distanceNM
             let isStale = CalculationsLogic.isStale(ac)
 
             currentIDs.insert(ac.id)
@@ -1255,14 +1242,16 @@ class ARSceneManager {
     /// Airports are sorted by distance first, so the nearest ones always win.
     /// This limits peak VRAM from airport cone + label textures without affecting
     /// which airports are *eligible* — all existing type and distance filters still apply.
-    private static let maxAirportNodes = 30
+    /// The 2D map applies the same cap, so it never offers an airport the scene does not draw.
+    static let maxAirportNodes = 30
 
     func updateAirports(
         _ airports: [Airport],
         userLocation: CLLocationCoordinate2D,
         userAltitude: Double,
         userHeading: Double,
-        cameraWorldPosition: SCNVector3 = .init()
+        cameraWorldPosition: SCNVector3 = .init(),
+        filter: TrafficFilter
     ) {
         let nearby: [Airport]
         if settings.showAirports {
@@ -1280,20 +1269,10 @@ class ARSceneManager {
             }
 
             if needsRecompute {
-                let filtered = CalculationsLogic.filterAirportsInRange(
-                    airports: airports,
-                    userCoord: userLocation,
-                    maxRangeNauticalMiles: settings.airportMaxDistance
-                ).filter { settings.shouldShow(airportType: $0.type) }
-
-                let withDist = filtered.map { airport -> (airport: Airport, dist: Double) in
-                    (airport, CalculationsLogic.distanceInNauticalMiles(from: userLocation,
-                                                                         to: airport.coordinate))
-                }.sorted { $0.dist < $1.dist }
-
-                let capped = withDist.count <= ARSceneManager.maxAirportNodes
-                    ? withDist : Array(withDist.prefix(ARSceneManager.maxAirportNodes))
-                cachedNearbyAirports = capped.map { $0.airport }
+                // Type toggles and Airport Max Distance, nearest first, capped — the same list the
+                // 2D map shows (#14).
+                cachedNearbyAirports = filter.shownAirports(airports, from: userLocation,
+                                                            limit: ARSceneManager.maxAirportNodes)
                 lastAirportComputeLocation = userLocation
             }
             nearby = cachedNearbyAirports

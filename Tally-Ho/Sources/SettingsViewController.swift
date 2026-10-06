@@ -11,7 +11,8 @@ extension ARVisualizationSettings {
 
     private static let udKey = "ARVisualizationSettings"
 
-    func save() {
+    /// `defaults` is injectable so tests can round-trip settings without touching the app's own.
+    func save(to defaults: UserDefaults = .standard) {
         let d: [String: Any] = [
             "showAircraft":          showAircraft,
             "aircraftMaxDistance":   aircraftMaxDistance,
@@ -22,6 +23,7 @@ extension ARVisualizationSettings {
             "showAircraftSpeed":     showAircraftSpeed,
             "showAircraftDistance":  showAircraftDistance,
             "showGroundAircraft":    showGroundAircraft,
+            "limitTrafficToAltitudeBand": limitTrafficToAltitudeBand,
             "showAirports":          showAirports,
             "airportMaxDistance":    airportMaxDistance,
             "showLargeAirports":     showLargeAirports,
@@ -31,11 +33,13 @@ extension ARVisualizationSettings {
             "showHUD":               showHUD,
             "hudBrightness":         hudBrightness.rawValue,
         ]
-        UserDefaults.standard.set(d, forKey: ARVisualizationSettings.udKey)
+        defaults.set(d, forKey: ARVisualizationSettings.udKey)
     }
 
-    static func load() -> ARVisualizationSettings? {
-        guard let d = UserDefaults.standard.dictionary(forKey: udKey) else { return nil }
+    /// A key missing from the stored dictionary keeps its default, so settings saved by a build
+    /// that predates a setting load with that setting's default (the altitude band: on).
+    static func load(from defaults: UserDefaults = .standard) -> ARVisualizationSettings? {
+        guard let d = defaults.dictionary(forKey: udKey) else { return nil }
         var s = ARVisualizationSettings()
         s.showAircraft         = d["showAircraft"]         as? Bool   ?? s.showAircraft
         s.aircraftMaxDistance  = d["aircraftMaxDistance"]  as? Double ?? s.aircraftMaxDistance
@@ -46,7 +50,8 @@ extension ARVisualizationSettings {
         s.showAircraftSpeed    = d["showAircraftSpeed"]    as? Bool   ?? s.showAircraftSpeed
         s.showAircraftDistance = d["showAircraftDistance"] as? Bool   ?? s.showAircraftDistance
         s.showGroundAircraft   = d["showGroundAircraft"]   as? Bool   ?? s.showGroundAircraft
-        s.showAirports         = d["showAirports"]         as? Bool   ?? s.showAirports
+        s.limitTrafficToAltitudeBand = d["limitTrafficToAltitudeBand"] as? Bool ?? s.limitTrafficToAltitudeBand
+        s.showAirports        = d["showAirports"]         as? Bool   ?? s.showAirports
         s.airportMaxDistance   = d["airportMaxDistance"]   as? Double ?? s.airportMaxDistance
         s.showLargeAirports    = d["showLargeAirports"]    as? Bool   ?? s.showLargeAirports
         s.showMediumAirports   = d["showMediumAirports"]   as? Bool   ?? s.showMediumAirports
@@ -181,6 +186,12 @@ class SettingsViewController: UITableViewController {
                 subtitle: "Include aircraft at or below 50 ft",
                 getter: { $0.showGroundAircraft },
                 setter: { $0.showGroundAircraft = $1 }
+            ),
+            .toggle(
+                title: "Only traffic within ±10,000 ft",
+                subtitle: "In the air, hide traffic more than 10,000 ft above or below you",
+                getter: { $0.limitTrafficToAltitudeBand },
+                setter: { $0.limitTrafficToAltitudeBand = $1 }
             ),
             .toggle(
                 title: "Show Altitude",
@@ -520,6 +531,8 @@ final class ToggleCell: UITableViewCell {
         super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
         selectionStyle = .none
         textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        // Wraps rather than truncating "Only traffic within ±10,000 ft" on a narrow phone.
+        textLabel?.numberOfLines = 0
         detailTextLabel?.textColor = .secondaryLabel
         detailTextLabel?.font = .systemFont(ofSize: 13)
         detailTextLabel?.numberOfLines = 2

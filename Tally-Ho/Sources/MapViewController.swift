@@ -3,9 +3,10 @@
 //  TallyOh - AR Aviation Traffic Visualization
 //
 //  2D top-down traffic map showing aircraft and airports around the user.
-//  • Obeys the same show/hide and type filters set in the AR settings.
-//  • Shows ALL aircraft/airports within the map's own range (not the AR distance cap).
-//  • Default range 30 NM; the user's last chosen range is persisted across sessions.
+//  • Shows exactly what the AR scene can show (#14): ARTrafficViewController hands it lists
+//    already passed through TrafficFilter, and the map applies no rules of its own.
+//  • Aircraft are drawn at the dead-reckoned position the filter judged them at.
+//  • Range 10–50 NM, default 30, persisted; it only zooms, it does not filter.
 //  • Updates live at 1 Hz via a dataProvider closure supplied by ARTrafficViewController.
 //  • Tap an aircraft or airport to dismiss the map and select it in the AR view.
 //
@@ -20,10 +21,11 @@ private final class MapCanvasView: UIView {
     // Data (refreshed every live-update tick)
     var userLocation: CLLocationCoordinate2D = CLLocationCoordinate2D()
     var userHeading: Double = 0
-    var aircraft: [Aircraft] = []
+    /// Already filtered: only what the AR scene shows.
+    var aircraft: [TrafficFilter.Verdict] = []
+    /// Already filtered: only what the AR scene shows.
     var airports: [Airport] = []
     var rangeNM: Double = 30
-    var settings: ARVisualizationSettings = ARVisualizationSettings()
 
     // Drawing constants
     private let ringColor        = UIColor.white.withAlphaComponent(0.18)
@@ -41,6 +43,9 @@ private final class MapCanvasView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = UIColor(white: 0.06, alpha: 1)
+        // Redraw on a bounds change (a rotation) instead of stretching the last frame until the
+        // next 1 Hz refresh.
+        contentMode = .redraw
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -109,46 +114,39 @@ private final class MapCanvasView: UIView {
         ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
 
-        // --- Airports (respects show/hide and size-category filters; ignores AR distance cap) ---
-        if settings.showAirports {
-            for ap in airports {
-                guard settings.shouldShow(airportType: ap.type) else { continue }
-                let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ap.coordinate)
-                guard distNM <= rangeNM else { continue }
+        // --- Airports (already filtered by TrafficFilter; the range only clips the view) ---
+        for ap in airports {
+            let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ap.coordinate)
+            guard distNM <= rangeNM else { continue }
 
-                let pt = canvasPoint(for: ap.coordinate, in: rect)
-                drawAirportSymbol(ctx: ctx, at: pt, color: airportColor)
-                drawnAirportHits.append((icao: ap.icao, point: pt))
+            let pt = canvasPoint(for: ap.coordinate, in: rect)
+            drawAirportSymbol(ctx: ctx, at: pt, color: airportColor)
+            drawnAirportHits.append((icao: ap.icao, point: pt))
 
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: labelFont,
-                    .foregroundColor: airportColor
-                ]
-                (ap.icao as NSString).draw(at: CGPoint(x: pt.x + 8, y: pt.y - 6), withAttributes: attrs)
-            }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: airportColor
+            ]
+            (ap.icao as NSString).draw(at: CGPoint(x: pt.x + 8, y: pt.y - 6), withAttributes: attrs)
         }
 
-        // --- Aircraft (respects show/hide and callsign filter; ignores AR distance cap) ---
-        if settings.showAircraft {
-            for ac in aircraft {
-                guard settings.passes(callsign: ac.callsign) else { continue }
-                if !settings.showGroundAircraft && ac.altitude <= 50 { continue }
-                let distNM = CalculationsLogic.distanceInNauticalMiles(from: userLocation, to: ac.coordinate)
-                guard distNM <= rangeNM else { continue }
+        // --- Aircraft (already filtered by TrafficFilter; the range only clips the view) ---
+        for shown in aircraft {
+            let ac = shown.aircraft
+            guard shown.distanceNM <= rangeNM else { continue }
 
-                let pt = canvasPoint(for: ac.coordinate, in: rect)
-                drawAircraftSymbol(ctx: ctx, at: pt, heading: ac.track, color: aircraftColor)
-                drawnAircraftHits.append((id: ac.id, point: pt))
+            let pt = canvasPoint(for: shown.coordinate, in: rect)
+            drawAircraftSymbol(ctx: ctx, at: pt, heading: ac.track, color: aircraftColor)
+            drawnAircraftHits.append((id: ac.id, point: pt))
 
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: labelFont,
-                    .foregroundColor: aircraftColor
-                ]
-                let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
-                (label as NSString).draw(
-                    at: CGPoint(x: pt.x + 9, y: pt.y - 7),
-                    withAttributes: attrs)
-            }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: aircraftColor
+            ]
+            let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
+            (label as NSString).draw(
+                at: CGPoint(x: pt.x + 9, y: pt.y - 7),
+                withAttributes: attrs)
         }
 
         // --- User symbol ---
@@ -232,19 +230,23 @@ class MapViewController: UIViewController {
 
     private var userLocation: CLLocationCoordinate2D
     private var userHeading: Double
-    private var aircraft: [Aircraft]
+    private var aircraft: [TrafficFilter.Verdict]
     private var airports: [Airport]
-    private var settings: ARVisualizationSettings
 
     // MARK: - Callbacks
 
-    /// Returns a fresh snapshot of all live data; called every 1 s by the update timer.
-    var dataProvider: (() -> (aircraft: [Aircraft], airports: [Airport],
+    /// Returns a fresh snapshot of all live data, already filtered; called every 1 s by the update
+    /// timer.
+    var dataProvider: (() -> (aircraft: [TrafficFilter.Verdict], airports: [Airport],
                               location: CLLocationCoordinate2D, heading: Double)?)?
 
     /// Called with "aircraft_<id>" or "airport_<icao>" when the user taps an item.
     /// The map is dismissed immediately afterward.
     var onSelect: ((String) -> Void)?
+
+    /// Called once, after the map has gone, however it was closed. The AR view restarts its tick
+    /// here: the map is presented over a running session and never pauses it (#14).
+    var onDismissed: (() -> Void)?
 
     // MARK: - Range
 
@@ -269,15 +271,13 @@ class MapViewController: UIViewController {
     init(
         userLocation: CLLocationCoordinate2D,
         userHeading: Double,
-        aircraft: [Aircraft],
-        airports: [Airport],
-        settings: ARVisualizationSettings
+        aircraft: [TrafficFilter.Verdict],
+        airports: [Airport]
     ) {
         self.userLocation = userLocation
         self.userHeading  = userHeading
         self.aircraft     = aircraft
         self.airports     = airports
-        self.settings     = settings
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -310,6 +310,12 @@ class MapViewController: UIViewController {
         super.viewDidDisappear(animated)
         updateTimer?.invalidate()
         updateTimer = nil
+        // Here rather than in a dismiss completion, so every way out — Close, a selection, or
+        // anything else that takes the map down — restarts the AR tick. Nothing is ever pushed over
+        // the map, so disappearing means it has gone.
+        let done = onDismissed
+        onDismissed = nil
+        done?()
     }
 
     // MARK: - Live Data
@@ -453,7 +459,6 @@ class MapViewController: UIViewController {
         canvasView.aircraft     = aircraft
         canvasView.airports     = airports
         canvasView.rangeNM      = currentRangeNM
-        canvasView.settings     = settings
         canvasView.setNeedsDisplay()
 
         rangeLabel.text = "\(Int(currentRangeNM)) NM"
