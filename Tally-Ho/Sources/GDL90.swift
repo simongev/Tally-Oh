@@ -289,4 +289,47 @@ enum GDL90 {
             verticalWarning: (metrics & 0x8000) != 0
         )
     }
+
+    // MARK: - Ownship identity (#13)
+
+    /// Recognises the receiver's own aircraft in the traffic it reports.
+    ///
+    /// The ownship report (0x0A) carries the aircraft's own ICAO address, and it used to be thrown
+    /// away. Without it there was no way to tell the user's own transponder, heard back through
+    /// ADS-R or TIS-B as a 0x14 traffic report, from a real target sitting on top of them — which
+    /// is the one target guaranteed to raise TCAS on every update. Keyed by address, never by
+    /// callsign: callsigns are not unique, and many GA aircraft do not transmit one at all.
+    struct OwnshipFilter {
+        /// The address from the most recent ownship report, uppercase hex; nil until one arrives.
+        private(set) var ownshipICAO: String?
+
+        /// Placeholders a receiver sends when it does not know the aircraft's own address. Neither
+        /// is an aircraft, so neither may hide one.
+        static func isUsableAddress(_ icao: String) -> Bool {
+            let upper = icao.uppercased()
+            return upper.count == 6 && upper != "000000" && upper != "FFFFFF"
+        }
+
+        /// Record the address from an ownship report. Returns it when it is new — so the caller
+        /// publishes it once rather than at the receiver's 1 Hz — and nil when it is unchanged or
+        /// a placeholder.
+        mutating func noteOwnshipReport(_ report: TrafficReport) -> String? {
+            let icao = report.icaoAddress.uppercased()
+            guard Self.isUsableAddress(icao), icao != ownshipICAO else { return nil }
+            ownshipICAO = icao
+            return icao
+        }
+
+        /// True for a 0x14 traffic report that is ownship's own transponder.
+        func isOwnshipEcho(_ report: TrafficReport) -> Bool {
+            Self.matches(id: report.icaoAddress, ownshipID: ownshipICAO)
+        }
+
+        /// Whether a traffic id is the ownship address. Case-insensitive, because the internet
+        /// feed and the receiver format hex independently.
+        static func matches(id: String, ownshipID: String?) -> Bool {
+            guard let ownshipID else { return false }
+            return id.uppercased() == ownshipID.uppercased()
+        }
+    }
 }

@@ -92,6 +92,18 @@ class ConnectionLogic: ObservableObject {
     /// Receiver GNSS altitude above the WGS-84 ellipsoid, from GDL90 message 0x0B.
     @Published var ownshipGeometricAltitudeFt: Double?
 
+    /// The aircraft's own ICAO address from the GDL90 ownship report (0x0A), uppercase hex (#13).
+    ///
+    /// A side channel rather than a field on `Aircraft`: it is a property of the receiver, not of
+    /// any target. Traffic with this id — the receiver's own transponder heard back as a 0x14,
+    /// or the internet feed's copy of the same aircraft — is dropped before it reaches
+    /// `detectedAircraft`. Kept across a signal loss, since the address stays ours and is still
+    /// what filters the internet copy; cleared only when listening stops.
+    @Published private(set) var ownshipID: String?
+
+    /// Confined to `adsbQueue`, where GDL90 is parsed. `ownshipID` is the main-thread copy.
+    private var gdl90Ownship = GDL90.OwnshipFilter()
+
     /// Set by the owner so ADS-B ownship reports feed the single ownship estimator directly,
     /// carrying their own timestamps instead of being resampled by the 4 Hz UI tick.
     weak var ownshipEstimator: OwnshipEstimator?
@@ -213,11 +225,15 @@ class ConnectionLogic: ObservableObject {
         listener?.cancel()
         listener = nil
         ownshipEstimator?.clearADSB()
+        adsbQueue.async { [weak self] in
+            self?.gdl90Ownship = GDL90.OwnshipFilter()
+        }
         DispatchQueue.main.async {
             self.connectionStatus = .disconnected
             self.detectedAircraft.removeAll()
             self.ownshipData = nil
             self.ownshipGeometricAltitudeFt = nil
+            self.ownshipID = nil
         }
     }
 
@@ -293,6 +309,20 @@ class ConnectionLogic: ObservableObject {
         switch messageID {
         case GDL90.MessageID.ownshipReport.rawValue:
             guard let report = GDL90.parseTrafficReport(message) else { return }
+            // The aircraft's own address, which used to be replaced by "OWNSHIP" and lost.
+            if let newID = gdl90Ownship.noteOwnshipReport(report) {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.ownshipID = newID
+                    // Anything stored under our own address arrived before the receiver said whose
+                    // it was: our own transponder echoed back, or the internet feed's copy of us.
+                    let purged = self.detectedAircraft.removeValue(forKey: newID) != nil
+                    FlightRecorder.shared.record(
+                        event: "adsb_ownship_id",
+                        detail: "id=\(newID) purged=\(purged ? 1 : 0)"
+                    )
+                }
+            }
             let hasPosition = report.latitude != 0 || report.longitude != 0
             // Feed the estimator straight from the receiver queue, with this report's own
             // arrival time and its own velocity, so coasting between the ~1 Hz reports does
@@ -324,6 +354,9 @@ class ConnectionLogic: ObservableObject {
 
         case GDL90.MessageID.trafficReport.rawValue:
             guard let report = GDL90.parseTrafficReport(message) else { return }
+            // Our own transponder heard back through ADS-R or TIS-B is not traffic. Left in, it
+            // sat on top of the viewer and raised an advisory on itself every update.
+            guard !gdl90Ownship.isOwnshipEcho(report) else { return }
             let aircraft = makeAircraft(from: report, isOwnship: false, receivedAt: receivedAt)
             DispatchQueue.main.async { self.detectedAircraft[aircraft.id] = aircraft }
 
@@ -486,6 +519,7 @@ class ConnectionLogic: ObservableObject {
             guard let self else { return }
             let currentAircraft = self.detectedAircraft
             let ownship         = self.ownshipData
+            let ownshipID       = self.ownshipID
             let ownLoc          = self.currentLocation
             let maxRadius       = self.internetQueryRadius
             let cap             = self.maxInternetAircraft
@@ -496,6 +530,11 @@ class ConnectionLogic: ObservableObject {
 
                 var updates: [String: Aircraft] = [:]
                 for var ac in list {
+                    // The receiver's own address: the internet feed's copy of the aircraft the user
+                    // is sitting in. Matched by id, because the proximity checks below compare a
+                    // latency-delayed internet position with a live one and miss it at speed.
+                    if GDL90.OwnshipFilter.matches(id: ac.id, ownshipID: ownshipID) { continue }
+
                     // Pre-filter by distance — aircraft outside render range are never stored.
                     if let ownLoc {
                         let distNM = CalculationsLogic.distanceInNauticalMiles(from: ownLoc, to: ac.coordinate)
@@ -528,7 +567,12 @@ class ConnectionLogic: ObservableObject {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     var merged = self.detectedAircraft
-                    for (id, ac) in updates { merged[id] = ac }
+                    // Checked again against the live id: an ownship report landing while this
+                    // fetch was being filtered must not let our own copy in behind it.
+                    for (id, ac) in updates
+                    where !GDL90.OwnshipFilter.matches(id: id, ownshipID: self.ownshipID) {
+                        merged[id] = ac
+                    }
 
                     // Enforce the cap by keeping the closest aircraft, so a nearer target can
                     // always displace a more distant one. Aircraft received earlier that have
