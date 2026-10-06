@@ -13,10 +13,35 @@
 //  - Once both conditions become satisfied the screen dismisses automatically.
 //  - There is no "Start" button; a prominent "Skip" button lets the user
 //    launch immediately without waiting.
+//  - In flight it dismisses itself on the first fix that shows the phone airborne (#15): the 10 m
+//    fix it waits for never comes in a cabin, and the user had to tap Skip on every launch.
 //
 
 import UIKit
 import CoreLocation
+
+// MARK: - Calibration in flight (#15)
+
+/// Whether the phone is flying, for the calibration prompts — which belong on the ground.
+///
+/// In a cabin the launch screen waits for a ≤ 10 m GPS fix that never comes, so every launch in flight
+/// ended in Skip; and the in-session prompts guard on the airborne estimate, which does not exist until
+/// the first 4 Hz tick has computed it. A fix moving at 50 kt or more answers both: nothing on the
+/// ground does that but a takeoff roll.
+enum CalibrationFlightPolicy {
+    static let airborneSpeedKt: Double = 50
+
+    /// A fix that shows the phone airborne. `CLLocation.speed` is in m/s, negative when invalid.
+    static func fixShowsFlight(speedMps: Double) -> Bool {
+        speedMps.isFinite && speedMps >= 0 && speedMps * 3600.0 / 1852.0 >= airborneSpeedKt
+    }
+
+    /// Whether to treat the phone as in flight: the airborne estimate, or — before there is one — a
+    /// GPS ground speed of 50 kt or more.
+    static func inFlight(airborneEstimate: Bool, gpsSpeedKt: Double) -> Bool {
+        airborneEstimate || (gpsSpeedKt.isFinite && gpsSpeedKt >= airborneSpeedKt)
+    }
+}
 
 // MARK: - CalibrationViewController
 
@@ -186,12 +211,12 @@ class CalibrationViewController: UIViewController {
         }
     }
 
-    private func completeDismiss() {
+    private func completeDismiss(seedLocation: CLLocation? = nil) {
         guard !dismissed else { return }
         dismissed = true
         locationManager.stopUpdatingLocation()
         locationManager.stopUpdatingHeading()
-        onComplete?(lastValidLocation, wasSkipped)
+        onComplete?(seedLocation ?? lastValidLocation, wasSkipped)
     }
 
     // MARK: - Actions
@@ -217,6 +242,13 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         if !earlyLocationSent {
             earlyLocationSent = true
             onEarlyLocation?(loc)
+        }
+        // In flight there is nothing to calibrate for and the fix it waits for will not come: go,
+        // after the early fetch above has been kicked off, as if the sensors had converged — not as a
+        // Skip, which would also silence the ground's prompts after landing.
+        if CalibrationFlightPolicy.fixShowsFlight(speedMps: loc.speed) {
+            completeDismiss(seedLocation: lastValidLocation ?? loc)
+            return
         }
         updateReadiness()
     }

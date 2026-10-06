@@ -7,6 +7,63 @@
 
 import UIKit
 
+// MARK: - One HUD frame (#15)
+
+/// The HUD's moving parts for one frame, computed on the render thread and applied on main through a
+/// latest-wins mailbox (`MainThreadMailbox.Latest`).
+struct HUDFrame {
+    enum Ladder {
+        case hidden
+        case shown(horizon: (CGPoint, CGPoint), plus5: (CGPoint, CGPoint), minus5: (CGPoint, CGPoint),
+                   plus10: (CGPoint, CGPoint)?, minus10: (CGPoint, CGPoint)?)
+    }
+    enum Heading {
+        /// Leave the rose as it is.
+        case unchanged
+        /// No world alignment yet: blank the rose.
+        case hidden
+        case shown(Double)
+    }
+
+    var ladder: Ladder
+    /// The bank rose's roll; nil leaves it.
+    var rollDeg: Double?
+    var heading: Heading
+    /// The projected horizon, when there is one. With it the arrow shows only if the horizon is off
+    /// screen; without it, always.
+    var horizon: (CGPoint, CGPoint)?
+    var arrowDirection: HUDOverlayView.HorizonArrowDirection
+
+    /// Whether either end of the projected horizon is within `margin` of the visible height.
+    static func horizonVisible(_ horizon: (CGPoint, CGPoint), viewHeight: CGFloat, margin: CGFloat = 20) -> Bool {
+        let range = -margin...(viewHeight + margin)
+        return range.contains(horizon.0.y) || range.contains(horizon.1.y)
+    }
+
+    /// The heading the rose shows: the camera's forward azimuth in ARKit's world plus **the same
+    /// frame's** placement offset — the one the targets were placed with on this frame — so the rose and
+    /// the traffic agree to the frame. Nil while the world has no alignment, when the offset means
+    /// nothing. Under the attitude hold the forward is `R_true`'s and the offset the hold's own, and
+    /// the sum is `cmYaw + K` exactly.
+    static func roseHeadingDeg(rawAzimuthDeg: Double, placementOffsetDeg: Double, aligned: Bool) -> Double? {
+        guard aligned, rawAzimuthDeg.isFinite, placementOffsetDeg.isFinite else { return nil }
+        return CalculationsLogic.normalizedAzimuth(rawAzimuthDeg + placementOffsetDeg)
+    }
+}
+
+/// Holds its view weakly, so a display link — which retains its target — cannot keep the HUD alive.
+private final class WeakDisplayLinkTarget: NSObject {
+    private weak var view: HUDOverlayView?
+    init(_ view: HUDOverlayView) { self.view = view }
+    @objc func tick(_ link: CADisplayLink) {
+        guard let view else {
+            link.invalidate()
+            return
+        }
+        view.tapeTick(link)
+    }
+}
+
 // MARK: - HUD Overlay
 
 /// Modern-HUD-style overlay: a gravity-referenced horizon line with labeled
@@ -451,9 +508,75 @@ final class HUDOverlayView: UIView {
         horizonArrowLayer.isHidden = false
     }
 
+    /// New speed and altitude readings, at the 4 Hz status cadence. The tapes ease toward them a
+    /// display frame at a time (`TapeEasing`) instead of jumping, and the display link runs only
+    /// while one of them is still moving (#15).
     func updateReadouts(speedKt: Double, altitudeFt: Double) {
-        speedTape.setValue(speedKt)
-        altTape.setValue(altitudeFt)
+        let speedMoving = speedTape.setTarget(speedKt)
+        let altMoving = altTape.setTarget(altitudeFt)
+        if speedMoving || altMoving { startTapeLink() }
+    }
+
+    // MARK: - Tape easing (#15)
+
+    private var tapeLink: CADisplayLink?
+    private var lastTapeTimestamp: CFTimeInterval?
+
+    private func startTapeLink() {
+        guard tapeLink == nil, window != nil else { return }
+        let link = CADisplayLink(target: WeakDisplayLinkTarget(self), selector: #selector(WeakDisplayLinkTarget.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        tapeLink = link
+        lastTapeTimestamp = nil
+    }
+
+    private func stopTapeLink() {
+        tapeLink?.invalidate()
+        tapeLink = nil
+        lastTapeTimestamp = nil
+    }
+
+    fileprivate func tapeTick(_ link: CADisplayLink) {
+        let dt = lastTapeTimestamp.map { link.timestamp - $0 } ?? link.duration
+        lastTapeTimestamp = link.timestamp
+        let speedMoving = speedTape.step(dt: dt)
+        let altMoving = altTape.step(dt: dt)
+        if !speedMoving && !altMoving { stopTapeLink() }
+    }
+
+    override func willMove(toWindow newWindow: UIWindow?) {
+        super.willMove(toWindow: newWindow)
+        if newWindow == nil { stopTapeLink() }
+    }
+
+    // MARK: - A whole frame at once (#15)
+
+    /// Apply one frame of the moving parts — ladder, bank, heading and the off-screen-horizon arrow —
+    /// in a single transaction. The render thread computes it and leaves it in a latest-wins mailbox,
+    /// so a frame that arrives while main is busy replaces the one before rather than queueing
+    /// behind it.
+    func apply(_ frame: HUDFrame) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        switch frame.ladder {
+        case .hidden:
+            hideLadder()
+        case .shown(let horizon, let plus5, let minus5, let plus10, let minus10):
+            updateLadder(horizon: horizon, plus5: plus5, minus5: minus5, plus10: plus10, minus10: minus10)
+        }
+        if let roll = frame.rollDeg { updateBank(rollDeg: roll) }
+        switch frame.heading {
+        case .unchanged: break
+        case .hidden: hideHeading()
+        case .shown(let deg): updateHeading(headingDeg: deg)
+        }
+        if let horizon = frame.horizon {
+            let visible = HUDFrame.horizonVisible(horizon, viewHeight: bounds.height)
+            updateHorizonArrow(direction: visible ? nil : frame.arrowDirection)
+        } else {
+            updateHorizonArrow(direction: frame.arrowDirection)
+        }
+        CATransaction.commit()
     }
 
     /// Apply a brightness preset (alpha only) to every HUD element so the
