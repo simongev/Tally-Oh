@@ -97,9 +97,11 @@ struct OwnshipMatcher {
         /// Horizontal tolerance with no motion: GPS error on both sides, plus how far a straight
         /// dead-reckoning line strays from a turning aircraft between reports.
         var horizontalBaseNM: Double
-        /// Seconds of position latency allowed on top: a feed position is extrapolated from the
-        /// fetch time, not from when it was measured, so it trails by the feed's own age plus the
-        /// round trip — a couple of seconds, which is a third of a mile at airliner speed.
+        /// Seconds of position latency allowed on top. Written when a feed position was
+        /// extrapolated from the fetch time rather than from when it was measured, so it trailed by
+        /// the feed's own age plus the round trip — a couple of seconds, a third of a mile at
+        /// airliner speed. Since #17 a feed position is extrapolated from its own report time
+        /// (fetch time minus "seen_pos"), so that lag is gone and this allowance is now extra margin.
         var latencyAllowanceS: Double
         /// Vertical tolerance. Both altitudes are in the same datum by the time they get here;
         /// what remains is GPS vertical error, which the app accepts up to 150 m in the air.
