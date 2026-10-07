@@ -2780,9 +2780,10 @@ extension GyroYawHold {
     /// an ARKit frame from the latest sample, and that is what put up to 1° of pure timing into D at
     /// 15°/s; at the frame's own timestamp it is gone.
     ///
-    /// Past the newest sample it extrapolates at the last pair's rate, at most
-    /// `maxExtrapolationSeconds`; before the oldest it holds the oldest within the same bound. Nil
-    /// further out either way, or with no usable sample. `samples` must be in time order.
+    /// Past the newest sample it extrapolates at the rate over the last `minRateBaselineSeconds` or
+    /// more (#15: the last pair at 20 Hz, five samples back at 100 Hz, rather than a 10 ms difference),
+    /// at most `maxExtrapolationSeconds`; before the oldest it holds the oldest within the same bound.
+    /// Nil further out either way, or with no usable sample. `samples` must be in time order.
     static func interpolatedYawDeg(_ samples: [(t: TimeInterval, yawDeg: Double)],
                                    at time: TimeInterval,
                                    maxExtrapolationSeconds: TimeInterval = 0.1) -> Double? {
@@ -2791,8 +2792,8 @@ extension GyroYawHold {
         if time >= last.t {
             let ahead = time - last.t
             guard ahead <= maxExtrapolationSeconds else { return nil }
-            guard usable.count >= 2 else { return last.yawDeg }
-            let previous = usable[usable.count - 2]
+            guard let baseline = GyroYawHold.rateBaselineIndex(usable.map(\.t)) else { return last.yawDeg }
+            let previous = usable[baseline]
             let span = last.t - previous.t
             guard span > 0 else { return last.yawDeg }
             let rate = AngularResponse.signedDelta(previous.yawDeg, last.yawDeg) / span
@@ -2810,6 +2811,53 @@ extension GyroYawHold {
                 a.yawDeg + AngularResponse.signedDelta(a.yawDeg, b.yawDeg) * fraction)
         }
         return last.yawDeg
+    }
+}
+
+// MARK: - CoreMotion sample windows in time (#15)
+
+extension GyroYawHold {
+
+    /// How far back the CoreMotion history reaches. It was eight samples, 0.4 s at the 20 Hz device
+    /// motion used to run at; at 100 Hz eight samples would be 80 ms. Several frames' worth of
+    /// capture-to-render latency either way.
+    static let motionHistorySeconds: TimeInterval = 0.4
+    /// A ceiling on the samples kept, whatever the rate: 0.4 s at 100 Hz is 41.
+    static let motionHistoryCap = 64
+    /// The shortest span a CoreMotion rate is taken over. At 20 Hz a pair of samples is 50 ms apart,
+    /// so this is exactly the old consecutive-sample rate; at 100 Hz it is five samples back, not a
+    /// 10 ms difference that would multiply the attitude's noise by five.
+    static let minRateBaselineSeconds: TimeInterval = 0.04
+
+    /// Index of the sample a rate is taken against: the newest one at least `minBaselineSeconds`
+    /// before the last, or failing that the oldest. Nil with fewer than two. `times` in time order.
+    static func rateBaselineIndex(_ times: [TimeInterval],
+                                  minBaselineSeconds: TimeInterval = minRateBaselineSeconds) -> Int? {
+        guard times.count >= 2, let last = times.last else { return nil }
+        for i in stride(from: times.count - 2, through: 0, by: -1) where last - times[i] >= minBaselineSeconds {
+            return i
+        }
+        return 0
+    }
+
+    /// The samples within `seconds` of the newest, at most `cap` of them, oldest first.
+    static func trimmedMotionHistory<Sample>(_ samples: [Sample], time: (Sample) -> TimeInterval,
+                                             seconds: TimeInterval = motionHistorySeconds,
+                                             cap: Int = motionHistoryCap) -> [Sample] {
+        guard let newest = samples.last.map(time) else { return samples }
+        var kept = samples.filter { newest - time($0) <= seconds }
+        if kept.count > cap { kept.removeFirst(kept.count - cap) }
+        return kept
+    }
+
+    /// CoreMotion's azimuth rate at the newest sample, over at least `minRateBaselineSeconds`. NaN
+    /// without two samples or across a gap of more than `maxGapSeconds`.
+    static func baselineAzimuthRateDps(_ history: [(t: TimeInterval, yawDeg: Double)],
+                                       maxGapSeconds: TimeInterval = 0.5) -> Double {
+        guard let last = history.last, let baseline = rateBaselineIndex(history.map(\.t)) else { return .nan }
+        let previous = history[baseline]
+        return azimuthRateDps(fromDeg: previous.yawDeg, toDeg: last.yawDeg, seconds: last.t - previous.t,
+                              maxGapSeconds: maxGapSeconds)
     }
 }
 

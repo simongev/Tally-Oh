@@ -157,7 +157,8 @@ enum AttitudeHold {
 
     /// CoreMotion's attitude (device → reference) at `time`, slerped between the samples either side —
     /// the attitude counterpart of `GyroYawHold.interpolatedYawDeg`, with the same bounds. Past the
-    /// newest sample it extrapolates at the last pair's rotation rate, at most
+    /// newest sample it extrapolates at the rotation rate over the last
+    /// `GyroYawHold.minRateBaselineSeconds` or more (the last pair at 20 Hz, #15), at most
     /// `maxExtrapolationSeconds`; before the oldest it holds the oldest within the same bound. Nil
     /// further out either way. `samples` must be in time order.
     static func interpolatedAttitude(_ samples: [(t: TimeInterval, q: simd_quatd)],
@@ -168,8 +169,8 @@ enum AttitudeHold {
         if time >= last.t {
             let ahead = time - last.t
             guard ahead <= maxExtrapolationSeconds else { return nil }
-            guard usable.count >= 2, ahead > 0 else { return last.q }
-            let previous = usable[usable.count - 2]
+            guard ahead > 0, let baseline = GyroYawHold.rateBaselineIndex(usable.map(\.t)) else { return last.q }
+            let previous = usable[baseline]
             let span = last.t - previous.t
             guard span > 0 else { return last.q }
             // The rotation from the previous sample to the newest, in the reference frame, the short way.

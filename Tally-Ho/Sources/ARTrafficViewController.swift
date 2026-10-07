@@ -81,6 +81,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private var selectionNoteLabel: UILabel!
     private var offScreenArrowView: OffScreenArrowView!
     private var hudOverlayView: HUDOverlayView!
+    /// The HUD's frames from the render thread, latest wins: one main block queued at most (#15).
+    private let hudFrames = MainThreadMailbox.Latest<HUDFrame>()
     /// Ground speed from the phone's own GPS (knots), updated on every location
     /// fix. Used for the HUD speed readout when ADS-B ownship isn't available —
     /// mirrors the activeAltitude fallback pattern.
@@ -424,10 +426,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         private var signGuard = GyroYawHold.SignGuard()
 
         /// The last few samples on CoreMotion's clock, oldest first, so a frame can be given the yaw
-        /// at its own timestamp rather than the latest one. Eight at 20 Hz is 0.4 s, several frames'
-        /// worth of capture-to-render latency.
+        /// at its own timestamp rather than the latest one: `GyroYawHold.motionHistorySeconds` of
+        /// them, 0.4 s whatever the rate — several frames' worth of capture-to-render latency. It was
+        /// eight samples, which was 0.4 s only at 20 Hz (#15).
         private var history: [(t: TimeInterval, yawDeg: Double)] = []
-        private static let historyCount = 8
         /// The whole attitude beside the yaw (#12): device → reference, the reading chosen by gravity
         /// (`AttitudeHold.deviceToReference`), on the same clock and with the same depth.
         private var attitudeHistory: [(t: TimeInterval, q: simd_quatd)] = []
@@ -445,24 +447,24 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                     // Out of order or repeated: not a sample to interpolate across.
                 } else {
                     attitudeHistory.append((t: time, q: simd_quatd(attitude)))
-                    if attitudeHistory.count > MotionYawBox.historyCount { attitudeHistory.removeFirst() }
+                    attitudeHistory = GyroYawHold.trimmedMotionHistory(attitudeHistory, time: { $0.t })
                 }
             } else {
                 attitudeHistory.removeAll()
             }
-            let previous = yawDeg
             let previousTime = timestamp
             yawDeg = newYaw ?? .nan
             timestamp = time
             receivedAt = ProcessInfo.processInfo.systemUptime
             if yawDeg.isFinite {
                 history.append((t: time, yawDeg: yawDeg))
-                if history.count > MotionYawBox.historyCount { history.removeFirst() }
+                history = GyroYawHold.trimmedMotionHistory(history, time: { $0.t })
             } else {
                 history.removeAll()
             }
-            rateDps = GyroYawHold.azimuthRateDps(fromDeg: previous, toDeg: yawDeg,
-                                                 seconds: time - previousTime)
+            // Over at least `minRateBaselineSeconds`: the previous sample at 20 Hz, as before; five back
+            // at 100 Hz (#15). The sign check is weighted by time, so it sees the same turning at any rate.
+            rateDps = GyroYawHold.baselineAzimuthRateDps(history)
             signGuard.add(azimuthRateDps: rateDps, witnessRateDps: witnessRateDps,
                           seconds: time - previousTime)
         }
@@ -525,6 +527,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
     private let motionYaw = MotionYawBox()
+    /// The yaw hold's samples from the render thread, batched into one main block (#15).
+    private let holdSamples = MainThreadMailbox.Batch<GyroYawHold.Sample>()
 
     /// Holds the heading through ARKit's yaw jumps and air world resets. Main thread only: the render
     /// thread measures and posts each frame, and every write to the offset happens here.
@@ -896,6 +900,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         }
     }
 
+    /// Device motion's update interval: 100 Hz (#15).
+    private static let deviceMotionIntervalSeconds: TimeInterval = 1.0 / 100.0
+    /// The camera seed is fed one sample at least this far apart — every sample at 20 Hz, every fifth
+    /// at 100 Hz. Below 50 ms so 20 Hz timing jitter never drops one.
+    private static let cameraSeedMotionIntervalSeconds: TimeInterval = 0.045
+    /// Motion queue only: the timestamp of the last sample handed to the camera seed.
+    private var lastCameraSeedMotionTime: TimeInterval = -.greatestFiniteMagnitude
+
     /// Start device motion, purely to sample the phone's true yaw rate.
     ///
     /// Device motion needs no Motion & Fitness authorisation — that gates CMAltimeter and the
@@ -912,11 +924,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             return
         }
         guard !motionManager.isDeviceMotionActive else { return }
-        motionManager.deviceMotionUpdateInterval = 1.0 / 20.0
+        // 100 Hz (#15). At 20 Hz every frame in the air extrapolated the attitude up to 50 ms past the
+        // newest sample, and the HUD showed it as a 20 Hz sawtooth. Everything that counted samples
+        // now counts time, so the hold and its replays see the same thing at any rate.
+        motionManager.deviceMotionUpdateInterval = ARTrafficViewController.deviceMotionIntervalSeconds
         // A fresh start is a fresh reference frame, so no rate may be taken across it.
         motionYaw.reset()
+        lastCameraSeedMotionTime = -.greatestFiniteMagnitude
         let queue = OperationQueue()
-        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 1
+        // What the HUD is drawn from in the air: as urgent as the frames it feeds.
+        queue.qualityOfService = .userInteractive
         // The default reference frame, `xArbitraryZVertical`: gyro and gravity only. The
         // magnetometer-corrected frames would bring the cabin's field back in.
         motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
@@ -939,8 +957,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             self.motionYaw.update(yawDeg: yaw, witnessRateDps: verticalDps,
                                   deviceToReference: AttitudeHold.deviceToReference(rotation, gravity: gravityVector),
                                   at: motion.timestamp)
-            // Attitude for the camera seed's derotation. A no-op unless it is capturing.
-            self.cameraSeed.ingest(motion: motion)
+            // Attitude for the camera seed's derotation. A no-op unless it is capturing. Kept at about
+            // the 20 Hz it was built and tuned for — its history holds a count of samples meant as
+            // five seconds — by passing one sample every `cameraSeedMotionIntervalSeconds` (#15).
+            if motion.timestamp - self.lastCameraSeedMotionTime
+                >= ARTrafficViewController.cameraSeedMotionIntervalSeconds {
+                self.lastCameraSeedMotionTime = motion.timestamp
+                self.cameraSeed.ingest(motion: motion)
+            }
         }
     }
 
@@ -1963,8 +1987,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// compass ≤ 13°) — and the triggers here fire on *looser* ones (30 m, 20°) detected as
     /// edges, so accuracy that merely wobbles across 20° re-presents the screen the user just
     /// dismissed, over and over.
+    /// Flying, for the calibration prompts: the airborne estimate, or before it exists a fix at 50 kt
+    /// or more (#15). See `CalibrationFlightPolicy`.
+    private var calibrationInFlight: Bool {
+        CalibrationFlightPolicy.inFlight(airborneEstimate: isAirborneEstimate, gpsSpeedKt: lastGPSSpeedKt)
+    }
+
     private func presentCalibrationPopupIfNeeded() {
         guard !calibrationWasSkipped else { return }
+        // Never in flight — including the seconds before the first airborne estimate, which a fast
+        // GPS fix already answers (#15).
+        guard !calibrationInFlight else { return }
         guard !isCalibrationPopupShowing, presentedViewController == nil else { return }
         isCalibrationPopupShowing = true
         let calibration = CalibrationViewController()
@@ -2244,6 +2277,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     @objc private func infoButtonTapped() {
         statusLabel.isHidden.toggle()
+        // Built only while shown (#15), so bring it up to date as it appears.
+        if !statusLabel.isHidden { updateStatusLabel() }
     }
 
     // MARK: - Zoom
@@ -3625,6 +3660,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             // ladder/bank rose rather than this 0.25s readout timer (was a
             // visible ~4Hz step-jump before).
         }
+        // The status text is a dozen lines of formatting four times a second, for a panel that is
+        // hidden unless the info button is pressed — which refreshes it on the spot (#15).
+        guard !statusLabel.isHidden else { return }
 
         var lines: [String] = []
 
@@ -4278,8 +4316,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                         arAzimuthDeg: arAzimuth,
                                         cmYawDeg: motion.yawDeg.isFinite ? motion.yawDeg : nil,
                                         frameGapDeg: frameGapDeg)
+        // Every sample counts — the three-frame median and the step detection see each frame — so
+        // these are batched, not coalesced: one main block drains whatever has queued, in order (#15).
+        guard holdSamples.post(sample) else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.feedGyroYawHold(sample)
+            guard let self else { return }
+            for queued in self.holdSamples.takeAll() { self.feedGyroYawHold(queued) }
         }
     }
 
@@ -5538,14 +5580,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     /// rollDeg/heading (computed from two points sharing the same common-mode
     /// offset, or from an axis already discarded by the horizontal flatten
     /// below) — hence bank/heading already read smooth while the ladder didn't.
+    ///
+    /// The finished frame goes to main through a latest-wins mailbox (#15): one block queued at most,
+    /// and a frame that arrives while main is busy replaces the one before instead of queueing behind
+    /// it. With the HUD off nothing is computed or sent — the overlay is hidden as a whole.
     private func updateHUDLadder(pov: SCNNode) {
-        guard sceneManager?.settings.showHUD == true else {
-            DispatchQueue.main.async { [weak self] in
-                self?.hudOverlayView.hideLadder()
-                self?.hudOverlayView.updateHorizonArrow(direction: nil)
-            }
-            return
-        }
+        guard sceneManager?.settings.showHUD == true else { return }
         let camTransform = simd_float4x4(pov.worldTransform)
 
         let camPos = SIMD3<Float>(camTransform.columns.3.x, camTransform.columns.3.y, camTransform.columns.3.z)
@@ -5577,10 +5617,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // independent of the compass/declination math used for aircraft bearing.
         let horizLen = sqrt(forwardRaw.x * forwardRaw.x + forwardRaw.z * forwardRaw.z)
         guard horizLen > 0.05 else {   // looking nearly straight up/down
-            DispatchQueue.main.async { [weak self] in
-                self?.hudOverlayView.hideLadder()
-                self?.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
-            }
+            postHUDFrame(HUDFrame(ladder: .hidden, rollDeg: nil, heading: .unchanged, horizon: nil,
+                                  arrowDirection: arrowDirection))
             return
         }
         // Raw, unfiltered per-frame direction — same approach already used for
@@ -5613,10 +5651,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // 5° ones (both still shorter than the horizon) so they read as the
         // "bigger" graduation.
         guard let horizon = projectedPair(yOffset: 0, halfWidth: 7) else {
-            DispatchQueue.main.async { [weak self] in
-                self?.hudOverlayView.hideLadder()
-                self?.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
-            }
+            postHUDFrame(HUDFrame(ladder: .hidden, rollDeg: nil, heading: .unchanged, horizon: nil,
+                                  arrowDirection: arrowDirection))
             return
         }
         let plus5   = projectedPair(yOffset: rise5,   halfWidth: 4)
@@ -5657,45 +5693,40 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // logs — so the rose was wrong by the whole world-yaw offset while the markers, which do
         // apply it, were right. Exactly the reported symptom: accurate targets, wrong compass.
         //
-        // The correction is applied on the main thread below, where the offset is owned, rather
-        // than read across threads here.
+        // The correction is applied here, on the render thread, with **this frame's** placement offset
+        // — the one the targets were just placed with (#15). It used to be added on main from
+        // `appliedWorldYawOffsetDeg` read a frame or more later, so the rose and the traffic could
+        // disagree by whatever the offset moved in between. Markers go at `bearing − offset`, so a
+        // direction at ARKit azimuth `a` is truly at `a + offset`; before the world has an alignment
+        // that offset is meaningless and the rose is hidden, the rule build 34 applied to the fade.
         let rawHeadingDeg = arFrameRawAzimuthDeg(forward: forward)
+        let placementOffset = sceneManager?.placementAttitude().offsetDeg ?? appliedWorldYawOffsetDeg
+        let heading: HUDFrame.Heading
+        if let deg = HUDFrame.roseHeadingDeg(rawAzimuthDeg: rawHeadingDeg,
+                                             placementOffsetDeg: placementOffset,
+                                             aligned: worldIsAligned) {
+            heading = .shown(deg)
+        } else {
+            heading = .hidden
+        }
+        let ladder: HUDFrame.Ladder
+        if let plus5, let minus5 {
+            ladder = .shown(horizon: horizon, plus5: plus5, minus5: minus5, plus10: plus10, minus10: minus10)
+        } else {
+            ladder = .hidden
+        }
+        // The horizon line projected, but at a steep-but-not-extreme pitch it can still land off the
+        // visible area: main shows the same fixed arrow then, against its own bounds.
+        postHUDFrame(HUDFrame(ladder: ladder, rollDeg: rollDeg, heading: heading, horizon: horizon,
+                              arrowDirection: arrowDirection))
+    }
 
+    /// Leave a HUD frame for main, scheduling a drain only if none is queued (#15).
+    private func postHUDFrame(_ frame: HUDFrame) {
+        guard hudFrames.post(frame) else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            // One transaction for all three updates (was two separate
-            // transactions before the heading rose moved here) — fewer
-            // Core Animation commits per update.
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            if let plus5, let minus5 {
-                self.hudOverlayView.updateLadder(horizon: horizon, plus5: plus5, minus5: minus5, plus10: plus10, minus10: minus10)
-            } else {
-                self.hudOverlayView.hideLadder()
-            }
-            self.hudOverlayView.updateBank(rollDeg: rollDeg)
-            // Markers go at `bearing − offset`, so a direction sitting at ARKit azimuth `a` is
-            // truly at `a + offset`. Before the world has an alignment the offset is not merely
-            // approximate, it is meaningless — so the rose is hidden rather than shown pointing
-            // somewhere arbitrary, the same rule build 34 applied to the target fade.
-            if self.worldIsAligned {
-                self.hudOverlayView.updateHeading(
-                    headingDeg: CalculationsLogic.normalizedAzimuth(
-                        rawHeadingDeg + self.appliedWorldYawOffsetDeg))
-            } else {
-                self.hudOverlayView.hideHeading()
-            }
-            // The horizon line projected successfully above, but at a
-            // steep-but-not-extreme pitch it can still land outside the
-            // visible area — show the same fixed arrow in that case too.
-            let margin: CGFloat = 20
-            let visibleRange = -margin...(self.hudOverlayView.bounds.height + margin)
-            if visibleRange.contains(horizon.0.y) || visibleRange.contains(horizon.1.y) {
-                self.hudOverlayView.updateHorizonArrow(direction: nil)
-            } else {
-                self.hudOverlayView.updateHorizonArrow(direction: arrowDirection)
-            }
-            CATransaction.commit()
+            guard let self, let latest = self.hudFrames.take() else { return }
+            self.hudOverlayView.apply(latest)
         }
     }
 
@@ -5785,7 +5816,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
             alreadySkipped: calibrationWasSkipped,
             modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
             seedCapturing: seedIsCapturing,
-            airborne: isAirborneEstimate
+            airborne: calibrationInFlight
         )
     }
 
@@ -5999,7 +6030,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
                alreadySkipped: calibrationWasSkipped,
                modalShowing: isCalibrationPopupShowing || presentedViewController != nil,
                seedCapturing: seedIsCapturing,
-               airborne: isAirborneEstimate) {
+               airborne: calibrationInFlight) {
             CompassCalibrationPolicy.markCalibrationOffered()
             presentCalibrationPopupIfNeeded()
         }
