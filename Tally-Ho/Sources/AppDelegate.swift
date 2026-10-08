@@ -30,15 +30,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     /// calibration, so this round keeps the preload to this one isolated piece.
     private var preloadedAirports: [Airport]?
 
-    /// Aircraft from one standalone adsb.lol fetch, kicked off as soon as
-    /// calibration reports its first (rough) location — well before the AR
-    /// view exists. This is a single plain-data network call via ADSBLolClient
-    /// directly; no ConnectionLogic instance is created or shared here, so
-    /// none of its timers/sockets/Combine publishers cross the AppDelegate/
-    /// ARTrafficViewController boundary — deliberately avoiding the structural
-    /// change (a shared, lazily-constructed ConnectionLogic) suspected in the
-    /// earlier camera-freeze regression.
-    private var preloadedAircraft: [Aircraft]?
+    /// Aircraft fetched from adsb.lol while the calibration screen is up, kicked off as soon as
+    /// calibration reports its first (rough) location — well before the AR view exists — and
+    /// repeated at the live interval until the AR view takes it (#19), so the hand-over is never
+    /// older than one interval. Plain-data network calls via ADSBLolClient directly; no
+    /// ConnectionLogic instance is created or shared here, so none of its timers/sockets/Combine
+    /// publishers cross the AppDelegate/ARTrafficViewController boundary — deliberately avoiding
+    /// the structural change (a shared, lazily-constructed ConnectionLogic) suspected in the
+    /// earlier camera-freeze regression. Dropped at hand-over, timer and request with it.
+    private var trafficPreloader: TrafficPreloader?
     private let earlyADSBClient = ADSBLolClient()
 
     func application(
@@ -61,6 +61,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             }
         }
 
+        // Captures the client, not self, so the preloader holds no reference back to the delegate.
+        let client = earlyADSBClient
+        trafficPreloader = TrafficPreloader { coordinate, radiusNM, completion in
+            let task = client.fetchAircraft(
+                latitude: coordinate.latitude,
+                longitude: coordinate.longitude,
+                radiusNM: radiusNM
+            ) { result in
+                let aircraft: [Aircraft]?
+                if case .success(let list) = result { aircraft = list } else { aircraft = nil }
+                DispatchQueue.main.async { completion(aircraft) }
+            }
+            return { task?.cancel() }
+        }
+
         calibration.onEarlyLocation = { [weak self] loc in
             guard let self else { return }
             // Match the radius ConnectionLogic itself would use once the AR view
@@ -69,16 +84,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             // would return for the user's configured range.
             let maxDistance = ARVisualizationSettings.load()?.aircraftMaxDistance ?? 20.0
             let radiusNM = max(10, maxDistance * 1.25)
-            self.earlyADSBClient.fetchAircraft(
-                latitude: loc.coordinate.latitude,
-                longitude: loc.coordinate.longitude,
-                radiusNM: radiusNM
-            ) { [weak self] result in
-                guard case .success(let aircraft) = result else { return }
-                DispatchQueue.main.async {
-                    self?.preloadedAircraft = aircraft
-                }
-            }
+            // Fetches now, then every 8 s until hand-over. In flight the screen goes on this same
+            // fix, so the hand-over below stops it before a single refresh.
+            self.trafficPreloader?.start(at: loc.coordinate, radiusNM: radiusNM)
         }
 
         calibration.onComplete = { [weak self] seedLocation, wasSkipped in
@@ -89,7 +97,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             // screen the user has just declined.
             arVC.calibrationWasSkipped = wasSkipped
             arVC.preloadedAirports = self?.preloadedAirports
-            arVC.preloadedAircraft = self?.preloadedAircraft
+            // The freshest preload, report times untouched (#17). Handing over stops the refresh
+            // timer and cancels any request still running: no fetch outlives this screen.
+            arVC.preloadedAircraft = self?.trafficPreloader?.handOver()
+            self?.trafficPreloader = nil
             // Crossfade from calibration to AR
             UIView.transition(
                 with: window,
