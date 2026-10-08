@@ -5,7 +5,8 @@
 //  2D top-down traffic map showing aircraft and airports around the user.
 //  • Shows exactly what the AR scene can show (#14): ARTrafficViewController hands it lists
 //    already passed through TrafficFilter, and the map applies no rules of its own.
-//  • Aircraft are drawn at the dead-reckoned position the filter judged them at.
+//  • Aircraft are drawn at the dead-reckoned position the filter judged them at, labelled with
+//    the AR label's text: the same builder and the same label toggles (#18).
 //  • Range 10–50 NM, default 30, persisted; it only zooms, it does not filter.
 //  • Updates live at 1 Hz via a dataProvider closure supplied by ARTrafficViewController.
 //  • Tap an aircraft or airport to dismiss the map and select it in the AR view.
@@ -26,6 +27,9 @@ private final class MapCanvasView: UIView {
     /// Already filtered: only what the AR scene shows.
     var airports: [Airport] = []
     var rangeNM: Double = 30
+    /// The label toggles only (callsign, type, altitude, speed, distance). Which aircraft appear is
+    /// decided upstream by TrafficFilter, never here.
+    var labelSettings = ARVisualizationSettings()
 
     // Drawing constants
     private let ringColor        = UIColor.white.withAlphaComponent(0.18)
@@ -139,11 +143,14 @@ private final class MapCanvasView: UIView {
             drawAircraftSymbol(ctx: ctx, at: pt, heading: ac.track, color: aircraftColor)
             drawnAircraftHits.append((id: ac.id, point: pt))
 
+            // The AR label's text, from the AR label's builder (#18): every label toggle applies
+            // here exactly as in AR, and with all of them off there is no label.
+            let label = MapViewController.labelText(for: shown, settings: labelSettings)
+            guard !label.isEmpty else { continue }
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: labelFont,
                 .foregroundColor: aircraftColor
             ]
-            let label = "\(ac.callsign)\n\(Int(ac.altitude)) ft"
             (label as NSString).draw(
                 at: CGPoint(x: pt.x + 9, y: pt.y - 7),
                 withAttributes: attrs)
@@ -232,6 +239,17 @@ class MapViewController: UIViewController {
     private var userHeading: Double
     private var aircraft: [TrafficFilter.Verdict]
     private var airports: [Airport]
+    /// For the aircraft labels' toggles. Settings cannot be opened while the map is up, so these do
+    /// not change under it.
+    private let labelSettings: ARVisualizationSettings
+
+    /// The label the map draws for an aircraft: AR's text for the same settings, at the distance
+    /// the filter judged it at — the distance AR labels it with (#18).
+    static func labelText(for shown: TrafficFilter.Verdict, settings: ARVisualizationSettings) -> String {
+        ARComponentFactory.buildAircraftLabelText(aircraft: shown.aircraft,
+                                                  distanceNM: shown.distanceNM,
+                                                  settings: settings)
+    }
 
     // MARK: - Callbacks
 
@@ -240,12 +258,13 @@ class MapViewController: UIViewController {
     var dataProvider: (() -> (aircraft: [TrafficFilter.Verdict], airports: [Airport],
                               location: CLLocationCoordinate2D, heading: Double)?)?
 
-    /// Called with "aircraft_<id>" or "airport_<icao>" when the user taps an item.
-    /// The map is dismissed immediately afterward.
+    /// Called with "aircraft_<id>" or "airport_<icao>" when the user taps an item, while the map is
+    /// still up. The map is dismissed, without animation, straight afterward.
     var onSelect: ((String) -> Void)?
 
-    /// Called once, after the map has gone, however it was closed. The AR view restarts its tick
-    /// here: the map is presented over a running session and never pauses it (#14).
+    /// Called once, after the map has gone, however it was closed. The map is presented over a
+    /// running session and never pauses it (#14); the AR view lifts what it deferred while the map
+    /// was up here (#18).
     var onDismissed: (() -> Void)?
 
     // MARK: - Range
@@ -272,12 +291,14 @@ class MapViewController: UIViewController {
         userLocation: CLLocationCoordinate2D,
         userHeading: Double,
         aircraft: [TrafficFilter.Verdict],
-        airports: [Airport]
+        airports: [Airport],
+        labelSettings: ARVisualizationSettings
     ) {
-        self.userLocation = userLocation
-        self.userHeading  = userHeading
-        self.aircraft     = aircraft
-        self.airports     = airports
+        self.userLocation  = userLocation
+        self.userHeading   = userHeading
+        self.aircraft      = aircraft
+        self.airports      = airports
+        self.labelSettings = labelSettings
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -448,7 +469,9 @@ class MapViewController: UIViewController {
 
         guard let nid = nodeID else { return }
         onSelect?(nid)
-        dismiss(animated: true)
+        // No animation (#18): the selection is already applied and drawn underneath (`onSelect`), so
+        // the AR view is ready the moment the map goes, and a slide-out only delays seeing it.
+        dismiss(animated: false)
     }
 
     // MARK: - Refresh
@@ -459,6 +482,7 @@ class MapViewController: UIViewController {
         canvasView.aircraft     = aircraft
         canvasView.airports     = airports
         canvasView.rangeNM      = currentRangeNM
+        canvasView.labelSettings = labelSettings
         canvasView.setNeedsDisplay()
 
         rangeLabel.text = "\(Int(currentRangeNM)) NM"

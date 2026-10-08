@@ -119,6 +119,19 @@ class SettingsViewController: UITableViewController {
         )
         /// A tappable row that performs an action rather than changing a setting.
         case action(title: String, subtitle: String, handler: (SettingsViewController) -> Void)
+
+        var title: String {
+            switch self {
+            case .toggle(let title, _, _, _),
+                 .slider(let title, _, _, _, _, _, _, _),
+                 .textField(let title, _, _, _),
+                 .callsignPicker(let title, _, _, _, _),
+                 .readOnlyValue(let title, _, _),
+                 .segmentedOption(let title, _, _, _, _),
+                 .action(let title, _, _):
+                return title
+            }
+        }
     }
 
     private struct Section {
@@ -134,8 +147,13 @@ class SettingsViewController: UITableViewController {
 
     // MARK: Data
 
-    private var settings: ARVisualizationSettings
+    /// What Done hands back. Readable for tests; written only by the rows' setters.
+    private(set) var settings: ARVisualizationSettings
     private let onDismiss: (ARVisualizationSettings) -> Void
+    /// Whether the user is flying when Settings opens (#18). Rows that only mean anything in the air
+    /// — the ±10,000 ft band and "I'm Flying" — are left out on the ground. Leaving a row out never
+    /// changes its stored value: nothing writes a setting but its row.
+    private let airborne: Bool
     /// True when no ADS-B receiver is identifying the aircraft for us, so the user may
     /// pick their own callsign. When true an extra "My Airplane" section is shown.
     private let allowsOwnshipSelection: Bool
@@ -146,23 +164,7 @@ class SettingsViewController: UITableViewController {
     private let adsbOwnshipCallsign: String?
 
     private lazy var sections: [Section] = {
-        var result: [Section] = [
-        Section(header: "📟  HUD", rows: [
-            .toggle(
-                title: "Show HUD",
-                subtitle: "Horizon line and speed/altitude readout",
-                getter: { $0.showHUD },
-                setter: { $0.showHUD = $1 }
-            ),
-            .segmentedOption(
-                title: "HUD Brightness",
-                subtitle: "Dimmer keeps traffic markers visible underneath",
-                options: HUDBrightness.allCases.map { ($0.rawValue, $0.displayName) },
-                getter: { $0.hudBrightness.rawValue },
-                setter: { $0.hudBrightness = HUDBrightness(rawValue: $1) ?? $0.hudBrightness }
-            ),
-        ]),
-        Section(header: "✈️  Aircraft", rows: [
+        var aircraftRows: [RowKind] = [
             .toggle(
                 title: "Show Aircraft",
                 subtitle: "Display aircraft markers in AR",
@@ -187,12 +189,18 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.showGroundAircraft },
                 setter: { $0.showGroundAircraft = $1 }
             ),
-            .toggle(
+        ]
+        // The band applies only in the air (#14), so on the ground the row would be a switch that
+        // does nothing (#18).
+        if airborne {
+            aircraftRows.append(.toggle(
                 title: "Only traffic within ±10,000 ft",
                 subtitle: "In the air, hide traffic more than 10,000 ft above or below you",
                 getter: { $0.limitTrafficToAltitudeBand },
                 setter: { $0.limitTrafficToAltitudeBand = $1 }
-            ),
+            ))
+        }
+        aircraftRows += [
             .toggle(
                 title: "Show Altitude",
                 subtitle: "Altitude in feet MSL",
@@ -219,7 +227,25 @@ class SettingsViewController: UITableViewController {
                 getter: { $0.aircraftMaxDistance },
                 setter: { $0.aircraftMaxDistance = $1 }
             ),
+        ]
+
+        var result: [Section] = [
+        Section(header: "📟  HUD", rows: [
+            .toggle(
+                title: "Show HUD",
+                subtitle: "Horizon line and speed/altitude readout",
+                getter: { $0.showHUD },
+                setter: { $0.showHUD = $1 }
+            ),
+            .segmentedOption(
+                title: "HUD Brightness",
+                subtitle: "Dimmer keeps traffic markers visible underneath",
+                options: HUDBrightness.allCases.map { ($0.rawValue, $0.displayName) },
+                getter: { $0.hudBrightness.rawValue },
+                setter: { $0.hudBrightness = HUDBrightness(rawValue: $1) ?? $0.hudBrightness }
+            ),
         ]),
+        Section(header: "✈️  Aircraft", rows: aircraftRows),
         Section(header: "🛫  Airports", rows: [
             .toggle(
                 title: "Large Airports",
@@ -269,7 +295,10 @@ class SettingsViewController: UITableViewController {
             ]
         ))
 
-        if allowsOwnshipSelection {
+        // "I'm Flying" — the picker and the receiver's read-only answer alike — is a question about
+        // the aircraft you are in, so it is asked only in the air (#18). A pick made in flight stays
+        // stored on the ground; it is only not offered there.
+        if airborne, allowsOwnshipSelection {
             result.append(Section(
                 header: "🛩️  My Airplane",
                 footer: "On WiFi, the app cannot auto-detect which aircraft you are on. " +
@@ -287,7 +316,7 @@ class SettingsViewController: UITableViewController {
                     )
                 ]
             ))
-        } else if let ownship = adsbOwnshipCallsign {
+        } else if airborne, let ownship = adsbOwnshipCallsign {
             result.append(Section(
                 header: "🛩️  My Airplane",
                 footer: "Your aircraft is automatically identified by the ADS-B receiver.",
@@ -306,11 +335,13 @@ class SettingsViewController: UITableViewController {
     // MARK: Init
 
     init(settings: ARVisualizationSettings,
+         airborne: Bool,
          allowsOwnshipSelection: Bool = false,
          nearbyCallsigns: [String] = [],
          adsbOwnshipCallsign: String? = nil,
          onDismiss: @escaping (ARVisualizationSettings) -> Void) {
         self.settings             = settings
+        self.airborne             = airborne
         self.allowsOwnshipSelection = allowsOwnshipSelection
         self.nearbyCallsigns      = nearbyCallsigns
         self.adsbOwnshipCallsign  = adsbOwnshipCallsign
@@ -319,6 +350,15 @@ class SettingsViewController: UITableViewController {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: What the table shows
+
+    /// Section headers in table order. For tests: which rows are offered is decided here, at
+    /// construction, so it can be checked without loading the view.
+    var sectionHeaders: [String] { sections.map { $0.header } }
+
+    /// Row titles per section, in table order.
+    var rowTitles: [[String]] { sections.map { $0.rows.map { $0.title } } }
 
     // MARK: Lifecycle
 
