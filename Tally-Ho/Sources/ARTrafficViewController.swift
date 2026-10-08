@@ -2126,7 +2126,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // .formSheet doesn't hide the presenting view, so unlike .fullScreen (calibration) it
         // never fires viewWillDisappear/viewWillAppear on us. Only the 4 Hz HUD tick stops while it
         // is up; it restarts in presentationControllerDidDismiss(_:), which fires for both the Done
-        // button and an interactive swipe-down dismiss. The map does the same (#14, `showMap`).
+        // button and an interactive swipe-down dismiss. The map no longer does: it keeps the tick
+        // running and holds back only the seed steps (#18, `showMap`).
         //
         // **The ARKit session keeps running (#10).** It used to be paused here and reset on the way
         // back, and on 2026-10-02 that reset killed the camera three times out of three in the air:
