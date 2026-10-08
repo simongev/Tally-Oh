@@ -465,13 +465,24 @@ class ARComponentFactory {
 
     // MARK: - Aircraft Label Text
 
+    /// The aircraft label, for AR and the 2D map alike (#18): one line per enabled toggle, empty when
+    /// every toggle is off.
+    ///
+    /// Callsign and type share the first line, each only when its toggle is on and the source sent
+    /// one. The callsign used to be added unconditionally, so Show Callsign did nothing, and a target
+    /// with no callsign got an empty first line (" / B738", or a blank line above the altitude).
     static func buildAircraftLabelText(aircraft: Aircraft, distanceNM: Double = 0, settings: ARVisualizationSettings) -> String {
         var parts: [String] = []
-        var line1 = aircraft.callsign
-        if settings.showAircraftType && !aircraft.aircraftType.isEmpty {
-            line1 += " / \(aircraft.aircraftType)"
+        var identity: [String] = []
+        if settings.showCallsign && !aircraft.callsign.isEmpty {
+            identity.append(aircraft.callsign)
         }
-        parts.append(line1)
+        if settings.showAircraftType && !aircraft.aircraftType.isEmpty {
+            identity.append(aircraft.aircraftType)
+        }
+        if !identity.isEmpty {
+            parts.append(identity.joined(separator: " / "))
+        }
         if settings.showAircraftAltitude {
             // Quantize to nearest 100 ft so the label text (and its texture cache key) only
             // changes when altitude meaningfully changes, not on every raw ADS-B update.

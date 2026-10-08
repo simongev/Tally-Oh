@@ -80,6 +80,41 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// Says why a selected target has no AR node, in place of an arrow pointing at nothing (#14).
     private var selectionNoteLabel: UILabel!
     private var offScreenArrowView: OffScreenArrowView!
+
+    // MARK: - Map (#14, #18)
+
+    /// True while the 2D map is up. The tick keeps running under it but defers whatever needs the
+    /// phone aimed at the sky or would restart the world. See `showMap`.
+    private var isMapShown = false
+
+    /// A selection made on the map, from the tap to the map's close, for `map_selection_drawn`.
+    private var pendingMapSelection: (nodeID: String, selectedAt: CFTimeInterval)?
+
+    /// One-shot hand-off of a map selection to the render thread, which reports the first frame it
+    /// draws once the map has gone. Armed on main, fired from `didRenderScene`.
+    private final class SelectionDrawProbe {
+        private let lock = NSLock()
+        private var armed: (nodeID: String, selectedAt: CFTimeInterval)?
+
+        func arm(nodeID: String, selectedAt: CFTimeInterval) {
+            lock.lock()
+            armed = (nodeID: nodeID, selectedAt: selectedAt)
+            lock.unlock()
+        }
+
+        /// The armed selection, once; nil on every later call until armed again.
+        func fire() -> (nodeID: String, selectedAt: CFTimeInterval)? {
+            lock.lock()
+            defer { lock.unlock() }
+            let shot = armed
+            armed = nil
+            return shot
+        }
+    }
+    private let selectionDrawProbe = SelectionDrawProbe()
+
+    // MARK: - UI (continued)
+
     private var hudOverlayView: HUDOverlayView!
     /// The HUD's frames from the render thread, latest wins: one main block queued at most (#15).
     private let hudFrames = MainThreadMailbox.Latest<HUDFrame>()
@@ -2018,9 +2053,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard let settings = sceneManager?.settings else { return }
 
         // Collect callsigns of nearby aircraft so the picker offers meaningful options.
-        // Offered whenever there is no ADS-B receiver to identify the aircraft for us,
-        // airborne or not: identifying your own aircraft is now the only thing that hides
-        // it, so it has to be possible to do that on the ramp before departure.
+        // Offered when there is no ADS-B receiver to identify the aircraft for us, and only in the
+        // air (#18, Gev's ground test): on the ground Settings leaves the "I'm Flying" section out.
         let wifiMode = !usingADSBGPS
         var nearbyCallsigns: [String] = []
         if wifiMode, let loc = activeLocation {
@@ -2039,6 +2073,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         let vc = SettingsViewController(
             settings: settings,
+            airborne: isAirborneEstimate,
             allowsOwnshipSelection: wifiMode,
             nearbyCallsigns: nearbyCallsigns,
             adsbOwnshipCallsign: adsbCallsign
@@ -2151,24 +2186,27 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         resumeAfterOverlay()
     }
 
-    /// Restarts the HUD tick after Settings or the map closes. The session was never paused, so
-    /// nothing else is owed — in particular no `startARSession`, whose reset is what stuck the camera
-    /// in the air. For Settings it is called from both presentationControllerDidDismiss(_:) (an
-    /// interactive swipe-down) and the onDismiss closure (the Done button), since either may fire;
-    /// the guard makes the second call a no-op.
+    /// Restarts the HUD tick after Settings closes. The session was never paused, so nothing else is
+    /// owed — in particular no `startARSession`, whose reset is what stuck the camera in the air.
+    /// Called from both presentationControllerDidDismiss(_:) (an interactive swipe-down) and the
+    /// Settings onDismiss closure (the Done button), since either may fire; the guard makes the
+    /// second call a no-op. The map keeps the tick running and closes through `mapDidClose` (#18).
     private func resumeAfterOverlay() {
         guard !(updateTimer?.isValid ?? false) else { return }
-        // A seed cancelled by `cancelAimedCaptures(reason:)` starts again on the next tick, and gets
-        // the watchdog time a reset used to give it. Without this the seed's 10 s, counted from the
-        // world's start, could run out behind the sheet and the first tick back would hand the world
-        // to `.gravityAndHeading` instead of seeding it. Never shortened.
-        if awaitingSeed {
-            seedDeadline = max(seedDeadline,
-                               CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds)
-        }
+        renewSeedWatchdogAfterOverlay()
         updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateVisualization()
         }
+    }
+
+    /// A seed cancelled by `cancelAimedCaptures(reason:)` starts again on the next tick, and gets the
+    /// watchdog time a reset used to give it. Without this the seed's 10 s, counted from the world's
+    /// start, could run out behind the overlay and the first tick back would hand the world to
+    /// `.gravityAndHeading` instead of seeding it. Never shortened.
+    private func renewSeedWatchdogAfterOverlay() {
+        guard awaitingSeed else { return }
+        seedDeadline = max(seedDeadline,
+                           CACurrentMediaTime() + ARTrafficViewController.seedReferenceTimeoutSeconds)
     }
 
     // MARK: - Display filter (#14)
@@ -2225,9 +2263,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// carry or the seed landed, while its UIKit arrow was drawn in full the whole time.
     ///
     /// `.overFullScreen` leaves this view in the hierarchy, so neither callback fires and ARKit is
-    /// neither paused nor reset — the Settings pattern from #10. Only the 4 Hz HUD tick stops, and
-    /// the captures that measure where the phone is aimed are cancelled, since the phone is
-    /// pointing at a map rather than at the sky. The tick restarts when the map has gone.
+    /// neither paused nor reset — the Settings pattern from #10. The captures that measure where the
+    /// phone is aimed are cancelled, since the phone is pointing at a map rather than at the sky.
+    ///
+    /// **The 4 Hz tick keeps running under the map (#18).** Stopping it froze TCAS, ownship and the
+    /// markers for as long as the map was up, and made a selection wait for the first tick after the
+    /// map had gone. While `isMapShown`, the tick only defers what an aimed phone or a world restart
+    /// needs — the seed start and its watchdog, the airborne re-arm, the align hint — exactly as
+    /// stopping it did; `mapDidClose` lifts that.
     @objc private func showMap() {
         guard presentedViewController == nil, let content = mapContent() else { return }
 
@@ -2235,7 +2278,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             userLocation: content.location,
             userHeading: userHeading,
             aircraft: content.aircraft,
-            airports: content.airports
+            airports: content.airports,
+            labelSettings: sceneManager?.settings ?? ARVisualizationSettings()
         )
 
         // Fresh data every live-update tick, through the same filter.
@@ -2249,22 +2293,58 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             )
         }
 
-        // When the user taps an item on the map, dismiss the map and select it in the AR view.
+        // A tap on the map selects in the AR view before the map goes (#18): the selection, then one
+        // tick at once, so the node, its ring and the arrow are all in place underneath when the map
+        // is dismissed (without animation) straight after this returns.
         vc.onSelect = { [weak self] nodeID in
+            guard let self else { return }
+            let selectedAt = CACurrentMediaTime()
             FlightRecorder.shared.record(event: "map_selection", detail: nodeID)
-            self?.applySelection(nodeID: nodeID)
+            self.applySelection(nodeID: nodeID)
+            self.updateVisualization()
+            self.pendingMapSelection = (nodeID: nodeID, selectedAt: selectedAt)
         }
         vc.onDismissed = { [weak self] in
-            FlightRecorder.shared.record(event: "map_closed")
-            self?.resumeAfterOverlay()
+            self?.mapDidClose()
         }
 
         let nav = UINavigationController(rootViewController: vc)
         nav.modalPresentationStyle = .overFullScreen
-        updateTimer?.invalidate()
+        isMapShown = true
         cancelAimedCaptures(reason: "map_opened")
         FlightRecorder.shared.record(event: "map_opened")
         present(nav, animated: true)
+    }
+
+    /// The map has gone, however it was closed: lift what the tick deferred while it was up, and if
+    /// it closed on a selection, time that selection to the first frame drawn without the map.
+    private func mapDidClose() {
+        isMapShown = false
+        FlightRecorder.shared.record(event: "map_closed")
+        renewSeedWatchdogAfterOverlay()
+        // The tick ran throughout. Restarted only if something else stopped it while the map was up.
+        if !(updateTimer?.isValid ?? false) {
+            updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.updateVisualization()
+            }
+        }
+        if let selection = pendingMapSelection {
+            pendingMapSelection = nil
+            selectionDrawProbe.arm(nodeID: selection.nodeID, selectedAt: selection.selectedAt)
+        }
+    }
+
+    /// Log how long a map selection took to reach the screen: from the tap to the first SceneKit
+    /// frame rendered after the map had gone, and whether the target had a visible node by then.
+    /// Main thread, from the render thread's `didRenderScene`.
+    private func recordMapSelectionDrawn(nodeID: String, selectedAt: CFTimeInterval, drawnAt: CFTimeInterval) {
+        let node = sceneManager?.node(forID: nodeID)
+        let hasNode = node.map { !$0.isHidden } ?? false
+        FlightRecorder.shared.record(
+            event: "map_selection_drawn",
+            detail: String(format: "id=%@ ms=%.0f node=%d", nodeID, (drawnAt - selectedAt) * 1000,
+                           hasNode ? 1 : 0)
+        )
     }
 
     @objc private func backButtonTapped() {
@@ -2803,7 +2883,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                 if seedRearmedInPlace { endPendingSeed() }
             }
         }
-        applySeedRearmIfDue()
+        // Under the map (#18) the tick runs for the traffic, but nothing here may start a capture that
+        // measures where the phone is aimed — it is aimed at the map — or restart the world. A re-arm
+        // stays pending in `seedRearm` and is applied on the first tick after the map closes, as it was
+        // when the map stopped the tick altogether.
+        if !isMapShown { applySeedRearmIfDue() }
         let airborne = isAirborneEstimate
 
         // A reset carry that never found a steady frame, or whose azimuth failed the sign check,
@@ -2811,8 +2895,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         checkYawSignGuard()
         expireResetCarryIfDue()
 
-        // Establish the world's alignment, if this world has not got one yet.
-        updateStartupSeed()
+        // Establish the world's alignment, if this world has not got one yet. Deferred under the map
+        // (#18), its watchdog with it — `mapDidClose` renews the deadline as the reopened tick used to.
+        if !isMapShown { updateStartupSeed() }
 
         // Carry the offset through the aircraft's heading change. Ahead of the placement below so
         // this tick's markers are drawn with the offset this tick's heading calls for.
@@ -2907,7 +2992,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         )
         connectionLogic.updateLocation(loc, altitudeFeet: altitude)
 
-        updateAlignButtonVisibility()
+        // Its hint is scheduled and counted; one shown under the map would be spent unseen (#18).
+        if !isMapShown { updateAlignButtonVisibility() }
         noteFirstTargetIfNeeded(renderedCount: sceneManager?.renderedAircraftCount ?? 0)
         recordFlightSampleIfDue(state: state, aircraft: datumTraffic)
 
@@ -5731,6 +5817,16 @@ extension ARTrafficViewController: ARSCNViewDelegate {
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) { }
+
+    /// The first frame drawn after a map selection's map has gone, for `map_selection_drawn` (#18).
+    /// One lock per frame; one main block per selection.
+    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+        guard let shot = selectionDrawProbe.fire() else { return }
+        let drawnAt = CACurrentMediaTime()
+        DispatchQueue.main.async { [weak self] in
+            self?.recordMapSelectionDrawn(nodeID: shot.nodeID, selectedAt: shot.selectedAt, drawnAt: drawnAt)
+        }
+    }
 
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         arTrackingState = camera.trackingState
