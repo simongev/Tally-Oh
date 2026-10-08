@@ -133,8 +133,9 @@ class ConnectionLogic: ObservableObject {
     private var consecutiveInternetFailures = 0
     private let maxInternetFailuresBeforeOffline = 3
     // At 250 kt the user moves ~1.0 NM in 8 s — fetch frequently enough to
-    // keep the traffic picture current as the aircraft flies.
-    private let internetFetchInterval: TimeInterval = 8.0
+    // keep the traffic picture current as the aircraft flies. Shared with the calibration
+    // screen's preload (TrafficPreloader), which refreshes at the same interval (#19).
+    static let internetFetchInterval: TimeInterval = 8.0
     private var currentLocation: CLLocationCoordinate2D?
 
     /// Query radius for the internet fetch.  Kept in sync with the scene manager's
@@ -423,7 +424,7 @@ class ConnectionLogic: ObservableObject {
         if !isInternetAvailable { isInternetAvailable = networkReachability.isConnected }
         consecutiveInternetFailures = 0   // fresh start after a network-path change
         fetchInternetData()
-        internetFetchTimer = Timer.scheduledTimer(withTimeInterval: internetFetchInterval, repeats: true) { [weak self] _ in
+        internetFetchTimer = Timer.scheduledTimer(withTimeInterval: ConnectionLogic.internetFetchInterval, repeats: true) { [weak self] _ in
             self?.fetchInternetData()
         }
     }

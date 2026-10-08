@@ -89,26 +89,29 @@ class ADSBLolClient {
     // MARK: - Public API
 
     /// Fetch aircraft within a radius of the given position.
-    /// Completion is called on a background queue.
+    /// Completion is called on a background queue. Returns the request, so a caller that is going
+    /// away can cancel it (the calibration screen's preload, #19); a cancelled request completes
+    /// with a failure.
+    @discardableResult
     func fetchAircraft(
         latitude:  Double,
         longitude: Double,
         radiusNM:  Double,
         completion: @escaping (Result<[Aircraft], Error>) -> Void
-    ) {
+    ) -> URLSessionDataTask? {
         let distNM = max(1, Int(radiusNM.rounded()))
         let urlString = "\(baseURL)/lat/\(latitude)/lon/\(longitude)/dist/\(distNM)"
 
         guard let url = URL(string: urlString) else {
             completion(.failure(ADSBError.invalidURL))
-            return
+            return nil
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        session.dataTask(with: request) { data, _, error in
+        let task = session.dataTask(with: request) { data, _, error in
             if let error { completion(.failure(error)); return }
             guard let data else { completion(.failure(ADSBError.noData)); return }
 
@@ -118,7 +121,9 @@ class ADSBLolClient {
             } catch {
                 completion(.failure(error))
             }
-        }.resume()
+        }
+        task.resume()
+        return task
     }
 
     // MARK: - Private
