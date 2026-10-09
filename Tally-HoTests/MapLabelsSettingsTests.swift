@@ -228,4 +228,23 @@ struct SettingsRowsTests {
         #expect(airOnly.count == 2)
         #expect(airMinusAirOnly == ground)
     }
+
+    /// In the air "I'm Flying" comes above Export Flight Log (#22), picker or receiver alike; the
+    /// ground order is unchanged, with no "I'm Flying" at all.
+    @Test func sectionOrderOnTheGroundAndInTheAir() {
+        let common = ["📟  HUD", "✈️  Aircraft", "🛫  Airports"]
+        let diagnostics = "🛠  Diagnostics"
+        let groundOrder: [String] = common + [diagnostics]
+        let airOrder: [String] = common + [Self.myAirplane, diagnostics]
+
+        #expect(settingsVC(airborne: false, wifi: true).sectionHeaders == groundOrder)
+        #expect(settingsVC(airborne: false, wifi: false, adsbCallsign: "N123AB").sectionHeaders == groundOrder)
+        #expect(settingsVC(airborne: true, wifi: true).sectionHeaders == airOrder)
+        #expect(settingsVC(airborne: true, wifi: false, adsbCallsign: "N123AB").sectionHeaders == airOrder)
+
+        // Row by row, too: the last two rows in the air are "I'm Flying" then the export.
+        let airRows = allRowTitles(settingsVC(airborne: true, wifi: true))
+        let lastTwo: [String] = Array(airRows.suffix(2))
+        #expect(lastTwo == ["I'm Flying", "Export Flight Log"])
+    }
 }
