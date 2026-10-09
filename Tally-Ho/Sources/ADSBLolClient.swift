@@ -90,8 +90,7 @@ class ADSBLolClient {
 
     /// Fetch aircraft within a radius of the given position.
     /// Completion is called on a background queue. Returns the request, so a caller that is going
-    /// away can cancel it (the calibration screen's preload, #19); a cancelled request completes
-    /// with a failure.
+    /// away can cancel it; a cancelled request completes with a failure.
     @discardableResult
     func fetchAircraft(
         latitude:  Double,

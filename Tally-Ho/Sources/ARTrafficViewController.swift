@@ -187,23 +187,23 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// The aircraft hidden as the user's own, with how it was identified. Main thread.
     private var ownshipSelection: OwnshipSelection?
 
-    var seedLocation: CLLocation?
-
-    /// Set by whoever presented the launch calibration screen when the user chose Skip.
-    /// Suppresses the automatic calibration popup for the rest of this launch.
+    /// Set when the user chose Skip on the launch card or the popup. Suppresses the automatic
+    /// calibration popup for the rest of this launch.
     var calibrationWasSkipped: Bool = false
-    /// Airport CSV data parsed ahead of time during the calibration screen (see
-    /// AppDelegate). Pure background-thread data — no ConnectionLogic/network
-    /// involvement — kept deliberately isolated from ARSession/view-lifecycle
-    /// timing after an earlier attempt at preloading ConnectionLogic itself
-    /// froze the AR camera. nil-safe: loadAirports() falls back to its normal
-    /// disk read if this hasn't finished (or wasn't started) in time.
-    var preloadedAirports: [Airport]?
-    /// Aircraft from one standalone adsb.lol fetch made during calibration (see
-    /// AppDelegate.onEarlyLocation). Seeded into connectionLogic once in
-    /// viewDidLoad via seedInternetAircraft() — connectionLogic itself is still
-    /// constructed fresh, right here, exactly as without this preload.
-    var preloadedAircraft: [Aircraft]?
+
+    // MARK: - Launch calibration card (#20)
+
+    /// The calibration card over this view at launch, or nil once it has closed.
+    ///
+    /// A child overlay, not a presentation: presenting it would fire this view's `viewWillDisappear`,
+    /// which pauses the session and stops the tick — the very start the card now waits on. Everything
+    /// runs underneath it from launch: the session, location, ConnectionLogic and the seed. While it
+    /// is up `isCalibrationPopupShowing` is set too, so the popup and iOS's own figure-8 stay away
+    /// from it exactly as they did when it stood in front of an AR view that did not yet exist.
+    private var launchCard: CalibrationViewController?
+    /// Recognizers on `view` switched off while the card is up — a pinch or pan over it must not zoom
+    /// the view underneath or take a touch from Skip. Exactly these are switched back on.
+    private var gesturesHeldForLaunchCard: [UIGestureRecognizer] = []
 
     private var userLocation: CLLocationCoordinate2D?
     private var bestHorizontalAccuracy: CLLocationAccuracy = -1
@@ -883,7 +883,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        UIApplication.shared.isIdleTimerDisabled = true
+        // The idle timer is the app's, not this view's: AppDelegate sets it at launch and on every
+        // return to active (#20).
 
         setupUI()
         setupARScene()
@@ -906,33 +907,17 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // authorisation, so it raises no prompt to lose the race with.
         startYawRateUpdates()
 
-        if let seed = seedLocation {
-            userLocation        = seed.coordinate
-            gpsMSLAltitudeFeet  = seed.altitude * CalculationsLogic.metersToFeet
-            userAltitude        = gpsMSLAltitudeFeet
-            lastHorizontalAccuracy   = seed.horizontalAccuracy
-            bestHorizontalAccuracy   = seed.horizontalAccuracy
-            lastAcceptedFixTime      = seed.timestamp
-            ownshipEstimator.ingestPhoneLocation(
-                coordinate: seed.coordinate,
-                horizontalAccuracyM: seed.horizontalAccuracy,
-                groundSpeedKt: nil,
-                trackDeg: nil,
-                timestamp: seed.timestamp
-            )
-            ownshipEstimator.ingestPhoneAltitude(fusedMSLFt: userAltitude)
-            connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
-        }
-
+        // No location is handed in any more (#20): this view is created at launch and its own
+        // location manager delivers the first fix, which starts the internet fetch through
+        // `connectionLogic.updateLocation` as soon as it arrives.
         connectionLogic.startListening()
-
-        if let preloadedAircraft, !preloadedAircraft.isEmpty {
-            connectionLogic.seedInternetAircraft(preloadedAircraft)
-        }
 
         sceneManager?.onSelectionInvalidated = { [weak self] in
             self?.clearSelection()
         }
+
+        // Last, so it sits above every control this view has built.
+        showLaunchCard()
     }
 
     /// Device motion's update interval: 100 Hz (#15).
@@ -1113,10 +1098,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         startARSession(reason: "viewWillAppear")
         beginLiftSession(reason: "viewWillAppear")
 
-        // Anything presented .fullScreen over this view (the calibration screen) fires
+        // Anything presented .fullScreen over this view (the calibration popup) fires
         // viewWillDisappear while it is shown, pausing the AR session and invalidating the
         // timer. Restart everything here so the AR view is fully live again when it reappears.
         // The map and Settings do not come through here: neither pauses the session (#10, #14).
+        // Nor does the launch card, which is a child overlay for exactly that reason (#20).
 
         // Restart the 4 Hz update loop if it was invalidated while we were away.
         if !(updateTimer?.isValid ?? false) {
@@ -1178,7 +1164,6 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     }
 
     deinit {
-        UIApplication.shared.isIdleTimerDisabled = false
         connectionLogic.stopListening()
         // viewWillDisappear normally stops the tick, but it does not run on every path out of
         // this controller. The run loop holds the timer either way, so an uninvalidated one
@@ -1549,12 +1534,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // 200 NM even when the user had set the display range to 10 NM.
         let rangeNM = (sceneManager?.settings.airportMaxDistance ?? 40) * 1.25
 
-        if let preloaded = preloadedAirports {
-            allAirports = preloaded
-            filterNearbyAirports(from: preloaded, rangeNM: rangeNM)
-            return
-        }
-
+        // Parsed here at launch, under the calibration card (#20); nothing is parsed ahead of this.
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let parsed = AirportDataParser.loadAirportsFromCSV() else { return }
             DispatchQueue.main.async { [weak self] in
@@ -2037,7 +2017,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         isCalibrationPopupShowing = true
         let calibration = CalibrationViewController()
         calibration.modalPresentationStyle = .fullScreen
-        calibration.onComplete = { [weak self, weak calibration] _, wasSkipped in
+        calibration.onComplete = { [weak self, weak calibration] wasSkipped in
             calibration?.dismiss(animated: true)
             self?.isCalibrationPopupShowing = false
             // Skipping the popup suppresses later ones too, or the same loop just repeats
@@ -2045,6 +2025,76 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             if wasSkipped { self?.calibrationWasSkipped = true }
         }
         present(calibration, animated: true)
+    }
+
+    // MARK: - Launch calibration card (#20)
+
+    /// Put the calibration card over this view as a child. Once, at the end of `viewDidLoad`.
+    private func showLaunchCard() {
+        let card = CalibrationViewController()
+        card.isOverARView = true
+        card.onComplete = { [weak self, weak card] wasSkipped in
+            guard let self, let card else { return }
+            self.launchCardDidClose(card, wasSkipped: wasSkipped)
+        }
+        addChild(card)
+        card.view.frame = view.bounds
+        card.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(card.view)
+        card.didMove(toParent: self)
+        launchCard = card
+        // Keeps the popup and iOS's figure-8 off the card: both already stand aside for this flag.
+        isCalibrationPopupShowing = true
+        for recognizer in view.gestureRecognizers ?? [] where recognizer.isEnabled {
+            recognizer.isEnabled = false
+            gesturesHeldForLaunchCard.append(recognizer)
+        }
+    }
+
+    /// Tell the card how the world underneath it stands. From the 4 Hz tick, ahead of the tick's
+    /// position guard, so the card's timeout runs even before there is a fix.
+    private func updateLaunchCard(hasPosition: Bool) {
+        guard let card = launchCard else { return }
+        card.updateWorld(aligned: launchWorldReady(hasPosition: hasPosition), inFlight: calibrationInFlight)
+    }
+
+    /// What the card waits for underneath it: the world aligned — by its seed, or the heading
+    /// fallback — with tracking normal, which is when the fade lifts, and a position to place the
+    /// targets from. Reads the seed's state; decides nothing about it.
+    private func launchWorldReady(hasPosition: Bool) -> Bool {
+        guard hasPosition, worldIsAligned, case .normal = arTrackingState else { return false }
+        return true
+    }
+
+    /// The card has closed — ready, skipped, in flight or timed out. Logs it, hands the screen and
+    /// its gestures back, and fades the card off the live view.
+    private func launchCardDidClose(_ card: CalibrationViewController, wasSkipped: Bool) {
+        guard launchCard === card else { return }
+        launchCard = nil
+        isCalibrationPopupShowing = false
+        // Same as the popup's Skip: the user has declined, so nothing re-presents it this launch.
+        if wasSkipped { calibrationWasSkipped = true }
+        for recognizer in gesturesHeldForLaunchCard { recognizer.isEnabled = true }
+        gesturesHeldForLaunchCard.removeAll()
+
+        // `targets_faded` is the scene's own fade test, the one `applyWorldUsabilityFade` applies.
+        let solid = worldIsShown(arTrackingState) && worldIsAligned
+        FlightRecorder.shared.record(
+            event: "card_closed",
+            detail: String(format: "reason=%@ aligned=%d targets_faded=%d shown=%.2fs gps_ready=%d h_acc=%.0f ar=%@ rendered=%d",
+                           card.closeReason?.rawValue ?? "unknown", worldIsAligned ? 1 : 0,
+                           solid ? 0 : 1, card.secondsShown, card.gpsIsReady ? 1 : 0,
+                           lastHorizontalAccuracy, arTrackingStateDescription,
+                           sceneManager?.renderedAircraftCount ?? 0)
+        )
+
+        card.willMove(toParent: nil)
+        UIView.animate(withDuration: 0.3, animations: {
+            card.view.alpha = 0
+        }, completion: { _ in
+            card.view.removeFromSuperview()
+            card.removeFromParent()
+        })
     }
 
     // MARK: - Actions
@@ -2841,6 +2891,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // One snapshot drives the whole tick. Reading the estimator repeatedly would give
         // each consumer a slightly different dead-reckoned position within the same frame.
         let state = ownshipEstimator.snapshot()
+        // The launch card closes on this world (#20), and times out without a fix too.
+        updateLaunchCard(hasPosition: state.hasPosition)
         guard state.hasPosition else { return }
         let loc = state.coordinate
         let altitude = state.displayAltitudeFt
@@ -5855,10 +5907,13 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         DispatchQueue.main.async {
             self.updateStatusLabel()
             // The best serialization point available for the Motion request. Tracking reaching
-            // .normal proves the camera permission was granted and its alert is gone, and by
-            // then the launch screen's location prompt has been answered too — so the Motion
+            // .normal proves the camera permission was granted and its alert is gone. The location
+            // prompt used to be answered by then too, on the launch card before this view existed;
+            // since #20 the session starts at launch beside it, so wait for that answer as well —
+            // `locationManagerDidChangeAuthorization` makes the request once it comes. The Motion
             // alert gets the screen to itself instead of being raised behind another one.
-            if case .normal = camera.trackingState {
+            if case .normal = camera.trackingState,
+               self.locationManager.authorizationStatus != .notDetermined {
                 self.startDiagnosticAltimeterIfNeeded(trigger: "tracking_normal")
                 // The airborne card is *not* confirmed here any more. Tracking reaching normal said
                 // the card's job was done back when ARKit's own world was the seed; now the seed is
@@ -6182,6 +6237,11 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         case .authorizedWhenInUse, .authorizedAlways:
             locationManager.startUpdatingLocation()
             locationManager.startUpdatingHeading()
+            // Tracking may have reached normal while the location prompt was still up (#20); the
+            // Motion request waited for this answer. See `cameraDidChangeTrackingState`.
+            if case .normal = arTrackingState {
+                startDiagnosticAltimeterIfNeeded(trigger: "location_answered")
+            }
         case .denied, .restricted:
             let alert = UIAlertController(
                 title: "Location Required",

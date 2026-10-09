@@ -133,8 +133,7 @@ class ConnectionLogic: ObservableObject {
     private var consecutiveInternetFailures = 0
     private let maxInternetFailuresBeforeOffline = 3
     // At 250 kt the user moves ~1.0 NM in 8 s — fetch frequently enough to
-    // keep the traffic picture current as the aircraft flies. Shared with the calibration
-    // screen's preload (TrafficPreloader), which refreshes at the same interval (#19).
+    // keep the traffic picture current as the aircraft flies.
     static let internetFetchInterval: TimeInterval = 8.0
     private var currentLocation: CLLocationCoordinate2D?
 
@@ -500,14 +499,6 @@ class ConnectionLogic: ObservableObject {
         }
     }
 
-    /// Seed detectedAircraft with a list fetched ahead of time (e.g. during the
-    /// calibration screen), so aircraft are visible on the very first frame
-    /// instead of waiting for the first regular fetch's network round-trip.
-    /// Runs through the exact same filter/cap/dedup logic as a normal fetch.
-    func seedInternetAircraft(_ list: [Aircraft]) {
-        mergeInternetAircraft(list)
-    }
-
     /// Fold one fetch's aircraft into the store, keyed by id.
     ///
     /// `lastUpdate` arrives as the report's own time — when the server last had a position, not
@@ -516,8 +507,7 @@ class ConnectionLogic: ObservableObject {
     /// drawing every internet target a second or more behind where it was.
     ///
     /// Because the time is now the report's, a report can be older than the one already stored
-    /// for the same aircraft: the calibration-screen preload landing after a regular fetch, or two
-    /// fetches answered out of order. The newer report always wins.
+    /// for the same aircraft: two fetches answered out of order. The newer report always wins.
     static func merge(_ updates: [String: Aircraft], into store: [String: Aircraft]) -> [String: Aircraft] {
         var merged = store
         for (id, incoming) in updates {
