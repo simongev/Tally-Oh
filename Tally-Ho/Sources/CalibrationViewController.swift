@@ -100,12 +100,31 @@ class CalibrationViewController: UIViewController {
     var onEarlyLocation: ((CLLocation) -> Void)?
     private var earlyLocationSent = false
 
+    // MARK: - Field check (#21)
+
+    /// The field-check client name for `MagneticFieldMonitor.shared`.
+    private static let fieldMonitorClient = "calibration"
+    /// When the compass card was first held back by the field alone, on the media clock.
+    private var fieldWaitStart: CFTimeInterval?
+    /// Re-evaluates the cards twice a second, so the field verdict and the ten-second wait move
+    /// the card even when no heading update arrives. Invalidated on dismissal.
+    private var readinessTimer: Timer?
+    private var lastCompassCard: CompassCardStatus?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         setupUI()
         setupLocation()
+        MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
+        readinessTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateReadiness()
+        }
+    }
+
+    deinit {
+        readinessTimer?.invalidate()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -195,16 +214,23 @@ class CalibrationViewController: UIViewController {
             gpsReady = false
         }
 
-        // Compass card
-        if bestCompassAccuracy < 0 {
-            compassCard.setState(.waiting, detail: "Move phone in a figure-8…")
-        } else if bestCompassAccuracy <= compassAccuracyThreshold {
-            compassCard.setState(.ready, detail: String(format: "±%.0f°  ✓", bestCompassAccuracy))
-            compassReady = true
-        } else {
-            compassCard.setState(.improving, detail: String(format: "±%.0f°  (need ≤ %.0f°)  Move in ∞", bestCompassAccuracy, compassAccuracyThreshold))
-            compassReady = false
+        // Compass card — decided entirely by `compassCardStatus` (#21).
+        let now = CACurrentMediaTime()
+        let card = Self.compassCardStatus(
+            headingAccuracyDeg: bestCompassAccuracy,
+            thresholdDeg: compassAccuracyThreshold,
+            field: MagneticFieldMonitor.shared.assessment().verdict,
+            fieldWaitedSeconds: fieldWaitStart.map { now - $0 } ?? 0)
+        if card.heldByField, fieldWaitStart == nil { fieldWaitStart = now }
+        let look: CalibrationState
+        switch card.look {
+        case .waiting:   look = .waiting
+        case .improving: look = .improving
+        case .ready:     look = .ready
         }
+        compassCard.setState(look, detail: card.detail)
+        compassReady = card.isReady
+        lastCompassCard = card
 
         if gpsReady && compassReady {
             completeDismiss()
@@ -216,7 +242,109 @@ class CalibrationViewController: UIViewController {
         dismissed = true
         locationManager.stopUpdatingLocation()
         locationManager.stopUpdatingHeading()
+        readinessTimer?.invalidate()
+        readinessTimer = nil
+        recordCompassOutcome()
+        MagneticFieldMonitor.shared.stop(client: Self.fieldMonitorClient)
         onComplete?(seedLocation ?? lastValidLocation, wasSkipped)
+    }
+
+    // MARK: - Compass card criterion (#21)
+
+    /// How long the compass card waits for a clean field before letting the launch go on without
+    /// one. Long enough to step back from a railing or a car; short enough that a user who cannot
+    /// is not stuck. The AR view then shows a "compass disturbed" note while it lasts.
+    static let fieldWaitSeconds: TimeInterval = 10.0
+
+    /// What the compass card shows, and whether it lets the screen finish.
+    struct CompassCardStatus: Equatable {
+        enum Look { case waiting, improving, ready }
+        var look: Look
+        var detail: String
+        /// The compass half of the screen's completion.
+        var isReady: Bool
+        /// Ready only because the wait for a clean field ran out.
+        var proceededWithoutCleanField = false
+        /// Held back by the field alone: the heading accuracy itself is good enough.
+        var heldByField = false
+    }
+
+    /// The compass card's whole criterion, in one place.
+    ///
+    /// It used to be iOS's `headingAccuracy` alone, which reads 10–12.5° almost always and passed on
+    /// the first reading every time, local iron or not. Now the heading must also be steering by the
+    /// Earth's field: green only when `MagneticFieldIntegrity` finds the field's strength and dip
+    /// matching WMM. A disturbed field holds the card with the instruction to move; after
+    /// `fieldWaitSeconds` it lets the launch proceed anyway, without going green. A device that cannot
+    /// measure the field keeps the old rule.
+    static func compassCardStatus(headingAccuracyDeg: Double,
+                                  thresholdDeg: Double,
+                                  field: MagneticFieldIntegrity.Verdict,
+                                  fieldWaitedSeconds: TimeInterval) -> CompassCardStatus {
+        if headingAccuracyDeg < 0 {
+            return CompassCardStatus(look: .waiting, detail: "Move phone in a figure-8…", isReady: false)
+        }
+        if headingAccuracyDeg > thresholdDeg {
+            return CompassCardStatus(
+                look: .improving,
+                detail: String(format: "±%.0f°  (need ≤ %.0f°)  Move in ∞", headingAccuracyDeg, thresholdDeg),
+                isReady: false)
+        }
+        switch field {
+        case .clean:
+            return CompassCardStatus(look: .ready,
+                                     detail: String(format: "±%.0f°  ✓  field checked", headingAccuracyDeg),
+                                     isReady: true)
+        case .unavailable:
+            return CompassCardStatus(look: .ready,
+                                     detail: String(format: "±%.0f°  ✓", headingAccuracyDeg),
+                                     isReady: true)
+        case .disturbed, .pending:
+            if fieldWaitedSeconds >= fieldWaitSeconds {
+                let detail = field == .disturbed
+                    ? "Compass disturbed — continuing anyway"
+                    : "Compass field not verified — continuing anyway"
+                return CompassCardStatus(look: .improving, detail: detail, isReady: true,
+                                         proceededWithoutCleanField: true, heldByField: true)
+            }
+            let detail = field == .disturbed
+                ? "Compass disturbed — move away from metal or cars"
+                : String(format: "±%.0f°  checking the magnetic field…", headingAccuracyDeg)
+            return CompassCardStatus(look: .improving, detail: detail, isReady: false, heldByField: true)
+        }
+    }
+
+    /// One line on how the compass card ended, with the field it was judged on.
+    private func recordCompassOutcome() {
+        let assessment = MagneticFieldMonitor.shared.assessment()
+        let card = lastCompassCard
+        let outcome: String
+        if wasSkipped {
+            outcome = "skipped"
+        } else if card?.proceededWithoutCleanField == true {
+            outcome = "proceeded_unclean"
+        } else if card?.isReady == true {
+            outcome = "ready"
+        } else {
+            outcome = "not_ready"
+        }
+        func value(_ x: Double?, _ decimals: Int) -> String {
+            guard let x, x.isFinite else { return "-" }
+            return String(format: "%.\(decimals)f", x)
+        }
+        let accuracy: Double? = bestCompassAccuracy >= 0 ? bestCompassAccuracy : nil
+        let waited: Double? = fieldWaitStart.map { CACurrentMediaTime() - $0 }
+        let parts: [String] = [
+            "outcome=\(outcome)",
+            "field=\(assessment.verdict.rawValue)",
+            "field_ut=\(value(assessment.measuredUT, 1))",
+            "expected_ut=\(value(assessment.expectedUT, 1))",
+            "dip=\(value(assessment.dipDeg, 1))",
+            "expected_dip=\(value(assessment.expectedDipDeg, 1))",
+            "hdg_acc=\(value(accuracy, 1))",
+            "waited=\(value(waited, 1))",
+        ]
+        FlightRecorder.shared.record(event: "calibration_compass", detail: parts.joined(separator: " "))
     }
 
     // MARK: - Actions
@@ -239,6 +367,9 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         if loc.horizontalAccuracy <= gpsAccuracyThreshold {
             lastValidLocation = loc
         }
+        MagneticFieldMonitor.shared.updatePosition(latitudeDeg: loc.coordinate.latitude,
+                                                   longitudeDeg: loc.coordinate.longitude,
+                                                   altitudeMeters: loc.altitude)
         if !earlyLocationSent {
             earlyLocationSent = true
             onEarlyLocation?(loc)

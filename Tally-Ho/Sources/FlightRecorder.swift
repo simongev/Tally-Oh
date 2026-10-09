@@ -81,7 +81,8 @@ final class FlightRecorder {
         "n_targets_press", "n_targets_geom",
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
         "datum_n", "datum_delta_isa_k", "datum_k", "datum_c_ft",
-        "own_press_alt_ft", "hud_heading_deg"
+        "own_press_alt_ft", "hud_heading_deg",
+        "field_ut", "field_expected_ut", "dip_deg", "dip_expected_deg", "field_clean"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -345,6 +346,17 @@ final class FlightRecorder {
         /// columns is the offset in force — and a row with `ar_heading_deg` but no
         /// `hud_heading_deg` is a world that had not been aligned yet.
         var hudHeadingDeg: Double?
+
+        /// The compass field check (#21): the calibrated field's strength (µT) and dip below the
+        /// horizontal (degrees) as measured — one-second medians — beside what WMM2025 says they
+        /// should be here, and the verdict. `field_clean` is empty while there is no verdict, and
+        /// every column is empty in the air, where the check does not run. These are the columns the
+        /// thresholds get tuned against: no log before #21 recorded the field at all.
+        var fieldUT: Double?
+        var fieldExpectedUT: Double?
+        var dipDeg: Double?
+        var dipExpectedDeg: Double?
+        var fieldClean: Bool?
     }
 
     // MARK: - Recording
@@ -521,6 +533,11 @@ final class FlightRecorder {
         fields.append(format(sample.datumCFt, decimals: 0))
         fields.append(format(sample.ownPressureAltitudeFt,     decimals: 0))
         fields.append(format(sample.hudHeadingDeg,             decimals: 1))
+        fields.append(format(sample.fieldUT,                   decimals: 2))
+        fields.append(format(sample.fieldExpectedUT,           decimals: 2))
+        fields.append(format(sample.dipDeg,                    decimals: 2))
+        fields.append(format(sample.dipExpectedDeg,            decimals: 2))
+        fields.append(sample.fieldClean.map { $0 ? "1" : "0" } ?? "")
 
         return fields.joined(separator: ",")
     }
