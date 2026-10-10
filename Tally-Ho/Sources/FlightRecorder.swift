@@ -81,7 +81,9 @@ final class FlightRecorder {
         "n_targets_press", "n_targets_geom",
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
         "datum_n", "datum_delta_isa_k", "datum_k", "datum_c_ft",
-        "own_press_alt_ft", "hud_heading_deg"
+        "own_press_alt_ft", "hud_heading_deg",
+        "field_ut", "field_expected_ut", "dip_deg", "dip_expected_deg", "field_clean",
+        "motion_hz", "field_motion_hz"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -345,6 +347,25 @@ final class FlightRecorder {
         /// columns is the offset in force — and a row with `ar_heading_deg` but no
         /// `hud_heading_deg` is a world that had not been aligned yet.
         var hudHeadingDeg: Double?
+
+        /// The compass field check (#21): the calibrated field's strength (µT) and dip below the
+        /// horizontal (degrees) as measured — one-second medians — beside what WMM2025 says they
+        /// should be here, and the verdict. `field_clean` is empty while there is no verdict, and
+        /// every column is empty in the air, where the check does not run. These are the columns the
+        /// thresholds get tuned against: no log before #21 recorded the field at all.
+        var fieldUT: Double?
+        var fieldExpectedUT: Double?
+        var dipDeg: Double?
+        var dipExpectedDeg: Double?
+        var fieldClean: Bool?
+
+        /// Delivered rate of the main device-motion stream (requested 100 Hz) and of the field
+        /// monitor's own stream (10 Hz) over the second since the previous row. The field one is
+        /// empty while that stream is stopped — in the air, always — so a row with both filled is one
+        /// where the two `CMMotionManager`s ran together, and `motion_hz` there says whether the
+        /// second one slowed the stream the holds are built on (#21).
+        var motionHz: Double?
+        var fieldMotionHz: Double?
     }
 
     // MARK: - Recording
@@ -521,6 +542,13 @@ final class FlightRecorder {
         fields.append(format(sample.datumCFt, decimals: 0))
         fields.append(format(sample.ownPressureAltitudeFt,     decimals: 0))
         fields.append(format(sample.hudHeadingDeg,             decimals: 1))
+        fields.append(format(sample.fieldUT,                   decimals: 2))
+        fields.append(format(sample.fieldExpectedUT,           decimals: 2))
+        fields.append(format(sample.dipDeg,                    decimals: 2))
+        fields.append(format(sample.dipExpectedDeg,            decimals: 2))
+        fields.append(sample.fieldClean.map { $0 ? "1" : "0" } ?? "")
+        fields.append(format(sample.motionHz,                  decimals: 1))
+        fields.append(format(sample.fieldMotionHz,             decimals: 1))
 
         return fields.joined(separator: ",")
     }

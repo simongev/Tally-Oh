@@ -44,6 +44,43 @@ enum CalibrationFlightPolicy {
     static func inFlight(airborneEstimate: Bool, gpsSpeedKt: Double) -> Bool {
         airborneEstimate || (gpsSpeedKt.isFinite && gpsSpeedKt >= airborneSpeedKt)
     }
+
+    // MARK: Positively on the ground (#21)
+
+    /// A fix that positively shows the phone on the ground: a valid speed below `airborneSpeedKt`.
+    ///
+    /// Not the negation of `fixShowsFlight`. A fix with no valid speed — a cached, Wi-Fi or cell fix,
+    /// often the first one delivered after `startUpdatingLocation` — shows neither, and on a flight
+    /// launch that first fix must not count as ground.
+    static func fixShowsGround(speedMps: Double) -> Bool {
+        speedMps.isFinite && speedMps >= 0 && speedMps * 3600.0 / 1852.0 < airborneSpeedKt
+    }
+
+    /// Whether the phone is positively on the ground: not airborne by the estimate, and its latest
+    /// valid GPS speed below `airborneSpeedKt`. With no valid speed yet it is not known to be on the
+    /// ground — the window at a flight launch before the airborne estimate has any basis.
+    static func positivelyOnGround(airborneEstimate: Bool, latestValidSpeedKt: Double?) -> Bool {
+        guard !airborneEstimate, let speed = latestValidSpeedKt, speed.isFinite, speed >= 0 else {
+            return false
+        }
+        return speed < airborneSpeedKt
+    }
+
+    /// What the calibration screen does with the field monitor on a fix.
+    enum FieldMonitorStep: Equatable {
+        /// The fix shows flight: stop it, and the screen goes.
+        case stopForFlight
+        /// The fix positively shows the ground: run it.
+        case start
+        /// The fix shows neither (no valid speed): change nothing.
+        case leave
+    }
+
+    static func fieldMonitorStep(speedMps: Double) -> FieldMonitorStep {
+        if fixShowsFlight(speedMps: speedMps) { return .stopForFlight }
+        if fixShowsGround(speedMps: speedMps) { return .start }
+        return .leave
+    }
 }
 
 // MARK: - The launch card over the AR view (#20)
@@ -150,6 +187,17 @@ class CalibrationViewController: UIViewController {
     /// Whether the GPS row has reached its threshold, for the same line.
     var gpsIsReady: Bool { gpsReady }
 
+    // MARK: - Field check (#21)
+
+    /// The field-check client name for `MagneticFieldMonitor.shared`.
+    private static let fieldMonitorClient = "calibration"
+    /// When the compass card was first held back by the field alone, on the media clock.
+    private var fieldWaitStart: CFTimeInterval?
+    /// Re-evaluates the cards twice a second, so the field verdict and the ten-second wait move
+    /// the card even when no heading update arrives. Invalidated on dismissal.
+    private var readinessTimer: Timer?
+    private var lastCompassCard: CompassCardStatus?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -157,6 +205,15 @@ class CalibrationViewController: UIViewController {
         shownAt = CACurrentMediaTime()
         setupUI()
         setupLocation()
+        // The field monitor starts on the first fix that positively shows the phone on the ground,
+        // below — a valid speed under 50 kt. Never on a fix without a valid speed, so never in flight.
+        readinessTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateReadiness()
+        }
+    }
+
+    deinit {
+        readinessTimer?.invalidate()
     }
 
     /// The AR view underneath reports its world, about four times a second (#20). Also what drives
@@ -277,16 +334,23 @@ class CalibrationViewController: UIViewController {
             gpsReady = false
         }
 
-        // Compass card
-        if bestCompassAccuracy < 0 {
-            compassCard.setState(.waiting, detail: "Move phone in a figure-8…")
-        } else if bestCompassAccuracy <= compassAccuracyThreshold {
-            compassCard.setState(.ready, detail: String(format: "±%.0f°  ✓", bestCompassAccuracy))
-            compassReady = true
-        } else {
-            compassCard.setState(.improving, detail: String(format: "±%.0f°  (need ≤ %.0f°)  Move in ∞", bestCompassAccuracy, compassAccuracyThreshold))
-            compassReady = false
+        // Compass card — decided entirely by `compassCardStatus` (#21).
+        let now = CACurrentMediaTime()
+        let card = Self.compassCardStatus(
+            headingAccuracyDeg: bestCompassAccuracy,
+            thresholdDeg: compassAccuracyThreshold,
+            field: MagneticFieldMonitor.shared.assessment().verdict,
+            fieldWaitedSeconds: fieldWaitStart.map { now - $0 } ?? 0)
+        if card.heldByField, fieldWaitStart == nil { fieldWaitStart = now }
+        let look: CalibrationState
+        switch card.look {
+        case .waiting:   look = .waiting
+        case .improving: look = .improving
+        case .ready:     look = .ready
         }
+        compassCard.setState(look, detail: card.detail)
+        compassReady = card.isReady
+        lastCompassCard = card
 
         evaluateClose()
     }
@@ -297,7 +361,109 @@ class CalibrationViewController: UIViewController {
         closeReason = reason
         locationManager.stopUpdatingLocation()
         locationManager.stopUpdatingHeading()
+        readinessTimer?.invalidate()
+        readinessTimer = nil
+        recordCompassOutcome()
+        MagneticFieldMonitor.shared.stop(client: Self.fieldMonitorClient)
         onComplete?(wasSkipped)
+    }
+
+    // MARK: - Compass card criterion (#21)
+
+    /// How long the compass card waits for a clean field before letting the launch go on without
+    /// one. Long enough to step back from a railing or a car; short enough that a user who cannot
+    /// is not stuck. The AR view then shows a "compass disturbed" note while it lasts.
+    static let fieldWaitSeconds: TimeInterval = 10.0
+
+    /// What the compass card shows, and whether it lets the screen finish.
+    struct CompassCardStatus: Equatable {
+        enum Look { case waiting, improving, ready }
+        var look: Look
+        var detail: String
+        /// The compass half of the screen's completion.
+        var isReady: Bool
+        /// Ready only because the wait for a clean field ran out.
+        var proceededWithoutCleanField = false
+        /// Held back by the field alone: the heading accuracy itself is good enough.
+        var heldByField = false
+    }
+
+    /// The compass card's whole criterion, in one place.
+    ///
+    /// It used to be iOS's `headingAccuracy` alone, which reads 10–12.5° almost always and passed on
+    /// the first reading every time, local iron or not. Now the heading must also be steering by the
+    /// Earth's field: green only when `MagneticFieldIntegrity` finds the field's strength and dip
+    /// matching WMM. A disturbed field holds the card with the instruction to move; after
+    /// `fieldWaitSeconds` it lets the launch proceed anyway, without going green. A device that cannot
+    /// measure the field keeps the old rule.
+    static func compassCardStatus(headingAccuracyDeg: Double,
+                                  thresholdDeg: Double,
+                                  field: MagneticFieldIntegrity.Verdict,
+                                  fieldWaitedSeconds: TimeInterval) -> CompassCardStatus {
+        if headingAccuracyDeg < 0 {
+            return CompassCardStatus(look: .waiting, detail: "Move phone in a figure-8…", isReady: false)
+        }
+        if headingAccuracyDeg > thresholdDeg {
+            return CompassCardStatus(
+                look: .improving,
+                detail: String(format: "±%.0f°  (need ≤ %.0f°)  Move in ∞", headingAccuracyDeg, thresholdDeg),
+                isReady: false)
+        }
+        switch field {
+        case .clean:
+            return CompassCardStatus(look: .ready,
+                                     detail: String(format: "±%.0f°  ✓  field checked", headingAccuracyDeg),
+                                     isReady: true)
+        case .unavailable:
+            return CompassCardStatus(look: .ready,
+                                     detail: String(format: "±%.0f°  ✓", headingAccuracyDeg),
+                                     isReady: true)
+        case .disturbed, .pending:
+            if fieldWaitedSeconds >= fieldWaitSeconds {
+                let detail = field == .disturbed
+                    ? "Compass disturbed — continuing anyway"
+                    : "Compass field not verified — continuing anyway"
+                return CompassCardStatus(look: .improving, detail: detail, isReady: true,
+                                         proceededWithoutCleanField: true, heldByField: true)
+            }
+            let detail = field == .disturbed
+                ? "Compass disturbed — move away from metal or cars"
+                : String(format: "±%.0f°  checking the magnetic field…", headingAccuracyDeg)
+            return CompassCardStatus(look: .improving, detail: detail, isReady: false, heldByField: true)
+        }
+    }
+
+    /// One line on how the compass card ended, with the field it was judged on.
+    private func recordCompassOutcome() {
+        let assessment = MagneticFieldMonitor.shared.assessment()
+        let card = lastCompassCard
+        let outcome: String
+        if wasSkipped {
+            outcome = "skipped"
+        } else if card?.proceededWithoutCleanField == true {
+            outcome = "proceeded_unclean"
+        } else if card?.isReady == true {
+            outcome = "ready"
+        } else {
+            outcome = "not_ready"
+        }
+        func value(_ x: Double?, _ decimals: Int) -> String {
+            guard let x, x.isFinite else { return "-" }
+            return String(format: "%.\(decimals)f", x)
+        }
+        let accuracy: Double? = bestCompassAccuracy >= 0 ? bestCompassAccuracy : nil
+        let waited: Double? = fieldWaitStart.map { CACurrentMediaTime() - $0 }
+        let parts: [String] = [
+            "outcome=\(outcome)",
+            "field=\(assessment.verdict.rawValue)",
+            "field_ut=\(value(assessment.measuredUT, 1))",
+            "expected_ut=\(value(assessment.expectedUT, 1))",
+            "dip=\(value(assessment.dipDeg, 1))",
+            "expected_dip=\(value(assessment.expectedDipDeg, 1))",
+            "hdg_acc=\(value(accuracy, 1))",
+            "waited=\(value(waited, 1))",
+        ]
+        FlightRecorder.shared.record(event: "calibration_compass", detail: parts.joined(separator: " "))
     }
 
     // MARK: - Actions
@@ -323,10 +489,24 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         // In flight there is nothing to calibrate for and the fix it waits for will not come: go, as
         // if the sensors had converged — not as a Skip, which would also silence the ground's prompts
         // after landing.
-        if CalibrationFlightPolicy.fixShowsFlight(speedMps: loc.speed) {
+        //
+        // The field check (#21) runs only once a fix positively shows the ground; a fix with no valid
+        // speed changes nothing, so a flight launch whose first fix is cached never starts it. This is
+        // the only place the card starts it — the overlay (#20) adds no other way.
+        switch CalibrationFlightPolicy.fieldMonitorStep(speedMps: loc.speed) {
+        case .stopForFlight:
+            MagneticFieldMonitor.shared.setOnGround(false)
             completeDismiss(reason: .inFlight)
             return
+        case .start:
+            MagneticFieldMonitor.shared.setOnGround(true)
+            MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
+        case .leave:
+            break
         }
+        MagneticFieldMonitor.shared.updatePosition(latitudeDeg: loc.coordinate.latitude,
+                                                   longitudeDeg: loc.coordinate.longitude,
+                                                   altitudeMeters: loc.altitude)
         updateReadiness()
     }
 

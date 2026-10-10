@@ -909,7 +909,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         // No location is handed in any more (#20): this view is created at launch and its own
         // location manager delivers the first fix, which starts the internet fetch through
-        // `connectionLogic.updateLocation` as soon as it arrives.
+        // `connectionLogic.updateLocation` as soon as it arrives. The same fix's valid speed is what
+        // says whether the phone is on the ground for the field check (#21): `latestValidGPSSpeedKt`
+        // is set there, never from anything handed in.
         connectionLogic.startListening()
 
         sceneManager?.onSelectionInvalidated = { [weak self] in
@@ -959,6 +961,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // magnetometer-corrected frames would bring the cabin's field back in.
         motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
             guard let self, let motion else { return }
+            // Counted for the log's `motion_hz` only (#21); nothing reads it back into the holds.
+            self.mainMotionSampleCount &+= 1
             let rate = motion.rotationRate
             let gravity = motion.gravity
             let aboutVertical = rate.x * gravity.x + rate.y * gravity.y + rate.z * gravity.z
@@ -1365,6 +1369,27 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         tcasOverlayView.backgroundColor = .clear
         view.insertSubview(tcasOverlayView, aboveSubview: arSceneView)
 
+        // Compass-field note (#21): small, bottom centre, hidden unless the field is disturbed on
+        // the ground. A sibling above the AR view like the other overlays; takes no touches.
+        compassDisturbedLabel = UILabel()
+        compassDisturbedLabel.translatesAutoresizingMaskIntoConstraints = false
+        compassDisturbedLabel.text = "⚠️ Compass disturbed"
+        compassDisturbedLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        compassDisturbedLabel.textColor = .white
+        compassDisturbedLabel.textAlignment = .center
+        compassDisturbedLabel.backgroundColor = UIColor(red: 0.55, green: 0.33, blue: 0.0, alpha: 0.8)
+        compassDisturbedLabel.layer.cornerRadius = 8
+        compassDisturbedLabel.clipsToBounds = true
+        compassDisturbedLabel.isUserInteractionEnabled = false
+        compassDisturbedLabel.isHidden = true
+        view.addSubview(compassDisturbedLabel)
+        NSLayoutConstraint.activate([
+            compassDisturbedLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            compassDisturbedLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -44),
+            compassDisturbedLabel.widthAnchor.constraint(equalToConstant: 180),
+            compassDisturbedLabel.heightAnchor.constraint(equalToConstant: 24),
+        ])
+
         // METAR panel (hidden by default, shown when airport selected)
         setupMetarPanel()
 
@@ -1685,6 +1710,31 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// The same median, applied on the ground. See GroundYawCorrection for the gates.
     private var groundYaw = GroundYawCorrection()
+
+    // MARK: - Compass field integrity (#21)
+
+    /// This view's client name for `MagneticFieldMonitor.shared`. Held on the ground only.
+    private static let fieldMonitorClient = "ar_ground"
+    /// Which compass samples the ground seed and the ground correction may use. Main thread.
+    private var groundCompassGate = GroundCompassGate()
+    /// The latest field assessment, for the HUD note and the log. Main thread.
+    private var fieldAssessment = MagneticFieldIntegrity.Assessment.pending
+    /// Whether the render thread may feed compass samples into the ground correction's window:
+    /// always in the air, exactly as before; on the ground only while the field is clean. Written
+    /// on main, read on the render thread — one word, like the other cross-thread scalars here.
+    private var compassSamplesAllowed: Bool = true
+    /// The small "compass disturbed" note, shown on the ground while the field is disturbed.
+    private var compassDisturbedLabel: UILabel!
+    private var lastLoggedFieldVerdict: MagneticFieldIntegrity.Verdict?
+    /// Samples the main 100 Hz device-motion stream has delivered. Incremented on the motion queue,
+    /// read on main — one word. With `mainMotionRate` it puts the stream's effective rate in the log,
+    /// so a slowdown while the field monitor's second manager runs would show (#21).
+    private var mainMotionSampleCount = 0
+    /// The latest *valid* GPS speed, knots; nil until a fix has carried one. `lastGPSSpeedKt` reads 0
+    /// before then, which is not the same as a phone known to be standing still (#21).
+    private var latestValidGPSSpeedKt: Double?
+    private var mainMotionRate = SampleRateMeter()
+    private var fieldMotionRate = SampleRateMeter()
     /// Render-thread throttle for handing that median to the main thread. The correction itself
     /// updates at most once a second; checking faster than twice a second just queues work.
     private var lastGroundYawCheck: TimeInterval = 0
@@ -2943,6 +2993,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         if !isMapShown { applySeedRearmIfDue() }
         let airborne = isAirborneEstimate
 
+        // The compass field check (#21), ahead of the seed so the seed sees this tick's verdict.
+        updateCompassFieldCheck(airborne: airborne, coordinate: loc, altitudeFt: altitude)
+
         // A reset carry that never found a steady frame, or whose azimuth failed the sign check,
         // hands the world to the seed, ahead of the seed's own tick so the seed starts on this one.
         checkYawSignGuard()
@@ -3161,6 +3214,70 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         FlightRecorder.shared.record(event: "ownship_selected", detail: detail)
     }
 
+    // MARK: - Compass field integrity (#21)
+
+    /// The ground compass's field check, once a tick. In the air the monitor stops and nothing here
+    /// gates anything: the air seed and the air holds never consult it.
+    private func updateCompassFieldCheck(airborne: Bool, coordinate: CLLocationCoordinate2D,
+                                         altitudeFt: Double) {
+        let monitor = MagneticFieldMonitor.shared
+        // The second CMMotionManager runs only while the phone is *positively* on the ground: not
+        // airborne by the estimate, and a valid GPS speed under 50 kt. At a flight launch the first
+        // tick can read as ground before the estimate has any basis; with no valid speed yet it does
+        // not count. Not on the ground stops it at once, whoever else still holds it — the
+        // calibration card included, should it still be up (#20).
+        monitor.setOnGround(CalibrationFlightPolicy.positivelyOnGround(
+            airborneEstimate: airborne, latestValidSpeedKt: latestValidGPSSpeedKt))
+        if airborne {
+            monitor.stop(client: ARTrafficViewController.fieldMonitorClient)
+            groundCompassGate.reset()
+            fieldAssessment = .pending
+            compassSamplesAllowed = true
+            compassDisturbedLabel.isHidden = true
+            lastLoggedFieldVerdict = nil
+            return
+        }
+        // On the ground the ground path needs the field: held here, and running once the phone is
+        // positively on the ground. Until then the verdict stays pending, which holds the correction
+        // and gives the seed its grace.
+        monitor.start(client: ARTrafficViewController.fieldMonitorClient)
+        monitor.updatePosition(latitudeDeg: coordinate.latitude, longitudeDeg: coordinate.longitude,
+                               altitudeMeters: altitudeFt * CalculationsLogic.feetToMeters)
+        let assessment = monitor.assessment()
+        fieldAssessment = assessment
+        groundCompassGate.update(assessment.verdict, at: CACurrentMediaTime())
+        compassSamplesAllowed = groundCompassGate.correctionMayUseCompass
+        compassDisturbedLabel.isHidden = assessment.verdict != .disturbed
+        if assessment.verdict != .pending, assessment.verdict != lastLoggedFieldVerdict {
+            lastLoggedFieldVerdict = assessment.verdict
+            FlightRecorder.shared.record(event: "compass_field", detail: fieldDetail(assessment))
+        }
+    }
+
+    /// The field check in one log detail: verdict, measured and modelled strength and dip.
+    private func fieldDetail(_ assessment: MagneticFieldIntegrity.Assessment) -> String {
+        func value(_ x: Double?) -> String {
+            guard let x, x.isFinite else { return "-" }
+            return String(format: "%.1f", x)
+        }
+        let parts: [String] = [
+            "field=\(assessment.verdict.rawValue)",
+            "field_ut=\(value(assessment.measuredUT))",
+            "expected_ut=\(value(assessment.expectedUT))",
+            "dip=\(value(assessment.dipDeg))",
+            "expected_dip=\(value(assessment.expectedDipDeg))",
+        ]
+        return parts.joined(separator: " ")
+    }
+
+    /// Which field a ground compass seed began on, and whether it went ahead without a clean one.
+    private func recordSeedCompassField() {
+        let proceeded = groundCompassGate.seedProceedsUnclean(at: CACurrentMediaTime())
+        FlightRecorder.shared.record(
+            event: "seed_compass_field",
+            detail: fieldDetail(fieldAssessment) + " proceeded_unclean=\(proceeded ? 1 : 0)")
+    }
+
     // MARK: - Flight Recorder
 
     /// Log how long this glance took to put a target on screen. The app is used in
@@ -3336,7 +3453,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let now = Date()
         guard now.timeIntervalSince(lastRecorderSampleTime) >= 1.0 else { return }
         lastRecorderSampleTime = now
-        FlightRecorder.shared.record(currentFlightSample(state: state, aircraft: aircraft))
+        var sample = currentFlightSample(state: state, aircraft: aircraft)
+        // Effective rates over the second since the last row (#21): the main stream always, as a
+        // baseline, and the field monitor's while it runs — rows with both filled are the ones where
+        // the two managers ran together.
+        let clock = CACurrentMediaTime()
+        sample.motionHz = mainMotionRate.rate(count: mainMotionSampleCount, at: clock)
+        let fieldMonitor = MagneticFieldMonitor.shared
+        if fieldMonitor.isRunning {
+            sample.fieldMotionHz = fieldMotionRate.rate(count: fieldMonitor.deliveredSampleCount, at: clock)
+        } else {
+            fieldMotionRate.reset()
+        }
+        FlightRecorder.shared.record(sample)
         recordDatumSample(aircraft: aircraft)
         recordAirportCheck(userLocation: state.coordinate, userAltitudeFt: state.displayAltitudeFt)
     }
@@ -3441,6 +3570,18 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         sample.datumK                = latestDatumFit?.slope
         sample.datumCFt              = latestDatumFit?.interceptFt
         sample.ownPressureAltitudeFt = ownshipPressureAltitudeFt
+        // The compass field check (#21). Empty in the air, where the check does not run.
+        if !isAirborneEstimate {
+            sample.fieldUT          = fieldAssessment.measuredUT
+            sample.fieldExpectedUT  = fieldAssessment.expectedUT
+            sample.dipDeg           = fieldAssessment.dipDeg
+            sample.dipExpectedDeg   = fieldAssessment.expectedDipDeg
+            switch fieldAssessment.verdict {
+            case .clean:       sample.fieldClean = true
+            case .disturbed:   sample.fieldClean = false
+            case .pending, .unavailable: sample.fieldClean = nil
+            }
+        }
         if worldIsAligned, let raw = sample.arHeadingDeg {
             sample.hudHeadingDeg = CalculationsLogic.normalizedAzimuth(
                 raw + appliedWorldYawOffsetDeg)
@@ -4162,10 +4303,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         if compassUsable {
             worldYawErrorDeg = angleDifferenceDeg(from: rawAzimuthDeg, to: lastTrueHeading)
             hasSeededWorldYawError = true
-            // Fed unconditionally, read only on the ground: the airborne gate belongs at the
-            // decision (see resetReason), not here, so a lift that lands still has a populated
-            // window instead of having to refill one.
-            alignmentDrift.add(errorDeg: worldYawErrorDeg, at: time)
+            // Fed unconditionally in the air, read only on the ground: the airborne gate belongs at
+            // the decision (see resetReason), not here, so a lift that lands still has a populated
+            // window instead of having to refill one. On the ground, clean-field samples only (#21):
+            // a disturbed field stops the window filling, the correction holds what it has, and
+            // refines toward the clean median once the field recovers.
+            if compassSamplesAllowed {
+                alignmentDrift.add(errorDeg: worldYawErrorDeg, at: time)
+            }
         }
 
         updateResponseEstimators(arDeg: rawAzimuthDeg, compassUsable: compassUsable, at: time)
@@ -4875,6 +5020,10 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard lastTrueHeading >= 0,
               lastHeadingAccuracy >= 0, lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
         else { return nil }
+        // On the ground, a clean field — or one the seed has waited on for `seedGraceSeconds` (#21).
+        // A field going bad mid-capture takes the reference away, which cancels that capture.
+        guard isAirborneEstimate || groundCompassGate.seedMayUseCompass(at: CACurrentMediaTime())
+        else { return nil }
         return (.compass, lastTrueHeading)
     }
 
@@ -4969,6 +5118,7 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             airborneSeedArmed = true
         } else {
             startupSeed.begin(reference: reference.kind)
+            if reference.kind == .compass, !isAirborneEstimate { recordSeedCompassField() }
         }
         lastSeedSampleTime = 0
     }
@@ -6104,6 +6254,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         if loc.speed >= 0 {
             gpsSpeedKt = loc.speed * 1.944
             lastGPSSpeedKt = gpsSpeedKt
+            latestValidGPSSpeedKt = gpsSpeedKt
         }
         // Cached for updateHUDLadder() (SceneKit render thread) to read — the GPS-course
         // heading-bias learning needs the same course/accuracy validity signal.
