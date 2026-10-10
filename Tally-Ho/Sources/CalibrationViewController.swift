@@ -41,6 +41,43 @@ enum CalibrationFlightPolicy {
     static func inFlight(airborneEstimate: Bool, gpsSpeedKt: Double) -> Bool {
         airborneEstimate || (gpsSpeedKt.isFinite && gpsSpeedKt >= airborneSpeedKt)
     }
+
+    // MARK: Positively on the ground (#21)
+
+    /// A fix that positively shows the phone on the ground: a valid speed below `airborneSpeedKt`.
+    ///
+    /// Not the negation of `fixShowsFlight`. A fix with no valid speed — a cached, Wi-Fi or cell fix,
+    /// often the first one delivered after `startUpdatingLocation` — shows neither, and on a flight
+    /// launch that first fix must not count as ground.
+    static func fixShowsGround(speedMps: Double) -> Bool {
+        speedMps.isFinite && speedMps >= 0 && speedMps * 3600.0 / 1852.0 < airborneSpeedKt
+    }
+
+    /// Whether the phone is positively on the ground: not airborne by the estimate, and its latest
+    /// valid GPS speed below `airborneSpeedKt`. With no valid speed yet it is not known to be on the
+    /// ground — the window at a flight launch before the airborne estimate has any basis.
+    static func positivelyOnGround(airborneEstimate: Bool, latestValidSpeedKt: Double?) -> Bool {
+        guard !airborneEstimate, let speed = latestValidSpeedKt, speed.isFinite, speed >= 0 else {
+            return false
+        }
+        return speed < airborneSpeedKt
+    }
+
+    /// What the calibration screen does with the field monitor on a fix.
+    enum FieldMonitorStep: Equatable {
+        /// The fix shows flight: stop it, and the screen goes.
+        case stopForFlight
+        /// The fix positively shows the ground: run it.
+        case start
+        /// The fix shows neither (no valid speed): change nothing.
+        case leave
+    }
+
+    static func fieldMonitorStep(speedMps: Double) -> FieldMonitorStep {
+        if fixShowsFlight(speedMps: speedMps) { return .stopForFlight }
+        if fixShowsGround(speedMps: speedMps) { return .start }
+        return .leave
+    }
 }
 
 // MARK: - CalibrationViewController
@@ -117,8 +154,8 @@ class CalibrationViewController: UIViewController {
         super.viewDidLoad()
         setupUI()
         setupLocation()
-        // The field monitor starts on the first fix that shows the phone on the ground, below — never
-        // in flight, where this screen goes on its first fix anyway.
+        // The field monitor starts on the first fix that positively shows the phone on the ground,
+        // below — a valid speed under 50 kt. Never on a fix without a valid speed, so never in flight.
         readinessTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateReadiness()
         }
@@ -375,14 +412,20 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         // In flight there is nothing to calibrate for and the fix it waits for will not come: go,
         // after the early fetch above has been kicked off, as if the sensors had converged — not as a
         // Skip, which would also silence the ground's prompts after landing.
-        if CalibrationFlightPolicy.fixShowsFlight(speedMps: loc.speed) {
-            // Airborne by this screen's own test: the field check stops at once (#21).
-            MagneticFieldMonitor.shared.setAirborne(true)
+        //
+        // The field check (#21) runs only once a fix positively shows the ground; a fix with no valid
+        // speed changes nothing, so a flight launch whose first fix is cached never starts it.
+        switch CalibrationFlightPolicy.fieldMonitorStep(speedMps: loc.speed) {
+        case .stopForFlight:
+            MagneticFieldMonitor.shared.setOnGround(false)
             completeDismiss(seedLocation: lastValidLocation ?? loc)
             return
+        case .start:
+            MagneticFieldMonitor.shared.setOnGround(true)
+            MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
+        case .leave:
+            break
         }
-        // On the ground: the field check runs, against the model where the phone is (#21).
-        MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
         MagneticFieldMonitor.shared.updatePosition(latitudeDeg: loc.coordinate.latitude,
                                                    longitudeDeg: loc.coordinate.longitude,
                                                    altitudeMeters: loc.altitude)

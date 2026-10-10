@@ -201,6 +201,7 @@ struct MagneticFieldIntegrityTests {
 
     @Test func theMonitorRunsOnlyWhileAGroundClientWantsIt() {
         var demand = FieldMonitorDemand()
+        demand.setOnGround(true)
         #expect(!demand.shouldRun)
         demand.add("calibration")
         #expect(demand.shouldRun)
@@ -211,24 +212,66 @@ struct MagneticFieldIntegrityTests {
         #expect(!demand.shouldRun)           // the last one let go
     }
 
-    @Test func airborneStopsItWhoeverStillHoldsIt() {
+    @Test func nothingRunsUntilThePhoneIsPositivelyOnTheGround() {
+        var demand = FieldMonitorDemand()
+        demand.add("calibration")
+        demand.add("ar_ground")
+        // A flight launch: held by both, but nobody has said the phone is on the ground.
+        #expect(!demand.shouldRun)
+    }
+
+    @Test func leavingTheGroundStopsItWhoeverStillHoldsIt() {
         var demand = FieldMonitorDemand()
         demand.add("calibration")             // the card still up over the AR view (#20)
         demand.add("ar_ground")
-        demand.setAirborne(true)
+        demand.setOnGround(true)
+        #expect(demand.shouldRun)
+        demand.setOnGround(false)
         #expect(!demand.shouldRun)
         // Still held, so landing starts it again: the ground path needs it.
-        demand.setAirborne(false)
+        demand.setOnGround(true)
         #expect(demand.shouldRun)
     }
 
     @Test func landingDoesNotStartItIfNobodyNeedsIt() {
         var demand = FieldMonitorDemand()
         demand.add("ar_ground")
-        demand.setAirborne(true)
+        demand.setOnGround(false)
         demand.remove("ar_ground")
-        demand.setAirborne(false)
+        demand.setOnGround(true)
         #expect(!demand.shouldRun)
+    }
+
+    // MARK: - Positively on the ground (QA #21 round 1)
+
+    private let knots = 1852.0 / 3600.0   // m/s per knot
+
+    @Test func aFixWithNoValidSpeedStartsNothing() {
+        // speed = -1: CoreLocation's "invalid" — a cached, Wi-Fi or cell fix.
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: -1) == .leave)
+        #expect(!CalibrationFlightPolicy.fixShowsGround(speedMps: -1))
+        #expect(!CalibrationFlightPolicy.fixShowsFlight(speedMps: -1))
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: .nan) == .leave)
+    }
+
+    @Test func aGroundFixStartsItAndAFlightFixStopsIt() {
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: 0) == .start)
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: 49.9 * knots) == .start)
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: 50.1 * knots) == .stopForFlight)
+        #expect(CalibrationFlightPolicy.fieldMonitorStep(speedMps: 460 * knots) == .stopForFlight)
+    }
+
+    @Test func positivelyOnGroundNeedsAValidSpeedAndNoAirborneEstimate() {
+        typealias Policy = CalibrationFlightPolicy
+        // The AR view's first tick at a flight launch: not yet airborne, no valid speed yet.
+        #expect(!Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: nil))
+        #expect(Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: 0))
+        #expect(Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: 12))
+        // A takeoff roll before the estimate flips.
+        #expect(!Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: 60))
+        #expect(!Policy.positivelyOnGround(airborneEstimate: true, latestValidSpeedKt: 0))
+        #expect(!Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: -1))
+        #expect(!Policy.positivelyOnGround(airborneEstimate: false, latestValidSpeedKt: .nan))
     }
 
     // MARK: - Delivered rate

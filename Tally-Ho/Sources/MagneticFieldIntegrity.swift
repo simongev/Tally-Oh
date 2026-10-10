@@ -200,19 +200,23 @@ struct GroundCompassGate {
 
 // MARK: - Monitor lifecycle
 
-/// When the field monitor's CoreMotion stream runs (#21): while a client on the ground wants it, and
-/// never in the air. Airborne stops it at once, whoever still holds it — the calibration card
-/// included, which with #20 may still be up over the AR view — and landing starts it again only if
-/// a client still wants it.
+/// When the field monitor's CoreMotion stream runs (#21): while a client wants it and the phone is
+/// *positively* on the ground (`CalibrationFlightPolicy.positivelyOnGround`), never otherwise.
+///
+/// Off until someone has said the phone is on the ground, so a flight launch — whose first fix may
+/// carry no speed, and whose first AR tick may come before the airborne estimate has any basis —
+/// never starts it. Leaving the ground stops it at once, whoever still holds it (the calibration
+/// card included, which with #20 may still be up over the AR view); back on the ground it runs again
+/// only if a client still wants it.
 struct FieldMonitorDemand: Equatable {
     private(set) var clients: Set<String> = []
-    private(set) var airborne = false
+    private(set) var onGround = false
 
-    var shouldRun: Bool { !airborne && !clients.isEmpty }
+    var shouldRun: Bool { onGround && !clients.isEmpty }
 
     mutating func add(_ client: String) { clients.insert(client) }
     mutating func remove(_ client: String) { clients.remove(client) }
-    mutating func setAirborne(_ value: Bool) { airborne = value }
+    mutating func setOnGround(_ value: Bool) { onGround = value }
 }
 
 /// The delivered rate of a sample stream between two reads of its running count (#21) — used to log
@@ -257,11 +261,12 @@ struct SampleRateMeter {
 /// several can affect the delivered rates; this one asks for 10 Hz against the main stream's
 /// 100 Hz, so the hardware rate should be unchanged — and the flight log's `motion_hz` column
 /// measures the main stream so that a slowdown would show. It runs only on the ground and on the
-/// calibration screen, and stops the moment the phone is airborne (`FieldMonitorDemand`).
+/// calibration screen, only once the phone is positively on the ground, and stops the moment it is
+/// not (`FieldMonitorDemand`).
 ///
 /// Shared, with named clients, so the calibration screen and the AR view can both hold it — they may
 /// overlap once the card becomes an overlay (#20) — and it stops when the last lets go.
-/// `start`, `stop`, `setAirborne` and `updatePosition` are main-thread calls; `assessment` and
+/// `start`, `stop`, `setOnGround` and `updatePosition` are main-thread calls; `assessment` and
 /// `deliveredSampleCount` are safe from any thread.
 final class MagneticFieldMonitor {
 
@@ -306,7 +311,7 @@ final class MagneticFieldMonitor {
         return delivered
     }
 
-    /// Hold the monitor for `client`. Runs it unless the phone is airborne.
+    /// Hold the monitor for `client`. Runs it once the phone is positively on the ground.
     func start(client: String) {
         demand.add(client)
         apply()
@@ -318,11 +323,11 @@ final class MagneticFieldMonitor {
         apply()
     }
 
-    /// The ground/air split. Airborne stops the stream at once, whoever holds it; on the ground it
-    /// runs again only if a client still wants it.
-    func setAirborne(_ airborne: Bool) {
-        guard demand.airborne != airborne else { return }
-        demand.setAirborne(airborne)
+    /// Whether the phone is positively on the ground. False — airborne, or not yet known to be on the
+    /// ground — stops the stream at once, whoever holds it; true runs it if a client wants it.
+    func setOnGround(_ onGround: Bool) {
+        guard demand.onGround != onGround else { return }
+        demand.setOnGround(onGround)
         apply()
     }
 

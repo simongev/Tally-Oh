@@ -922,6 +922,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             )
             ownshipEstimator.ingestPhoneAltitude(fusedMSLFt: userAltitude)
             connectionLogic.updateLocation(seed.coordinate, altitudeFeet: userAltitude)
+            // The calibration screen's fix, if it carried a valid speed, already says whether the
+            // phone is on the ground (#21).
+            if seed.speed >= 0 { latestValidGPSSpeedKt = seed.speed * 1.944 }
         }
 
         connectionLogic.startListening()
@@ -1748,6 +1751,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// read on main — one word. With `mainMotionRate` it puts the stream's effective rate in the log,
     /// so a slowdown while the field monitor's second manager runs would show (#21).
     private var mainMotionSampleCount = 0
+    /// The latest *valid* GPS speed, knots; nil until a fix has carried one. `lastGPSSpeedKt` reads 0
+    /// before then, which is not the same as a phone known to be standing still (#21).
+    private var latestValidGPSSpeedKt: Double?
     private var mainMotionRate = SampleRateMeter()
     private var fieldMotionRate = SampleRateMeter()
     /// Render-thread throttle for handing that median to the main thread. The correction itself
@@ -3164,10 +3170,14 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private func updateCompassFieldCheck(airborne: Bool, coordinate: CLLocationCoordinate2D,
                                          altitudeFt: Double) {
         let monitor = MagneticFieldMonitor.shared
+        // The second CMMotionManager runs only while the phone is *positively* on the ground: not
+        // airborne by the estimate, and a valid GPS speed under 50 kt. At a flight launch the first
+        // tick can read as ground before the estimate has any basis; with no valid speed yet it does
+        // not count. Not on the ground stops it at once, whoever else still holds it — the
+        // calibration card included, should it still be up (#20).
+        monitor.setOnGround(CalibrationFlightPolicy.positivelyOnGround(
+            airborneEstimate: airborne, latestValidSpeedKt: latestValidGPSSpeedKt))
         if airborne {
-            // Stopped the moment the airborne estimate says so, whoever else still holds the monitor —
-            // the calibration card included, should it still be up (#20).
-            monitor.setAirborne(true)
             monitor.stop(client: ARTrafficViewController.fieldMonitorClient)
             groundCompassGate.reset()
             fieldAssessment = .pending
@@ -3176,8 +3186,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             lastLoggedFieldVerdict = nil
             return
         }
-        // Landed, or never left: the ground path needs the field, so the stream runs again.
-        monitor.setAirborne(false)
+        // On the ground the ground path needs the field: held here, and running once the phone is
+        // positively on the ground. Until then the verdict stays pending, which holds the correction
+        // and gives the seed its grace.
         monitor.start(client: ARTrafficViewController.fieldMonitorClient)
         monitor.updatePosition(latitudeDeg: coordinate.latitude, longitudeDeg: coordinate.longitude,
                                altitudeMeters: altitudeFt * CalculationsLogic.feetToMeters)
@@ -6189,6 +6200,7 @@ extension ARTrafficViewController: CLLocationManagerDelegate {
         if loc.speed >= 0 {
             gpsSpeedKt = loc.speed * 1.944
             lastGPSSpeedKt = gpsSpeedKt
+            latestValidGPSSpeedKt = gpsSpeedKt
         }
         // Cached for updateHUDLadder() (SceneKit render thread) to read — the GPS-course
         // heading-bias learning needs the same course/accuracy validity signal.
