@@ -280,20 +280,6 @@ class SettingsViewController: UITableViewController {
                 setter: { $0.airportMaxDistance = $1 }
             ),
         ])]
-        result.append(Section(
-            header: "🛠  Diagnostics",
-            footer: "The flight log records every input that positions targets — both GPS " +
-                    "chains, both altitude references, compass, camera attitude and receiver " +
-                    "link health — once per second, plus a marker each time the app is opened. " +
-                    "Export it after a flight to see what the sensors were reporting.",
-            rows: [
-                .action(
-                    title: "Export Flight Log",
-                    subtitle: "Share the recorded CSV",
-                    handler: { $0.exportFlightLog() }
-                )
-            ]
-        ))
 
         // "I'm Flying" — the picker and the receiver's read-only answer alike — is a question about
         // the aircraft you are in, so it is asked only in the air (#18). A pick made in flight stays
@@ -329,6 +315,23 @@ class SettingsViewController: UITableViewController {
                 ]
             ))
         }
+
+        // Last, below "I'm Flying" when that is offered (#22): in the air the question about your own
+        // aircraft comes before the diagnostics. The ground has no "I'm Flying", so its order is as it was.
+        result.append(Section(
+            header: "🛠  Diagnostics",
+            footer: "The flight log records every input that positions targets — both GPS " +
+                    "chains, both altitude references, compass, camera attitude and receiver " +
+                    "link health — once per second, plus a marker each time the app is opened. " +
+                    "Export it after a flight to see what the sensors were reporting.",
+            rows: [
+                .action(
+                    title: "Export Flight Log",
+                    subtitle: "Share the recorded CSV",
+                    handler: { $0.exportFlightLog() }
+                )
+            ]
+        ))
         return result
     }()
 
