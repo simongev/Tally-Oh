@@ -2,8 +2,11 @@
 //  CalibrationViewController.swift
 //  TallyOh - AR Aviation Traffic Visualization
 //
-//  Pre-flight calibration screen shown before the AR view.
-//  Waits for:
+//  The calibration card. At launch it is a child overlay over the AR view, which is already
+//  running underneath — session, location, traffic and seed all start at once (#20) — and it
+//  closes when GPS is ready and the world is aligned, on Skip, in flight, or after a timeout
+//  (`CalibrationCardPolicy`). Presented on its own (the in-session popup) it keeps the rule below.
+//  The popup waits for:
 //   1. GPS fix with horizontalAccuracy ≤ 10 m
 //   2. Compass heading with headingAccuracy ≤ 13°  (achieved by the user
 //      performing a figure-8 motion with the phone)
@@ -40,6 +43,42 @@ enum CalibrationFlightPolicy {
     /// GPS ground speed of 50 kt or more.
     static func inFlight(airborneEstimate: Bool, gpsSpeedKt: Double) -> Bool {
         airborneEstimate || (gpsSpeedKt.isFinite && gpsSpeedKt >= airborneSpeedKt)
+    }
+}
+
+// MARK: - The launch card over the AR view (#20)
+
+/// When the launch card closes.
+///
+/// It used to stand in front of everything: the AR view, its session, location, traffic and seed
+/// were created only when it closed, so the first targets came up faded and waited out ARKit's
+/// start and the seed afterwards (log 849c560a: faded from 1.07 s, `normal` at 2.62 s,
+/// `seed_captured` at 3.77 s, all after the card). Now all of that runs under the card from launch,
+/// and the card waits for the thing the user is waiting for: targets solid and placed.
+enum CalibrationCardPolicy {
+    enum CloseReason: String {
+        /// GPS ready and the world aligned: the targets underneath are solid and placed.
+        case ready
+        case skipped
+        /// A fix shows the phone flying: skipped, as since #15.
+        case inFlight = "in_flight"
+        /// Neither came in `timeoutSeconds` — GPS indoors, a seed that never lands — so the card gets
+        /// out of the way rather than holding the view hostage.
+        case timeout
+    }
+
+    static let timeoutSeconds: TimeInterval = 15
+
+    /// Why the card closes now, or nil to keep it up. Skip first, then flight, then ready, then the
+    /// timeout. `worldAligned` means aligned **and** tracking normal: that is when the fade lifts.
+    static func closeReason(gpsReady: Bool, worldAligned: Bool, skipped: Bool, inFlight: Bool,
+                            secondsShown: TimeInterval,
+                            timeoutSeconds: TimeInterval = timeoutSeconds) -> CloseReason? {
+        if skipped { return .skipped }
+        if inFlight { return .inFlight }
+        if gpsReady && worldAligned { return .ready }
+        if secondsShown.isFinite, secondsShown >= timeoutSeconds { return .timeout }
+        return nil
     }
 }
 
@@ -90,22 +129,65 @@ class CalibrationViewController: UIViewController {
     /// Called once when the screen is finished with. The flag reports whether the user chose
     /// Skip: the caller needs that to avoid re-presenting a screen the user just dismissed,
     /// since skipping means the sensors never reached the thresholds and will keep failing
-    /// whatever check the caller applies next.
-    var onComplete: ((CLLocation?, _ wasSkipped: Bool) -> Void)?
+    /// whatever check the caller applies next. Nothing else is handed back: the AR view has its
+    /// own location from launch (#20).
+    var onComplete: ((_ wasSkipped: Bool) -> Void)?
 
-    /// Fired once, the first time any location update arrives — well before
-    /// gpsAccuracyThreshold is met and the screen actually dismisses. Lets the
-    /// app kick off a network fetch that can overlap with the rest of
-    /// calibration instead of waiting until this screen is fully done.
-    var onEarlyLocation: ((CLLocation) -> Void)?
-    private var earlyLocationSent = false
+    /// Set by the AR view before the card is added over it at launch (#20): the card then closes by
+    /// `CalibrationCardPolicy`, on the world the parent reports through `updateWorld`. Left false
+    /// for the in-session popup, which closes when GPS and compass are ready, as before.
+    var isOverARView = false
+    /// Why the card closed, for the parent's `card_closed` line. Nil until it has.
+    private(set) var closeReason: CalibrationCardPolicy.CloseReason?
+    /// Over the AR view: whether its world is aligned with tracking normal and a position to place
+    /// from, and whether the phone is flying, as the parent last reported.
+    private var worldAligned = false
+    private var parentSaysInFlight = false
+    private var shownAt: TimeInterval = .nan
+
+    /// Seconds since the card was created, for the parent's `card_closed` line.
+    var secondsShown: TimeInterval { CACurrentMediaTime() - shownAt }
+    /// Whether the GPS row has reached its threshold, for the same line.
+    var gpsIsReady: Bool { gpsReady }
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        shownAt = CACurrentMediaTime()
         setupUI()
         setupLocation()
+    }
+
+    /// The AR view underneath reports its world, about four times a second (#20). Also what drives
+    /// the card's timeout.
+    func updateWorld(aligned: Bool, inFlight: Bool) {
+        worldAligned = aligned
+        parentSaysInFlight = inFlight
+        evaluateClose()
+        // Both rows can be green with the world still lining up, and a card with nothing left to
+        // wait for looks stuck. Say what it is waiting on.
+        guard !dismissed, isOverARView else { return }
+        let subtitle = gpsReady && !aligned ? CalibrationViewController.aligningSubtitle
+                                            : CalibrationViewController.calibratingSubtitle
+        if subtitleLabel.text != subtitle { subtitleLabel.text = subtitle }
+    }
+
+    private static let calibratingSubtitle = "Calibrating sensors for best AR accuracy"
+    private static let aligningSubtitle = "Aligning the view…"
+
+    /// Close if the rule for how this card is shown says so.
+    private func evaluateClose() {
+        guard !dismissed else { return }
+        if isOverARView {
+            if let reason = CalibrationCardPolicy.closeReason(
+                gpsReady: gpsReady, worldAligned: worldAligned, skipped: false,
+                inFlight: parentSaysInFlight, secondsShown: secondsShown) {
+                completeDismiss(reason: reason)
+            }
+        } else if gpsReady && compassReady {
+            completeDismiss(reason: .ready)
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -206,24 +288,23 @@ class CalibrationViewController: UIViewController {
             compassReady = false
         }
 
-        if gpsReady && compassReady {
-            completeDismiss()
-        }
+        evaluateClose()
     }
 
-    private func completeDismiss(seedLocation: CLLocation? = nil) {
+    private func completeDismiss(reason: CalibrationCardPolicy.CloseReason) {
         guard !dismissed else { return }
         dismissed = true
+        closeReason = reason
         locationManager.stopUpdatingLocation()
         locationManager.stopUpdatingHeading()
-        onComplete?(seedLocation ?? lastValidLocation, wasSkipped)
+        onComplete?(wasSkipped)
     }
 
     // MARK: - Actions
 
     @objc private func skipTapped() {
         wasSkipped = true
-        completeDismiss()
+        completeDismiss(reason: .skipped)
     }
 }
 
@@ -239,15 +320,11 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         if loc.horizontalAccuracy <= gpsAccuracyThreshold {
             lastValidLocation = loc
         }
-        if !earlyLocationSent {
-            earlyLocationSent = true
-            onEarlyLocation?(loc)
-        }
-        // In flight there is nothing to calibrate for and the fix it waits for will not come: go,
-        // after the early fetch above has been kicked off, as if the sensors had converged — not as a
-        // Skip, which would also silence the ground's prompts after landing.
+        // In flight there is nothing to calibrate for and the fix it waits for will not come: go, as
+        // if the sensors had converged — not as a Skip, which would also silence the ground's prompts
+        // after landing.
         if CalibrationFlightPolicy.fixShowsFlight(speedMps: loc.speed) {
-            completeDismiss(seedLocation: lastValidLocation ?? loc)
+            completeDismiss(reason: .inFlight)
             return
         }
         updateReadiness()
