@@ -153,15 +153,28 @@ enum MagneticFieldIntegrity {
 /// - The **seed** prefers a clean field too, but cannot wait for one indefinitely: until it lands a
 ///   `.gravity` world points nowhere, and after ten seconds without a reference the seed falls back
 ///   to restarting the session on ARKit's own compass alignment — the same disturbed compass, plus a
-///   restart. So after `seedGraceSeconds` of an unclean field it proceeds on the compass it has, as
-///   the calibration card does after its ten seconds, the HUD says so, and the correction takes over
-///   once the field is clean.
+///   restart. So after its grace on an unclean field — `cardUpSeedGraceSeconds` under the launch
+///   card, `seedGraceSeconds` after it — it proceeds on the compass it has, as the calibration card
+///   does after its ten seconds, the HUD says so, and the correction takes over once the field is
+///   clean.
 struct GroundCompassGate {
-    /// How long the seed waits for a clean field before proceeding without one. Short against the
-    /// seed's 10 s deadline. Since #20 the seed runs under the launch card rather than after it, so
-    /// this grace counts from launch, not from after the card's ten seconds; the card itself still
-    /// waits up to ten seconds on the field before it closes.
+    /// How long the seed waits for a clean field before proceeding without one, once the launch card
+    /// is gone — an in-session re-seed. Short against the seed's 10 s deadline.
     static let seedGraceSeconds: TimeInterval = 3.0
+
+    /// The same wait while the launch card is up (#20): the card's own field wait
+    /// (`CalibrationViewController.fieldWaitSeconds`, through the card's policy). Since #20 the seed
+    /// runs under the card, which hides the view, so waiting costs nothing — and a user who steps away
+    /// from the metal gets a seed that is clean itself, rather than one the ground correction has to
+    /// fix afterwards. Longer than the seed's 10 s deadline can allow, so while the card is up the AR
+    /// view holds that deadline for a seed waiting on the field alone (`holdsSeedWatchdog`); the
+    /// card's 15 s timeout bounds the wait.
+    static let cardUpSeedGraceSeconds: TimeInterval = CalibrationCardPolicy.compassWaitSeconds
+
+    /// The seed's grace with the launch card up or gone.
+    static func seedGrace(cardUp: Bool) -> TimeInterval {
+        cardUp ? cardUpSeedGraceSeconds : seedGraceSeconds
+    }
 
     private(set) var verdict: MagneticFieldIntegrity.Verdict = .pending
     private var notCleanSince: TimeInterval?
@@ -182,16 +195,25 @@ struct GroundCompassGate {
         verdict == .clean || verdict == .unavailable
     }
 
-    /// Whether the ground seed may take the compass as its reference now.
-    func seedMayUseCompass(at time: TimeInterval) -> Bool {
+    /// Whether the ground seed may take the compass as its reference now, with the launch card up or
+    /// gone (`seedGrace(cardUp:)`).
+    func seedMayUseCompass(at time: TimeInterval, cardUp: Bool = false) -> Bool {
         if correctionMayUseCompass { return true }
         guard let since = notCleanSince else { return false }
-        return time - since >= Self.seedGraceSeconds
+        return time - since >= Self.seedGrace(cardUp: cardUp)
     }
 
     /// True when the seed would be proceeding on a field that is not known to be clean.
-    func seedProceedsUnclean(at time: TimeInterval) -> Bool {
-        !correctionMayUseCompass && seedMayUseCompass(at: time)
+    func seedProceedsUnclean(at time: TimeInterval, cardUp: Bool = false) -> Bool {
+        !correctionMayUseCompass && seedMayUseCompass(at: time, cardUp: cardUp)
+    }
+
+    /// Whether the seed's 10 s watchdog is held this tick: the launch card up, and the seed waiting on
+    /// the field alone — the compass otherwise usable as its reference, this gate refusing it. Held,
+    /// the AR view renews the deadline rather than skipping it, so a field that comes clean late
+    /// still leaves the capture its full time. Never with the card gone.
+    func holdsSeedWatchdog(cardUp: Bool, compassOtherwiseUsable: Bool, at time: TimeInterval) -> Bool {
+        cardUp && compassOtherwiseUsable && !seedMayUseCompass(at: time, cardUp: true)
     }
 
     mutating func reset() {

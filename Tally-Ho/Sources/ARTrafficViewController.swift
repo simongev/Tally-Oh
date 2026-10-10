@@ -2105,7 +2105,25 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// position guard, so the card's timeout runs even before there is a fix.
     private func updateLaunchCard(hasPosition: Bool) {
         guard let card = launchCard else { return }
+        // While the card is up the seed may wait the card's ten seconds for a clean field, which its
+        // 10 s watchdog cannot allow: falling back would restart the session under the card. So a
+        // seed waiting on the field alone has its watchdog renewed each tick, never fired; the card's
+        // 15 s timeout bounds it, and the close renews it once more. Ahead of `updateStartupSeed`.
+        if seedWaitsOnlyForField { renewSeedWatchdogAfterOverlay() }
         card.updateWorld(aligned: launchWorldReady(hasPosition: hasPosition), inFlight: calibrationInFlight)
+    }
+
+    /// With the launch card up, whether the seed is waiting on the compass field alone: its reference
+    /// would be the ground compass — the same conditions as `seedReference`'s compass branch — but for
+    /// the field gate.
+    private var seedWaitsOnlyForField: Bool {
+        let compassOtherwiseUsable = !isAirborneEstimate
+            && lastGPSSpeedKt < ARTrafficViewController.minAnchorGroundSpeedKt
+            && lastTrueHeading >= 0
+            && lastHeadingAccuracy >= 0 && lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        return groundCompassGate.holdsSeedWatchdog(cardUp: launchCard != nil,
+                                                   compassOtherwiseUsable: compassOtherwiseUsable,
+                                                   at: CACurrentMediaTime())
     }
 
     /// What the card waits for underneath it: the world aligned — by its seed, or the heading
@@ -2128,6 +2146,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         if wasSkipped { calibrationWasSkipped = true }
         for recognizer in gesturesHeldForLaunchCard { recognizer.isEnabled = true }
         gesturesHeldForLaunchCard.removeAll()
+        // A seed still waiting gets a fresh watchdog from here, on the three-second grace — the one
+        // left by a 15 s timeout especially. Never shortened.
+        renewSeedWatchdogAfterOverlay()
 
         // `targets_faded` is the scene's own fade test, the one `applyWorldUsabilityFade` applies.
         let solid = worldIsShown(arTrackingState) && worldIsAligned
@@ -2306,7 +2327,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// A seed cancelled by `cancelAimedCaptures(reason:)` starts again on the next tick, and gets the
     /// watchdog time a reset used to give it. Without this the seed's 10 s, counted from the world's
     /// start, could run out behind the overlay and the first tick back would hand the world to
-    /// `.gravityAndHeading` instead of seeding it. Never shortened.
+    /// `.gravityAndHeading` instead of seeding it. Never shortened. Also holds the watchdog under the
+    /// launch card for a seed waiting on the field, and renews it when the card closes (#20/#21).
     private func renewSeedWatchdogAfterOverlay() {
         guard awaitingSeed else { return }
         seedDeadline = max(seedDeadline,
@@ -3275,7 +3297,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
     /// Which field a ground compass seed began on, and whether it went ahead without a clean one.
     private func recordSeedCompassField() {
-        let proceeded = groundCompassGate.seedProceedsUnclean(at: CACurrentMediaTime())
+        let proceeded = groundCompassGate.seedProceedsUnclean(at: CACurrentMediaTime(),
+                                                              cardUp: launchCard != nil)
         FlightRecorder.shared.record(
             event: "seed_compass_field",
             detail: fieldDetail(fieldAssessment) + " proceeded_unclean=\(proceeded ? 1 : 0)")
@@ -5023,9 +5046,11 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         guard lastTrueHeading >= 0,
               lastHeadingAccuracy >= 0, lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
         else { return nil }
-        // On the ground, a clean field — or one the seed has waited on for `seedGraceSeconds` (#21).
+        // On the ground, a clean field — or one the seed has waited on for its grace (#21): the card's
+        // ten seconds while the launch card is up, three once it is gone.
         // A field going bad mid-capture takes the reference away, which cancels that capture.
-        guard isAirborneEstimate || groundCompassGate.seedMayUseCompass(at: CACurrentMediaTime())
+        guard isAirborneEstimate
+                || groundCompassGate.seedMayUseCompass(at: CACurrentMediaTime(), cardUp: launchCard != nil)
         else { return nil }
         return (.compass, lastTrueHeading)
     }
