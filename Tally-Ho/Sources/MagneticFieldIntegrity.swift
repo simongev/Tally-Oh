@@ -144,37 +144,21 @@ enum MagneticFieldIntegrity {
 
 // MARK: - Ground compass gate
 
-/// Which compass samples the ground seed and the ground correction may use (#21). Ground only:
-/// in the air the caller does not consult it, and the air seed and holds are untouched.
+/// Which compass samples the ground correction may use (#21). Ground only: in the air the caller does
+/// not consult it, and the air seed and holds are untouched.
 ///
 /// - The **correction** uses clean samples only. While the field is disturbed its window stops
 ///   filling and ages out, so it holds the offset it has; once the field is clean again, it refines
-///   toward the clean median.
-/// - The **seed** prefers a clean field too, but cannot wait for one indefinitely: until it lands a
-///   `.gravity` world points nowhere, and after ten seconds without a reference the seed falls back
-///   to restarting the session on ARKit's own compass alignment — the same disturbed compass, plus a
-///   restart. So after `seedGraceSeconds` of an unclean field it proceeds on the compass it has, as
-///   the calibration card does after its ten seconds, the HUD says so, and the correction takes over
-///   once the field is clean.
+///   toward the clean median — fast, after an unclean seed (`FastGroundCorrection`).
+/// - The **seed** does not wait for a clean field (#21 follow-up, Gev's decision): it takes the
+///   compass as soon as it is otherwise ready, and a field that is disturbed or still pending flags it
+///   `unclean`. The card no longer holds for the compass either; the HUD's ⚠️ note says so.
 struct GroundCompassGate {
-    /// How long the seed waits for a clean field before proceeding without one. Short against the
-    /// seed's 10 s deadline. Since #20 the seed runs under the launch card rather than after it, so
-    /// this grace counts from launch, not from after the card's ten seconds; the card itself still
-    /// waits up to ten seconds on the field before it closes.
-    static let seedGraceSeconds: TimeInterval = 3.0
-
     private(set) var verdict: MagneticFieldIntegrity.Verdict = .pending
-    private var notCleanSince: TimeInterval?
 
     /// Feed the current verdict, once a tick.
-    mutating func update(_ verdict: MagneticFieldIntegrity.Verdict, at time: TimeInterval) {
+    mutating func update(_ verdict: MagneticFieldIntegrity.Verdict) {
         self.verdict = verdict
-        switch verdict {
-        case .clean, .unavailable:
-            notCleanSince = nil
-        case .disturbed, .pending:
-            if notCleanSince == nil { notCleanSince = time }
-        }
     }
 
     /// Whether the ground correction may take compass samples now.
@@ -182,21 +166,127 @@ struct GroundCompassGate {
         verdict == .clean || verdict == .unavailable
     }
 
-    /// Whether the ground seed may take the compass as its reference now.
-    func seedMayUseCompass(at time: TimeInterval) -> Bool {
-        if correctionMayUseCompass { return true }
-        guard let since = notCleanSince else { return false }
-        return time - since >= Self.seedGraceSeconds
+    /// Whether a ground seed taken now is unclean: the field disturbed, or not yet judged. A device
+    /// that cannot measure the field is not — it keeps the behaviour from before #21.
+    var seedIsUnclean: Bool {
+        !correctionMayUseCompass
     }
 
-    /// True when the seed would be proceeding on a field that is not known to be clean.
-    func seedProceedsUnclean(at time: TimeInterval) -> Bool {
-        !correctionMayUseCompass && seedMayUseCompass(at: time)
+    /// The seed's compass reference: the true heading whenever the compass is otherwise usable. The
+    /// field is not an input — there is no clean-field wait (#21 follow-up); it decides only whether
+    /// the seed is flagged `seedIsUnclean`.
+    static func seedCompassReferenceDeg(trueHeadingDeg: Double, headingAccuracyDeg: Double,
+                                        maxHeadingAccuracyDeg: Double) -> Double? {
+        guard trueHeadingDeg >= 0, headingAccuracyDeg >= 0, headingAccuracyDeg <= maxHeadingAccuracyDeg
+        else { return nil }
+        return trueHeadingDeg
     }
 
     mutating func reset() {
         verdict = .pending
-        notCleanSince = nil
+    }
+}
+
+// MARK: - Fast correction after an unclean seed
+
+/// The heading correction after a seed taken on an unclean field (#21 follow-up, Gev's "no wait").
+///
+/// The card no longer waits for a clean compass, so beside a car or a railing the seed takes the
+/// compass it has and the targets can sit 5–10° off. The ordinary ground correction is slow to fix
+/// that by design: its window needs ten samples half a second apart, its response gate wants the
+/// phone panned through about 40° before it trusts the compass, and it then moves a degree a second.
+/// So once the field has stayed clean for `cleanHoldSeconds`, this takes the clean compass at once —
+/// the median of the clean readings over that hold — and slews to it over `slewSeconds`, so the
+/// targets slide rather than jump, then hands back to the ordinary correction from where it ends.
+///
+/// Only after an unclean seed, and only on a clean field: a disturbed or pending field resets the
+/// hold, and nothing moves while it lasts. Armed again by the next unclean seed.
+struct FastGroundCorrection {
+    /// How long the field must stay clean before the correction applies.
+    static let cleanHoldSeconds: TimeInterval = 2.0
+    /// How long the slew to the clean compass takes.
+    static let slewSeconds: TimeInterval = 1.0
+    /// Fewest clean readings over the hold (the 4 Hz tick gives about nine).
+    static let minSamples = 4
+    /// Widest the clean readings may disagree — the ordinary correction's own dispersion limit.
+    static let maxDispersionDeg: Double = 12.0
+
+    /// One step of the slew: the offset to apply now.
+    struct Step: Equatable {
+        var offsetDeg: Double
+        /// The clean compass offset the slew is heading for.
+        var targetDeg: Double
+        var isFirst: Bool
+        var isLast: Bool
+    }
+
+    /// Waiting for a clean field after an unclean seed.
+    private(set) var isArmed = false
+    private var cleanSince: TimeInterval?
+    private var samples: [(time: TimeInterval, deg: Double)] = []
+    private var slew: (from: Double, delta: Double, start: TimeInterval, target: Double)?
+
+    /// Part-way through the slew. The ordinary correction stands aside meanwhile.
+    var isSlewing: Bool { slew != nil }
+
+    /// A seed has just been applied on the ground; arm only if it was unclean.
+    mutating func seedApplied(unclean: Bool) {
+        self = FastGroundCorrection()
+        isArmed = unclean
+    }
+
+    mutating func reset() {
+        self = FastGroundCorrection()
+    }
+
+    /// Fold in one tick, and get the offset to apply now, if any.
+    ///
+    /// - Parameters:
+    ///   - fieldClean: the field check's verdict is `.clean`.
+    ///   - compassSampleDeg: this tick's ARKit-minus-compass reading — the offset the compass says the
+    ///     world needs, the quantity the ordinary correction takes the median of — or nil when the
+    ///     compass is not usable this tick.
+    ///   - appliedOffsetDeg: the offset in force, where the slew starts.
+    ///   - canApply: on the ground, the world usable and aligned, no flight anchor.
+    mutating func update(fieldClean: Bool, compassSampleDeg: Double?, appliedOffsetDeg: Double,
+                         canApply: Bool, at time: TimeInterval) -> Step? {
+        if let current = slew {
+            guard canApply else {
+                // The world stopped being ours to move part-way through — tracking lost, a flight
+                // anchor. Stop where it stands (the offset already applied stays) and wait for
+                // another clean hold.
+                slew = nil
+                cleanSince = nil
+                samples.removeAll()
+                return nil
+            }
+            let progress = min(1, max(0, (time - current.start) / Self.slewSeconds))
+            let isLast = progress >= 1
+            if isLast {
+                slew = nil
+                isArmed = false
+            }
+            let offset = isLast
+                ? current.target
+                : AngularResponse.wrappedDeg(current.from + current.delta * progress)
+            return Step(offsetDeg: offset, targetDeg: current.target, isFirst: false, isLast: isLast)
+        }
+        guard isArmed, fieldClean, canApply else {
+            cleanSince = nil
+            samples.removeAll()
+            return nil
+        }
+        if cleanSince == nil { cleanSince = time }
+        if let deg = compassSampleDeg, deg.isFinite { samples.append((time: time, deg: deg)) }
+        samples.removeAll { time - $0.time > Self.cleanHoldSeconds }
+        guard let since = cleanSince, time - since >= Self.cleanHoldSeconds,
+              samples.count >= Self.minSamples else { return nil }
+        let values = samples.map { $0.deg }
+        guard AngularResponse.circularInterquartileRangeDeg(values) <= Self.maxDispersionDeg else { return nil }
+        let target = AngularResponse.circularMedianDeg(values)
+        let delta = AngularResponse.signedDelta(appliedOffsetDeg, target)
+        slew = (from: appliedOffsetDeg, delta: delta, start: time, target: target)
+        return Step(offsetDeg: appliedOffsetDeg, targetDeg: target, isFirst: true, isLast: false)
     }
 }
 

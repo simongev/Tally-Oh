@@ -134,67 +134,56 @@ struct MagneticFieldIntegrityTests {
 
     // MARK: - Ground seed and correction gate
 
-    @Test func aCleanFieldOpensBoth() {
+    @Test func aCleanFieldOpensTheCorrectionAndTheSeedIsClean() {
         var gate = GroundCompassGate()
-        gate.update(.clean, at: 0)
+        gate.update(.clean)
         #expect(gate.correctionMayUseCompass)
-        #expect(gate.seedMayUseCompass(at: 0))
-        #expect(!gate.seedProceedsUnclean(at: 0))
+        #expect(!gate.seedIsUnclean)
     }
 
-    @Test func aDisturbedFieldStopsTheCorrectionAndHoldsTheSeedForTheGrace() {
-        var gate = GroundCompassGate()
-        gate.update(.disturbed, at: 10)
-        #expect(!gate.correctionMayUseCompass)
-        #expect(!gate.seedMayUseCompass(at: 10))
-        #expect(!gate.seedMayUseCompass(at: 10 + GroundCompassGate.seedGraceSeconds - 0.1))
-        // The seed proceeds after the grace; the correction never does.
-        gate.update(.disturbed, at: 10 + GroundCompassGate.seedGraceSeconds)
-        #expect(gate.seedMayUseCompass(at: 10 + GroundCompassGate.seedGraceSeconds))
-        #expect(gate.seedProceedsUnclean(at: 10 + GroundCompassGate.seedGraceSeconds))
-        #expect(!gate.correctionMayUseCompass)
-    }
-
-    @Test func pendingWaitsLikeDisturbed() {
-        var gate = GroundCompassGate()
-        gate.update(.pending, at: 0)
-        #expect(!gate.correctionMayUseCompass)
-        #expect(!gate.seedMayUseCompass(at: 1))
-        #expect(gate.seedMayUseCompass(at: GroundCompassGate.seedGraceSeconds))
-    }
-
-    @Test func theGraceCountsFromTheFirstUncleanTick() {
-        var gate = GroundCompassGate()
-        gate.update(.pending, at: 0)
-        gate.update(.disturbed, at: 2)
-        // Pending then disturbed is one unclean stretch from t = 0.
-        #expect(gate.seedMayUseCompass(at: GroundCompassGate.seedGraceSeconds))
-    }
-
-    @Test func aFieldThatRecoversRestoresBothAndRestartsTheGrace() {
-        var gate = GroundCompassGate()
-        gate.update(.disturbed, at: 0)
-        gate.update(.clean, at: 5)
-        #expect(gate.correctionMayUseCompass)
-        #expect(gate.seedMayUseCompass(at: 5))
-        gate.update(.disturbed, at: 6)
-        #expect(!gate.seedMayUseCompass(at: 6 + GroundCompassGate.seedGraceSeconds - 0.1))
-        #expect(gate.seedMayUseCompass(at: 6 + GroundCompassGate.seedGraceSeconds))
+    @Test func aDisturbedOrPendingFieldStopsTheCorrectionAndFlagsTheSeed() {
+        for unclean in [Integrity.Verdict.disturbed, .pending] {
+            var gate = GroundCompassGate()
+            gate.update(unclean)
+            #expect(!gate.correctionMayUseCompass)
+            #expect(gate.seedIsUnclean)
+        }
     }
 
     @Test func aDeviceThatCannotMeasureKeepsTheOldBehaviour() {
         var gate = GroundCompassGate()
-        gate.update(.unavailable, at: 0)
+        gate.update(.unavailable)
         #expect(gate.correctionMayUseCompass)
-        #expect(gate.seedMayUseCompass(at: 0))
+        #expect(!gate.seedIsUnclean)
     }
 
-    @Test func resetStartsOver() {
+    @Test func resetStartsPending() {
         var gate = GroundCompassGate()
-        gate.update(.disturbed, at: 0)
+        gate.update(.clean)
         gate.reset()
-        gate.update(.disturbed, at: 100)
-        #expect(!gate.seedMayUseCompass(at: 100 + GroundCompassGate.seedGraceSeconds - 0.1))
+        #expect(gate.verdict == .pending)
+        #expect(gate.seedIsUnclean)
+    }
+
+    /// The seed does not wait for a clean field (#21 follow-up): its compass reference is the heading
+    /// whenever the compass is otherwise usable — the field is not even an input — and only the flag
+    /// says the field was not clean.
+    @Test func theSeedDoesNotWaitForACleanField() {
+        for verdict in [Integrity.Verdict.disturbed, .pending, .clean, .unavailable] {
+            var gate = GroundCompassGate()
+            gate.update(verdict)
+            let reference = GroundCompassGate.seedCompassReferenceDeg(
+                trueHeadingDeg: 132, headingAccuracyDeg: 11.6, maxHeadingAccuracyDeg: 25)
+            #expect(reference == 132)
+            #expect(gate.seedIsUnclean == (verdict == .disturbed || verdict == .pending))
+        }
+        // The compass's own conditions still apply.
+        #expect(GroundCompassGate.seedCompassReferenceDeg(trueHeadingDeg: -1, headingAccuracyDeg: 10,
+                                                          maxHeadingAccuracyDeg: 25) == nil)
+        #expect(GroundCompassGate.seedCompassReferenceDeg(trueHeadingDeg: 132, headingAccuracyDeg: 30,
+                                                          maxHeadingAccuracyDeg: 25) == nil)
+        #expect(GroundCompassGate.seedCompassReferenceDeg(trueHeadingDeg: 132, headingAccuracyDeg: -1,
+                                                          maxHeadingAccuracyDeg: 25) == nil)
     }
 
     // MARK: - Monitor lifecycle
@@ -310,51 +299,41 @@ struct MagneticFieldIntegrityTests {
 
     private typealias Card = CalibrationViewController
 
-    private func card(accuracy: Double = 11.6, field: Integrity.Verdict, waited: TimeInterval = 0)
+    private func card(accuracy: Double = 11.6, field: Integrity.Verdict)
         -> CalibrationViewController.CompassCardStatus {
-        Card.compassCardStatus(headingAccuracyDeg: accuracy, thresholdDeg: 13,
-                               field: field, fieldWaitedSeconds: waited)
+        Card.compassCardStatus(headingAccuracyDeg: accuracy, thresholdDeg: 13, field: field)
     }
 
     @Test func theCardGoesGreenOnlyOnACleanField() {
         let clean = card(field: .clean)
-        #expect(clean.look == .ready && clean.isReady && !clean.heldByField)
+        #expect(clean.look == .ready && clean.isReady && clean.isVerified)
         for unclean in [Integrity.Verdict.disturbed, .pending] {
-            let held = card(field: unclean)
-            #expect(held.look != .ready)
-            #expect(!held.isReady)
-            #expect(held.heldByField)
+            let amber = card(field: unclean)
+            #expect(amber.look == .improving)
+            #expect(!amber.isVerified)
         }
+    }
+
+    /// The field no longer holds the card (#21 follow-up): a disturbed or pending field still counts
+    /// as ready once the heading is inside its threshold.
+    @Test func theFieldNeverHoldsTheCard() {
+        #expect(card(field: .disturbed).isReady)
+        #expect(card(field: .pending).isReady)
     }
 
     @Test func aDisturbedFieldTellsTheUserWhatToDo() {
         #expect(card(field: .disturbed).detail == "Compass disturbed — move away from metal or cars")
     }
 
-    @Test func afterTenSecondsTheCardProceedsWithoutGoingGreen() {
-        let early = card(field: .disturbed, waited: Card.fieldWaitSeconds - 0.1)
-        #expect(!early.isReady)
-        let late = card(field: .disturbed, waited: Card.fieldWaitSeconds)
-        #expect(late.isReady)
-        #expect(late.proceededWithoutCleanField)
-        #expect(late.look != .ready)
-        let unverified = card(field: .pending, waited: Card.fieldWaitSeconds)
-        #expect(unverified.isReady && unverified.proceededWithoutCleanField)
-        #expect(Card.fieldWaitSeconds == 10)
-    }
-
     @Test func headingAccuracyStillComesFirst() {
         let waiting = card(accuracy: -1, field: .clean)
-        #expect(waiting.look == .waiting && !waiting.isReady && !waiting.heldByField)
+        #expect(waiting.look == .waiting && !waiting.isReady && !waiting.isVerified)
         let poor = card(accuracy: 20, field: .clean)
-        #expect(poor.look == .improving && !poor.isReady && !poor.heldByField)
-        // The field is only consulted once the heading is good enough, so the wait is not counted
-        // against a heading that is still settling.
-        #expect(!card(accuracy: 20, field: .disturbed).heldByField)
+        #expect(poor.look == .improving && !poor.isReady && !poor.isVerified)
     }
 
     @Test func aDeviceThatCannotMeasureTheFieldKeepsTheOldRule() {
         let legacy = card(field: .unavailable)
-        #expect(legacy.look == .ready && legacy.isReady && !legacy.proceededWithoutCleanField)
+        #expect(legacy.look == .ready && legacy.isReady && legacy.isVerified)
     }
 }

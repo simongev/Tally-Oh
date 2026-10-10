@@ -1717,6 +1717,11 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     private static let fieldMonitorClient = "ar_ground"
     /// Which compass samples the ground seed and the ground correction may use. Main thread.
     private var groundCompassGate = GroundCompassGate()
+    /// After an unclean ground seed, takes the clean compass fast once the field has stayed clean
+    /// (#21 follow-up). Main thread.
+    private var fastGroundCorrection = FastGroundCorrection()
+    /// Whether the ground compass seed now capturing began on an unclean field. Main thread.
+    private var seedCaptureBeganUnclean = false
     /// The latest field assessment, for the HUD note and the log. Main thread.
     private var fieldAssessment = MagneticFieldIntegrity.Assessment.pending
     /// Whether the render thread may feed compass samples into the ground correction's window:
@@ -2998,6 +3003,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
 
         // The compass field check (#21), ahead of the seed so the seed sees this tick's verdict.
         updateCompassFieldCheck(airborne: airborne, coordinate: loc, altitudeFt: altitude)
+        updateFastGroundCorrection(airborne: airborne)
 
         // A reset carry that never found a steady frame, or whose azimuth failed the sign check,
         // hands the world to the seed, ahead of the seed's own tick so the seed starts on this one.
@@ -3248,7 +3254,7 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                                altitudeMeters: altitudeFt * CalculationsLogic.feetToMeters)
         let assessment = monitor.assessment()
         fieldAssessment = assessment
-        groundCompassGate.update(assessment.verdict, at: CACurrentMediaTime())
+        groundCompassGate.update(assessment.verdict)
         compassSamplesAllowed = groundCompassGate.correctionMayUseCompass
         compassDisturbedLabel.isHidden = assessment.verdict != .disturbed
         if assessment.verdict != .pending, assessment.verdict != lastLoggedFieldVerdict {
@@ -3273,12 +3279,56 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         return parts.joined(separator: " ")
     }
 
-    /// Which field a ground compass seed began on, and whether it went ahead without a clean one.
+    /// Which field a ground compass seed began on, and whether it went ahead without a clean one —
+    /// which, with no clean-field wait any more, is whenever the field is disturbed or still pending.
     private func recordSeedCompassField() {
-        let proceeded = groundCompassGate.seedProceedsUnclean(at: CACurrentMediaTime())
+        let unclean = groundCompassGate.seedIsUnclean
+        seedCaptureBeganUnclean = unclean
         FlightRecorder.shared.record(
             event: "seed_compass_field",
-            detail: fieldDetail(fieldAssessment) + " proceeded_unclean=\(proceeded ? 1 : 0)")
+            detail: fieldDetail(fieldAssessment) + " proceeded_unclean=\(unclean ? 1 : 0)")
+    }
+
+    /// The fast correction after an unclean ground seed, once a tick (#21 follow-up). Applies the clean
+    /// compass, slewed over a second, once the field has stayed clean for two; until then, and always
+    /// on a disturbed field, nothing. In the air it is dropped: the air paths never use it.
+    private func updateFastGroundCorrection(airborne: Bool) {
+        guard !airborne else {
+            fastGroundCorrection.reset()
+            return
+        }
+        let compassUsable = hasSeededWorldYawError
+            && lastTrueHeading >= 0
+            && lastHeadingAccuracy >= 0 && lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        let canApply = !hasFlightAnchor
+            && worldYawSource != .none
+            && worldIsUsableForDisplay(arTrackingState)
+        let now = CACurrentMediaTime()
+        guard let step = fastGroundCorrection.update(
+            fieldClean: groundCompassGate.verdict == .clean,
+            compassSampleDeg: compassUsable ? worldYawErrorDeg : nil,
+            appliedOffsetDeg: appliedWorldYawOffsetDeg,
+            canApply: canApply, at: now) else { return }
+
+        // Applied exactly as an ordinary ground correction step is, follower included.
+        let offset = step.offsetDeg
+        appliedWorldYawOffsetDeg = offset
+        sceneManager?.worldYawOffsetDeg = offset
+        worldYawSource = .ground
+        noteAlignment(offsetDeg: offset, source: .ground, measuredByCompass: true)
+        if yawFollower.hasSeed {
+            yawFollower.seed(offsetDeg: offset, trackDeg: lastGPSCourseDeg, source: .ground, at: now)
+        }
+        if step.isFirst || step.isLast {
+            FlightRecorder.shared.record(
+                event: "ground_yaw_fast",
+                detail: String(format: "phase=%@ offset=%.2f target=%.2f %@",
+                               step.isFirst ? "start" : "done", offset, step.targetDeg,
+                               fieldDetail(fieldAssessment)))
+        }
+        // The ordinary correction carries on from what is applied, not from the seed — primed on
+        // every step, so a slew cut short (tracking lost) leaves it holding the offset in force.
+        groundYaw.prime(offsetDeg: offset)
     }
 
     // MARK: - Flight Recorder
@@ -4929,6 +4979,8 @@ extension ARTrafficViewController: ARSCNViewDelegate {
                                            dispersionDeg: Double?,
                                            at time: TimeInterval) {
         guard !hasFlightAnchor else { return }
+        // The fast correction owns the offset for the second of its slew (#21 follow-up).
+        guard !fastGroundCorrection.isSlewing else { return }
         // **Runs on top of the seed from build 33, and that is the point.** The median here is
         // measured against the *uncorrected* ARKit azimuth, so it reads back the total offset the
         // world needs — the seed's value plus whatever the seed got wrong — which is why the
@@ -5020,14 +5072,14 @@ extension ARTrafficViewController: ARSCNViewDelegate {
             else { return nil }
             return (.track, lastGPSCourseDeg)
         }
-        guard lastTrueHeading >= 0,
-              lastHeadingAccuracy >= 0, lastHeadingAccuracy <= maxHeadingAccuracyForYawFix
+        // No clean-field wait on the ground (#21 follow-up, Gev's decision): the compass is taken as
+        // soon as it is otherwise ready, flagged unclean when the field is disturbed or still pending
+        // (`recordSeedCompassField`), and `FastGroundCorrection` puts it right once the field is clean.
+        guard let heading = GroundCompassGate.seedCompassReferenceDeg(
+            trueHeadingDeg: lastTrueHeading, headingAccuracyDeg: lastHeadingAccuracy,
+            maxHeadingAccuracyDeg: maxHeadingAccuracyForYawFix)
         else { return nil }
-        // On the ground, a clean field — or one the seed has waited on for `seedGraceSeconds` (#21).
-        // A field going bad mid-capture takes the reference away, which cancels that capture.
-        guard isAirborneEstimate || groundCompassGate.seedMayUseCompass(at: CACurrentMediaTime())
-        else { return nil }
-        return (.compass, lastTrueHeading)
+        return (.compass, heading)
     }
 
     /// Whether this world is one the app aligns itself — every world now, except after the
@@ -5234,6 +5286,12 @@ extension ARTrafficViewController: ARSCNViewDelegate {
         // designed to compose: a one-second snapshot for speed, then a fifteen-second rolling
         // median across many headings for accuracy.
         groundYaw.prime(offsetDeg: estimate.offsetDeg)
+        // A ground compass seed taken on an unclean field — at its start or now — arms the fast
+        // correction (#21 follow-up). Any other seed disarms it.
+        let groundCompassSeed = estimate.referenceKind == .compass && !isAirborneEstimate
+        fastGroundCorrection.seedApplied(
+            unclean: groundCompassSeed && (seedCaptureBeganUnclean || groundCompassGate.seedIsUnclean))
+        seedCaptureBeganUnclean = false
         // The anchor constant a later reset in the air carries over. See GyroYawHold.
         noteAlignment(offsetDeg: estimate.offsetDeg, source: .seed,
                       anchorConstantDeg: estimate.anchorConstantDeg,

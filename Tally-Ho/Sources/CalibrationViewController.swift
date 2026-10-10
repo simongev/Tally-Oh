@@ -92,12 +92,15 @@ enum CalibrationFlightPolicy {
 /// were created only when it closed, so the first targets came up faded and waited out ARKit's
 /// start and the seed afterwards (log 849c560a: faded from 1.07 s, `normal` at 2.62 s,
 /// `seed_captured` at 3.77 s, all after the card). Now all of that runs under the card from launch,
-/// and the card waits for the thing the user is waiting for: targets solid and placed — and, since
-/// #21, a compass steering by the Earth's field, for as long as that is worth waiting for.
+/// and the card waits for the thing the user is waiting for: targets solid and placed.
+///
+/// Not for a clean compass (#21 follow-up, Gev's decision). The card used to hold up to ten seconds
+/// for one; now a disturbed field gets the HUD's ⚠️ note, the seed takes the compass it has, and the
+/// heading corrects itself quickly once the field turns clean (`FastGroundCorrection`).
 enum CalibrationCardPolicy {
     enum CloseReason: String {
-        /// On the ground: GPS ready, the world aligned, and the compass verified or waited on for
-        /// `compassWaitSeconds`. The targets underneath are solid and placed.
+        /// On the ground: GPS ready and the world aligned. The targets underneath are solid and
+        /// placed.
         case ready
         case skipped
         /// The phone is flying: closed at once, as since #15.
@@ -113,29 +116,23 @@ enum CalibrationCardPolicy {
         var countsAsSkip: Bool { self == .skipped || self == .timeout }
     }
 
-    /// How long the card waits on an unverified compass field once everything else is ready: the
-    /// compass card's own wait (#21), counted from when the card appeared.
-    static let compassWaitSeconds: TimeInterval = CalibrationViewController.fieldWaitSeconds
     static let timeoutSeconds: TimeInterval = 15
 
     /// Why the card closes now, or nil to keep it up. In order:
     ///
     /// 1. Skip.
     /// 2. In flight.
-    /// 3. On the ground: GPS ready, the world aligned — aligned **and** tracking normal with a position
-    ///    to place from, which is when the fade lifts — and the compass field clean
-    ///    (`compassVerified`, from `compassCardStatus`) or `compassWaitSeconds` on the card.
+    /// 3. On the ground: GPS ready (≤ 10 m) and the world aligned — aligned **and** tracking normal
+    ///    with a position to place from, which is when the fade lifts. The compass field does not
+    ///    hold it.
     /// 4. `timeoutSeconds` on the card, whatever else.
-    static func closeReason(gpsReady: Bool, worldAligned: Bool, compassVerified: Bool,
+    static func closeReason(gpsReady: Bool, worldAligned: Bool,
                             skipped: Bool, inFlight: Bool, secondsShown: TimeInterval,
-                            compassWaitSeconds: TimeInterval = compassWaitSeconds,
                             timeoutSeconds: TimeInterval = timeoutSeconds) -> CloseReason? {
         if skipped { return .skipped }
         if inFlight { return .inFlight }
+        if gpsReady && worldAligned { return .ready }
         let shown = secondsShown.isFinite ? secondsShown : 0
-        if gpsReady && worldAligned && (compassVerified || shown >= compassWaitSeconds) {
-            return .ready
-        }
         if shown >= timeoutSeconds { return .timeout }
         return nil
     }
@@ -208,22 +205,23 @@ class CalibrationViewController: UIViewController {
     var secondsShown: TimeInterval { CACurrentMediaTime() - shownAt }
     /// Whether the GPS row has reached its threshold, for the same line.
     var gpsIsReady: Bool { gpsReady }
-    /// Whether the compass card is green on its own merits (#21): the field checked clean, or a
-    /// device that cannot measure it with the heading inside its threshold. Not when it is only
-    /// "continuing anyway" after its wait.
+    /// Whether the compass card is green (#21): the field checked clean, or a device that cannot
+    /// measure it with the heading inside its threshold. For the `card_closed` line only — it no
+    /// longer holds the card.
     var compassIsVerified: Bool {
-        guard let card = lastCompassCard else { return false }
-        return card.isReady && !card.proceededWithoutCleanField
+        lastCompassCard?.isVerified ?? false
     }
 
     // MARK: - Field check (#21)
 
     /// The field-check client name for `MagneticFieldMonitor.shared`.
     private static let fieldMonitorClient = "calibration"
-    /// When the compass card was first held back by the field alone, on the media clock.
-    private var fieldWaitStart: CFTimeInterval?
-    /// Re-evaluates the cards twice a second, so the field verdict and the ten-second wait move
-    /// the card even when no heading update arrives. Invalidated on dismissal.
+    /// When the compass row first showed the heading good but the field not verified, on the media
+    /// clock — the `waited=` column of `calibration_compass`. It holds nothing back any more; the
+    /// column keeps its name so the log reads as before.
+    private var fieldUnverifiedSince: CFTimeInterval?
+    /// Re-evaluates the cards twice a second, so the field verdict moves the compass row even when
+    /// no heading update arrives. Invalidated on dismissal.
     private var readinessTimer: Timer?
     private var lastCompassCard: CompassCardStatus?
 
@@ -267,7 +265,7 @@ class CalibrationViewController: UIViewController {
         guard !dismissed else { return }
         if isOverARView {
             if let reason = CalibrationCardPolicy.closeReason(
-                gpsReady: gpsReady, worldAligned: worldAligned, compassVerified: compassIsVerified,
+                gpsReady: gpsReady, worldAligned: worldAligned,
                 skipped: false, inFlight: parentSaysInFlight, secondsShown: secondsShown) {
                 completeDismiss(reason: reason)
             }
@@ -364,13 +362,13 @@ class CalibrationViewController: UIViewController {
         }
 
         // Compass card — decided entirely by `compassCardStatus` (#21).
-        let now = CACurrentMediaTime()
         let card = Self.compassCardStatus(
             headingAccuracyDeg: bestCompassAccuracy,
             thresholdDeg: compassAccuracyThreshold,
-            field: MagneticFieldMonitor.shared.assessment().verdict,
-            fieldWaitedSeconds: fieldWaitStart.map { now - $0 } ?? 0)
-        if card.heldByField, fieldWaitStart == nil { fieldWaitStart = now }
+            field: MagneticFieldMonitor.shared.assessment().verdict)
+        if card.isReady, !card.isVerified, fieldUnverifiedSince == nil {
+            fieldUnverifiedSince = CACurrentMediaTime()
+        }
         let look: CalibrationState
         switch card.look {
         case .waiting:   look = .waiting
@@ -400,66 +398,56 @@ class CalibrationViewController: UIViewController {
 
     // MARK: - Compass card criterion (#21)
 
-    /// How long the compass card waits for a clean field before letting the launch go on without
-    /// one. Long enough to step back from a railing or a car; short enough that a user who cannot
-    /// is not stuck. The AR view then shows a "compass disturbed" note while it lasts.
-    static let fieldWaitSeconds: TimeInterval = 10.0
-
     /// What the compass card shows, and whether it lets the screen finish.
     struct CompassCardStatus: Equatable {
         enum Look { case waiting, improving, ready }
         var look: Look
         var detail: String
-        /// The compass half of the screen's completion.
+        /// The compass half of the in-session popup's completion: the heading inside its threshold.
+        /// The field never holds it.
         var isReady: Bool
-        /// Ready only because the wait for a clean field ran out.
-        var proceededWithoutCleanField = false
-        /// Held back by the field alone: the heading accuracy itself is good enough.
-        var heldByField = false
+        /// Green: ready, and the field checked clean — or a device that cannot measure it.
+        var isVerified: Bool
     }
 
     /// The compass card's whole criterion, in one place.
     ///
     /// It used to be iOS's `headingAccuracy` alone, which reads 10–12.5° almost always and passed on
-    /// the first reading every time, local iron or not. Now the heading must also be steering by the
-    /// Earth's field: green only when `MagneticFieldIntegrity` finds the field's strength and dip
-    /// matching WMM. A disturbed field holds the card with the instruction to move; after
-    /// `fieldWaitSeconds` it lets the launch proceed anyway, without going green. A device that cannot
-    /// measure the field keeps the old rule.
+    /// the first reading every time, local iron or not. Since #21 it is green only when
+    /// `MagneticFieldIntegrity` finds the field's strength and dip matching WMM. It no longer holds
+    /// the card for that (Gev's decision): a disturbed field shows the instruction to move and stays
+    /// amber, the card goes on its other conditions, and the HUD's ⚠️ note and the fast correction
+    /// take over. A device that cannot measure the field keeps the old rule.
     static func compassCardStatus(headingAccuracyDeg: Double,
                                   thresholdDeg: Double,
-                                  field: MagneticFieldIntegrity.Verdict,
-                                  fieldWaitedSeconds: TimeInterval) -> CompassCardStatus {
+                                  field: MagneticFieldIntegrity.Verdict) -> CompassCardStatus {
         if headingAccuracyDeg < 0 {
-            return CompassCardStatus(look: .waiting, detail: "Move phone in a figure-8…", isReady: false)
+            return CompassCardStatus(look: .waiting, detail: "Move phone in a figure-8…",
+                                     isReady: false, isVerified: false)
         }
         if headingAccuracyDeg > thresholdDeg {
             return CompassCardStatus(
                 look: .improving,
                 detail: String(format: "±%.0f°  (need ≤ %.0f°)  Move in ∞", headingAccuracyDeg, thresholdDeg),
-                isReady: false)
+                isReady: false, isVerified: false)
         }
         switch field {
         case .clean:
             return CompassCardStatus(look: .ready,
                                      detail: String(format: "±%.0f°  ✓  field checked", headingAccuracyDeg),
-                                     isReady: true)
+                                     isReady: true, isVerified: true)
         case .unavailable:
             return CompassCardStatus(look: .ready,
                                      detail: String(format: "±%.0f°  ✓", headingAccuracyDeg),
-                                     isReady: true)
-        case .disturbed, .pending:
-            if fieldWaitedSeconds >= fieldWaitSeconds {
-                let detail = field == .disturbed
-                    ? "Compass disturbed — continuing anyway"
-                    : "Compass field not verified — continuing anyway"
-                return CompassCardStatus(look: .improving, detail: detail, isReady: true,
-                                         proceededWithoutCleanField: true, heldByField: true)
-            }
-            let detail = field == .disturbed
-                ? "Compass disturbed — move away from metal or cars"
-                : String(format: "±%.0f°  checking the magnetic field…", headingAccuracyDeg)
-            return CompassCardStatus(look: .improving, detail: detail, isReady: false, heldByField: true)
+                                     isReady: true, isVerified: true)
+        case .disturbed:
+            return CompassCardStatus(look: .improving,
+                                     detail: "Compass disturbed — move away from metal or cars",
+                                     isReady: true, isVerified: false)
+        case .pending:
+            return CompassCardStatus(look: .improving,
+                                     detail: String(format: "±%.0f°  checking the magnetic field…", headingAccuracyDeg),
+                                     isReady: true, isVerified: false)
         }
     }
 
@@ -470,10 +458,10 @@ class CalibrationViewController: UIViewController {
         let outcome: String
         if wasSkipped {
             outcome = "skipped"
-        } else if card?.proceededWithoutCleanField == true {
-            outcome = "proceeded_unclean"
-        } else if card?.isReady == true {
+        } else if card?.isVerified == true {
             outcome = "ready"
+        } else if card?.isReady == true {
+            outcome = "proceeded_unclean"
         } else {
             outcome = "not_ready"
         }
@@ -482,7 +470,7 @@ class CalibrationViewController: UIViewController {
             return String(format: "%.\(decimals)f", x)
         }
         let accuracy: Double? = bestCompassAccuracy >= 0 ? bestCompassAccuracy : nil
-        let waited: Double? = fieldWaitStart.map { CACurrentMediaTime() - $0 }
+        let waited: Double? = fieldUnverifiedSince.map { CACurrentMediaTime() - $0 }
         let parts: [String] = [
             "outcome=\(outcome)",
             "field=\(assessment.verdict.rawValue)",
