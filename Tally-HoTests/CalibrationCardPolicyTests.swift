@@ -175,10 +175,19 @@ struct CalibrationCardPolicyTests {
         #expect(closed.t == 0.5)
     }
 
-    /// Skip mid-wait.
-    @Test func skipMidWait() throws {
-        let closed = try #require(replay(gpsAt: 1.0, alignedAt: 3.77, skipAt: 5.1))
+    /// Skip while the card is still up. With no compass wait any more (#21 follow-up), the card is up
+    /// past four seconds only while something else is missing — here the 10 m fix, indoors.
+    @Test func skipWhileWaitingForGPS() throws {
+        let closed = try #require(replay(alignedAt: 3.77, skipAt: 5.1))
         #expect(closed.reason == .skipped)
         #expect(closed.t == 5.25)
+    }
+
+    /// And a Skip that would have landed in the old compass wait finds the card already gone: with GPS
+    /// and the world aligned it closed at 4.0 s, as ready.
+    @Test func theOldCompassWaitIsGone() throws {
+        let closed = try #require(replay(gpsAt: 1.0, alignedAt: 3.77, skipAt: 5.1))
+        #expect(closed.reason == .ready)
+        #expect(closed.t == 4.0)
     }
 }
