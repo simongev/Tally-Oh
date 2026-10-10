@@ -2122,7 +2122,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         guard launchCard === card else { return }
         launchCard = nil
         isCalibrationPopupShowing = false
-        // Same as the popup's Skip: the user has declined, so nothing re-presents it this launch.
+        // Same as the popup's Skip: nothing re-presents it this launch. A timeout reports as a Skip
+        // too (`CloseReason.countsAsSkip`), so the GPS-degrade popup cannot pause and reset the
+        // session after one.
         if wasSkipped { calibrationWasSkipped = true }
         for recognizer in gesturesHeldForLaunchCard { recognizer.isEnabled = true }
         gesturesHeldForLaunchCard.removeAll()
@@ -2131,9 +2133,10 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let solid = worldIsShown(arTrackingState) && worldIsAligned
         FlightRecorder.shared.record(
             event: "card_closed",
-            detail: String(format: "reason=%@ aligned=%d targets_faded=%d shown=%.2fs gps_ready=%d h_acc=%.0f ar=%@ rendered=%d",
+            detail: String(format: "reason=%@ aligned=%d targets_faded=%d shown=%.2fs gps_ready=%d compass_verified=%d h_acc=%.0f ar=%@ rendered=%d",
                            card.closeReason?.rawValue ?? "unknown", worldIsAligned ? 1 : 0,
                            solid ? 0 : 1, card.secondsShown, card.gpsIsReady ? 1 : 0,
+                           card.compassIsVerified ? 1 : 0,
                            lastHorizontalAccuracy, arTrackingStateDescription,
                            sceneManager?.renderedAircraftCount ?? 0)
         )

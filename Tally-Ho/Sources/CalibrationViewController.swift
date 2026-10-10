@@ -4,12 +4,13 @@
 //
 //  The calibration card. At launch it is a child overlay over the AR view, which is already
 //  running underneath — session, location, traffic and seed all start at once (#20) — and it
-//  closes when GPS is ready and the world is aligned, on Skip, in flight, or after a timeout
-//  (`CalibrationCardPolicy`). Presented on its own (the in-session popup) it keeps the rule below.
+//  closes on Skip, in flight, on the ground when GPS is ready, the world is aligned and the compass
+//  field is clean or has been waited on, or after a timeout (`CalibrationCardPolicy`). Presented on
+//  its own (the in-session popup) it keeps the rule below.
 //  The popup waits for:
 //   1. GPS fix with horizontalAccuracy ≤ 10 m
-//   2. Compass heading with headingAccuracy ≤ 13°  (achieved by the user
-//      performing a figure-8 motion with the phone)
+//   2. The compass card, decided by `compassCardStatus` (#21): heading accuracy ≤ 13° and the field
+//      checked against WMM, or ten seconds of waiting on the field
 //
 //  - If both conditions are already satisfied on the first reading the screen
 //    is bypassed instantly (no flash shown to the user).
@@ -91,30 +92,51 @@ enum CalibrationFlightPolicy {
 /// were created only when it closed, so the first targets came up faded and waited out ARKit's
 /// start and the seed afterwards (log 849c560a: faded from 1.07 s, `normal` at 2.62 s,
 /// `seed_captured` at 3.77 s, all after the card). Now all of that runs under the card from launch,
-/// and the card waits for the thing the user is waiting for: targets solid and placed.
+/// and the card waits for the thing the user is waiting for: targets solid and placed — and, since
+/// #21, a compass steering by the Earth's field, for as long as that is worth waiting for.
 enum CalibrationCardPolicy {
     enum CloseReason: String {
-        /// GPS ready and the world aligned: the targets underneath are solid and placed.
+        /// On the ground: GPS ready, the world aligned, and the compass verified or waited on for
+        /// `compassWaitSeconds`. The targets underneath are solid and placed.
         case ready
         case skipped
-        /// A fix shows the phone flying: skipped, as since #15.
+        /// The phone is flying: closed at once, as since #15.
         case inFlight = "in_flight"
-        /// Neither came in `timeoutSeconds` — GPS indoors, a seed that never lands — so the card gets
+        /// Not ready in `timeoutSeconds` — GPS indoors, a seed that never lands — so the card gets
         /// out of the way rather than holding the view hostage.
         case timeout
+
+        /// Whether the close counts as a Skip, so nothing re-presents the card this launch. A
+        /// timeout does (CTO decision on the #20/#21 combine): the sensors never got there, the
+        /// GPS-degrade trigger would only fire on the same weakness, and its popup pauses and resets
+        /// the session the user is now looking at.
+        var countsAsSkip: Bool { self == .skipped || self == .timeout }
     }
 
+    /// How long the card waits on an unverified compass field once everything else is ready: the
+    /// compass card's own wait (#21), counted from when the card appeared.
+    static let compassWaitSeconds: TimeInterval = CalibrationViewController.fieldWaitSeconds
     static let timeoutSeconds: TimeInterval = 15
 
-    /// Why the card closes now, or nil to keep it up. Skip first, then flight, then ready, then the
-    /// timeout. `worldAligned` means aligned **and** tracking normal: that is when the fade lifts.
-    static func closeReason(gpsReady: Bool, worldAligned: Bool, skipped: Bool, inFlight: Bool,
-                            secondsShown: TimeInterval,
+    /// Why the card closes now, or nil to keep it up. In order:
+    ///
+    /// 1. Skip.
+    /// 2. In flight.
+    /// 3. On the ground: GPS ready, the world aligned — aligned **and** tracking normal with a position
+    ///    to place from, which is when the fade lifts — and the compass field clean
+    ///    (`compassVerified`, from `compassCardStatus`) or `compassWaitSeconds` on the card.
+    /// 4. `timeoutSeconds` on the card, whatever else.
+    static func closeReason(gpsReady: Bool, worldAligned: Bool, compassVerified: Bool,
+                            skipped: Bool, inFlight: Bool, secondsShown: TimeInterval,
+                            compassWaitSeconds: TimeInterval = compassWaitSeconds,
                             timeoutSeconds: TimeInterval = timeoutSeconds) -> CloseReason? {
         if skipped { return .skipped }
         if inFlight { return .inFlight }
-        if gpsReady && worldAligned { return .ready }
-        if secondsShown.isFinite, secondsShown >= timeoutSeconds { return .timeout }
+        let shown = secondsShown.isFinite ? secondsShown : 0
+        if gpsReady && worldAligned && (compassVerified || shown >= compassWaitSeconds) {
+            return .ready
+        }
+        if shown >= timeoutSeconds { return .timeout }
         return nil
     }
 }
@@ -186,6 +208,13 @@ class CalibrationViewController: UIViewController {
     var secondsShown: TimeInterval { CACurrentMediaTime() - shownAt }
     /// Whether the GPS row has reached its threshold, for the same line.
     var gpsIsReady: Bool { gpsReady }
+    /// Whether the compass card is green on its own merits (#21): the field checked clean, or a
+    /// device that cannot measure it with the heading inside its threshold. Not when it is only
+    /// "continuing anyway" after its wait.
+    var compassIsVerified: Bool {
+        guard let card = lastCompassCard else { return false }
+        return card.isReady && !card.proceededWithoutCleanField
+    }
 
     // MARK: - Field check (#21)
 
@@ -238,8 +267,8 @@ class CalibrationViewController: UIViewController {
         guard !dismissed else { return }
         if isOverARView {
             if let reason = CalibrationCardPolicy.closeReason(
-                gpsReady: gpsReady, worldAligned: worldAligned, skipped: false,
-                inFlight: parentSaysInFlight, secondsShown: secondsShown) {
+                gpsReady: gpsReady, worldAligned: worldAligned, compassVerified: compassIsVerified,
+                skipped: false, inFlight: parentSaysInFlight, secondsShown: secondsShown) {
                 completeDismiss(reason: reason)
             }
         } else if gpsReady && compassReady {
@@ -365,7 +394,8 @@ class CalibrationViewController: UIViewController {
         readinessTimer = nil
         recordCompassOutcome()
         MagneticFieldMonitor.shared.stop(client: Self.fieldMonitorClient)
-        onComplete?(wasSkipped)
+        // A timeout reports as a Skip (CTO, #20/#21 combine): nothing re-presents the card after it.
+        onComplete?(wasSkipped || reason.countsAsSkip)
     }
 
     // MARK: - Compass card criterion (#21)

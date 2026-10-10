@@ -158,7 +158,9 @@ enum MagneticFieldIntegrity {
 ///   once the field is clean.
 struct GroundCompassGate {
     /// How long the seed waits for a clean field before proceeding without one. Short against the
-    /// seed's 10 s deadline; the calibration card has usually given the user ten seconds already.
+    /// seed's 10 s deadline. Since #20 the seed runs under the launch card rather than after it, so
+    /// this grace counts from launch, not from after the card's ten seconds; the card itself still
+    /// waits up to ten seconds on the field before it closes.
     static let seedGraceSeconds: TimeInterval = 3.0
 
     private(set) var verdict: MagneticFieldIntegrity.Verdict = .pending
