@@ -117,7 +117,8 @@ class CalibrationViewController: UIViewController {
         super.viewDidLoad()
         setupUI()
         setupLocation()
-        MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
+        // The field monitor starts on the first fix that shows the phone on the ground, below — never
+        // in flight, where this screen goes on its first fix anyway.
         readinessTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateReadiness()
         }
@@ -367,9 +368,6 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         if loc.horizontalAccuracy <= gpsAccuracyThreshold {
             lastValidLocation = loc
         }
-        MagneticFieldMonitor.shared.updatePosition(latitudeDeg: loc.coordinate.latitude,
-                                                   longitudeDeg: loc.coordinate.longitude,
-                                                   altitudeMeters: loc.altitude)
         if !earlyLocationSent {
             earlyLocationSent = true
             onEarlyLocation?(loc)
@@ -378,9 +376,16 @@ extension CalibrationViewController: CLLocationManagerDelegate {
         // after the early fetch above has been kicked off, as if the sensors had converged — not as a
         // Skip, which would also silence the ground's prompts after landing.
         if CalibrationFlightPolicy.fixShowsFlight(speedMps: loc.speed) {
+            // Airborne by this screen's own test: the field check stops at once (#21).
+            MagneticFieldMonitor.shared.setAirborne(true)
             completeDismiss(seedLocation: lastValidLocation ?? loc)
             return
         }
+        // On the ground: the field check runs, against the model where the phone is (#21).
+        MagneticFieldMonitor.shared.start(client: Self.fieldMonitorClient)
+        MagneticFieldMonitor.shared.updatePosition(latitudeDeg: loc.coordinate.latitude,
+                                                   longitudeDeg: loc.coordinate.longitude,
+                                                   altitudeMeters: loc.altitude)
         updateReadiness()
     }
 

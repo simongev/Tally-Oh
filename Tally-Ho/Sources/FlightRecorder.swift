@@ -82,7 +82,8 @@ final class FlightRecorder {
         "datum_offset_n", "datum_offset_median_ft", "datum_offset_p25_ft", "datum_offset_p75_ft",
         "datum_n", "datum_delta_isa_k", "datum_k", "datum_c_ft",
         "own_press_alt_ft", "hud_heading_deg",
-        "field_ut", "field_expected_ut", "dip_deg", "dip_expected_deg", "field_clean"
+        "field_ut", "field_expected_ut", "dip_deg", "dip_expected_deg", "field_clean",
+        "motion_hz", "field_motion_hz"
     ]
 
     private static let header = columns.joined(separator: ",")
@@ -357,6 +358,14 @@ final class FlightRecorder {
         var dipDeg: Double?
         var dipExpectedDeg: Double?
         var fieldClean: Bool?
+
+        /// Delivered rate of the main device-motion stream (requested 100 Hz) and of the field
+        /// monitor's own stream (10 Hz) over the second since the previous row. The field one is
+        /// empty while that stream is stopped — in the air, always — so a row with both filled is one
+        /// where the two `CMMotionManager`s ran together, and `motion_hz` there says whether the
+        /// second one slowed the stream the holds are built on (#21).
+        var motionHz: Double?
+        var fieldMotionHz: Double?
     }
 
     // MARK: - Recording
@@ -538,6 +547,8 @@ final class FlightRecorder {
         fields.append(format(sample.dipDeg,                    decimals: 2))
         fields.append(format(sample.dipExpectedDeg,            decimals: 2))
         fields.append(sample.fieldClean.map { $0 ? "1" : "0" } ?? "")
+        fields.append(format(sample.motionHz,                  decimals: 1))
+        fields.append(format(sample.fieldMotionHz,             decimals: 1))
 
         return fields.joined(separator: ",")
     }

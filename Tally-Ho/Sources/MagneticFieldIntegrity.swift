@@ -198,6 +198,54 @@ struct GroundCompassGate {
     }
 }
 
+// MARK: - Monitor lifecycle
+
+/// When the field monitor's CoreMotion stream runs (#21): while a client on the ground wants it, and
+/// never in the air. Airborne stops it at once, whoever still holds it — the calibration card
+/// included, which with #20 may still be up over the AR view — and landing starts it again only if
+/// a client still wants it.
+struct FieldMonitorDemand: Equatable {
+    private(set) var clients: Set<String> = []
+    private(set) var airborne = false
+
+    var shouldRun: Bool { !airborne && !clients.isEmpty }
+
+    mutating func add(_ client: String) { clients.insert(client) }
+    mutating func remove(_ client: String) { clients.remove(client) }
+    mutating func setAirborne(_ value: Bool) { airborne = value }
+}
+
+/// The delivered rate of a sample stream between two reads of its running count (#21) — used to log
+/// whether the main 100 Hz device-motion stream slows while the field monitor's second manager runs.
+struct SampleRateMeter {
+    /// Reads closer together than this are ignored rather than measured over a sliver of time.
+    static let minIntervalSeconds: TimeInterval = 0.2
+    /// A longer gap — the app backgrounded, the tick stopped — gives no rate, rather than an
+    /// average over the gap that would read as a slowdown.
+    static let maxIntervalSeconds: TimeInterval = 5.0
+
+    private var last: (count: Int, time: TimeInterval)?
+
+    /// Samples per second since the previous read; nil on the first read, after a gap, or when the
+    /// count went backwards (the stream was restarted).
+    mutating func rate(count: Int, at time: TimeInterval) -> Double? {
+        guard let previous = last else {
+            last = (count, time)
+            return nil
+        }
+        let interval = time - previous.time
+        guard interval >= Self.minIntervalSeconds else { return nil }
+        last = (count, time)
+        let delivered = count - previous.count
+        guard interval <= Self.maxIntervalSeconds, delivered >= 0 else { return nil }
+        return Double(delivered) / interval
+    }
+
+    mutating func reset() {
+        last = nil
+    }
+}
+
 // MARK: - Monitor
 
 /// CoreMotion's calibrated magnetic field and gravity, judged against WMM at the current position.
@@ -207,12 +255,14 @@ struct GroundCompassGate {
 /// gyro and gravity only — because the gyro yaw hold, the attitude hold and the camera seed are
 /// built on a frame the cabin's field cannot reach. Apple advises one manager per app because
 /// several can affect the delivered rates; this one asks for 10 Hz against the main stream's
-/// 100 Hz, so the hardware rate is unchanged, and it runs only on the ground and on the calibration
-/// screen, never in the air.
+/// 100 Hz, so the hardware rate should be unchanged — and the flight log's `motion_hz` column
+/// measures the main stream so that a slowdown would show. It runs only on the ground and on the
+/// calibration screen, and stops the moment the phone is airborne (`FieldMonitorDemand`).
 ///
 /// Shared, with named clients, so the calibration screen and the AR view can both hold it — they may
 /// overlap once the card becomes an overlay (#20) — and it stops when the last lets go.
-/// `start`, `stop` and `updatePosition` are main-thread calls; `assessment` is safe from any thread.
+/// `start`, `stop`, `setAirborne` and `updatePosition` are main-thread calls; `assessment` and
+/// `deliveredSampleCount` are safe from any thread.
 final class MagneticFieldMonitor {
 
     static let shared = MagneticFieldMonitor()
@@ -228,8 +278,10 @@ final class MagneticFieldMonitor {
         return q
     }()
     private let lock = NSLock()
-    private var clients = Set<String>()
+    /// Main thread.
+    private var demand = FieldMonitorDemand()
     // Under `lock`:
+    private var delivered = 0
     private var readings: [MagneticFieldIntegrity.Reading] = []
     private var expected: MagneticFieldModel.Field?
     private var expectedAt: (latitude: Double, longitude: Double)?
@@ -244,12 +296,55 @@ final class MagneticFieldMonitor {
         isAvailable = CMMotionManager.availableAttitudeReferenceFrames().contains(.xArbitraryCorrectedZVertical)
     }
 
+    /// Whether the stream is running now.
+    var isRunning: Bool { manager.isDeviceMotionActive }
+
+    /// Samples delivered since launch, for `SampleRateMeter`. Safe from any thread.
+    var deliveredSampleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return delivered
+    }
+
+    /// Hold the monitor for `client`. Runs it unless the phone is airborne.
     func start(client: String) {
-        clients.insert(client)
-        guard isAvailable, !manager.isDeviceMotionActive else { return }
+        demand.add(client)
+        apply()
+    }
+
+    /// Let go for `client`; the stream stops when the last client lets go.
+    func stop(client: String) {
+        demand.remove(client)
+        apply()
+    }
+
+    /// The ground/air split. Airborne stops the stream at once, whoever holds it; on the ground it
+    /// runs again only if a client still wants it.
+    func setAirborne(_ airborne: Bool) {
+        guard demand.airborne != airborne else { return }
+        demand.setAirborne(airborne)
+        apply()
+    }
+
+    private func apply() {
+        if demand.shouldRun {
+            guard isAvailable, !manager.isDeviceMotionActive else { return }
+            startStream()
+        } else if manager.isDeviceMotionActive {
+            manager.stopDeviceMotionUpdates()
+            lock.lock()
+            readings.removeAll()
+            lock.unlock()
+        }
+    }
+
+    private func startStream() {
         manager.deviceMotionUpdateInterval = Self.updateInterval
         manager.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, _ in
             guard let self, let motion else { return }
+            self.lock.lock()
+            self.delivered &+= 1
+            self.lock.unlock()
             // An uncalibrated field still carries the phone's own magnetisation: no verdict from it.
             guard motion.magneticField.accuracy != .uncalibrated else { return }
             let f = motion.magneticField.field
@@ -263,15 +358,6 @@ final class MagneticFieldMonitor {
             self.readings.removeAll { $0.time < cutoff }
             self.lock.unlock()
         }
-    }
-
-    func stop(client: String) {
-        clients.remove(client)
-        guard clients.isEmpty else { return }
-        manager.stopDeviceMotionUpdates()
-        lock.lock()
-        readings.removeAll()
-        lock.unlock()
     }
 
     /// Re-evaluate the model where the phone is. Recomputed only after moving a kilometre or so —

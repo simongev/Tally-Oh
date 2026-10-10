@@ -974,6 +974,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         // magnetometer-corrected frames would bring the cabin's field back in.
         motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
             guard let self, let motion else { return }
+            // Counted for the log's `motion_hz` only (#21); nothing reads it back into the holds.
+            self.mainMotionSampleCount &+= 1
             let rate = motion.rotationRate
             let gravity = motion.gravity
             let aboutVertical = rate.x * gravity.x + rate.y * gravity.y + rate.z * gravity.z
@@ -1742,6 +1744,12 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
     /// The small "compass disturbed" note, shown on the ground while the field is disturbed.
     private var compassDisturbedLabel: UILabel!
     private var lastLoggedFieldVerdict: MagneticFieldIntegrity.Verdict?
+    /// Samples the main 100 Hz device-motion stream has delivered. Incremented on the motion queue,
+    /// read on main — one word. With `mainMotionRate` it puts the stream's effective rate in the log,
+    /// so a slowdown while the field monitor's second manager runs would show (#21).
+    private var mainMotionSampleCount = 0
+    private var mainMotionRate = SampleRateMeter()
+    private var fieldMotionRate = SampleRateMeter()
     /// Render-thread throttle for handing that median to the main thread. The correction itself
     /// updates at most once a second; checking faster than twice a second just queues work.
     private var lastGroundYawCheck: TimeInterval = 0
@@ -3157,6 +3165,9 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
                                          altitudeFt: Double) {
         let monitor = MagneticFieldMonitor.shared
         if airborne {
+            // Stopped the moment the airborne estimate says so, whoever else still holds the monitor —
+            // the calibration card included, should it still be up (#20).
+            monitor.setAirborne(true)
             monitor.stop(client: ARTrafficViewController.fieldMonitorClient)
             groundCompassGate.reset()
             fieldAssessment = .pending
@@ -3165,6 +3176,8 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
             lastLoggedFieldVerdict = nil
             return
         }
+        // Landed, or never left: the ground path needs the field, so the stream runs again.
+        monitor.setAirborne(false)
         monitor.start(client: ARTrafficViewController.fieldMonitorClient)
         monitor.updatePosition(latitudeDeg: coordinate.latitude, longitudeDeg: coordinate.longitude,
                                altitudeMeters: altitudeFt * CalculationsLogic.feetToMeters)
@@ -3378,7 +3391,19 @@ class ARTrafficViewController: UIViewController, UIAdaptivePresentationControlle
         let now = Date()
         guard now.timeIntervalSince(lastRecorderSampleTime) >= 1.0 else { return }
         lastRecorderSampleTime = now
-        FlightRecorder.shared.record(currentFlightSample(state: state, aircraft: aircraft))
+        var sample = currentFlightSample(state: state, aircraft: aircraft)
+        // Effective rates over the second since the last row (#21): the main stream always, as a
+        // baseline, and the field monitor's while it runs — rows with both filled are the ones where
+        // the two managers ran together.
+        let clock = CACurrentMediaTime()
+        sample.motionHz = mainMotionRate.rate(count: mainMotionSampleCount, at: clock)
+        let fieldMonitor = MagneticFieldMonitor.shared
+        if fieldMonitor.isRunning {
+            sample.fieldMotionHz = fieldMotionRate.rate(count: fieldMonitor.deliveredSampleCount, at: clock)
+        } else {
+            fieldMotionRate.reset()
+        }
+        FlightRecorder.shared.record(sample)
         recordDatumSample(aircraft: aircraft)
         recordAirportCheck(userLocation: state.coordinate, userAltitudeFt: state.displayAltitudeFt)
     }

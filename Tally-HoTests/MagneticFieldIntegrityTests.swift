@@ -197,6 +197,72 @@ struct MagneticFieldIntegrityTests {
         #expect(!gate.seedMayUseCompass(at: 100 + GroundCompassGate.seedGraceSeconds - 0.1))
     }
 
+    // MARK: - Monitor lifecycle
+
+    @Test func theMonitorRunsOnlyWhileAGroundClientWantsIt() {
+        var demand = FieldMonitorDemand()
+        #expect(!demand.shouldRun)
+        demand.add("calibration")
+        #expect(demand.shouldRun)
+        demand.add("ar_ground")
+        demand.remove("calibration")
+        #expect(demand.shouldRun)            // the AR view still holds it
+        demand.remove("ar_ground")
+        #expect(!demand.shouldRun)           // the last one let go
+    }
+
+    @Test func airborneStopsItWhoeverStillHoldsIt() {
+        var demand = FieldMonitorDemand()
+        demand.add("calibration")             // the card still up over the AR view (#20)
+        demand.add("ar_ground")
+        demand.setAirborne(true)
+        #expect(!demand.shouldRun)
+        // Still held, so landing starts it again: the ground path needs it.
+        demand.setAirborne(false)
+        #expect(demand.shouldRun)
+    }
+
+    @Test func landingDoesNotStartItIfNobodyNeedsIt() {
+        var demand = FieldMonitorDemand()
+        demand.add("ar_ground")
+        demand.setAirborne(true)
+        demand.remove("ar_ground")
+        demand.setAirborne(false)
+        #expect(!demand.shouldRun)
+    }
+
+    // MARK: - Delivered rate
+
+    @Test func theRateIsSamplesOverTheInterval() {
+        var meter = SampleRateMeter()
+        #expect(meter.rate(count: 1_000, at: 10) == nil)      // first read: no interval yet
+        let hz = meter.rate(count: 1_100, at: 11)
+        #expect(hz == 100)
+        // A slowed stream reads as one.
+        #expect(meter.rate(count: 1_160, at: 12) == 60)
+    }
+
+    @Test func aReadTooSoonKeepsTheWindowOpen() {
+        var meter = SampleRateMeter()
+        _ = meter.rate(count: 0, at: 0)
+        #expect(meter.rate(count: 5, at: 0.05) == nil)
+        // Measured from t = 0, not from the ignored read.
+        #expect(meter.rate(count: 100, at: 1) == 100)
+    }
+
+    @Test func aGapOrARestartGivesNoRate() {
+        var meter = SampleRateMeter()
+        _ = meter.rate(count: 0, at: 0)
+        // Backgrounded for a minute: no average over the gap.
+        #expect(meter.rate(count: 200, at: 60) == nil)
+        // The next second measures normally again.
+        #expect(meter.rate(count: 300, at: 61) == 100)
+        // The stream restarted and its count went backwards.
+        #expect(meter.rate(count: 10, at: 62) == nil)
+        meter.reset()
+        #expect(meter.rate(count: 0, at: 70) == nil)
+    }
+
     // MARK: - Calibration card
 
     private typealias Card = CalibrationViewController
